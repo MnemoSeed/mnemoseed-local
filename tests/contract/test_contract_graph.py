@@ -1,9 +1,8 @@
 """Driver-agnostic contract tests for the GraphStore port (prd-08 appendix B.2).
 
 Every method of the graph port gets at least one behavioral test, run against
-the embedded (sqlite_graph) and postgres (pg_graph) driver families. The two
-drivers are mirror implementations of the same relational schema (D1 / D2), so
-the assertions hold on both sides unchanged.
+the embedded (sqlite_graph) driver family. Assertions are behavioral so a
+future driver that honours the same semantics passes unchanged.
 """
 
 from __future__ import annotations
@@ -14,9 +13,11 @@ import pytest
 from _support import PROFILE, make_edge, make_intention, make_pref, make_prov
 from pydantic import ValidationError
 
-from mnemoseed.schema.graph import GraphNode, NodeType, PromotionStatus, RelType
-from mnemoseed.storage.ports import (
+from mnemoseed_local.schema.graph import GraphNode, NodeType, PromotionStatus, RelType
+from mnemoseed_local.storage.ports import (
     Capability,
+    EdgeFilter,
+    EdgeKind,
     GraphFlag,
     GraphWeightUpdate,
     IntentionStatus,
@@ -34,6 +35,7 @@ def test_capabilities(stack) -> None:
             Capability.GRAPH_TRAVERSE_2HOP,
             Capability.GRAPH_VERSION_CHAIN,
             Capability.GRAPH_COOCCURRENCE_EDGES,
+            Capability.GRAPH_EDGE_LIST,
         }
     )
     assert stack.graph.capabilities() == stack.graph.info.capabilities == expected
@@ -197,6 +199,175 @@ def test_bump_cooccurrence_symmetric_and_increments(stack) -> None:
     stack.graph.bump_cooccurrence("other", "node-a", PROFILE)
     reached = stack.graph.traverse("node-a", depth=1, filter=NodeFilter(profile_id=PROFILE))
     assert {n.node_id for n in reached} == {"node-a", "node-b", "other"}
+
+
+def test_list_edges_kinds_filters_and_stable_pagination(stack) -> None:
+    """prd-08 appendix B.2 v1.1: the bulk edge listing contract.
+
+    Every item carries edge id / endpoints / kind (relation | cooccurrence) /
+    weight / timestamp; filters cover profile isolation, endpoint node types,
+    the created time window, cognitive tier and a min-weight floor; pages use a
+    stable order with honest totals.
+    """
+    now = time.time()
+    for node_id, ntype, tier in (
+        ("le-a", NodeType.PREFERENCE, 1),
+        ("le-b", NodeType.PREFERENCE, 1),
+        ("le-c", NodeType.PREFERENCE, 2),
+        ("le-tool", NodeType.TOOL, 2),
+    ):
+        props = {"name": "gh"} if ntype is NodeType.TOOL else dict(_support_props())
+        stack.graph.upsert_node(
+            GraphNode(
+                node_id=node_id,
+                profile_id=PROFILE,
+                node_type=ntype,
+                props=props,
+                cognitive_tier=tier,
+                provenance=make_prov(),
+            )
+        )
+    stack.graph.upsert_node(
+        GraphNode(
+            node_id="le-foreign",
+            profile_id="p2",
+            node_type=NodeType.PREFERENCE,
+            props=dict(_support_props()),
+            cognitive_tier=1,
+            provenance=make_prov(),
+        )
+    )
+    # created order: e1 oldest (now-300), then e3, e4, e5, and the
+    # cooccurrence bump lands newest (~now).
+    stack.graph.add_edge(
+        make_edge("le-a", "le-b", rel=RelType.EVIDENCED_BY, weight=0.8, created_at=now - 300.0)
+    )
+    stack.graph.add_edge(
+        make_edge("le-tool", "le-b", rel=RelType.CONTAINS, weight=0.4, created_at=now - 100.0)
+    )
+    stack.graph.add_edge(make_edge("le-c", "le-a", rel=RelType.HAS, weight=0.6, created_at=now - 50.0))
+    stack.graph.add_edge(
+        make_edge("le-tool", "le-c", rel=RelType.EVIDENCED_BY, weight=0.9, created_at=now - 25.0)
+    )
+    stack.graph.bump_cooccurrence("le-a", "le-tool", PROFILE)  # weight 1.0, ~now
+    stack.graph.add_edge(make_edge("le-foreign", "le-a", profile_id="p2", created_at=now - 50.0))
+
+    edge_filter = EdgeFilter(profile_id=PROFILE)
+    all_edges = stack.graph.list_edges(edge_filter, Page(0, 50))
+    assert all_edges.total == 5
+    assert [e.created_at for e in all_edges.items] == sorted(
+        (e.created_at for e in all_edges.items), reverse=True
+    )
+    by_id = {e.edge_id: e for e in all_edges.items}
+    assert len(by_id) == 5  # every edge id is unique and non-empty
+    kinds = {frozenset((e.src, e.dst)): e.kind for e in all_edges.items}
+    assert kinds[frozenset(("le-a", "le-b"))] is EdgeKind.RELATION
+    assert kinds[frozenset(("le-a", "le-tool"))] is EdgeKind.COOCCURRENCE
+    assert kinds[frozenset(("le-tool", "le-b"))] is EdgeKind.RELATION
+    cooc = next(e for e in all_edges.items if e.kind is EdgeKind.COOCCURRENCE)
+    assert cooc.weight == pytest.approx(1.0)
+    assert cooc.created_at >= now - 2.0
+
+    by_node_type = stack.graph.list_edges(
+        EdgeFilter(profile_id=PROFILE, node_types=(NodeType.PREFERENCE,)), Page(0, 50)
+    )
+    assert {frozenset((e.src, e.dst)) for e in by_node_type.items} == {
+        frozenset(("le-a", "le-b")),
+        frozenset(("le-c", "le-a")),
+    }
+    both_types = stack.graph.list_edges(
+        EdgeFilter(profile_id=PROFILE, node_types=(NodeType.PREFERENCE, NodeType.TOOL)), Page(0, 50)
+    )
+    assert both_types.total == 5
+
+    by_tier = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, tier=1), Page(0, 50))
+    assert {frozenset((e.src, e.dst)) for e in by_tier.items} == {frozenset(("le-a", "le-b"))}
+    tier_two = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, tier=2), Page(0, 50))
+    assert {frozenset((e.src, e.dst)) for e in tier_two.items} == {frozenset(("le-tool", "le-c"))}
+
+    by_weight = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, min_weight=0.7), Page(0, 50))
+    assert {frozenset((e.src, e.dst)) for e in by_weight.items} == {
+        frozenset(("le-a", "le-b")),
+        frozenset(("le-a", "le-tool")),
+        frozenset(("le-tool", "le-c")),
+    }
+
+    window = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, created_after=now - 200.0), Page(0, 50))
+    assert {frozenset((e.src, e.dst)) for e in window.items} == {
+        frozenset(("le-tool", "le-b")),
+        frozenset(("le-c", "le-a")),
+        frozenset(("le-tool", "le-c")),
+        frozenset(("le-a", "le-tool")),
+    }
+    bounded = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, created_before=now - 200.0), Page(0, 50))
+    assert {frozenset((e.src, e.dst)) for e in bounded.items} == {frozenset(("le-a", "le-b"))}
+
+    first = stack.graph.list_edges(edge_filter, Page(offset=0, limit=2))
+    second = stack.graph.list_edges(edge_filter, Page(offset=2, limit=2))
+    third = stack.graph.list_edges(edge_filter, Page(offset=4, limit=2))
+    beyond = stack.graph.list_edges(edge_filter, Page(offset=10, limit=2))
+    assert len(first.items) == 2 and len(second.items) == 2 and len(third.items) == 1
+    assert beyond.items == []
+    assert first.total == second.total == third.total == beyond.total == 5
+    seen = {e.edge_id for e in [*first.items, *second.items, *third.items, *beyond.items]}
+    assert seen == {e.edge_id for e in all_edges.items}
+    assert first.items[0].created_at >= first.items[1].created_at  # stable, newest first
+
+
+def _support_props() -> dict:
+    """The frozen PREFERENCE payload the driver validates on write."""
+    return {
+        "domain": "coding",
+        "statement": "dark mode",
+        "valence": 0.8,
+        "prior_width": 0.3,
+        "trait_anchor": "anima-1",
+        "evidence_chain": [{"event": "created", "at": 123.0}],
+    }
+
+
+def test_list_edges_excludes_edges_with_stale_endpoints(stack) -> None:
+    """Both-endpoints-current guard (QA defect 2 + 3): list_edges must never
+    leak an edge whose endpoint is a tombstoned or superseded (non-current)
+    revision — with type/tier filters AND unfiltered. A mutation removing the
+    current-revision endpoint condition must make this test red on both driver
+    dialects."""
+    now = time.time()
+    for node_id, tier in (("lz-a", 1), ("lz-b", 1), ("lz-c", 1), ("lz-d", 1)):
+        stack.graph.upsert_node(
+            GraphNode(
+                node_id=node_id,
+                profile_id=PROFILE,
+                node_type=NodeType.PREFERENCE,
+                props=dict(_support_props()),
+                cognitive_tier=tier,
+                provenance=make_prov(),
+            )
+        )
+    stack.graph.add_edge(make_edge("lz-a", "lz-b", rel=RelType.HAS, weight=0.8, created_at=now))
+    stack.graph.add_edge(make_edge("lz-b", "lz-c", rel=RelType.HAS, weight=0.6, created_at=now))
+    stack.graph.add_edge(make_edge("lz-c", "lz-d", rel=RelType.HAS, weight=0.5, created_at=now))
+
+    deleted_at = time.time()
+    stack.graph.tombstone("lz-b", deleted_at)  # no current revision remains
+    stack.graph.invalidate("lz-c", deleted_at)  # superseded without replacement
+
+    # unfiltered: NO type/tier filter — the stale-endpoint edges must still vanish
+    unfiltered = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE), Page(0, 50))
+    assert unfiltered.items == []
+    assert unfiltered.total == 0
+
+    # filtered by type: both endpoints must be current AND matching
+    by_type = stack.graph.list_edges(
+        EdgeFilter(profile_id=PROFILE, node_types=(NodeType.PREFERENCE,)), Page(0, 50)
+    )
+    assert by_type.items == []
+    assert by_type.total == 0
+
+    # filtered by tier: the current-revision restriction holds for tier too
+    by_tier = stack.graph.list_edges(EdgeFilter(profile_id=PROFILE, tier=1), Page(0, 50))
+    assert by_tier.items == []
+    assert by_tier.total == 0
 
 
 def test_traverse_profile_scoped(stack) -> None:
@@ -405,7 +576,7 @@ def test_batch_update_weights(stack) -> None:
 
 
 def test_tombstone_tombstoned_node_via_port(stack) -> None:
-    """`tombstone` (design/03 2.4): a deleted node is invisible to reads /
+    """`tombstone` (design/03 storage-layer erasure): a deleted node is invisible to reads /
     traversal / future as_of, yet its version chain survives for audit.
 
     Tombstone semantics are expressible entirely through the existing

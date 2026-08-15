@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed.capture import (
+from mnemoseed_local.capture import (
     ContentTarget,
     InMemoryCapturePipeline,
     Rule,
@@ -23,8 +23,8 @@ from mnemoseed.capture import (
     StrippingPipeline,
     TurnSegmenter,
 )
-from mnemoseed.daemon.app import create_app
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.daemon.app import create_app
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
 
 SESSION = "sess-f1-1"
 PROFILE = "prof-main"
@@ -129,7 +129,7 @@ def test_pipeline_reload_rejects_bad_ruleset() -> None:
 
 
 def test_end_session_and_settled_pass_through() -> None:
-    from mnemoseed.storage.ports import TurnRange
+    from mnemoseed_local.storage.ports import TurnRange
 
     pipeline = StrippingPipeline()
     pipeline.submit_turn(_turn(_tool_step(NPM_LOG)))

@@ -10,9 +10,9 @@ connect. Every public call is O(1) bookkeeping.
 
 from __future__ import annotations
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed.dream import DreamState, DreamTrigger, NullSnapshotter, SnapshotResult, TriggerStatus
-from mnemoseed.storage.ports import TurnRange
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.dream import DreamState, DreamTrigger, NullSnapshotter, SnapshotResult, TriggerStatus
+from mnemoseed_local.storage.ports import TurnRange
 
 
 class _RecordingSnapshotter:

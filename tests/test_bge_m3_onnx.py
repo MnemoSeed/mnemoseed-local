@@ -15,10 +15,10 @@ from urllib.parse import urlparse
 
 import pytest
 
-from mnemoseed.storage.drivers import bge_m3_onnx
-from mnemoseed.storage.drivers.bge_m3_onnx import BgeM3OnnxEmbedder
-from mnemoseed.storage.ports import Capability, EmbeddingResult
-from mnemoseed.storage.registry import EMBED_DRIVERS, register
+from mnemoseed_local.storage.drivers import bge_m3_onnx
+from mnemoseed_local.storage.drivers.bge_m3_onnx import BgeM3OnnxEmbedder
+from mnemoseed_local.storage.ports import Capability, EmbeddingResult
+from mnemoseed_local.storage.registry import EMBED_DRIVERS, register
 
 _MODEL_DIMENSION = 1024
 
@@ -278,4 +278,4 @@ def test_bootstrap_offline_error_is_typed_and_actionable(tmp_path, monkeypatch) 
     message = str(excinfo.value)
     assert "tokenizer.json" in message  # first artifact being fetched
     assert str(tmp_path / "models") in message  # exact local path
-    assert "mnemoseed up" in message  # retry command
+    assert "mnemoseed-local up" in message  # retry command

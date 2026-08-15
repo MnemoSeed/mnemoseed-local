@@ -8,14 +8,14 @@ overlap and the situational-weak-cue rerank weight (FR-3.14).
 
 from __future__ import annotations
 
-from mnemoseed.retrieve.cues import (
+from mnemoseed_local.retrieve.cues import (
     CueConfig,
     CueExtractor,
     ExtractedCues,
     Intent,
     extract_cues,
 )
-from mnemoseed.schema.stamp import Cues
+from mnemoseed_local.schema.stamp import Cues
 
 EXTRACT = CueExtractor().extract
 

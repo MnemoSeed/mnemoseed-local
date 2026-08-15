@@ -11,25 +11,25 @@ from collections.abc import Sequence
 
 import pytest
 
-from mnemoseed.capture.pool import ScorePool
-from mnemoseed.capture.scorer import (
+from mnemoseed_local.capture.pool import ScorePool
+from mnemoseed_local.capture.scorer import (
     Durability,
     DurabilityResult,
     ScoreComponents,
     ScoredTurn,
     TurnScorer,
 )
-from mnemoseed.capture.stamper import (
+from mnemoseed_local.capture.stamper import (
     ConsistencyVerdict,
     NearDuplicateChecker,
     StampWriter,
     WriteContext,
     WriteOutcomeKind,
 )
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, EmotionCue, Provenance
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import SparseVector, WeightUpdate
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, EmotionCue, Provenance
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import SparseVector, WeightUpdate
 
 SESSION = "sess-stamp-1"
 PROFILE = "prof-main"

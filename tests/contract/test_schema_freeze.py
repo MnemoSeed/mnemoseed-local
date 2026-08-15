@@ -10,25 +10,20 @@ behavioral semantics live in the ``test_contract_*`` modules.
 from __future__ import annotations
 
 import asyncio
-import uuid
 
 import pyarrow as pa
-from _support import require_pg
 
-from mnemoseed.schema.graph import NodeType
-from mnemoseed.storage.drivers._migrations import (
+from mnemoseed_local.schema.graph import NodeType
+from mnemoseed_local.storage.drivers._migrations import (
     MIGRATIONS,
     AddColumn,
     AddTrigger,
     CreateIndex,
     CreateTable,
-    current_postgres_schema_version,
     current_schema_version,
 )
-from mnemoseed.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
-from mnemoseed.storage.drivers.pg_graph import PgGraphDriver
-from mnemoseed.storage.drivers.pgvector import chunks_ddl, hnsw_index_ddl
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
 
 _DIM = 64
 
@@ -61,10 +56,6 @@ FROZEN_A1_FIELDS: tuple[str, ...] = (
     "reinforce_count",
 )
 
-# Postgres stores persona in the anima_id column (pgvector._to_row), so the
-# canonical persona_id has an alias there instead of a dedicated column.
-_PG_ALIASES: dict[str, str] = {"persona_id": "anima_id"}
-
 
 def test_vector_schema_freeze_lance(tmp_path) -> None:
     """lancedb_embedded._schema(): every A.1 field plus the structured legs."""
@@ -84,32 +75,6 @@ def test_vector_schema_freeze_lance(tmp_path) -> None:
     # turn bounds are stored columns but nullable: plain chunks have no window
     for name in ("session_id", "turn_start", "turn_end"):
         assert schema.field(name).nullable
-
-
-def test_vector_schema_freeze_postgres_ddl() -> None:
-    """pgvector.chunks_ddl(): same A.1 catalog (persona aliased to anima_id)."""
-    sql = chunks_ddl("chunks_freeze", _DIM)
-    upper = sql.upper()
-    assert "CHUNK_ID TEXT PRIMARY KEY" in upper
-    assert f"VECTOR_DENSE VECTOR({_DIM}) NOT NULL" in upper
-    assert "VECTOR_SPARSE JSONB NOT NULL" in upper
-    assert "SESSION_ID TEXT" in upper
-    assert "TURN_START INTEGER" in upper
-    assert "TURN_END INTEGER" in upper
-
-    seen = {_column_name(field, sql) for field in FROZEN_A1_FIELDS}
-    for field in FROZEN_A1_FIELDS:
-        assert field in seen or field in _PG_ALIASES, f"A.1 field {field!r} has no pg column"
-    assert "persona_id" not in seen, "postgres maps persona_id -> anima_id (alias is intentional)"
-    assert "anima_id" in seen
-
-    index = hnsw_index_ddl("chunks_freeze")
-    assert "USING hnsw (vector_dense vector_cosine_ops)" in index
-
-
-def _column_name(canonical: str, sql: str) -> str | None:
-    column = _PG_ALIASES.get(canonical, canonical)
-    return column if f"{column} " in sql else None
 
 
 def _field_type(schema: pa.Schema, name: str, kind: type) -> pa.StructType:
@@ -236,13 +201,17 @@ def test_meta_schema_freeze_walk() -> None:
     assert {"user_id", "username", "password_hash", "role", "created_at"} <= user_names
     assert "token_hash" in added_meta_columns
     assert "token_hash" not in {column.name for column in tokens.columns}
+    # v8 (E1-4): the reserved config.scope column lands as a migration delta,
+    # never a v1 base column — the D1 "settings DB primary" reservation.
+    assert "scope" in added_meta_columns
+    assert "scope" not in {column.name for column in tables["config"].columns}
 
 
 # ------------------------------------------------------- D6 named graph instances
 
 
-def test_named_graph_instances_build_on_both_backends(tmp_path) -> None:
-    """D6: "main" and a second named instance come up on sqlite and on pg."""
+def test_named_graph_instances_build(tmp_path) -> None:
+    """D6: "main" and a second named instance come up on sqlite."""
     main = SqliteGraphDriver(path=tmp_path / "graph-main.db")
     isolated = SqliteGraphDriver(path=tmp_path / "graph-isolated.db")
     assert main.info.name == isolated.info.name == "sqlite_graph"
@@ -250,14 +219,3 @@ def test_named_graph_instances_build_on_both_backends(tmp_path) -> None:
     assert current_schema_version(isolated._conn, "graph") == 5
     asyncio.run(main.close())
     asyncio.run(isolated.close())
-
-    dsn = require_pg()
-    schema_main = f"grp_main_{uuid.uuid4().hex[:8]}"
-    schema_isolated = f"grp_iso_{uuid.uuid4().hex[:8]}"
-    pg_main = PgGraphDriver(dsn=dsn, schema=schema_main)
-    pg_isolated = PgGraphDriver(dsn=dsn, schema=schema_isolated)
-    assert pg_main.info.name == pg_isolated.info.name == "pg_graph"
-    assert current_postgres_schema_version(pg_main._conn, "graph", schema=schema_main) == 5
-    assert current_postgres_schema_version(pg_isolated._conn, "graph", schema=schema_isolated) == 5
-    asyncio.run(pg_main.close())
-    asyncio.run(pg_isolated.close())

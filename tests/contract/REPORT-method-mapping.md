@@ -2,13 +2,11 @@
 
 Generated automatically by `tests/contract/test_contract_coverage.py`. Every
 public method of the four storage Protocols has at least one contract test
-that runs against the embedded and postgres driver families.
+that runs against the embedded driver family.
 
-Driver families covered by the `stack` fixture:
+Driver family covered by the `stack` fixture:
 
 - embedded: lancedb_embedded + sqlite_graph + sqlite_meta + synthetic embedder
-- pg: pgvector + pg_graph + pg_meta + synthetic embedder (skipped cleanly when
-  `MNEMOSEED_TEST_PG_DSN` is not set)
 
 ## VectorStore (12 methods)
 
@@ -27,7 +25,7 @@ Driver families covered by the `stack` fixture:
 | update_weights | `test_contract_vector.py::test_update_weights` |
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 
-## GraphStore (19 methods)
+## GraphStore (20 methods)
 
 | Method | Contract test |
 |---|---|
@@ -42,6 +40,7 @@ Driver families covered by the `stack` fixture:
 | find_same_predicate | `test_contract_graph.py::test_find_same_predicate` |
 | get_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | invalidate | `test_contract_graph.py::test_invalidate_closes_current_revision` |
+| list_edges | `test_contract_graph.py::test_list_edges_kinds_filters_and_stable_pagination` |
 | list_nodes | `test_contract_graph.py::test_list_nodes_filter_pagination` |
 | query_intentions | `test_contract_graph.py::test_query_intentions_status_and_due` |
 | set_flags | `test_contract_graph.py::test_set_and_clear_flags` |
@@ -51,12 +50,13 @@ Driver families covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (30 methods)
+## MetaStore (32 methods)
 
 | Method | Contract test |
 |---|---|
 | add_token_usage | `test_contract_meta.py::test_dream_token_ledger_atomic_increment` |
 | advance_watermark | `test_contract_meta.py::test_pool_watermark_gap_raises` |
+| archive_profile | `test_contract_meta.py::test_profile_archive_flag` |
 | audit_append | `test_contract_meta.py::test_audit_append_and_query` |
 | audit_query | `test_contract_meta.py::test_audit_append_and_query` |
 | authenticate_token | `test_contract_meta.py::test_token_secret_hashed_at_rest_and_authenticates` |
@@ -83,6 +83,7 @@ Driver families covered by the `stack` fixture:
 | schema_version | `test_contract_meta.py::test_schema_version_and_migrate_forward_only` |
 | set_config | `test_contract_meta.py::test_config_versioned_get_set_rollback` |
 | token_usage | `test_contract_meta.py::test_dream_token_ledger_atomic_increment` |
+| update_dream_run_model | `test_contract_meta.py::test_dream_run_model_update_records_resolved_model` |
 | update_user_password | `test_contract_meta.py::test_users_crud_and_password_rotation` |
 | upsert_profile | `test_contract_meta.py::test_profile_crud_and_token_cascade` |
 

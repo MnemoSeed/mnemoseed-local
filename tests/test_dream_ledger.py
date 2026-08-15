@@ -17,15 +17,15 @@ from __future__ import annotations
 
 import pytest
 
-from mnemoseed.config import DEFAULT_DREAM_TOKEN_BUDGET_USD
-from mnemoseed.dream.delta import PriceTable
-from mnemoseed.dream.ledger import (
+from mnemoseed_local.config import DEFAULT_DREAM_TOKEN_BUDGET_USD
+from mnemoseed_local.dream.delta import PriceTable
+from mnemoseed_local.dream.ledger import (
     DEFAULT_MONTHLY_BUDGET_USD,
     LedgerStatus,
     TokenLedger,
     year_month_for,
 )
-from mnemoseed.storage.ports import AuditEntry
+from mnemoseed_local.storage.ports import AuditEntry
 
 # 2026-08-01T00:00:00Z and 2026-09-01T00:00:00Z (UTC, pinned deterministically).
 _AUG = 1785542400.0

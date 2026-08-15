@@ -9,9 +9,9 @@ import time
 
 import pytest
 
-from mnemoseed.storage.drivers._migrations import apply_migrations, current_schema_version
-from mnemoseed.storage.drivers.sqlite_meta import SqliteMetaDriver
-from mnemoseed.storage.ports import (
+from mnemoseed_local.storage.drivers._migrations import apply_migrations, current_schema_version
+from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+from mnemoseed_local.storage.ports import (
     AuditEntry,
     AuditFilter,
     Capability,
@@ -24,7 +24,7 @@ from mnemoseed.storage.ports import (
     StoredUser,
     TurnRange,
 )
-from mnemoseed.storage.registry import META_DRIVERS, register
+from mnemoseed_local.storage.registry import META_DRIVERS, register
 
 
 @pytest.fixture(autouse=True)
@@ -363,6 +363,23 @@ def test_dream_run_list_orders_and_filters(driver):
     assert {r.run_id for r in interrupted.items} == {"r2"}
 
 
+def test_dream_run_model_recorded_after_resolution(driver):
+    """F2: a run registered without a model (snapshot capture precedes route
+    resolution) gets the pinned model written back once reflect resolves the
+    route at run start; a later resolution overwrites it."""
+    driver.record_dream_run(DreamRun(run_id="run-a", session_id="s1", started_at=100.0))
+    assert driver.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0].model_id == ""
+    driver.update_dream_run_model("run-a", "kimi-k3")
+    runs = driver.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50))
+    assert runs.items[0].model_id == "kimi-k3"
+    driver.update_dream_run_model("run-a", "deepseek-v4-flash")
+    assert driver.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0].model_id == (
+        "deepseek-v4-flash"
+    )
+    # an unknown run is a silent no-op (the run is always registered first)
+    driver.update_dream_run_model("no-such-run", "kimi-k3")
+
+
 # ---------------------------------------------------------------- migrations
 
 
@@ -382,15 +399,16 @@ def test_meta_migration_preserves_data_and_is_forward_only(tmp_path):
     driver = SqliteMetaDriver(path=path)
     try:
         # graph-tagged v2 is not applied to a meta-only file; v3 adds the
-        # per-profile score pool, v4 the dream token ledger and v6 the identity
-        # users table + hashed token column, so meta lands at 6 (the legacy
+        # per-profile score pool, v4 the dream token ledger, v6 the identity
+        # users table + hashed token column, v7 the profile archive flag and
+        # v8 the reserved config.scope column, so meta lands at 8 (the legacy
         # singleton score_pool is neither dropped nor migrated).
-        assert driver.schema_version() == 6
+        assert driver.schema_version() == 8
         got = driver.get_profile("u1")
         assert got is not None
         assert got.display_name == "survivor"
         driver.migrate()  # idempotent re-run
-        assert driver.schema_version() == 6
+        assert driver.schema_version() == 8
     finally:
         asyncio.run(driver.close())
 
@@ -399,7 +417,7 @@ def test_schema_version_equals_latest_new_install(tmp_path):
     db = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
         assert db.schema_version() == db.migrate()
-        assert db.schema_version() == 6
+        assert db.schema_version() == 8
         # a profile row written after init survives a migrate() no-op
         db.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
         db.migrate()

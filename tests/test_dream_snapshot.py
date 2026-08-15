@@ -14,13 +14,14 @@ seams. The store and meta fakes are minimal in-memory doublets of the two ports.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed.dream import (
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.dream import (
     DreamState,
     DreamTrigger,
     FileSnapshotter,
@@ -31,8 +32,8 @@ from mnemoseed.dream import (
     resume_boundary,
     write_snapshot_file,
 )
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.ports import (
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.ports import (
     Capability,
     ChunkFilter,
     DreamRun,
@@ -47,17 +48,29 @@ _RANGE = TurnRange(0, 3)
 
 
 class _FakeStore:
-    """VectorStore-shaped in-memory double: snapshot_read + purge_range."""
+    """VectorStore-shaped in-memory double: snapshot_read + purge_range +
+    mark_consolidated (the dream safe-clear seam)."""
 
     def __init__(self, chunks: list[ChunkStamp] | None = None) -> None:
         self.chunks: list[ChunkStamp] = list(chunks or [])
         self.purged: list[tuple[str, int, int]] = []
+        self.marked: list[str] = []  # ids handed to mark_consolidated (safe-clear)
 
     def capabilities(self) -> frozenset[Capability]:
         return frozenset({Capability.VECTOR_SNAPSHOT})
 
     def snapshot_read(self, filter: ChunkFilter) -> list[ChunkStamp]:
         return [c for c in self.chunks if c.profile_id == filter.profile_id]
+
+    def delete_chunk(self, chunk_id: str) -> None:
+        self.chunks = [c for c in self.chunks if c.chunk_id != chunk_id]
+
+    def mark_consolidated(self, chunk_ids: Sequence[str]) -> None:
+        ids = set(chunk_ids)
+        self.marked.extend(chunk_ids)
+        self.chunks = [
+            c.model_copy(update={"consolidated": True}) if c.chunk_id in ids else c for c in self.chunks
+        ]
 
     def purge_range(self, session_id: str, turn_start: int, turn_end: int) -> int:
         self.purged.append((session_id, turn_start, turn_end))
@@ -86,36 +99,37 @@ class _ReadFailsStore(_FakeStore):
 
 
 class _OrderProbeStore(_FakeStore):
-    """Purge doublet that snapshots the on-disk journal state at the instant
-    each purge_range call happens, so tests can assert the merge marker was
-    persisted BEFORE any store mutation (marker-before-purge ordering)."""
+    """Safe-clear doublet that snapshots the on-disk journal state at the
+    instant each mark_consolidated call happens, so tests can assert the merge
+    marker was persisted BEFORE any store mutation (marker-before-clear
+    ordering)."""
 
     def __init__(self, chunks: list[ChunkStamp] | None = None, *, journal: Path) -> None:
         super().__init__(chunks)
         self._journal = journal
         self.file_states: list[frozenset[str]] = []
 
-    def purge_range(self, session_id: str, turn_start: int, turn_end: int) -> int:
+    def mark_consolidated(self, chunk_ids: Sequence[str]) -> None:
         files = list(self._journal.glob("*.json"))
         if files:
             snapshot = load_snapshot_file(files[0])
             self.file_states.append(snapshot.phases if snapshot is not None else frozenset())
-        return super().purge_range(session_id, turn_start, turn_end)
+        return super().mark_consolidated(chunk_ids)
 
 
 class _CrashPurgeStore(_FakeStore):
-    """Purge doublet that dies mid-clear (simulated) so tests can check the
-    crash window between journal commit and store purge leaves an idempotent
+    """Safe-clear doublet that dies mid-clear (simulated) so tests can check the
+    crash window between journal commit and store clear leaves an idempotent
     journal: the committed merge is never re-executed and survivors are never
-    re-written."""
+    re-marked."""
 
     def __init__(self, chunks: list[ChunkStamp] | None = None) -> None:
         super().__init__(chunks)
-        self.purge_calls = 0
+        self.mark_calls = 0
 
-    def purge_range(self, session_id: str, turn_start: int, turn_end: int) -> int:
-        self.purge_calls += 1
-        raise StorageError("crash simulated inside store purge")
+    def mark_consolidated(self, chunk_ids: Sequence[str]) -> None:
+        self.mark_calls += 1
+        raise StorageError("crash simulated inside store clear")
 
 
 class _FakeMeta:
@@ -306,24 +320,27 @@ def test_safe_clear_only_runs_after_merge_commit(tmp_path: Path) -> None:
 
     trigger.handle_event(_event(profile="alice", rng=TurnRange(0, 4)))
     assert trigger.status("alice").state is DreamState.DREAMING
-    assert store.purged == []  # not before the merge commits
+    assert store.marked == []  # not before the merge commits
 
     fs2 = _snapshotter(store, meta, directory=tmp_path)
     recovered = fs2.recover()
     assert recovered
     fs2.adopt(recovered[0])
-    assert store.purged == []  # recovery of an unmerged snapshot never purges
+    assert store.marked == []  # recovery of an unmerged snapshot never clears
 
     trigger.on_reflect_complete("alice")
     trigger.on_merge_committed("alice")
-    # purge ran exactly once per snapshot session, scoped to the snapshot range
-    assert sorted(store.purged) == sorted([("s1", 0, 4), ("s2", 0, 4)])
-    # nothing outside the snapshot's range was removed
-    assert {c.chunk_id for c in store.chunks} == {"c"}
+    # the safe-clear marked exactly the in-range rows as consolidated, once per
+    # snapshot scope; nothing was deleted
+    assert sorted(store.marked) == ["a", "b"]
+    assert store.purged == []  # the range purge never fires
+    assert {c.chunk_id for c in store.chunks} == {"a", "b", "c"}  # all retained
+    assert all(c.consolidated for c in store.chunks if c.chunk_id in {"a", "b"})
+    assert not any(c.consolidated for c in store.chunks if c.chunk_id == "c")
 
-    # a re-delivered merge commit purges nothing more (idempotent)
+    # a re-delivered merge commit marks nothing more (idempotent)
     assert fs.purge_snapshot("alice", TurnRange(0, 4)) == 0
-    assert len(store.purged) == 2
+    assert len(store.marked) == 2
 
 
 def test_purge_guarded_against_wrong_scope(tmp_path: Path) -> None:
@@ -334,7 +351,63 @@ def test_purge_guarded_against_wrong_scope(tmp_path: Path) -> None:
     # a purge for a different range is refused: scope is exact
     assert fs.purge_snapshot("alice", TurnRange(3, 5)) == 0
     assert store.purged == []
+    assert store.marked == []
     assert {c.chunk_id for c in store.chunks} == {"a"}
+
+
+# ---------------------------------------------------------------- safe clear = mark consolidated
+#
+# design/03 §4: after the dream clears its snapshot, the corresponding chunks
+# are MARKED consolidated=true (decay λ×3 via the D1 sweeper) and RETAINED as
+# the evidence scene — never physically deleted. The old delete-on-merge
+# behavior was the QA-flagged divergence; these tests pin the corrected
+# semantics (mark + retain, provenance intact).
+
+
+def test_safe_clear_marks_consumed_chunks_consolidated_and_retains_them(tmp_path: Path) -> None:
+    """The merge-consumed path (explicit consumed allow-list) marks exactly the
+    consumed rows consolidated and keeps every chunk in the verbatim channel."""
+    store = _FakeStore(
+        [
+            _stamp("a", "in a", turn_start=0, turn_end=2, session="s1"),
+            _stamp("b", "in b", turn_start=1, turn_end=3, session="s1"),
+        ]
+    )
+    fs = _snapshotter(store, directory=tmp_path)
+    fs.request("alice", TurnRange(0, 3))
+    marked = fs.purge_snapshot("alice", TurnRange(0, 3), consumed_chunk_ids=["a"])
+
+    assert marked == 1
+    assert sorted(store.marked) == ["a"]  # the mark path ran, never a delete
+    assert {c.chunk_id for c in store.chunks} == {"a", "b"}  # both retained
+    by_id = {c.chunk_id: c for c in store.chunks}
+    assert by_id["a"].consolidated is True
+    assert by_id["b"].consolidated is False  # the overflow chunk stays unmarked
+    assert by_id["a"].text == "in a"  # verbatim channel intact
+    assert store.purged == []  # no range purge either
+
+
+def test_safe_clear_legacy_no_allow_list_marks_every_snapshot_chunk(tmp_path: Path) -> None:
+    """Pre-delta snapshots carry no consumed allow-list: the legacy fallback
+    marks every in-range snapshot chunk consolidated (behavior-equivalent
+    coverage to the old full-range purge, minus any deletion)."""
+    store = _FakeStore(
+        [
+            _stamp("a", "in a", turn_start=0, turn_end=2, session="s1"),
+            _stamp("b", "in b", turn_start=1, turn_end=3, session="s2"),
+            _stamp("c", "out c", turn_start=9, turn_end=9, session="s2"),
+        ]
+    )
+    fs = _snapshotter(store, directory=tmp_path)
+    fs.request("alice", TurnRange(0, 4))
+    marked = fs.purge_snapshot("alice", TurnRange(0, 4))
+
+    assert marked == 2
+    assert sorted(store.marked) == ["a", "b"]
+    assert sorted(c.chunk_id for c in store.chunks) == ["a", "b", "c"]  # all retained
+    assert all(c.consolidated is True for c in store.chunks if c.chunk_id in {"a", "b"})
+    assert not any(c.consolidated for c in store.chunks if c.chunk_id == "c")
+    assert store.purged == []  # the range purge never fires
 
 
 # ---------------------------------------------------------------- phase markers
@@ -387,9 +460,11 @@ def test_multi_profile_snapshots_do_not_mix(tmp_path: Path) -> None:
     assert ra is not None and [c.chunk_id for c in ra.chunks] == ["a1"]
     assert rb is not None and [c.chunk_id for c in rb.chunks] == ["b1"]
 
-    # purging alice's committed merge leaves bob's sources untouched
+    # clearing alice's committed merge leaves bob's sources untouched
     assert fs.purge_snapshot("alice", TurnRange(0, 2)) == 1
-    assert {c.chunk_id for c in store.chunks} == {"b1"}
+    assert {c.chunk_id for c in store.chunks} == {"a1", "b1"}  # alice's chunk is retained
+    assert next(c for c in store.chunks if c.chunk_id == "a1").consolidated is True
+    assert not any(c.consolidated for c in store.chunks if c.chunk_id == "b1")
 
     # only bob's unmerged snapshot survives recovery
     recovered = _snapshotter(store, meta, directory=tmp_path).recover()
@@ -515,7 +590,7 @@ def test_reflect_done_snapshot_resumes_at_merge_not_reflect(tmp_path: Path) -> N
 
     # the (future T4) merge completion fires the safe-clear exactly once
     trigger.on_merge_committed("alice")
-    assert sorted(store.purged) == [("s1", 0, 2)]
+    assert store.marked == ["a"]  # the consumed row was marked consolidated
     assert trigger.status("alice").state is DreamState.IDLE
     assert trigger.status("alice").current_range is None
     # terminal: the journal now marks the dream complete, recovery ends
@@ -541,9 +616,9 @@ def test_resume_merge_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_purge_persists_merge_marker_before_store_clear(tmp_path: Path) -> None:
-    """Ordering lock: safer-clear must commit the MERGE_DONE journal BEFORE the
-    first purge_range hit. A regression that purged first would leave the
-    journal unmarked at purge time and this test would go red."""
+    """Ordering lock: safe-clear must commit the MERGE_DONE journal BEFORE the
+    first mark_consolidated hit. A regression that cleared first would leave
+    the journal unmarked at clear time and this test would go red."""
     store = _OrderProbeStore(
         [_stamp("a", "text a", turn_start=0, turn_end=2, session="s1")],
         journal=tmp_path,
@@ -558,7 +633,7 @@ def test_purge_persists_merge_marker_before_store_clear(tmp_path: Path) -> None:
 def test_crash_between_marker_and_purge_does_not_reexecute(tmp_path: Path) -> None:
     """A crash (simulated store failure) between the journal commit and the
     store clear leaves an idempotent journal: recovery does NOT re-execute the
-    committed merge, and leftover rows are never double-purged."""
+    committed merge, and leftover rows are never double-marked."""
     store = _CrashPurgeStore([_stamp("a", "text a", turn_start=0, turn_end=2, session="s1")])
     fs = _snapshotter(store, directory=tmp_path)
     fs.request("alice", TurnRange(0, 2))
@@ -571,10 +646,11 @@ def test_crash_between_marker_and_purge_does_not_reexecute(tmp_path: Path) -> No
     assert SnapshotPhase.MERGE_DONE.value in on_disk.phases
     # the committed merge is never re-executed by recovery
     assert fs.recover() == []
-    # a later retry is a no-op: no double clear, survivors untouched
+    # a later retry is a no-op: no double clear, the row stays unmarked
     assert fs.purge_snapshot("alice", TurnRange(0, 2)) == 0
-    assert store.purge_calls == 1
+    assert store.mark_calls == 1
     assert {c.chunk_id for c in store.chunks} == {"a"}
+    assert not any(c.consolidated for c in store.chunks)
 
 
 def test_purge_preserves_journaled_reflect_result(tmp_path: Path) -> None:

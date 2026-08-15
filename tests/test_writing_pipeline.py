@@ -9,14 +9,14 @@ from collections.abc import Sequence
 
 import pytest
 
-from mnemoseed.capture.pipeline import ScoringPipeline, WritingPipeline
-from mnemoseed.capture.pool import ScorePool
-from mnemoseed.capture.scorer import TurnScorer
-from mnemoseed.capture.stamper import StampWriter, WriteContext, WriteOutcomeKind
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import SparseVector, WeightUpdate
+from mnemoseed_local.capture.pipeline import ScoringPipeline, WritingPipeline
+from mnemoseed_local.capture.pool import ScorePool
+from mnemoseed_local.capture.scorer import TurnScorer
+from mnemoseed_local.capture.stamper import StampWriter, WriteContext, WriteOutcomeKind
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import SparseVector, WeightUpdate
 
 SESSION = "sess-write-1"
 SESSION_B = "sess-write-2"
@@ -183,7 +183,7 @@ def test_stats_track_reconcile_outcome() -> None:
 
 
 def test_end_session_and_settled_pass_through() -> None:
-    from mnemoseed.storage.ports import TurnRange
+    from mnemoseed_local.storage.ports import TurnRange
 
     store = _FakeVectorStore()
     pipe = _writing_pipeline(store, _Clock())

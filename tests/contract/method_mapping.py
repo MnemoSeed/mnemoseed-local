@@ -46,6 +46,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "batch_update_weights": "test_contract_graph.py::test_batch_update_weights",
         "query_intentions": "test_contract_graph.py::test_query_intentions_status_and_due",
         "tombstone": "test_contract_graph.py::test_tombstone_tombstoned_node_via_port",
+        "list_edges": "test_contract_graph.py::test_list_edges_kinds_filters_and_stable_pagination",
     },
     "MetaStore": {
         "capabilities": "test_contract_meta.py::test_capabilities",
@@ -58,6 +59,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "get_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
         "delete_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
         "list_profiles": "test_contract_meta.py::test_profile_crud_and_token_cascade",
+        "archive_profile": "test_contract_meta.py::test_profile_archive_flag",
         "issue_token": "test_contract_meta.py::test_issue_token_and_revoke",
         "revoke_token": "test_contract_meta.py::test_issue_token_and_revoke",
         "get_config": "test_contract_meta.py::test_config_versioned_get_set_rollback",
@@ -67,6 +69,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "audit_query": "test_contract_meta.py::test_audit_append_and_query",
         "record_dream_run": "test_contract_meta.py::test_dream_runs_roundtrip",
         "list_dream_runs": "test_contract_meta.py::test_dream_runs_roundtrip",
+        "update_dream_run_model": "test_contract_meta.py::test_dream_run_model_update_records_resolved_model",
         "add_token_usage": "test_contract_meta.py::test_dream_token_ledger_atomic_increment",
         "token_usage": "test_contract_meta.py::test_dream_token_ledger_atomic_increment",
         "schema_version": "test_contract_meta.py::test_schema_version_and_migrate_forward_only",
@@ -90,10 +93,14 @@ COVERAGE: dict[str, dict[str, str]] = {
 # Appendix B reference method counts (prd-08 appendix B.1..B.4). MetaStore
 # grew to 29 with the issue-#14 identity chain surface (create/get/list/count/
 # update_password user + authenticate_token over hashed bearer digests) and to
-# 30 with create_owner (the atomic single-transaction owner setup).
+# 30 with create_owner (the atomic single-transaction owner setup), and to 31
+# with archive_profile (PRD-07 FR-7.3 console profile archive), and to 32 with
+# update_dream_run_model (F2 per-run model pinning recorded on dream_runs).
+# GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
+# 2026-08-13, the console Graph View bulk edge listing).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 12,
-    "GraphStore": 19,
-    "MetaStore": 30,
+    "GraphStore": 20,
+    "MetaStore": 32,
     "Embedder": 3,
 }

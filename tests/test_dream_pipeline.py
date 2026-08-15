@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed.dream import (
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.dream import (
     DreamState,
     DreamTrigger,
     FileSnapshotter,
@@ -28,11 +28,11 @@ from mnemoseed.dream import (
     load_snapshot_file,
     resume_boundary,
 )
-from mnemoseed.dream.merge import MergeOutcome
-from mnemoseed.dream.pipeline import DreamPipeline
-from mnemoseed.dream.snapshot import Snapshot, SnapshotChunk
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.ports import TurnRange
+from mnemoseed_local.dream.merge import MergeOutcome
+from mnemoseed_local.dream.pipeline import DreamPipeline
+from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.ports import TurnRange
 
 _RANGE = TurnRange(0, 2)
 _PROFILE = "alice"

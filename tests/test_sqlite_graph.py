@@ -2,21 +2,24 @@
 weights, intentions, and the migration 1->head data-preservation simulation."""
 
 import asyncio
+import os
+import random
 import sqlite3
 import time
 
 import pytest
 
-from mnemoseed.schema.graph import Edge, GraphNode, NodeType, RelType
-from mnemoseed.schema.stamp import Provenance
-from mnemoseed.storage.drivers._migrations import (
+from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
+from mnemoseed_local.schema.stamp import Provenance
+from mnemoseed_local.storage.drivers._migrations import (
     MIGRATIONS,
     apply_migrations,
     current_schema_version,
 )
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.ports import (
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.ports import (
     Capability,
+    EdgeFilter,
     GraphFlag,
     GraphWeightUpdate,
     IntentionStatus,
@@ -24,7 +27,7 @@ from mnemoseed.storage.ports import (
     Page,
     StorageError,
 )
-from mnemoseed.storage.registry import GRAPH_DRIVERS, register
+from mnemoseed_local.storage.registry import GRAPH_DRIVERS, register
 
 _PREF_PROPS: dict = {
     "domain": "coding",
@@ -96,7 +99,8 @@ def test_capabilities_full_set():
     assert Capability.GRAPH_VERSION_CHAIN in caps
     assert Capability.GRAPH_COOCCURRENCE_EDGES in caps
     assert Capability.GRAPH_TRAVERSE_2HOP in caps
-    assert len(caps) == 3
+    assert Capability.GRAPH_EDGE_LIST in caps
+    assert len(caps) == 4
 
 
 def test_pragmas_wal_and_foreign_keys(tmp_path):
@@ -586,8 +590,9 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
             "dream_runs",
             "dream_token_ledger",
         }
-        # v2/v5 are graph-only; v3/v4/v6 are meta (the identity chain lands in v6)
-        assert current_schema_version(conn, "meta") == 6
+        # v2/v5 are graph-only; v3/v4/v6/v7/v8 are meta (identity chain lands in
+        # v6, the profile archive flag in v7, the reserved config.scope in v8)
+        assert current_schema_version(conn, "meta") == 8
     finally:
         conn.close()
 
@@ -595,7 +600,7 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
 def test_migration_sequence_is_shared_and_forward_only():
     versions = [m.version for m in MIGRATIONS]
     assert versions == sorted(versions)
-    assert versions == [1, 2, 3, 4, 5, 6]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8]
     stores = {op.store for m in MIGRATIONS for op in m.ops}
     assert stores == {"graph", "meta"}
     # every store-region can reach the tail of the shared sequence independently
@@ -605,3 +610,85 @@ def test_migration_sequence_is_shared_and_forward_only():
 
 def _column_names(conn, table: str) -> set[str]:
     return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+# ---------------------------------------------------------------- list_edges (B.2 v1.1)
+
+
+def test_list_edges_orders_by_created_desc_id_asc(driver):
+    """Stable order contract: created_at desc, edge id asc tie-breaker."""
+    for node_id in ("e-a", "e-b", "e-c", "e-d"):
+        driver.upsert_node(make_pref(node_id=node_id))
+    now = time.time()
+    driver.add_edge(
+        Edge(src="e-a", dst="e-b", rel=RelType.EVIDENCED_BY, profile_id="p1", created_at=now - 10)
+    )
+    driver.add_edge(Edge(src="e-b", dst="e-c", rel=RelType.EVIDENCED_BY, profile_id="p1", created_at=now - 5))
+    driver.add_edge(Edge(src="e-c", dst="e-d", rel=RelType.EVIDENCED_BY, profile_id="p1", created_at=now - 5))
+    page = driver.list_edges(EdgeFilter(profile_id="p1"), Page(limit=10))
+    assert page.total == 3
+    newest = page.items[0]
+    # the two same-time edges fall back to the id tie-breaker: strictly ordered
+    assert [e.created_at for e in page.items] == sorted((e.created_at for e in page.items), reverse=True)
+    assert newest.src in {"e-b", "e-c"}
+    assert newest.dst in {"e-c", "e-d"}
+    assert newest.created_at == pytest.approx(now - 5, abs=0.002)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MNEMOSEED_GRAPH_PERF"),
+    reason="set MNEMOSEED_GRAPH_PERF=1 for the list_edges page-scale benchmark "
+    "(seeds ~5k nodes / ~19k edges; NFR-7.2 first-paint target)",
+)
+def test_list_edges_5k_graph_page_returns_at_design_scale(driver):
+    """NFR-7.2 design-scale page read: on a ~5k-node / ~19k-edge graph a single
+    paginated page must return far inside the first-paint budget (generous CI
+    bound; the real cost is a profile-indexed range scan, not a table scan)."""
+    rng = random.Random(7)
+    now = time.time()
+    node_ids: list[str] = []
+    for index in range(5_000):
+        node_id = f"perf-{index:05d}"
+        node_ids.append(node_id)
+        driver.upsert_node(
+            make_pref(
+                node_id=node_id,
+                profile_id="p1",
+                cognitive_tier=rng.choice((1, 1, 2, 3)),
+                decay_weight=round(rng.uniform(0.05, 1.0), 3),
+                created_at=now - rng.uniform(0.0, 90 * 24 * 3600.0),
+            )
+        )
+    pairs: set[tuple[str, str]] = set()
+    while len(pairs) < 19_000:
+        a = rng.choice(node_ids)
+        b = rng.choice(node_ids)
+        if a == b:
+            continue
+        pairs.add(tuple(sorted((a, b))))
+    for a, b in pairs:
+        driver.add_edge(
+            Edge(
+                src=a,
+                dst=b,
+                rel=rng.choice((RelType.EVIDENCED_BY, RelType.CO_OCCURRED)),
+                profile_id="p1",
+                weight=round(rng.uniform(0.1, 1.0), 3),
+                created_at=now - rng.uniform(0.0, 90 * 24 * 3600.0),
+            )
+        )
+    started = time.perf_counter()
+    page = driver.list_edges(EdgeFilter(profile_id="p1"), Page(offset=0, limit=500))
+    elapsed = time.perf_counter() - started
+    filtered = driver.list_edges(
+        EdgeFilter(profile_id="p1", node_types=(NodeType.PREFERENCE,), min_weight=0.5),
+        Page(offset=0, limit=500),
+    )
+    filtered_elapsed = time.perf_counter() - started - elapsed
+    assert page.total == 19_000
+    assert len(page.items) == 500
+    print(
+        f"[list_edges@5k] page500={elapsed * 1000:.1f}ms "
+        f"filtered={filtered_elapsed * 1000:.1f}ms total={filtered.total}"
+    )
+    assert elapsed < 2.0, f"bulk edge page on a 5k graph took {elapsed:.2f}s"

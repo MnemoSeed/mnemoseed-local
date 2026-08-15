@@ -10,7 +10,7 @@ import math
 
 import pytest
 
-from mnemoseed.storage.ports import Capability
+from mnemoseed_local.storage.ports import Capability
 
 
 def test_capabilities(stack) -> None:

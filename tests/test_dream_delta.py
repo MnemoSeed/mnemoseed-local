@@ -26,8 +26,8 @@ from typing import Any
 
 import pytest
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed.dream import (
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.dream import (
     DEFAULT_DELTA_BUDGET_TOKENS,
     DELTA_BUDGET_CEILING_TOKENS,
     DELTA_BUDGET_FLOOR_TOKENS,
@@ -52,12 +52,12 @@ from mnemoseed.dream import (
     resolve_delta_budget,
     resume_boundary,
 )
-from mnemoseed.dream.merge import MergeOutcome, Merger
-from mnemoseed.dream.pipeline import DreamPipeline
-from mnemoseed.dream.snapshot import FileSnapshotter, Snapshot, SnapshotChunk
-from mnemoseed.llm.types import ChatResult, Usage
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.ports import AuditEntry, TurnRange
+from mnemoseed_local.dream.merge import MergeOutcome, Merger
+from mnemoseed_local.dream.pipeline import DreamPipeline
+from mnemoseed_local.dream.snapshot import FileSnapshotter, Snapshot, SnapshotChunk
+from mnemoseed_local.llm.types import ChatResult, Usage
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.ports import AuditEntry, TurnRange
 
 _RANGE = TurnRange(0, 10)
 _DEFAULT_INPUT = PriceTable().input_usd_per_m
@@ -519,7 +519,7 @@ class _VectorFake:
     def __init__(self, chunks: list[ChunkStamp] | None = None) -> None:
         self.chunks = list(chunks or [])
         self.purged: list[tuple[str, int, int]] = []
-        self.deleted: list[str] = []  # per-id safe-clear (consumed-ids-scoped)
+        self.marked: list[str] = []  # consumed-ids-scoped safe-clear (mark path)
 
     def capabilities(self) -> frozenset[object]:
         return frozenset()
@@ -528,8 +528,14 @@ class _VectorFake:
         return [c for c in self.chunks if c.profile_id == getattr(filter, "profile_id", None)]
 
     def delete_chunk(self, chunk_id: str) -> None:
-        self.deleted.append(chunk_id)
         self.chunks = [c for c in self.chunks if c.chunk_id != chunk_id]
+
+    def mark_consolidated(self, chunk_ids: object) -> None:
+        ids = set(chunk_ids)
+        self.marked.extend(chunk_ids)
+        self.chunks = [
+            c.model_copy(update={"consolidated": True}) if c.chunk_id in ids else c for c in self.chunks
+        ]
 
     def purge_range(self, session_id: str, turn_start: int, turn_end: int) -> int:
         self.purged.append((session_id, turn_start, turn_end))
@@ -663,7 +669,7 @@ def test_d1_verifier_repro_over_budget_chunk_survives_then_later_dream_completes
     chunk does not fit the default budget survives the full reflect -> merge ->
     commit -> safe-clear chain untouched, stays journaled at the reflect
     boundary, and a later dream with a bigger budget picks it up and completes
-    the commit + purge normally."""
+    the commit + clear-as-mark normally."""
     store = _VectorFake([_stamp("huge", "I prefer dark mode. " * 2200)])
     fs, trigger, llm, merger = _chain(tmp_path, store)
     trigger.handle_event(_event())
@@ -671,8 +677,8 @@ def test_d1_verifier_repro_over_budget_chunk_survives_then_later_dream_completes
     # defense 1 engages at the reflect boundary: nothing to pack -> no cloud call
     assert llm.calls == []
     assert merger.call_count == 0  # the merger is never reached
-    assert store.purged == []  # the safe-clear purge never fired
-    assert store.deleted == []  # no per-id delete either
+    assert store.purged == []  # the safe-clear never fired
+    assert store.marked == []  # no mark either
     assert [c.chunk_id for c in store.chunks] == ["huge"]  # the chunk survives
 
     snapshot = fs.active("alice")
@@ -705,15 +711,16 @@ def test_d1_verifier_repro_over_budget_chunk_survives_then_later_dream_completes
     assert len(llm2.calls) == 1
     assert "I prefer dark mode" in llm2.calls[0][1]  # the retained chunk reached the model
     # the safe-clear is id-scoped now: exactly the consumed row, never a range delete
-    assert store.deleted == ["huge"]
+    assert store.marked == ["huge"]  # marked consolidated, never deleted
     assert store.purged == []
-    assert store.chunks == []  # the over-budget chunk was processed and cleared, not lost
+    assert [c.chunk_id for c in store.chunks] == ["huge"]  # retained as evidence scene
+    assert store.chunks[0].consolidated is True
 
 
 def test_d1_partial_overflow_with_empty_triples_defers_merge(tmp_path: Path) -> None:
     """Defense line 2 (pipeline): the packed delta reflects fine, but with the
     overflow chunk flagged and ZERO triples extracted, the snapshot is NOT handed
-    to the merger -- committing would purge source chunks the model never saw."""
+    to the merger -- committing would clear source chunks the model never saw."""
     noise = _stamp("noise", "lorem ipsum dolor sit amet", turn_start=0, turn_end=1)
     huge = _stamp("huge", "z" * 44000, turn_start=0, turn_end=1)
     store = _VectorFake([noise, huge])
@@ -723,8 +730,8 @@ def test_d1_partial_overflow_with_empty_triples_defers_merge(tmp_path: Path) -> 
     assert len(llm.calls) == 1  # the packed (noise-only) delta WAS reflected
     assert "huge" not in llm.calls[0][1]  # the overflow chunk never reached the model
     assert merger.call_count == 0  # engine-side insurance: merge blocked
-    assert store.purged == []  # no commit, no purge
-    assert store.deleted == []  # and no per-id delete either
+    assert store.purged == []  # no commit, no clear
+    assert store.marked == []  # and no mark either
     assert {c.chunk_id for c in store.chunks} == {"noise", "huge"}  # nothing dropped
 
 
@@ -732,7 +739,7 @@ def test_d1_merge_boundary_recovery_respects_persisted_overflow(tmp_path: Path) 
     """The overflow flag survives the journal round-trip: a crashed dream that
     reflected a truncated delta and crashed before merge resumes at the MERGE
     boundary with the guard active -- reflect is never re-run and the deferred
-    merge cannot purge the overflow chunk."""
+    merge cannot mark the overflow chunk."""
     noise = _stamp("noise", "lorem ipsum dolor sit amet", turn_start=0, turn_end=1)
     huge = _stamp("huge", "z" * 140000, turn_start=0, turn_end=1)  # ~35k tokens: over the 32k ceiling
     store = _VectorFake([noise, huge])
@@ -775,11 +782,11 @@ def test_d1_merge_boundary_recovery_respects_persisted_overflow(tmp_path: Path) 
     assert reflector.calls == []  # reflect must never re-run at the merge boundary
     assert merger.call_count == 0  # the persisted overflow held the guard
     assert store.purged == []
-    assert store.deleted == []
+    assert store.marked == []
     assert {c.chunk_id for c in store.chunks} == {"noise", "huge"}
 
 
-def test_d1_control_all_noise_without_overflow_still_commits_and_purges(tmp_path: Path) -> None:
+def test_d1_control_all_noise_without_overflow_still_commits_and_marks(tmp_path: Path) -> None:
     """Control: a legitimately empty result with NO overflow (an all-noise
     session) must still merge, commit, and safe-clear exactly as it did before
     the delta layer -- the guard only defers overflow-truncated empties."""
@@ -794,19 +801,20 @@ def test_d1_control_all_noise_without_overflow_still_commits_and_purges(tmp_path
 
     assert len(llm.calls) == 1
     assert merger.call_count == 1  # merge ran and committed (empty result, no overflow)
-    # no overflow: the allow-list equals every chunk, so the id-scoped purge is
-    # behavior-equivalent to the old full-range purge -- both rows are cleared
-    assert sorted(store.deleted) == ["noise-a", "noise-b"]
+    # no overflow: the allow-list equals every chunk, so the id-scoped clear is
+    # behavior-equivalent to the old full-range clear -- both rows are marked
+    assert sorted(store.marked) == ["noise-a", "noise-b"]
     assert store.purged == []
-    assert store.chunks == []  # all-noise rows cleared, exactly as before T5
+    assert {c.chunk_id for c in store.chunks} == {"noise-a", "noise-b"}  # retained
+    assert all(c.consolidated for c in store.chunks)
     assert trigger.status("alice").state is DreamState.IDLE
     assert FileSnapshotter(store=store, meta=_MetaFake(), directory=tmp_path / "dreams").recover() == []
 
 
 def test_purge_snapshot_explicit_consumed_allow_list_is_id_scoped(tmp_path: Path) -> None:
-    """The purge seam accepts an explicit id allow-list (or equivalent mechanism):
-    only those rows are deleted, never-seen rows survive, and a merge-complete
-    snapshot never re-purges."""
+    """The clear seam accepts an explicit id allow-list (or equivalent mechanism):
+    only those rows are marked consolidated, never-seen rows stay unmarked, and
+    a merge-complete snapshot never re-clears."""
     store = _VectorFake(
         [
             _stamp("c1", "a" * 8, turn_start=0, turn_end=1),
@@ -816,12 +824,15 @@ def test_purge_snapshot_explicit_consumed_allow_list_is_id_scoped(tmp_path: Path
     fs = FileSnapshotter(store=store, meta=_MetaFake(), directory=tmp_path / "dreams")
     assert fs.request("alice", _RANGE).ok
     assert fs.purge_snapshot("alice", _RANGE, consumed_chunk_ids=["c1"]) == 1
-    assert [c.chunk_id for c in store.chunks] == ["c2"]  # the never-seen row survives
+    assert sorted(c.chunk_id for c in store.chunks) == ["c1", "c2"]  # both retained
     assert store.purged == []  # id-scoped: no range purge fired
-    assert store.deleted == ["c1"]
-    # marker guard: a re-drive is a no-op, never a double delete
+    assert store.marked == ["c1"]
+    assert next(c for c in store.chunks if c.chunk_id == "c1").consolidated is True
+    assert not any(c.consolidated for c in store.chunks if c.chunk_id == "c2")
+    # marker guard: a re-drive is a no-op, never a double clear
     assert fs.purge_snapshot("alice", _RANGE, consumed_chunk_ids=["c1", "c2"]) == 0
-    assert [c.chunk_id for c in store.chunks] == ["c2"]
+    assert sorted(c.chunk_id for c in store.chunks) == ["c1", "c2"]
+    assert not any(c.consolidated for c in store.chunks if c.chunk_id == "c2")
 
 
 def test_d1_verifier_probe_partial_overflow_with_triples_keeps_overflow_chunks(
@@ -830,9 +841,9 @@ def test_d1_verifier_probe_partial_overflow_with_triples_keeps_overflow_chunks(
     """Verifier probe (the HIGH data-loss residual, fixed end-to-end): 22 chunks
     over a 60-turn window at the default 10000-token budget pack 19 (c0-c18) and
     overflow 3 (c19-c21). One triple is extracted so the
-    merge commits -- but the safe-clear now deletes ONLY the consumed rows, so
-    the 3 chunks the model never saw stay in the store for a later dream
-    instead of being silently purged."""
+    merge commits -- but the safe-clear now marks ONLY the consumed rows, so
+    the 3 chunks the model never saw stay unmarked in the store for a later
+    dream instead of being silently cleared."""
     store = _VectorFake(
         [
             _stamp(f"c{i}", "I prefer dark mode. " * 100, turn_start=i * 2, turn_end=i * 2 + 1)
@@ -847,17 +858,21 @@ def test_d1_verifier_probe_partial_overflow_with_triples_keeps_overflow_chunks(
     assert "c0" in llm.calls[0][1] and "c18" in llm.calls[0][1]
     assert "c19" not in llm.calls[0][1] and "c21" not in llm.calls[0][1]
     assert merger.call_count == 1  # one triple extracted -> the commit goes through
-    assert set(store.deleted) == {f"c{i}" for i in range(19)}  # consumed rows only
+    assert set(store.marked) == {f"c{i}" for i in range(19)}  # consumed rows only
     assert store.purged == []  # id-scoped, never range-scoped
-    assert {c.chunk_id for c in store.chunks} == {f"c{i}" for i in range(19, 22)}  # 3 overflow chunks survive
+    remaining = {c.chunk_id: c.consolidated for c in store.chunks}
+    assert set(remaining) == {f"c{i}" for i in range(22)}  # every chunk retained
+    assert all(remaining[c] for c in remaining if c in {f"c{i}" for i in range(19)})  # packed marked
+    overflow_ids = {f"c{i}" for i in range(19, 22)}
+    assert not any(remaining[c] for c in remaining if c in overflow_ids)  # overflow unmarked
     assert trigger.status("alice").state is DreamState.IDLE
 
 
-def test_d1_recovery_partial_overflow_with_triples_purges_only_consumed(tmp_path: Path) -> None:
+def test_d1_recovery_partial_overflow_with_triples_marks_only_consumed(tmp_path: Path) -> None:
     """Merge-boundary recovery WITH triples: the journaled consumed allow-list
-    survives the boot round-trip, so the resumed committed merge purges ONLY the
-    packed rows -- the never-reflected overflow chunk survives for a later dream
-    (verifier ask: packed ids read back from the journal at resume)."""
+    survives the boot round-trip, so the resumed committed merge marks ONLY the
+    packed rows -- the never-reflected overflow chunk stays unmarked for a later
+    dream (verifier ask: packed ids read back from the journal at resume)."""
     chunks = [
         _stamp(f"c{i}", "I prefer dark mode", turn_start=i * 2, turn_end=i * 2 + 1) for i in range(5)
     ] + [_stamp("huge", "z" * 140000, turn_start=50, turn_end=51)]  # ~35k tokens: over the 32k ceiling
@@ -900,9 +915,12 @@ def test_d1_recovery_partial_overflow_with_triples_purges_only_consumed(tmp_path
 
     assert reflector.calls == []  # reflect never re-runs at the merge boundary
     assert merger.call_count == 1  # triples present -> the committed merge proceeds
-    assert sorted(store.deleted) == ["c0", "c1", "c2", "c3", "c4"]  # consumed rows only
+    assert sorted(store.marked) == ["c0", "c1", "c2", "c3", "c4"]  # consumed rows only
     assert store.purged == []
-    assert [c.chunk_id for c in store.chunks] == ["huge"]  # the overflow chunk survives
+    remaining = {c.chunk_id: c.consolidated for c in store.chunks}
+    assert set(remaining) == {f"c{i}" for i in range(5)} | {"huge"}  # every chunk retained
+    assert all(remaining[f"c{i}"] for i in range(5))
+    assert remaining["huge"] is False  # the overflow chunk stays unmarked
 
 
 # ---------------------------------------------------------------- FR-2.5b monthly ledger gate

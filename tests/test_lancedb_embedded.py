@@ -11,17 +11,17 @@ import time
 
 import pytest
 
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import (
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import (
     Capability,
     ChunkFilter,
     Page,
     SparseVector,
     WeightUpdate,
 )
-from mnemoseed.storage.registry import VECTOR_DRIVERS, register
+from mnemoseed_local.storage.registry import VECTOR_DRIVERS, register
 
 
 @pytest.fixture(autouse=True)

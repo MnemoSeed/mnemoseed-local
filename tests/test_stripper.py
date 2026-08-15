@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from mnemoseed.capture import (
+from mnemoseed_local.capture import (
     RULESET_V1,
     ContentTarget,
     Rule,
@@ -22,7 +22,7 @@ from mnemoseed.capture import (
     Stripper,
     StripperError,
 )
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
 
 # ---------------------------------------------------------------- fixtures
 

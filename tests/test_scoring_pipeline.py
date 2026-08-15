@@ -5,11 +5,11 @@ pooling and dropping all run on the lazy drain side so /ingest stays untouched.
 
 from __future__ import annotations
 
-from mnemoseed.capture.pipeline import InMemoryCapturePipeline, ScoringPipeline
-from mnemoseed.capture.pool import PoolEventKind, ScorePool
-from mnemoseed.capture.scorer import TurnScorer
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.capture.pipeline import InMemoryCapturePipeline, ScoringPipeline
+from mnemoseed_local.capture.pool import PoolEventKind, ScorePool
+from mnemoseed_local.capture.scorer import TurnScorer
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 
 SESSION = "sess-score-p1"
 PROFILE = "prof-main"
@@ -124,7 +124,7 @@ def test_stats_are_observable_and_cumulative() -> None:
 
 
 def test_end_session_and_settled_pass_through() -> None:
-    from mnemoseed.storage.ports import TurnRange
+    from mnemoseed_local.storage.ports import TurnRange
 
     pipe = _pipeline()
     pipe.end_session(SESSION, TurnRange(start=0, end=5))

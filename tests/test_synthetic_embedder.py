@@ -7,9 +7,9 @@ import math
 
 import pytest
 
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import Capability, EmbeddingResult
-from mnemoseed.storage.registry import EMBED_DRIVERS, register
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import Capability, EmbeddingResult
+from mnemoseed_local.storage.registry import EMBED_DRIVERS, register
 
 _DIM = 64
 

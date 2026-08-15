@@ -17,15 +17,15 @@ from dataclasses import dataclass
 
 import pytest
 
-from mnemoseed.retrieve.cues import ExtractedCues, Intent
-from mnemoseed.retrieve.hybrid import HybridRecall, HybridRetriever
-from mnemoseed.schema.graph import Edge, GraphNode, NodeType, RelType
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import ChunkFilter, NodeFilter, Page
-from mnemoseed.storage.registry import GRAPH_DRIVERS, VECTOR_DRIVERS, register
+from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
+from mnemoseed_local.retrieve.hybrid import HybridRecall, HybridRetriever
+from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import ChunkFilter, NodeFilter, Page
+from mnemoseed_local.storage.registry import GRAPH_DRIVERS, VECTOR_DRIVERS, register
 
 _DIM = 64
 _PROFILE = "alice"

@@ -3,7 +3,7 @@
 Two jobs: re-register the real drivers (test_registry, which shares the module
 registries, clears them at teardown — the import-time @register fires only
 once), and provide the parametrized `stack` fixture that runs every contract
-test against embedded and, when a live Postgres is available, pg.
+test against the embedded driver family.
 """
 
 from __future__ import annotations
@@ -11,17 +11,13 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from _support import PG_DSN, ContractStack, build_embedded, build_pg
+from _support import ContractStack, build_embedded
 
-from mnemoseed.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
-from mnemoseed.storage.drivers.openai_compatible import OpenAICompatibleEmbedder
-from mnemoseed.storage.drivers.pg_graph import PgGraphDriver
-from mnemoseed.storage.drivers.pg_meta import PgMetaDriver
-from mnemoseed.storage.drivers.pgvector import PgVectorStore
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.drivers.sqlite_meta import SqliteMetaDriver
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.registry import (
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.registry import (
     EMBED_DRIVERS,
     GRAPH_DRIVERS,
     META_DRIVERS,
@@ -31,13 +27,9 @@ from mnemoseed.storage.registry import (
 
 _REAL_DRIVERS: tuple[tuple[object, type], ...] = (
     (VECTOR_DRIVERS, LanceDbEmbeddedStore),
-    (VECTOR_DRIVERS, PgVectorStore),
     (GRAPH_DRIVERS, SqliteGraphDriver),
-    (GRAPH_DRIVERS, PgGraphDriver),
     (META_DRIVERS, SqliteMetaDriver),
-    (META_DRIVERS, PgMetaDriver),
     (EMBED_DRIVERS, SyntheticEmbedder),
-    (EMBED_DRIVERS, OpenAICompatibleEmbedder),
 )
 
 
@@ -50,14 +42,9 @@ def _ensure_real_drivers_registered() -> None:
     yield
 
 
-@pytest.fixture(params=["embedded", "pg"])
-def stack(request: pytest.FixtureRequest, tmp_path) -> ContractStack:
-    """One contract stack per backend; the pg arm skips cleanly offline."""
-    if request.param == "pg":
-        if not PG_DSN:
-            pytest.skip("MNEMOSEED_TEST_PG_DSN not set (pg contract arm skips offline / in CI)")
-        built = build_pg(PG_DSN)
-    else:
-        built = build_embedded(tmp_path)
+@pytest.fixture
+def stack(tmp_path) -> ContractStack:
+    """The embedded contract stack (lancedb + sqlite graph + sqlite meta + synthetic)."""
+    built = build_embedded(tmp_path)
     yield built
     asyncio.run(built.close())

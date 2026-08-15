@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from mnemoseed.llm import LLMDriverInfo, LLMError, UnknownLLMDriverError
-from mnemoseed.llm.registry import LLMRegistry, register
+from mnemoseed_local.llm import LLMDriverInfo, LLMError, UnknownLLMDriverError
+from mnemoseed_local.llm.registry import LLMRegistry, register
 
 
 class _FakeD:

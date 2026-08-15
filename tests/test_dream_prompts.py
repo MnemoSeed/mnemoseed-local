@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import json
 
-from mnemoseed.dream import StubReflectLLM, build_reflect_prompt
-from mnemoseed.dream.snapshot import Snapshot, SnapshotChunk
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.ports import TurnRange
+from mnemoseed_local.dream import StubReflectLLM, build_reflect_prompt
+from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.ports import TurnRange
 
 _RANGE = TurnRange(0, 4)
 
@@ -88,7 +88,7 @@ def test_prompt_contains_debiasing_contract_rules() -> None:
 
 
 def test_prompt_is_versioned() -> None:
-    from mnemoseed.dream import PROMPT_VERSION
+    from mnemoseed_local.dream import PROMPT_VERSION
 
     assert PROMPT_VERSION == "v1"
     assert build_reflect_prompt(_snap(_stamp("c1", "x"))).version == PROMPT_VERSION

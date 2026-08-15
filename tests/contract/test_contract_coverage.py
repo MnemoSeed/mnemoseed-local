@@ -5,7 +5,7 @@ at least one contract test mapped in ``method_mapping`` -- and that every mapped
 name really is a protocol method (no phantom entries). A missing method is a
 HARD FAILURE per the M0 task AC-3 requirement ("Flag any Appendix B method with
 NO test as a hard failure"). Also verifies the reference method counts from
-appendix B (12 / 18 / 19 / 3) and that each referenced test actually exists,
+appendix B (12 / 20 / 32 / 3) and that each referenced test actually exists,
 then regenerates the checked-in mapping report artifact.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from method_mapping import COVERAGE, EXPECTED_METHOD_COUNTS, PORT_ORDER
 
-from mnemoseed.storage.ports import Embedder, GraphStore, MetaStore, VectorStore
+from mnemoseed_local.storage.ports import Embedder, GraphStore, MetaStore, VectorStore
 
 _REPORT = Path(__file__).parent / "REPORT-method-mapping.md"
 _PROTOCOLS = {
@@ -95,13 +95,11 @@ def test_report_artifact_is_generated() -> None:
         "",
         "Generated automatically by `tests/contract/test_contract_coverage.py`. Every",
         "public method of the four storage Protocols has at least one contract test",
-        "that runs against the embedded and postgres driver families.",
+        "that runs against the embedded driver family.",
         "",
-        "Driver families covered by the `stack` fixture:",
+        "Driver family covered by the `stack` fixture:",
         "",
         "- embedded: lancedb_embedded + sqlite_graph + sqlite_meta + synthetic embedder",
-        "- pg: pgvector + pg_graph + pg_meta + synthetic embedder (skipped cleanly when",
-        "  `MNEMOSEED_TEST_PG_DSN` is not set)",
         "",
     ]
     for layer in PORT_ORDER:

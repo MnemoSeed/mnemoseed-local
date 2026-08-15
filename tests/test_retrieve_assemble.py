@@ -17,24 +17,24 @@ from dataclasses import dataclass
 
 import pytest
 
-from mnemoseed.dream.delta import estimate_tokens
-from mnemoseed.retrieve.assemble import (
+from mnemoseed_local.dream.delta import estimate_tokens
+from mnemoseed_local.retrieve.assemble import (
     AssembleConfig,
     AssembledContext,
     Assembler,
     CoverageReport,
     EntryFlag,
 )
-from mnemoseed.retrieve.cues import ExtractedCues, Intent
-from mnemoseed.retrieve.hybrid import HybridConfig, HybridRecall, HybridRetriever
-from mnemoseed.schema.graph import Edge, GraphNode, NodeType, RelType
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.drivers.sqlite_meta import SqliteMetaDriver
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed.storage.ports import TurnRange
-from mnemoseed.storage.registry import GRAPH_DRIVERS, META_DRIVERS, VECTOR_DRIVERS, register
+from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
+from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRecall, HybridRetriever
+from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import TurnRange
+from mnemoseed_local.storage.registry import GRAPH_DRIVERS, META_DRIVERS, VECTOR_DRIVERS, register
 
 _DIM = 64
 _PROFILE = "alice"
@@ -86,6 +86,7 @@ def _chunk(
     ingested_at: float = 1.0,
     entities: tuple[str, ...] = (),
     profile: str = _PROFILE,
+    consolidated: bool = False,
 ) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
@@ -104,7 +105,7 @@ def _chunk(
         ),
         decay_weight=decay,
         score=0.5,
-        consolidated=False,
+        consolidated=consolidated,
         ingested_at=ingested_at,
         turn_start=turn_start,
         turn_end=turn_end,
@@ -493,6 +494,39 @@ def test_freshness_fragment_count_deduped_across_rerun_passes(stack) -> None:
     assert result.coverage.fresh_evidence_chunks == 1
     assert result.coverage.pending_marked == 3
     assert result.coverage.pool_size == 3
+
+
+def test_freshness_probe_excludes_consolidated_chunks(stack) -> None:
+    """design/03 §4 + QA defect 1: the Freshness Guard probe targets
+    UNconsolidated fragments — a chunk the dream merge marked consolidated must
+    not re-surface as 'fresh unconsolidated evidence' (pending_consolidation
+    marking / recent_evidence attachment), even though its turn range is past
+    the watermark."""
+    stack.meta.advance_watermark(_PROFILE, TurnRange(start=0, end=5))
+    stack.graph.upsert_node(
+        _node("g_cons", statement="prefers vim for edits", entities=("LanceDb",), decay=0.9)
+    )
+    _write(
+        stack,
+        _chunk(
+            "c_cons",
+            "digested fragment the dream already folded into the graph",
+            decay=0.5,
+            turn_start=9,
+            turn_end=10,
+            ingested_at=50.0,
+            entities=("LanceDb",),
+            consolidated=True,
+        ),
+    )
+    result = _assemble(stack, _recall(stack, "lancedb loader", _query_cues(("LanceDb",))))
+    assert result.coverage.fresh_evidence_chunks == 0  # never fresh evidence again
+    assert result.coverage.pending_marked == 0
+    assert stack.graph.get_node("g_cons").pending_consolidation is False
+    entry = next(entry for entry in result.entries if entry.id == "g_cons")
+    assert EntryFlag.PENDING_CONSOLIDATION not in entry.flags
+    assert EntryFlag.FRESH_EVIDENCE not in entry.flags
+    assert entry.recent_evidence == ()
 
 
 def test_pre_existing_pending_flag_surfaces_without_probe(stack) -> None:

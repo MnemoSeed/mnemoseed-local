@@ -12,8 +12,8 @@ from collections.abc import Callable
 
 import pytest
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind, PoolStats, ScorePool
-from mnemoseed.storage.ports import PoolState, TurnRange
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind, PoolStats, ScorePool
+from mnemoseed_local.storage.ports import PoolState, TurnRange
 
 
 class _Clock:

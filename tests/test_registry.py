@@ -6,9 +6,9 @@ Every test registers throwaway fake drivers into the module-level registries
 
 import pytest
 
-from mnemoseed.config import Config, LayerSpec, _InstanceOverride
-from mnemoseed.storage.factory import build_stores
-from mnemoseed.storage.ports import (
+from mnemoseed_local.config import Config, LayerSpec, _InstanceOverride
+from mnemoseed_local.storage.factory import build_stores
+from mnemoseed_local.storage.ports import (
     Capability,
     CapabilityStartupError,
     DriverInfo,
@@ -21,7 +21,7 @@ from mnemoseed.storage.ports import (
     VectorStore,
     validate_capabilities,
 )
-from mnemoseed.storage.registry import (
+from mnemoseed_local.storage.registry import (
     DRIVER_REGISTRIES,
     EMBED_DRIVERS,
     GRAPH_DRIVERS,
@@ -34,7 +34,12 @@ FULL_VECTOR = frozenset(
     {Capability.VECTOR_HYBRID_SEARCH, Capability.VECTOR_METADATA_FILTER, Capability.VECTOR_SNAPSHOT}
 )
 FULL_GRAPH = frozenset(
-    {Capability.GRAPH_VERSION_CHAIN, Capability.GRAPH_COOCCURRENCE_EDGES, Capability.GRAPH_TRAVERSE_2HOP}
+    {
+        Capability.GRAPH_VERSION_CHAIN,
+        Capability.GRAPH_COOCCURRENCE_EDGES,
+        Capability.GRAPH_TRAVERSE_2HOP,
+        Capability.GRAPH_EDGE_LIST,
+    }
 )
 FULL_META = frozenset({Capability.META_TRANSACTION, Capability.META_CONCURRENT_READERS})
 FULL_EMBED = frozenset(
@@ -110,6 +115,7 @@ def test_capability_enum_is_exactly_fr_8_6_set():
         "graph.traverse_2hop",
         "graph.version_chain",
         "graph.cooccurrence_edges",
+        "graph.edge_list",
         "meta.transaction",
         "meta.concurrent_readers",
         "embed.local_inference",
@@ -117,7 +123,7 @@ def test_capability_enum_is_exactly_fr_8_6_set():
         "embed.sparse_output",
     }
     assert {c.value for c in Capability} == expected
-    assert len(list(Capability)) == 11
+    assert len(list(Capability)) == 12
 
 
 def test_register_via_decorator():

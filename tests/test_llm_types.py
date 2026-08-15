@@ -9,7 +9,7 @@ degrade for real (FR-2.6) instead of catching strings.
 
 from __future__ import annotations
 
-from mnemoseed.llm import (
+from mnemoseed_local.llm import (
     ChatResult,
     HealthReport,
     LLMDriverInfo,

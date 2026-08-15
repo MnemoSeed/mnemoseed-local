@@ -1,47 +1,30 @@
-# MnemoSeed 设计文档索引（中文工作稿）
+# MnemoSeed Local
 
-> 本目录是**中文工作树**：日常设计/PRD 更新先落在这里。英文正典在 `docs/design/`、`docs/prd/`，每次 merge 到 main / 发版前从本树同步。
-> 所有图表使用 Mermaid.js 记录与渲染。
+**单机、单用户、本地的 AI 记忆层** —— 给 coding agent 用。
 
-## 目录
+MnemoSeed Local 是 MnemoSeed 的本地单机版：没有账号体系（localhost 隐式信任）、
+没有控制台、CLI 优先；profile 固定为 `default`（框架内部保留 profile 机制）。
+核心闭环：**capture → dream --once（手动）→ decay → retrieve**，dream 推理走
+本地模型（默认 ollama；保留 openai-compatible 回退驱动）。
 
-### 设计文档（design/）
+## 为什么需要它
 
-| 文档 | 内容 |
-|---|---|
-| [00-总览与设计哲学](design/00-总览与设计哲学.md) | 定位、脑神经科学基础映射表、总体架构图 |
-| [01-记忆管线五阶段](design/01-记忆管线五阶段.md) | Capture / Consolidate / Retrieve / Reconcile / Decay + Provenance 全管线设计 |
-| [02-梦境引擎](design/02-梦境引擎.md) | 触发状态机、快照隔离、中断保护、双轨分流写入、增量脱水 |
-| [03-存储与检索](design/03-存储与检索.md) | 混合双库总线、STORAGE_MODE 路由矩阵、混合检索、抗稀释策略 |
-| [04-隔离解耦与隐私](design/04-隔离解耦与隐私.md) | 认知分级隔离、E2EE 传输+加密存储隐私架构、官方 SaaS 标配 TEE |
-| [09-anima与偏好动力学](design/09-anima与偏好动力学.md) | **进阶模块（不在 M1 首发）**：Anima 灵魂模型（三层一体/无损切换）、偏好贝叶斯后验更新、特质雷达可视化 |
-| [10-云端部署与远程接入](design/10-云端部署与远程接入.md) | daemon 上云/VPS 部署指南：拓扑、TLS 与鉴权、宿主远程接入、验证清单 |
-| [05-业界对标与精华提取](design/05-业界对标与精华提取.md) | Stanford/Microsoft/Anthropic/Nvidia 四透镜、Claude-Mem、MemPalace 拆解与取舍决策记录 |
-| [06-接入与安装体验](design/06-接入与安装体验.md) | 三层适配架构（daemon/MCP/plugin）、profile 凭证身份模型（login/link）、宿主能力矩阵、3 分钟安装流程、断开卸载语义 |
-| [07-管理控制台](design/07-管理控制台.md) | MnemoSeed Console：profiles 管理、记忆浏览、图谱可视化、单条记忆全档案、梦境面板与 token 用量、模型路由设置 |
-| [08-多端同步与冲突合并](design/08-多端同步与冲突合并.md) | CRDT/CALM/HLC 理论基座：四类数据的合并机制盘点、反熵同步协议、巩固租约、Tombstone 删除 |
+Agent 每次新开会话都会遗忘。Local 版在本机替你保存"值得记的东西"：会话里
+的高价值片段按原文入库（verbatim 通道不丢失），consolidate 成结构化的知识图，
+下次检索时把对的上下文还给 agent。所有数据只在本机流转。
 
-### 开发任务 PRD（prd/）
+## 定位
 
-| 文档 | 模块 |
-|---|---|
-| [PRD-00 路线图与里程碑](prd/PRD-00-路线图.md) | M0–M4 里程碑、依赖关系、优先级 |
-| [PRD-01 捕获子系统](prd/PRD-01-捕获子系统.md) | Local Stripper、重要性评分、Watermark 积分池 |
-| [PRD-02 梦境引擎](prd/PRD-02-梦境引擎.md) | 异步巩固、快照、Tier 分流、De-biasing |
-| [PRD-03 检索与 MCP 网关](prd/PRD-03-检索与MCP网关.md) | 混合检索 API、MCP 工具定义、上下文装配 |
-| [PRD-04 衰减调和与溯源](prd/PRD-04-衰减调和与溯源.md) | Decay 权重、Reconcile 冲突协议、Provenance schema |
-| [PRD-05 云端同步与 TEE](prd/PRD-05-云端同步与TEE.md) | E2EE 同步、Nitro Enclaves、计费套利网关 |
-| [PRD-06 宿主接入与安装](prd/PRD-06-宿主接入与安装.md) | daemon embedded 模式、installer、login/link 身份绑定、Claude Code plugin（hooks）、MCP 降级模式、uninstall |
-| [PRD-07 管理控制台](prd/PRD-07-管理控制台.md) | Console SPA：Dashboard/Profiles/记忆浏览/梦境审查/冲突收件箱（M1 只读核心，M2 补全） |
-| [PRD-08 M0 地基](prd/PRD-08-M0地基.md) | repo 骨架 + CI、四存储接口双驱动、capability 校验、schema 冻结 + 纯前向迁移（阻塞全部后续 PRD） |
+- **本地优先**：默认零云依赖，dream 走本地模型
+- **无账号**：localhost 即信任边界，profile 固定 `default`
+- **CLI 优先**：capture / retrieve / dream --once / decay / daemon
+- **生产血统**：从 mnemoseed 主仓库移植而来，存储层、schema、迁移完全同源
 
-## 理论文献备案
+## 状态
 
-**[REFERENCES.md](REFERENCES.md)** —— 所有引用理论的完整出处与核实状态（✅ Crossref 已核实 / 📕 经典专著 / ⚠️ 待抽查）。铁律：未验证的信息必须标注，不允许靠推测或记忆充数。
+A1（地基）已完成：config、secrets、存储端口 + 嵌入式驱动
+（sqlite_meta / sqlite_graph / lancedb_embedded / bge_m3_onnx /
+synthetic_embedder）、schema（stamp + graph）、迁移。
+CLI 表面（capture / retrieve / dream / daemon）在 A2。
 
-## 外部理论来源
-
-1. **wast3《Memory Engineering》**（X, 2026-08-04, 182.8K views）—— 五阶段记忆管线框架（Capture/Consolidate/Retrieve/Reconcile/Decay）及评论区 Provenance 补充。本文档不是照抄，而是将其映射到互补学习系统（CLS）、再巩固（Reconsolidation）、突触稳态（SHY）等脑神经科学机制上重新推导。
-2. **N01ennn《How to be a Memory Engineer》**（X, 2026-08-03）—— Stanford/Microsoft/Anthropic/Nvidia 四透镜，15 步工程纪律。拆解与取舍见 design/05。
-3. **Claude-Mem / MemPalace** —— 两个实际运行中的记忆系统的概念拆解与取舍（design/05）。
-4. **MnemoSeed 白皮书 v3.1 / PRD v3.0 / 创世白皮书**（前期讨论产物，内部归档）—— 双库架构、梦境引擎、认知分级、脱水节流阀。
+开发文档见 [MVP.md](MVP.md)（范围冻结）。

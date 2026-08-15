@@ -1,8 +1,8 @@
 """Driver-agnostic contract tests for the MetaStore port (prd-08 appendix B.3).
 
 Every meta method gets at least one behavioral test against the embedded
-(sqlite_meta) and postgres (pg_meta) drivers. Both carry the same append-only
-audit enforcement at the database level, and the same atomic pool semantics.
+(sqlite_meta) driver. The driver carries the append-only audit enforcement at
+the database level, and the same atomic pool semantics.
 """
 
 from __future__ import annotations
@@ -10,11 +10,10 @@ from __future__ import annotations
 import sqlite3
 import time
 
-import psycopg
 import pytest
 from _support import make_prov, raw_meta_row
 
-from mnemoseed.storage.ports import (
+from mnemoseed_local.storage.ports import (
     AuditEntry,
     AuditFilter,
     Capability,
@@ -115,6 +114,28 @@ def test_profile_crud_and_token_cascade(stack) -> None:
     stack.meta.delete_profile("u1")
     assert stack.meta.get_profile("u1") is None
     assert raw_meta_row(stack, "tokens", "token_id", token.token_id) == {}  # FK cascade
+
+
+def test_profile_archive_flag(stack) -> None:
+    """FR-7.3 console profile archive: the flag roundtrips, rename never
+    touches it (upsert updates display_name only), and unknown profiles raise."""
+    stack.meta.upsert_profile(_pool_profile(stack))
+    assert stack.meta.get_profile("u1").archived is False
+    stack.meta.archive_profile("u1", True)
+    assert stack.meta.get_profile("u1").archived is True
+    assert stack.meta.list_profiles()[0].archived is True
+    stack.meta.archive_profile("u1", False)
+    assert stack.meta.get_profile("u1").archived is False
+
+    # rename preserves the flag
+    stack.meta.archive_profile("u1", True)
+    stack.meta.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma Renamed"))
+    got = stack.meta.get_profile("u1")
+    assert got.display_name == "Uma Renamed"
+    assert got.archived is True
+
+    with pytest.raises(StorageError, match="unknown profile"):
+        stack.meta.archive_profile("ghost", True)
 
 
 def test_issue_token_and_revoke(stack) -> None:
@@ -254,15 +275,10 @@ def test_audit_append_and_query(stack) -> None:
 
 
 def test_audit_append_only_enforced_by_database(stack) -> None:
-    """Both dialects refuse to mutate audit_log at the database level."""
+    """The driver refuses to mutate audit_log at the database level."""
     stack.meta.audit_append(AuditEntry(actor="alice", action="insert", at=100.0))
-    if stack.backend == "embedded":
-        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-            stack.meta._conn.execute("UPDATE audit_log SET action = 'tampered'")
-    else:
-        with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
-            with stack.meta._conn.transaction():
-                stack.meta._conn.execute("UPDATE audit_log SET action = 'tampered'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        stack.meta._conn.execute("UPDATE audit_log SET action = 'tampered'")
 
 
 def test_dream_runs_roundtrip(stack) -> None:
@@ -289,14 +305,27 @@ def test_dream_runs_roundtrip(stack) -> None:
     assert second.total == 0
 
 
+def test_dream_run_model_update_records_resolved_model(stack) -> None:
+    """F2: a run is registered at snapshot capture without a model; the
+    per-run route resolution pins the model and records it on the run row."""
+    stack.meta.record_dream_run(DreamRun(run_id="run-m1", session_id="s1", started_at=100.0))
+    stack.meta.update_dream_run_model("run-m1", "kimi-k3")
+    run = stack.meta.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0]
+    assert run.model_id == "kimi-k3"
+    stack.meta.update_dream_run_model("run-m1", "deepseek-v4-flash")
+    run = stack.meta.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0]
+    assert run.model_id == "deepseek-v4-flash"
+    stack.meta.update_dream_run_model("no-such-run", "kimi-k3")  # unknown run: silent no-op
+
+
 def test_schema_version_and_migrate_forward_only(stack) -> None:
-    """meta's head is v6 (frozen v1 schema + v3 profile_score_pool + v4
-    dream_token_ledger + v6 identity users/token_hash); migrate is idempotent
-    and forward-only."""
-    assert stack.meta.schema_version() == 6
-    assert stack.meta.migrate() == 6
-    assert stack.meta.migrate(target=1) == 6  # back-targeting is a no-op at head
-    assert stack.meta.schema_version() == 6
+    """meta's head is v8 (frozen v1 schema + v3 profile_score_pool + v4
+    dream_token_ledger + v6 identity users/token_hash + v7 profile archive
+    flag + v8 reserved config.scope); migrate is idempotent and forward-only."""
+    assert stack.meta.schema_version() == 8
+    assert stack.meta.migrate() == 8
+    assert stack.meta.migrate(target=1) == 8  # back-targeting is a no-op at head
+    assert stack.meta.schema_version() == 8
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:

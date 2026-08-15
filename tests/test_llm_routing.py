@@ -1,13 +1,14 @@
 """Role routing: [dream.llm] config, lazy resolution, env-var key substitution,
-audit logging, and boot-safe isolation (PRD-02 T6; FR-2.14 / design/02 §6-§7).
+audit logging, and boot-safe isolation (PRD-02 T6; FR-2.14 / design/02 §6-§7),
+A2 local trim.
 
-Behavior pinned here: route defaults follow design/02 §6 (deep_reflection ->
-Kimi K3, short_increment -> DeepSeek V4 Flash, both via Fireworks; local_track
--> local Ollama); API keys are referenced by env-var NAME and never stored as
-values; each role has its own default key env var with the shared provider
-variable as fallback (role-specific wins when both are set);
-drivers materialize lazily per-role so a misconfigured unused role never breaks
-boot; and RoleRouter.check() (the console 实测 button) never raises.
+Behavior pinned here: the A2 MVP has ONE dream role ("dream") defaulting to
+the local ollama track (openai_compatible kept as the fallback driver); legacy
+deep_reflection / short_increment / local_track tables are tolerated and
+ignored with a warning; API keys are referenced by env-var NAME and never
+stored as values; drivers materialize lazily per-role so a misconfigured role
+never breaks boot; and RoleRouter.check() (the console test button) never
+raises.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from mnemoseed.config import (
+from mnemoseed_local.config import (
     DEFAULT_LLM_ROUTES,
     LLM_ROLES,
     Config,
@@ -25,7 +26,7 @@ from mnemoseed.config import (
     RoleLLMConfig,
     load_config,
 )
-from mnemoseed.llm import (
+from mnemoseed_local.llm import (
     ChatResult,
     HealthReport,
     LLMDriverInfo,
@@ -34,9 +35,9 @@ from mnemoseed.llm import (
     RoleRouter,
     UnknownLLMDriverError,
 )
-from mnemoseed.llm.drivers.oauth import OAuthLLM
-from mnemoseed.llm.drivers.ollama import OllamaLLM
-from mnemoseed.llm.registry import LLMRegistry, register
+from mnemoseed_local.llm.drivers.ollama import OllamaLLM
+from mnemoseed_local.llm.drivers.openai_compatible import OpenAICompatibleLLM
+from mnemoseed_local.llm.registry import LLMRegistry, register
 
 
 def _write(path: Any, text: str) -> None:
@@ -47,28 +48,19 @@ def _write(path: Any, text: str) -> None:
 # ---------------------------------------------------------------- config defaults
 
 
-def test_default_roles_are_exactly_the_prd_triple() -> None:
-    assert LLM_ROLES == ("deep_reflection", "short_increment", "local_track")
+def test_default_roles_are_exactly_the_single_dream_role() -> None:
+    assert LLM_ROLES == ("dream",)
     assert set(DEFAULT_LLM_ROUTES) == set(LLM_ROLES)
 
 
-def test_defaults_follow_design_02_section_6(monkeypatch) -> None:
+def test_defaults_follow_the_local_ollama_track(monkeypatch) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     cfg = load_config(Path("/nonexistent/config.toml"))
-    deep = cfg.llm["deep_reflection"]
-    assert deep.driver == "openai_compatible"
-    assert deep.model == "accounts/fireworks/models/kimi-k3"  # design/02 deep track
-    assert deep.params["api_key_env"] == "MNEMOSEED_DEEP_REFLECTION_API_KEY,FIREWORKS_API_KEY"
-    assert deep.params["base_url"] == "https://api.fireworks.ai/inference/v1"
-    short = cfg.llm["short_increment"]
-    assert short.driver == "openai_compatible"
-    assert short.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
-    assert short.params["api_key_env"] == "MNEMOSEED_SHORT_INCREMENT_API_KEY,FIREWORKS_API_KEY"
-    local = cfg.llm["local_track"]
-    assert local.driver == "ollama"
-    # FR-2.7: the offline default is a <=14B quantized model, never the PRD 70B line
-    assert "70b" not in local.model.lower()
-    assert local.params["base_url"] == "http://localhost:11434"
+    dream = cfg.llm["dream"]
+    assert dream.driver == "ollama"
+    assert dream.model == "llama3.1:8b"
+    assert dream.params["base_url"] == "http://localhost:11434"
+    assert set(cfg.llm) == set(LLM_ROLES)
 
 
 def test_default_key_references_are_env_var_names_never_literals() -> None:
@@ -91,50 +83,68 @@ def test_dream_llm_table_parses(tmp_path, monkeypatch) -> None:
     _write(
         p,
         'preset = "embedded"\n'
-        "[dream.llm.local_track]\n"
+        "[dream.llm.dream]\n"
         'driver = "ollama"\n'
         'model = "qwen2.5:7b"\n'
         'base_url = "http://127.0.0.1:11434"\n',
     )
-    local = load_config(p).llm["local_track"]
-    assert local.driver == "ollama"
-    assert local.model == "qwen2.5:7b"
-    assert local.params["base_url"] == "http://127.0.0.1:11434"
+    dream = load_config(p).llm["dream"]
+    assert dream.driver == "ollama"
+    assert dream.model == "qwen2.5:7b"
+    assert dream.params["base_url"] == "http://127.0.0.1:11434"
 
 
-def test_dream_llm_unconfigured_roles_inherit_defaults(tmp_path, monkeypatch) -> None:
+def test_legacy_role_tables_are_accepted_ignored_with_deprecation_warning(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A2 trim: legacy deep_reflection / short_increment / local_track tables
+    must not break a user's existing config — they are tolerated, logged as a
+    deprecation, and ignored."""
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
     _write(
         p,
-        'preset = "embedded"\n[dream.llm.deep_reflection]\ndriver = "anthropic"\nmodel = "claude-opus-5"\n',
+        'preset = "embedded"\n'
+        "[dream.llm.deep_reflection]\n"
+        'driver = "openai_compatible"\n'
+        'model = "kimi-k3"\n'
+        "[dream.llm.short_increment]\n"
+        'driver = "openai_compatible"\n'
+        'model = "deepseek-v4-flash-0731"\n'
+        "[dream.llm.local_track]\n"
+        'driver = "ollama"\n'
+        'model = "llama3.1:8b"\n',
     )
-    cfg = load_config(p)
-    assert cfg.llm["deep_reflection"].model == "claude-opus-5"
-    assert cfg.llm["short_increment"].driver == "openai_compatible"  # untouched: default
-    assert cfg.llm["local_track"].driver == "ollama"
+    with caplog.at_level("WARNING", logger="mnemoseed_local.config"):
+        cfg = load_config(p)
+    assert set(cfg.llm) == {"dream"}
+    assert cfg.llm["dream"].driver == "ollama"  # defaults intact
+    assert cfg.llm["dream"].model == "llama3.1:8b"
+    assert "deprecated" in caplog.text.lower()
+
+
+def test_dream_llm_unknown_role_still_names_the_key(tmp_path, monkeypatch) -> None:
+    """The deprecation tolerance is scoped to the legacy roles only: any other
+    unknown role remains a hard config error."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(
+        p,
+        'preset = "embedded"\n[dream.llm.extra_role]\ndriver = "openai_compatible"\nmodel = "m"\n',
+    )
+    with pytest.raises(ConfigError, match=r"config\[dream.llm.extra_role\]"):
+        load_config(p)
 
 
 def test_dream_llm_partial_override_inherits_driver_and_model(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n[dream.llm.deep_reflection]\napi_key_env = "MY_ALT_KEY"\n')
+    _write(p, 'preset = "embedded"\n[dream.llm.dream]\napi_key_env = "MY_ALT_KEY"\n')
     cfg = load_config(p)
-    deep = cfg.llm["deep_reflection"]
-    assert deep.driver == "openai_compatible"  # inherited
-    assert deep.model == "accounts/fireworks/models/kimi-k3"  # inherited
-    assert deep.params["api_key_env"] == "MY_ALT_KEY"
-
-
-def test_dream_llm_unknown_role_names_key(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    p = tmp_path / "config.toml"
-    _write(
-        p,
-        'preset = "embedded"\n[dream.llm.extra_role]\ndriver = "anthropic"\nmodel = "m"\n',
-    )
-    with pytest.raises(ConfigError, match=r"config\[dream.llm.extra_role\]"):
-        load_config(p)
+    dream = cfg.llm["dream"]
+    assert dream.driver == "ollama"  # inherited
+    assert dream.model == "llama3.1:8b"  # inherited
+    assert dream.params["api_key_env"] == "MY_ALT_KEY"
 
 
 def test_dream_llm_must_be_a_table(tmp_path, monkeypatch) -> None:
@@ -148,23 +158,23 @@ def test_dream_llm_must_be_a_table(tmp_path, monkeypatch) -> None:
 def test_dream_llm_role_must_be_a_table(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n[dream.llm]\ndeep_reflection = "nope"\n')
-    with pytest.raises(ConfigError, match=r"config\[dream.llm.deep_reflection\]"):
+    _write(p, 'preset = "embedded"\n[dream.llm]\ndream = "nope"\n')
+    with pytest.raises(ConfigError, match=r"config\[dream.llm.dream\]"):
         load_config(p)
 
 
 def test_dream_llm_bad_driver_type_names_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n[dream.llm.local_track]\ndriver = 42\n')
-    with pytest.raises(ConfigError, match=r"config\[dream.llm.local_track.driver\]"):
+    _write(p, 'preset = "embedded"\n[dream.llm.dream]\ndriver = 42\n')
+    with pytest.raises(ConfigError, match=r"config\[dream.llm.dream.driver\]"):
         load_config(p)
 
 
 def test_programmatic_config_carries_dream_llm_defaults() -> None:
     cfg = Config()
     assert set(cfg.llm) == set(LLM_ROLES)
-    assert cfg.llm["local_track"].driver == "ollama"
+    assert cfg.llm["dream"].driver == "ollama"
 
 
 # ---------------------------------------------------------------- router fakes
@@ -210,69 +220,101 @@ class _AuditSink:
         self.entries.append(entry)
 
 
-def _router(routes, *, registry: LLMRegistry | None = None, audit: Any = None, env: Any = None) -> RoleRouter:
+def _router(
+    routes,
+    *,
+    registry: LLMRegistry | None = None,
+    audit: Any = None,
+    env: Any = None,
+    generation: Any = None,
+) -> RoleRouter:
     return RoleRouter(
         routes=routes,
         registry=registry,
         audit=audit,
         env=env if env is not None else (lambda name: None),
         clock=lambda: 42.0,
+        generation=generation,
     )
 
 
 # ---------------------------------------------------------------- router behavior
 
 
-def test_router_resolves_local_role_to_ollama_instance() -> None:
-    router = _router(Config().llm)
-    llm = router.resolve("local_track")
+def test_router_resolves_ollama_driver_for_configured_role() -> None:
+    routes = {
+        "dream": RoleLLMConfig(
+            role="dream",
+            driver="ollama",
+            model="llama3.1:8b",
+            params={"base_url": "http://localhost:11434"},
+        )
+    }
+    router = _router(routes)
+    llm = router.resolve("dream")
     assert isinstance(llm, OllamaLLM)
     assert llm.model == "llama3.1:8b"
 
 
-def test_router_role_specific_key_wins_over_shared_fallback() -> None:
-    """Per-role key separation (FR-2.14): each role defaults to its own env
-    var with the shared provider var as fallback; the role-specific value
-    wins when both are set, so two roles can use different providers/keys."""
-    env: dict[str, str] = {
-        "MNEMOSEED_DEEP_REFLECTION_API_KEY": "sk-role-specific",
-        "FIREWORKS_API_KEY": "sk-shared",
+def test_router_resolves_openai_compatible_with_env_key() -> None:
+    routes = {
+        "dream": RoleLLMConfig(
+            role="dream",
+            driver="openai_compatible",
+            model="some-model",
+            params={"api_key_env": "FIREWORKS_API_KEY", "base_url": "https://api.test/v1"},
+        )
     }
-    router = _router(Config().llm, env=env.get)
-    assert router.resolve("deep_reflection").api_key == "sk-role-specific"
-    # short_increment has no role-specific var set -> falls back to shared
-    assert router.resolve("short_increment").api_key == "sk-shared"
-
-
-def test_router_unset_role_key_with_no_fallback_yields_empty_key() -> None:
-    router = _router(Config().llm, env={}.get)
-    llm = router.resolve("deep_reflection")  # constructs; provider 401 surfaces at chat time
-    assert llm.api_key == ""
-
-
-def test_router_resolves_deep_reflection_with_env_key() -> None:
     env: dict[str, str] = {"FIREWORKS_API_KEY": "sk-fw-test"}
-    router = _router(Config().llm, env=env.get)
-    llm = router.resolve("deep_reflection")
-    assert llm.model == "accounts/fireworks/models/kimi-k3"
+    router = _router(routes, env=env.get)
+    llm = router.resolve("dream")
+    assert isinstance(llm, OpenAICompatibleLLM)
     assert llm.api_key == "sk-fw-test"
+    assert llm.model == "some-model"
 
 
 def test_router_missing_env_yet_constructs_no_auth() -> None:
     # an unset key env var never blocks resolve: the driver constructs with an
     # empty key and the provider 401 surfaces as LLMUnavailable at chat time
     router = _router(Config().llm)
-    llm = router.resolve("deep_reflection")
+    llm = router.resolve("dream")
     assert llm.api_key == ""
 
 
 def test_router_resolve_caches_same_instance() -> None:
     router = _router(Config().llm)
-    a = router.resolve("local_track")
-    b = router.resolve("local_track")
+    a = router.resolve("dream")
+    b = router.resolve("dream")
     assert a is b
-    other = router.resolve("short_increment")
-    assert other is not a
+
+
+def test_router_rebuilds_role_when_generation_bumps() -> None:
+    """E1-2 (F2): the per-role generation check rebuilds a changed role."""
+    generations = {"dream": 0}
+    reg = LLMRegistry("test-router-gen")
+    register(reg)(_FakeLLM)
+    routes = {
+        "dream": RoleLLMConfig(role="dream", driver="fake_chat", model="m1"),
+    }
+    router = _router(routes, registry=reg, generation=lambda role: generations[role])
+    first = router.resolve("dream")
+    routes["dream"] = RoleLLMConfig(role="dream", driver="fake_chat", model="m2")
+    generations["dream"] += 1
+    rebuilt = router.resolve("dream")
+    assert rebuilt is not first
+    assert rebuilt.params["model"] == "m2"
+
+
+def test_router_reuses_cached_instance_when_generation_unchanged() -> None:
+    """E1-2: the generation counter IS the invalidation signal — mutating the
+    routes mapping alone never rebuilds a cached instance."""
+    reg = LLMRegistry("test-router-gen2")
+    register(reg)(_FakeLLM)
+    routes = {"dream": RoleLLMConfig(role="dream", driver="fake_chat", model="m1")}
+    router = _router(routes, registry=reg, generation=lambda role: 0)
+    first = router.resolve("dream")
+    routes["dream"] = RoleLLMConfig(role="dream", driver="fake_chat", model="m2")
+    assert router.resolve("dream") is first
 
 
 def test_router_unknown_role_raises_typed_route_error() -> None:
@@ -281,61 +323,20 @@ def test_router_unknown_role_raises_typed_route_error() -> None:
         router.resolve("no_such_role")
 
 
-def test_router_unknown_driver_only_fails_when_that_role_resolved() -> None:
+def test_router_unknown_driver_only_fails_when_role_resolved() -> None:
     routes = dict(Config().llm)
-    routes["short_increment"] = RoleLLMConfig(role="short_increment", driver="no_such_driver", model="m")
+    routes["dream"] = RoleLLMConfig(role="dream", driver="no_such_driver", model="m")
     router = _router(routes)
-    # boot path: an unrelated role resolves fine, the broken role is untouched
-    assert isinstance(router.resolve("local_track"), OllamaLLM)
     with pytest.raises(UnknownLLMDriverError, match="no_such_driver"):
-        router.resolve("short_increment")
-
-
-def test_router_unused_broken_role_never_breaks_boot() -> None:
-    routes = dict(Config().llm)
-    routes["deep_reflection"] = RoleLLMConfig(
-        role="deep_reflection", driver="not_registered_anywhere", model="x"
-    )
-    router = _router(routes)
-    assert isinstance(router.resolve("local_track"), OllamaLLM)  # boot only uses this role
-    report = router.check("deep_reflection")  # the console button still degrades, never raises
-    assert report.ok is False
-    assert "not_registered_anywhere" in report.detail["error"]
-
-
-def test_router_audit_logs_role_configured_once_env_name_never_value() -> None:
-    sink = _AuditSink()
-    env: dict[str, str] = {"FIREWORKS_API_KEY": "sk-super-secret"}
-    router = _router(Config().llm, audit=sink, env=env.get)
-    router.resolve("deep_reflection")
-    router.resolve("deep_reflection")  # cached: no second audit entry
-    assert len(sink.entries) == 1
-    entry = sink.entries[0]
-    assert entry.actor == "dream-router"
-    assert entry.action == "llm_role_configured"
-    assert entry.at == 42.0
-    assert entry.detail["role"] == "deep_reflection"
-    assert entry.detail["driver"] == "openai_compatible"
-    assert entry.detail["model"] == "accounts/fireworks/models/kimi-k3"
-    assert entry.detail["api_key_env"] == "MNEMOSEED_DEEP_REFLECTION_API_KEY,FIREWORKS_API_KEY"
-    assert "sk-super-secret" not in str(entry.detail)  # never the key value
-
-
-def test_router_audit_batches_refresh_entry_same_role_reuses_instance() -> None:
-    sink = _AuditSink()
-    router = _router(Config().llm, audit=sink)
-    router.resolve("local_track")
-    router.resolve("local_track")
-    assert len(sink.entries) == 1
-    assert sink.entries[0].detail["driver"] == "ollama"
+        router.resolve("dream")
 
 
 def test_router_check_returns_driver_health() -> None:
     reg = LLMRegistry("test-router")
     register(reg)(_FakeLLM)
-    routes = {"short_increment": RoleLLMConfig(role="short_increment", driver="fake_chat", model="m")}
+    routes = {"dream": RoleLLMConfig(role="dream", driver="fake_chat", model="m")}
     router = _router(routes, registry=reg)
-    report = router.check("short_increment")
+    report = router.check("dream")
     assert isinstance(report, HealthReport)
     assert report.ok is True
     assert report.detail["model"] == "m"
@@ -344,61 +345,45 @@ def test_router_check_returns_driver_health() -> None:
 def test_router_check_surfaces_driver_failure_typed() -> None:
     reg = LLMRegistry("test-router-2")
     register(reg)(_BrokenLLM)
-    routes = {"short_increment": RoleLLMConfig(role="short_increment", driver="broken_chat", model="m")}
+    routes = {"dream": RoleLLMConfig(role="dream", driver="broken_chat", model="m")}
     router = _router(routes, registry=reg)
-    report = router.check("short_increment")
+    report = router.check("dream")
     assert report.ok is False
     assert "provider down" in report.detail["error"]
 
 
 def test_router_check_unconfigured_role_is_failed_health() -> None:
-    routes = {"deep_reflection": RoleLLMConfig(role="deep_reflection", driver="no_such_driver", model="m")}
+    routes = {"dream": RoleLLMConfig(role="dream", driver="no_such_driver", model="m")}
     router = _router(routes)
-    report = router.check("deep_reflection")
+    report = router.check("dream")
     assert report.ok is False
     assert "no_such_driver" in report.detail["error"]
 
 
 def test_router_roles_in_config_order() -> None:
     router = _router(Config().llm)
-    assert router.roles() == ("deep_reflection", "short_increment", "local_track")
+    assert router.roles() == ("dream",)
 
 
-def test_router_can_resolve_oauth_stub() -> None:
-    routes = {"local_track": RoleLLMConfig(role="local_track", driver="oauth", model="")}
-    router = _router(routes)
-    llm = router.resolve("local_track")
-    assert isinstance(llm, OAuthLLM)
-    with pytest.raises(LLMUnavailable):
-        llm.chat(system="s", user="u")
-
-
-def test_router_oauth_role_from_config(tmp_path, monkeypatch) -> None:
-    """FR-2.14: a [dream.llm.<role>] table selects driver='oauth' + provider, and
-    the router hands the provider/model through to the driver."""
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    p = tmp_path / "config.toml"
-    _write(
-        p,
-        'preset = "embedded"\n'
-        "[dream.llm.deep_reflection]\n"
-        'driver = "oauth"\n'
-        'provider = "codex"\n'
-        'model = "gpt-5.6-codex"\n',
-    )
-    deep = load_config(p).llm["deep_reflection"]
-    assert deep.driver == "oauth"
-    assert deep.model == "gpt-5.6-codex"
-    assert deep.params["provider"] == "codex"
-    router = RoleRouter(
-        routes=dict(load_config(p).llm),
-        env=lambda name: "",
-        clock=lambda: 0.0,
-    )
-    llm = router.resolve("deep_reflection")
-    assert isinstance(llm, OAuthLLM)
-    assert llm.provider == "codex"
-    assert llm.model == "gpt-5.6-codex"
-    # the other roles keep their defaults — oauth is opt-in per role
-    short = router.resolve("short_increment")
-    assert short.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+def test_router_audit_logs_role_configured_once_env_name_never_value() -> None:
+    sink = _AuditSink()
+    routes = {
+        "dream": RoleLLMConfig(
+            role="dream",
+            driver="openai_compatible",
+            model="some-model",
+            params={"api_key_env": "FIREWORKS_API_KEY", "base_url": "https://api.test/v1"},
+        )
+    }
+    env: dict[str, str] = {"FIREWORKS_API_KEY": "sk-super-secret"}
+    router = _router(routes, audit=sink, env=env.get)
+    router.resolve("dream")
+    router.resolve("dream")  # cached: no second audit entry
+    assert len(sink.entries) == 1
+    entry = sink.entries[0]
+    assert entry.actor == "dream-router"
+    assert entry.action == "llm_role_configured"
+    assert entry.at == 42.0
+    assert entry.detail["role"] == "dream"
+    assert entry.detail["api_key_env"] == "FIREWORKS_API_KEY"
+    assert "sk-super-secret" not in str(entry.detail)  # never the key value

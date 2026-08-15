@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from mnemoseed.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed.dream import (
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.dream import (
     DreamState,
     DreamTrigger,
     FileSnapshotter,
@@ -34,9 +34,9 @@ from mnemoseed.dream import (
     load_snapshot_file,
     write_snapshot_file,
 )
-from mnemoseed.dream.snapshot import Snapshot, SnapshotChunk
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.ports import Capability, ChunkFilter, DreamRun, TurnRange
+from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.ports import Capability, ChunkFilter, DreamRun, TurnRange
 
 _RANGE = TurnRange(0, 4)
 
@@ -494,7 +494,7 @@ def test_recovered_snapshot_reflects_like_fresh(tmp_path: Path) -> None:
 
 
 def test_result_prompt_version_round_trip_and_stub_json_schema(tmp_path: Path) -> None:
-    from mnemoseed.dream import PROMPT_VERSION
+    from mnemoseed_local.dream import PROMPT_VERSION
 
     snap = _snap(_stamp("c1", "I prefer dark mode"))
     result = _run(snap, tmp_path)
@@ -547,7 +547,7 @@ def test_reflected_triple_defaults_to_positive_polarity(tmp_path: Path) -> None:
 
 
 def test_reflect_journal_round_trips_result_and_conflicts(tmp_path: Path) -> None:
-    from mnemoseed.dream import result_from_payload
+    from mnemoseed_local.dream import result_from_payload
 
     snap = _snap(
         _stamp("c1", "I always use vim"),
@@ -563,3 +563,69 @@ def test_reflect_journal_round_trips_result_and_conflicts(tmp_path: Path) -> Non
     assert restored is not None
     assert restored == outcome.result
     assert restored.conflicts == (("user", "has_habit", "use vim"),)
+
+
+# ---------------------------------------------------------------- E1-2 (F2) per-run resolve
+
+
+class _ResolvableLLM:
+    """A ChatLLM naming itself so a test can prove WHICH instance a run used.
+
+    ``model`` mirrors the driver instances' attribute the run-start pinning
+    seam reports (F2 dream_runs.model recording)."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.model = label
+        self.used = 0
+
+    def chat(self, *, system: str, user: str) -> str:
+        del system, user
+        self.used += 1
+        return "[]"
+
+
+def test_reflect_resolves_llm_at_run_start_when_resolver_wired(tmp_path: Path) -> None:
+    """E1-2 (F2): with a ``resolve_llm`` seam, each reflect pass materializes
+    the route at run start (pinned for that run), so a routing change lands on
+    the NEXT run without rebuilding the orchestrator."""
+    first = _ResolvableLLM("route-a")
+    second = _ResolvableLLM("route-b")
+    resolver = iter([first, second])
+
+    reflector = ReflectOrchestrator(
+        llm=first,  # boot-time fallback; superseded by the resolver
+        resolve_llm=lambda: next(resolver),
+        directory=tmp_path,
+        sleep=lambda _: None,
+    )
+    outcome_a = reflector.reflect(_snap(_stamp("c1", "I prefer dark mode")))
+    assert outcome_a.ok
+    assert first.used == 1
+    assert second.used == 0
+    # the NEXT run resolves the changed route fresh, pinned for its own run
+    outcome_b = reflector.reflect(_snap(_stamp("c2", "I prefer light mode")))
+    assert outcome_b.ok
+    assert second.used == 1
+
+
+def test_reflect_on_run_started_reports_pinned_model_for_each_run(tmp_path: Path) -> None:
+    """F2: the ``on_run_started`` seam fires per run with the RESOLVED
+    instance's model (the run-start pin), so dream_runs.model can record it."""
+    first = _ResolvableLLM("kimi-k3")
+    second = _ResolvableLLM("deepseek-v4-flash")
+    resolver = iter([first, second])
+    pinned: list[tuple[str, str]] = []
+
+    reflector = ReflectOrchestrator(
+        llm=first,
+        resolve_llm=lambda: next(resolver),
+        on_run_started=lambda run_id, model: pinned.append((run_id, model)),
+        directory=tmp_path,
+        sleep=lambda _: None,
+    )
+    snap_a = _snap(_stamp("c1", "I prefer dark mode"))
+    snap_b = _snap(_stamp("c2", "I prefer light mode"))
+    assert reflector.reflect(snap_a).ok
+    assert reflector.reflect(snap_b).ok
+    assert pinned == [(snap_a.snapshot_id, "kimi-k3"), (snap_b.snapshot_id, "deepseek-v4-flash")]

@@ -21,19 +21,19 @@ from pathlib import Path
 
 import pytest
 
-from mnemoseed.dream import (
+from mnemoseed_local.dream import (
     ReflectedTriple,
     ReflectionResult,
     ReflectOrchestrator,
     Route,
     StubReflectLLM,
 )
-from mnemoseed.dream.merge import Merger
-from mnemoseed.dream.snapshot import Snapshot, SnapshotChunk
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.drivers.sqlite_meta import SqliteMetaDriver
-from mnemoseed.storage.ports import AuditFilter, NodeFilter, Page, TurnRange
+from mnemoseed_local.dream.merge import Merger
+from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+from mnemoseed_local.storage.ports import AuditFilter, NodeFilter, Page, TurnRange
 
 _RANGE = TurnRange(0, 2)
 _PROFILE = "alice"

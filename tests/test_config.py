@@ -3,7 +3,7 @@ STORAGE_MODE shortcut, and validation errors that name the offending key."""
 
 import pytest
 
-from mnemoseed.config import (
+from mnemoseed_local.config import (
     DEFAULT_DREAM_TOKEN_BUDGET_USD,
     DEFAULT_PRESET,
     Config,
@@ -35,18 +35,18 @@ def test_default_config_is_embedded(tmp_path, monkeypatch):
 
 def test_storage_mode_env_overrides_file_preset(tmp_path, monkeypatch):
     p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n')
-    monkeypatch.setenv("STORAGE_MODE", "docker")
+    _write(p, 'preset = "custom"\n')
+    monkeypatch.setenv("STORAGE_MODE", "embedded")
     cfg = load_config(p)
-    assert cfg.preset == "docker"
-    assert cfg.layer_instances("vector")["main"].driver == "pgvector"
+    assert cfg.preset == "embedded"
+    assert cfg.layer_instances("vector")["main"].driver == "lancedb_embedded"
 
 
 def test_storage_mode_does_not_override_explicit_layer(tmp_path, monkeypatch):
     p = tmp_path / "config.toml"
-    _write(p, '[storage.vector]\ndriver = "lancedb_embedded"\n')
-    monkeypatch.setenv("STORAGE_MODE", "docker")
-    assert load_config(p).layer_instances("vector")["main"].driver == "lancedb_embedded"
+    _write(p, '[storage.embed]\ndriver = "synthetic"\n')
+    monkeypatch.setenv("STORAGE_MODE", "embedded")
+    assert load_config(p).layer_instances("embed")["main"].driver == "synthetic"
 
 
 def test_storage_mode_invalid_names_env_key(tmp_path, monkeypatch):
@@ -66,10 +66,10 @@ def test_config_file_invalid_preset_names_preset_key(tmp_path, monkeypatch):
 def test_layer_override_wins_over_preset(tmp_path, monkeypatch):
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
-    _write(p, '[storage.vector]\ndriver = "pgvector"\n')
+    _write(p, '[storage.embed]\ndriver = "synthetic"\n')
     cfg = load_config(p)
-    assert cfg.layer_instances("vector")["main"].driver == "pgvector"
-    assert cfg.layer_instances("graph")["main"].driver == "sqlite_graph"  # preset fallback
+    assert cfg.layer_instances("embed")["main"].driver == "synthetic"
+    assert cfg.layer_instances("meta")["main"].driver == "sqlite_meta"  # preset fallback
 
 
 def test_named_multi_instance(tmp_path, monkeypatch):
@@ -80,14 +80,14 @@ def test_named_multi_instance(tmp_path, monkeypatch):
         "[storage.graph]\n"
         "[storage.graph.instances.isolated]\n"
         'driver = "sqlite_graph"\n'
-        'path = "~/.mnemoseed/isolated.db"\n',
+        'path = "~/.mnemoseed-local/isolated.db"\n',
     )
     graph = load_config(p).layer_instances("graph")
     assert set(graph) == {"main", "isolated"}
     assert graph["main"].driver == "sqlite_graph"
     assert graph["main"].params == {}
     assert graph["isolated"].driver == "sqlite_graph"
-    assert graph["isolated"].params == {"path": "~/.mnemoseed/isolated.db"}
+    assert graph["isolated"].params == {"path": "~/.mnemoseed-local/isolated.db"}
 
 
 def test_instance_driver_wins_over_layer_driver(tmp_path, monkeypatch):
@@ -95,16 +95,16 @@ def test_instance_driver_wins_over_layer_driver(tmp_path, monkeypatch):
     p = tmp_path / "config.toml"
     _write(
         p,
-        "[storage.graph]\n"
-        'driver = "sqlite_graph"\n'
-        "[storage.graph.instances.main]\n"
-        'driver = "pg_graph"\n'
-        "[storage.graph.instances.isolated]\n"
-        'driver = "sqlite_graph"\n',
+        "[storage.embed]\n"
+        'driver = "bge_m3_onnx"\n'
+        "[storage.embed.instances.main]\n"
+        'driver = "synthetic"\n'
+        "[storage.embed.instances.isolated]\n"
+        'driver = "synthetic"\n',
     )
-    graph = load_config(p).layer_instances("graph")
-    assert graph["main"].driver == "pg_graph"
-    assert graph["isolated"].driver == "sqlite_graph"
+    embed = load_config(p).layer_instances("embed")
+    assert embed["main"].driver == "synthetic"
+    assert embed["isolated"].driver == "synthetic"
 
 
 def test_custom_preset_requires_explicit_layer(tmp_path, monkeypatch):
@@ -170,9 +170,9 @@ def test_default_toml_parses(tmp_path, monkeypatch):
 def test_programmatic_config_resolves_without_file(tmp_path):
     cfg = Config(
         preset="embedded",
-        storage={"vector": _layer_spec("vector", "pgvector")},
+        storage={"vector": _layer_spec("vector", "lancedb_embedded")},
     )
-    assert cfg.layer_instances("vector")["main"].driver == "pgvector"
+    assert cfg.layer_instances("vector")["main"].driver == "lancedb_embedded"
     assert cfg.preset == "embedded"
     assert cfg.layer_instances("graph")["main"].driver == "sqlite_graph"
 

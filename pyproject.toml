@@ -3,33 +3,32 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mnemoseed"
-version = "0.1.1"
-description = "Cross-model neutral AI memory layer — five-stage memory pipeline derived from neuroscience"
+name = "mnemoseed-local"
+version = "0.1.0"
+description = "Local single-user memory daemon for coding agents — capture, dream, decay, retrieve"
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "httpx>=0.27",
-    # embedded vector layer: lancedb chunks table + hybrid search (FR-8.3)
-    "lancedb>=0.15",
-    # bge-m3 embedder: CPU inference + XLM-RoBERTa tokenization (FR-8.3)
+    # embedded vector layer: lancedb chunks table + hybrid search.
+    # Pinned to the production-proven line: 0.37+ moved `.metric` off the
+    # base query-builder type surface, breaking the mypy gate.
+    "lancedb==0.36.0",
+    # bge-m3 embedder: CPU inference + XLM-RoBERTa tokenization
     "onnxruntime>=1.18",
     "tokenizers>=0.20",
     # vector math shared by the vector/embed drivers (synthetic, bge-m3, lancedb)
     "numpy>=2.0",
-    # postgres driver family (FR-8.4): pg_graph / pg_meta / pgvector second drivers.
-    # Base deps because the pg drivers are the docker preset defaults and CI
-    # imports them under a plain uv sync (AC-1).
-    "psycopg[binary]>=3.2",
-    "pgvector>=0.3",
-    # MCP stdio memory gateway (PRD-03 FR-3.1): official MCP SDK, pinned to 2.x.
-    "mcp>=2.0,<3",
-    # local owner passwords are argon2id-hashed at rest (issue #14, PRD-06 FR-6.1e)
-    "argon2-cffi>=23.1",
+    # OS keychain custody: Windows Credential Manager / macOS Keychain /
+    # Linux libsecret. Probe-detected: the chain falls back to the
+    # restricted-file backend when no keyring answers.
+    "keyring>=25",
+    # daemon surface: FastAPI app + uvicorn runner (the A2 daemon ships the
+    # capture/recall/dream/config HTTP endpoints; localhost-only by default).
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [dependency-groups]
@@ -41,23 +40,10 @@ dev = [
 ]
 
 [project.scripts]
-mnemoseed = "mnemoseed.cli:main"
+mnemoseed-local = "mnemoseed_local.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mnemoseed"]
-
-# Ship the host adapter/plugin template trees as package data so `mnemoseed
-# install` works from an installed wheel (issue #9). The repo-root layout is
-# kept as the marketplace-distribution source (design/06 section 2.1); the
-# wheel copy lands under the package at a stable, resolution-known location.
-# The installer resolves them via mnemoseed.installer.templating.
-# The trees must also ride the sdist, since wheels are rebuilt from it.
-[tool.hatch.build.targets.sdist]
-include = ["src", "adapters", "plugins/claude-code", "tests", "README.md", "LICENSE"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"adapters" = "src/mnemoseed/_templates/adapters"
-"plugins/claude-code" = "src/mnemoseed/_templates/plugins/claude-code"
+packages = ["src/mnemoseed_local"]
 
 [tool.ruff]
 line-length = 110
@@ -79,16 +65,10 @@ show_error_codes = true
 
 # third-party libs without type stubs / py.typed markers
 [[tool.mypy.overrides]]
-module = ["pyarrow", "lancedb", "lancedb.query", "onnxruntime"]
+module = ["pyarrow", "lancedb", "lancedb.query", "onnxruntime", "keyring"]
 ignore_missing_imports = true
 disable_error_code = ["import-untyped"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.ruff.lint.per-file-ignores]
-# Hook entry scripts must insert the plugin/adapter dir into sys.path before
-# importing the shared client, so import order is intentional there.
-"plugins/**" = ["I001", "UP034"]
-"adapters/**" = ["I001", "UP034"]

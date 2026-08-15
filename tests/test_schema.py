@@ -2,8 +2,8 @@
 
 import time
 
-from mnemoseed.schema.graph import GraphNode, NodeType
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.schema.graph import GraphNode, NodeType
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 
 
 def make_stamp(**over) -> ChunkStamp:

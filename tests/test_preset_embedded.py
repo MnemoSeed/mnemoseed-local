@@ -7,17 +7,17 @@ import asyncio
 
 import pytest
 
-from mnemoseed.config import Config, LayerSpec
-from mnemoseed.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
-from mnemoseed.storage.drivers import (
+from mnemoseed_local.config import Config, LayerSpec
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
     lancedb_embedded,
     sqlite_graph,
     sqlite_meta,
     synthetic_embedder,
 )
-from mnemoseed.storage.factory import build_stores
-from mnemoseed.storage.registry import (
+from mnemoseed_local.storage.factory import build_stores
+from mnemoseed_local.storage.registry import (
     EMBED_DRIVERS,
     GRAPH_DRIVERS,
     META_DRIVERS,

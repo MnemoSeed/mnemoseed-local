@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import pytest
 
-from mnemoseed.capture.scorer import (
+from mnemoseed_local.capture.scorer import (
     Durability,
     ScoredTurn,
     ScoringConfig,
     TurnScorer,
 )
-from mnemoseed.schema.turn import HostId, Turn, TurnRole, TurnStep
-from mnemoseed.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
+from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 
 
 def _turn(text: str, *, index: int = 0, profile: str = "prof-main") -> Turn:

@@ -1,9 +1,9 @@
 """Driver-agnostic contract tests for the VectorStore port (prd-08 appendix B.1).
 
 Every method of the port gets at least one behavioral test; the suite runs
-against the embedded (lancedb_embedded) and postgres (pgvector) driver families
-via the parametrized `stack` fixture. Assertions are deliberately behavioral so
-a third driver that honours the same semantics passes unchanged.
+against the embedded (lancedb_embedded) driver family via the `stack` fixture.
+Assertions are deliberately behavioral so a third driver that honours the same
+semantics passes unchanged.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from _support import (
     write_turn_chunk,
 )
 
-from mnemoseed.storage.ports import (
+from mnemoseed_local.storage.ports import (
     Capability,
     ChunkFilter,
     Page,

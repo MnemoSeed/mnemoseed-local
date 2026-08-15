@@ -16,11 +16,11 @@ import threading
 
 import pytest
 
-from mnemoseed.schema.graph import GraphNode, NodeType
-from mnemoseed.schema.stamp import Provenance
-from mnemoseed.storage.drivers.sqlite_graph import SqliteGraphDriver
-from mnemoseed.storage.drivers.sqlite_meta import SqliteMetaDriver
-from mnemoseed.storage.ports import NodeFilter, Page, PoolState, StoredProfile, TurnRange
+from mnemoseed_local.schema.graph import GraphNode, NodeType
+from mnemoseed_local.schema.stamp import Provenance
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+from mnemoseed_local.storage.ports import NodeFilter, Page, PoolState, StoredProfile, TurnRange
 
 _NODE_PROPS = {
     "domain": "coding",
