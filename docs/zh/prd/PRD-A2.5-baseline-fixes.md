@@ -56,3 +56,21 @@
 
 - 四任务 QA 全过；`uv run pytest -q`、`ruff check`、`ruff format --check`、`mypy src` 干净；
 - 单 commit 收口（orchestrator 执行）：`phase A2.5: baseline hardening — async dream, retrieval filter, config registry, budget removal`。
+
+## 收口记录（2026-08-16）
+
+- 收口 commit：`16ee68b`（34 文件，+2675/-678），已推送 `MnemoSeed/mnemoseed-local`（main）。
+- 全程 TDD；QA 门禁逐任务对抗验收（变异击杀 20+ 发）。最终 908 passed / 5 skipped，ruff/format/mypy 干净。
+- QA 判定：T2 PASS、T4 PASS、T1a FAIL→修复后 PASS（D1 停机 future 挂起）、T1b PASS、T3a FAIL→修复后 PASS（D-T3a-1 降级混合写入原子性）、T3b PASS。
+
+## QA 观察项存档（非阻断，供 A3/Phase B 分诊）
+
+1. pool-fired（relay 路径）失败的梦无指纹、无快速退避，靠 hard_deadline（默认 24h）兜底——若期望全路径快速重试需补指纹登记。
+2. 退避重发与新近 floor-eligible 触发可产生重叠窗口双梦（worker 串行保证安全，属浪费非损坏）。
+3. `DREAM_RETRY_BASE_S` 绝对值无测试守卫（测试自引用常量）；退避 given_up 与 next_at=inf 双保险单边无守卫。
+4. `DreamWorker.stop()` 后 submit 会挂起（API 级边界，daemon 停机路径不可达）；stop() 的 executor shutdown 竞态日志被吞（不影响正确性）。
+5. 重载下事件循环瞬时 stall（/healthz p95≈609ms）：主体是既有 drain 成本，T1a 竞争贡献约 +35-40%；收紧方向=drain 存储写序列化/批量提交（Phase B 性能主题）。
+6. `trigger.status()` 跨线程读可能撕裂快照（良性）。
+7. boot recovery 链仍同步于 lifespan（真实 LLM 下启动可达分钟级）——T1b 评估为暂不修，记录。
+8. `OllamaLLM` 直构默认模型已在收口统一为 qwen3.5:9b；Ledger record 签名无"拒绝 budget kwarg"级守卫（M-T3b-4 未杀中，load/configwrite 双侧已硬拦，风险低）。
+9. doctor 测试的 cli/config 双 patch 已由 T3a 的 cli_home fixture 合并；`dream.ensemble`/`hardware_tier` 键尚**无运行期消费端**（vote/verify 实现属后续任务，键语义=声明性配置）。
