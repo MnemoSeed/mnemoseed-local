@@ -1,7 +1,8 @@
 """mnemoseed-local CLI entry point (A2 MVP).
 
 Verbs: init / up / status / doctor / recall / remember / dream (--once,
-status) / forget / config (get | set | rollback) / uninstall (--purge).
+status) / forget / config (get | set | rollback) / uninstall (--purge) /
+hook (install | uninstall | status) / mcp (MCP stdio gateway).
 Local loopback by default; every state-changing verb talks to the daemon REST
 (FR-7.12); no identity/accounts/tokens in the local MVP.
 """
@@ -19,6 +20,7 @@ from mnemoseed_local import __version__
 from mnemoseed_local.config import (
     CONFIG_DIR,
     CONFIG_PATH,
+    DEFAULT_LLM_ROUTES,
     Config,
     ConfigError,
     default_config_toml,
@@ -41,6 +43,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     CONFIG_PATH.write_text(default_config_toml(), encoding="utf-8")
     print(f"initialized {CONFIG_DIR}")
     print(f"config: {CONFIG_PATH}")
+    # A3 T5 (design/01 §6 Phase A3): point at self-check and the one-time model
+    # pull. Guidance only — the CLI never pulls a model silently.
+    model = DEFAULT_LLM_ROUTES["dream"].model
+    print("next steps:")
+    print("  1. mnemoseed-local doctor   (self-check incl. hardware tier)")
+    print(f"  2. ollama pull {model}   (dream model, first time only)")
+    print("  3. mnemoseed-local up")
     return 0
 
 
@@ -58,6 +67,19 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"preset: {config.preset}")
     if config.preset == "embedded":
         print("embedded single-process daemon - all drivers in-process, zero external services")
+
+    # A3 T5 model-missing UX: an ollama dream route needs its model pulled
+    # before boot — fail fast with the fix hint, never a silent `ollama pull`
+    # (the bge-m3 lazy-load precedent). A non-ollama route skips the pre-flight
+    # entirely: the provider's model inventory is out of doctor's reach.
+    if config.llm["dream"].driver == "ollama":
+        model_ok, model_detail = _dream_model_check(config)
+        if not model_ok:
+            if model_detail.startswith("model "):
+                print(f"error: dream {model_detail}", file=sys.stderr)
+            else:
+                print(f"error: {model_detail}", file=sys.stderr)
+            return 1
 
     # Resolve the storage stack up front so a bad driver key or invalid params
     # fail with a clean one-line error instead of a uvicorn startup traceback.
@@ -126,6 +148,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     checks.append(("isolated graph", has_isolated, isolated_detail))
 
+    # A3 T5 (design/01 §4.8 decision 8): informational tier recommendation.
+    # Config-only, so it always reports — even when the storage stack or the
+    # dream llm probe would fail later in the checklist.
+    checks.append(_hardware_tier_check(config))
+
     from mnemoseed_local.llm import LLMError, RoleRouter
     from mnemoseed_local.storage.factory import build_stores
     from mnemoseed_local.storage.ports import StorageError
@@ -150,6 +177,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append(("dream llm", report.ok, f"{config.llm['dream'].driver} {report.detail}"))
     except LLMError as exc:
         checks.append(("dream llm", False, str(exc)))
+
+    # A3 T5 model-missing UX: the ollama dream route's model must be pulled.
+    model_ok, model_detail = _dream_model_check(config)
+    checks.append(("dream model", model_ok, model_detail))
     return _doctor_report(checks)
 
 
@@ -240,6 +271,71 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
         False,
         f"prefix+delta+margin={needed} > num_ctx={num_ctx}; lower the delta ceiling or raise num_ctx",
     )
+
+
+def models_contain(models: list[str], configured: str) -> bool:
+    """Ollama model-name normalization (A3 T5): is `configured` in the pulled list?
+
+    A configured name WITH a tag matches exactly ``name:tag`` (plus a bare
+    ``name`` server entry when the tag is ``latest`` — some ollama builds elide
+    the default tag in /api/tags). A configured name WITHOUT a tag matches
+    either ``name`` or ``name:latest``, but never a pinned non-latest tag.
+    """
+    if ":" not in configured:
+        wanted = {configured, f"{configured}:latest"}
+    else:
+        name, _, tag = configured.partition(":")
+        wanted = {configured, name} if tag == "latest" else {configured}
+    return any(model in wanted for model in models)
+
+
+def _dream_model_check(config: Config) -> tuple[bool, str]:
+    """A3 T5 (design/01 §6 Phase A3): the ollama dream route's model must be pulled.
+
+    Compare the configured ``route.model`` against the server's ``GET
+    /api/tags`` inventory (via the driver's ``check()`` probe; name comparison
+    goes through ``models_contain``). A missing model fails with the pull hint
+    and an unreachable server fails with a start-ollama hint — never a silent
+    pull. A non-ollama route skips the check (same precedent as the ctx-window
+    check: the provider's model inventory is out of doctor's reach). ``up``
+    calls the same helper as a pre-flight before booting the daemon.
+    """
+    route = config.llm["dream"]
+    if route.driver != "ollama":
+        return True, f"route driver {route.driver!r} is not ollama; model presence check skipped"
+    from mnemoseed_local.llm import LLMError, RoleRouter
+
+    try:
+        llm = RoleRouter(routes=config.llm, audit=None).resolve("dream")
+    except LLMError as exc:
+        return False, str(exc)
+    report = llm.check()
+    if not report.ok:
+        error = report.detail.get("error", "unknown error")
+        return False, f"ollama server unreachable ({error}); start ollama first"
+    models = [str(name) for name in (report.detail.get("models") or []) if isinstance(name, str)]
+    if models_contain(models, route.model):
+        return True, f"model {route.model!r} present"
+    return False, f"model {route.model!r} not pulled; run: ollama pull {route.model}"
+
+
+def _hardware_tier_check(config: Config) -> tuple[str, bool, str]:
+    """A3 T5 (design/01 §4.8 decision 8): informational tier recommendation.
+
+    Always ``ok=True``: a recommended/current tier mismatch is a hint, never a
+    failure. The detail format is a pinned machine-readable contract — the
+    install script extracts the recommended tier from this exact line.
+    """
+    from mnemoseed_local import hardware
+
+    vram_gb = hardware.probe_max_vram_gb()
+    ram_gb = hardware.probe_ram_gb()
+    tier = hardware.recommended_tier(vram_gb, ram_gb)
+    detail = (
+        f'recommended tier "{tier}" (vram={int(vram_gb)}GB, ram={int(ram_gb or 0.0)}GB); '
+        f'current tier "{config.dream.hardware_tier}"'
+    )
+    return ("hardware tier", True, detail)
 
 
 def cmd_recall(args: argparse.Namespace) -> int:
@@ -471,6 +567,63 @@ def cmd_config_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------ host hook (A3 T2)
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """OpenCode host hook management (design/01 §4.5).
+
+    Local filesystem operations only — the daemon REST write path is never
+    touched. ``status`` adds a read-only /healthz reachability probe.
+    """
+    from mnemoseed_local.hosts import install as hook
+
+    if args.hook_command == "install":
+        path, changed = hook.install_plugin()
+        if changed:
+            print(f"installed hook: {path}")
+        else:
+            print(f"hook already up to date: {path}")
+        # OpenCode auto-discovers plugin files at startup, so a running host
+        # only picks the hook up on its next boot.
+        print("restart opencode to pick up the hook (plugin files load at startup)")
+        return 0
+    if args.hook_command == "uninstall":
+        path, existed = hook.uninstall_plugin()
+        if existed:
+            print(f"uninstalled hook: {path}")
+        else:
+            print(f"hook not installed: {path}")
+        print("restart opencode for the removal to take effect")
+        return 0
+    info = hook.hook_status()
+    state_label = {
+        "not-installed": "not installed",
+        "match": "installed (matches shipped plugin)",
+        "differs": "installed (differs from shipped plugin)",
+    }[info.state]
+    print(f"hook: {state_label}")
+    print(f"path: {info.path}")
+    reach = "reachable" if info.daemon_reachable else "unreachable"
+    print(f"daemon: {reach} ({info.base_url})")
+    return 0
+
+
+# ------------------------------------------------------------ MCP gateway (A3 T3)
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """MCP stdio gateway (design/01 §4.5, ingestion channel ③).
+
+    Blocking JSON-RPC loop over stdin/stdout. A down daemon is NOT a startup
+    error: the handshake works regardless; only tools/call surfaces the
+    connectivity failure as a structured isError result.
+    """
+    from mnemoseed_local.mcp_gateway import server as mcp_server
+
+    return mcp_server.serve(client=mcp_server.build_client(args))
+
+
 # ------------------------------------------------------------ plumbing
 
 
@@ -557,6 +710,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_uninstall = sub.add_parser("uninstall", help="remove the local daemon / data directory")
     p_uninstall.add_argument("--purge", action="store_true", help="delete the data files too")
     p_uninstall.add_argument("--yes", action="store_true", help="skip the purge confirmation")
+
+    p_hook = sub.add_parser("hook", help="manage the OpenCode host hook (plugin auto-discovery)")
+    p_hook.add_argument(
+        "hook_command",
+        choices=("install", "uninstall", "status"),
+        help="install writes the plugin into the opencode config root; "
+        "uninstall removes it; status reports the install state and daemon reachability",
+    )
+
+    p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")
+    p_mcp.add_argument("--baseurl", default=None, help="daemon base URL override")
     return parser
 
 
@@ -583,6 +747,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_config(args) if args.config_command != "rollback" else cmd_config_rollback(args)
     if args.command == "uninstall":
         return cmd_uninstall(args)
+    if args.command == "hook":
+        return cmd_hook(args)
+    if args.command == "mcp":
+        return cmd_mcp(args)
     parser.print_help(file=sys.stderr)
     return 2
 

@@ -20,6 +20,42 @@ pipelines with a config-driven dream scheduler (pool-score floor + idle window
 + 24h hard deadline), no-accounts loopback daemon, and the `mnemoseed-local`
 CLI. Install script + MCP gateway + packaging polish land in Phase A3.
 
+## Install
+
+One command, zero dependencies to prepare: the orchestrator detects and
+installs ollama + uv when missing, installs the `mnemoseed-local` CLI via
+`uv tool`, runs `init` + `doctor`, and — only after your confirmation — pulls
+the dream model. Idempotent; pass `--dry-run` / `-DryRun` to preview the plan
+with no side effects, and `--yes` / `-Yes` to skip the model-pull prompt.
+
+Windows (PowerShell 5.1+):
+
+```powershell
+irm https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.ps1 | iex
+```
+
+Linux/macOS (POSIX sh):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
+```
+
+Afterwards: `mnemoseed-local up` starts the daemon; `mnemoseed-local hook
+install` installs the OpenCode host adapter.
+
+## MCP gateway
+
+The CLI ships a zero-config MCP stdio gateway (newline-delimited JSON-RPC,
+daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
+
+```json
+{"mcp": {"mnemoseed": {"type": "local", "command": ["mnemoseed-local", "mcp"]}}}
+```
+
+Tools: `recall(query, top_k?)`, `remember(text)`, `dream_once()`. The
+handshake works even when the daemon is down; only tool calls report the
+connectivity error.
+
 ## Development
 
 Test-driven, with an adversarial verifier on every task: failing tests first.

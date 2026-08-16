@@ -1,0 +1,1 @@
+{"host":"opencode","event":"assistant_message","session_id":"oc-sess-01","profile_id":"default","ts":1755500001.25,"content":{"text":"失败原因是测试里的时钟断言没有冻结；我给你改成注入时钟。","model_id":"anthropic/claude-sonnet-4-5"},"raw":{"messageID":"msg-assistant-1"}}

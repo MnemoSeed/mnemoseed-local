@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [development, main]
+    branches: [main]
   pull_request:
-    branches: [development, main]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -29,3 +29,23 @@ jobs:
         run: uv run mypy src
       - name: Test
         run: uv run pytest -q
+
+  install-script-smoke:
+    # Phase A3 (T1+T4): the zero-dependency install orchestrators must stay
+    # syntax-valid and their dry-run must be side-effect-free on both shells.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dry-run install.sh
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sh -n install.sh && sh install.sh --dry-run
+      - name: Dry-run install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\install.ps1 -DryRun

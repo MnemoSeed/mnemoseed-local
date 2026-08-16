@@ -1,0 +1,1 @@
+{"host":"opencode","event":"tool_use","session_id":"oc-sess-01","profile_id":"default","ts":1755500002.5,"content":{"tool_name":"bash","input":{"command":"uv run pytest -q"},"output":"938 passed, 5 skipped"},"raw":{"callID":"call-7"}}
