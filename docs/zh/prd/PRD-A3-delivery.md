@@ -15,7 +15,7 @@
      c. `uv tool install mnemoseed-local`（已装则 `uv tool upgrade`）；
      d. `mnemoseed-local init`（已初始化则跳过）；
      e. `mnemoseed-local doctor`（内含 T5 的硬件荐档行），报告荐档与模型名；
-     f. **交互确认后** `ollama pull <model>`（荐档对应默认模型：standard→`qwen3.5:9b`、lite→`qwen3.5:4b`、advanced→官方 27B 标）；`-Yes`/`--yes` 跳确认；**绝不静默拉取**；
+     f. **交互确认后** `ollama pull <model>`——拉取目标 = 当前配置 `llm.dream.model`（config.toml 无覆写时 = `qwen3.5:9b`；与 T5 的 up/doctor 存在性检查同源，保证"拉的就是查的"）；荐档 ≠ 当前档时打印调整提示（hint-only，脚本不改配置键）；`-Yes`/`--yes` 跳确认；**绝不静默拉取**；
      g. 末次 doctor 复验 + 引导语（`mnemoseed-local up`，hook 安装提示）。
   2. `--dry-run` 模式：只打印将执行的步骤与探测结果，不产生任何副作用（脚本在 CI 可验证的唯一形态）。
   3. 幂等：每一步"已就绪则跳过"；任一外部命令失败给出单句原因 + 退出码非零；仅用系统自带命令（pwsh 5.1+ / POSIX sh + curl/wget），不引入新依赖。
@@ -79,7 +79,7 @@
 - 设计依据：§6 Phase A3（"模型缺失 UX：init/doctor 引导 + up 启动检查、缺失时报错附 `ollama pull` 提示，**绝不静默拉取**（复用 bge-m3 懒加载先例）"）、§4.8/决策 8（三档与荐档）。
 - 范围：
   1. doctor 新增 **"dream model"** 检查：ollama 路由时比较配置 `model` 与 `GET /api/tags` 结果（名称规格化：允许 `name` 或 `name:latest` 等价），缺失 → FAIL 且 detail 附 `ollama pull <model>`；服务器不可达 → FAIL 附启动提示；非 ollama 路由跳过（与 ctx-window 检查同一先例）。
-  2. doctor 新增 **"hardware tier"** 信息化检查（恒 ok=true）：探测总 RAM（Windows ctypes GlobalMemoryStatusEx / Linux /proc/meminfo / macOS sysctl，零新依赖）与 NVIDIA VRAM（`nvidia-smi` 存在时；缺席视为 0），输出 `recommended tier: X（VRAM y GB / RAM z GB）(current: dream.hardware_tier)`；推荐规则：VRAM ≥ 22GB → advanced；VRAM ≥ 7GB 或 RAM ≥ 30GB → standard；否则 lite。不一致仅提示，不 FAIL。
+  2. doctor 新增 **"hardware tier"** 信息化检查（恒 ok=true）：探测总 RAM（Windows ctypes GlobalMemoryStatusEx / Linux /proc/meminfo / macOS sysctl，零新依赖）与 NVIDIA VRAM（`nvidia-smi` 存在时；缺席视为 0）；detail 格式钉死（T1 脚本以此提取）：`recommended tier "standard" (vram=12GB, ram=32GB); current tier "standard"`；推荐规则：VRAM ≥ 22GB → advanced；VRAM ≥ 7GB 或 RAM ≥ 30GB → standard；否则 lite。不一致仅提示，不 FAIL。
   3. `up` 启动检查：dream 路由为 ollama 时，run_server 前做模型存在性预检（复用 doctor 同一判定函数）；服务器不可达或模型缺失 → stderr 单句报错（附 `ollama pull <model>` 或启动 ollama 提示）退出码 1；**绝不静默拉取**；非 ollama 路由跳过。
   4. `init` 引导文案：写配置后追加三行 next-steps（doctor / `ollama pull qwen3.5:9b` / `up`）。
 - AC：
