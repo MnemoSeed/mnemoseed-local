@@ -310,3 +310,57 @@ def test_balances_snapshot() -> None:
     pool.add_points("a", 3.0, TurnRange(0, 0))
     pool.add_points("b", 5.0, TurnRange(0, 0))
     assert pool.balances() == {"a": 3.0, "b": 5.0}
+
+
+# ---------------------------------------------------------------- forced cap from config (T3a / AC6)
+
+
+def test_forced_cap_fires_at_the_config_value() -> None:
+    """A pool bound to a live Config reads dream.pool_forced_cap: with a 20
+    cap the forced consolidation fires at 20 points, not the 50 default."""
+    from mnemoseed_local.config import Config, DreamConfig
+
+    clock = _Clock()
+    events, sink = _sink()
+    config = Config()
+    config.dream = DreamConfig(pool_forced_cap=20.0)
+    pool = ScorePool(clock=clock, sink=sink, config=config)
+    pool.add_points("p", 10.0, TurnRange(0, 0))
+    assert events == []  # 10 < 20: below the configured cap
+    fired = pool.add_points("p", 10.0, TurnRange(1, 1))
+    assert len(fired) == 1
+    assert fired[0].kind is PoolEventKind.FORCED_CONSOLIDATION
+    assert fired[0].balance == pytest.approx(20.0)
+
+
+def test_forced_cap_hot_applies_without_reconstruction() -> None:
+    """The pool holds a live Config reference: a configwrite cap change fires
+    the SAME pool instance at the new cap (no daemon restart)."""
+    from mnemoseed_local.config import Config, DreamConfig
+
+    clock = _Clock()
+    events, sink = _sink()
+    config = Config()  # cap 50.0 default
+    pool = ScorePool(clock=clock, sink=sink, config=config)
+    pool.add_points("p", 30.0, TurnRange(0, 0))
+    assert events == []  # 30 < 50 default cap, busy idle -> nothing fires
+
+    # hot-apply: the configwrite seam replaces config.dream on the SAME object
+    config.dream = DreamConfig(pool_forced_cap=20.0)
+    fired = pool.add_points("p", 5.0, TurnRange(1, 1))
+    assert len(fired) == 1
+    assert fired[0].kind is PoolEventKind.FORCED_CONSOLIDATION
+    assert fired[0].balance == pytest.approx(35.0)
+
+
+def test_forced_cap_constructor_arg_binds_when_no_config() -> None:
+    """Unbound pools keep the constructor forced_cap contract (regression
+    fence for every historic direct construction)."""
+    clock = _Clock()
+    events, sink = _sink()
+    pool = ScorePool(clock=clock, sink=sink, forced_cap=20.0)
+    pool.add_points("p", 10.0, TurnRange(0, 0))
+    assert events == []
+    fired = pool.add_points("p", 10.0, TurnRange(1, 1))
+    assert len(fired) == 1
+    assert fired[0].kind is PoolEventKind.FORCED_CONSOLIDATION

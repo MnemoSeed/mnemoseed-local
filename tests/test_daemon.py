@@ -8,13 +8,19 @@ and the daemon refuses a non-loopback baseurl at boot.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.daemon.app import DreamWorker, create_app
+from mnemoseed_local.dream import DreamTrigger, SnapshotResult
 from mnemoseed_local.schema.turn import HostId
+from mnemoseed_local.storage.ports import TurnRange
 
 PROFILE = "default"
 SESSION = "sess-daemon"
@@ -29,6 +35,7 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         'preset = "embedded"\n'
         f'[storage.vector]\nuri = "{(tmp_path / "chunks.lance").as_posix()}"\ndimensions = 64\n'
         f'[storage.graph]\npath = "{(tmp_path / "cortex.db").as_posix()}"\n'
+        f'[storage.graph.instances.isolated]\npath = "{(tmp_path / "isolated.db").as_posix()}"\n'
         f'[storage.meta]\npath = "{(tmp_path / "meta.db").as_posix()}"\n'
         f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
         "[dream.llm.dream]\n"
@@ -71,6 +78,32 @@ def test_non_loopback_baseurl_is_refused(tmp_path: Path, monkeypatch: pytest.Mon
             pass
 
 
+def test_boot_refuses_without_isolated_graph_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: the isolated graph instance is mandatory at boot — a config without
+    it refuses startup with a clear error (and a fix hint), never a silent
+    downgrade that strands tier-3 output."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'preset = "embedded"\n'
+        f'[storage.vector]\nuri = "{(tmp_path / "chunks.lance").as_posix()}"\ndimensions = 64\n'
+        f'[storage.graph]\npath = "{(tmp_path / "cortex.db").as_posix()}"\n'
+        f'[storage.meta]\npath = "{(tmp_path / "meta.db").as_posix()}"\n'
+        f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
+        "[dream.llm.dream]\n"
+        'driver = "stub"\n'
+        'model = "stub"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    app = create_app()
+    with pytest.raises(RuntimeError, match="isolated"):
+        with TestClient(app):
+            pass
+
+
 def _spy_scorepool(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Replace the daemon's ScorePool with a recording subclass so the boot
     wiring can be asserted without sleeping. The real pool still runs, so the
@@ -84,6 +117,7 @@ def _spy_scorepool(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         def __init__(self, *args, **kwargs):
             seen["dream_threshold"] = kwargs.get("dream_threshold")
             seen["idle_window_sec"] = kwargs.get("idle_window_sec")
+            seen["forced_cap"] = kwargs.get("forced_cap")
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(app_module, "ScorePool", _SpyPool)
@@ -93,21 +127,25 @@ def _spy_scorepool(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 def test_pool_thresholds_come_from_config(config_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The capture pool is constructed from the config keys, never fixed
     literals: dream_threshold <- dream.floor_pool_points, idle_window_sec <-
-    dream.idle_min_sec (the live 900s default)."""
+    dream.idle_min_sec (the live 900s default), forced_cap <- the 50.0 default
+    of dream.pool_forced_cap."""
     seen = _spy_scorepool(monkeypatch)
     with _boot(config_path) as client:
         assert client.get("/healthz").json()["status"] == "ok"
     assert seen["dream_threshold"] == 10.0  # config.dream.floor_pool_points
     assert seen["idle_window_sec"] == 900.0  # config.dream.idle_min_sec
+    assert seen["forced_cap"] == 50.0  # config.dream.pool_forced_cap
 
 
 def test_pool_thresholds_follow_a_changed_config_on_next_boot(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A config edit applies at the NEXT boot: the pool is rebuilt from the
-    live config, so a new floor / idle window is in effect immediately."""
+    live config, so a new floor / idle window / forced cap is in effect
+    immediately."""
     config_path.write_text(
-        config_path.read_text(encoding="utf-8") + "[dream]\nfloor_pool_points = 4.0\nidle_min_sec = 60.0\n",
+        config_path.read_text(encoding="utf-8")
+        + "[dream]\nfloor_pool_points = 4.0\nidle_min_sec = 60.0\npool_forced_cap = 20.0\n",
         encoding="utf-8",
     )
     seen = _spy_scorepool(monkeypatch)
@@ -115,6 +153,22 @@ def test_pool_thresholds_follow_a_changed_config_on_next_boot(
         assert client.get("/healthz").json()["status"] == "ok"
     assert seen["dream_threshold"] == 4.0
     assert seen["idle_window_sec"] == 60.0
+    assert seen["forced_cap"] == 20.0
+
+
+def test_dream_outcome_seam_wired_to_scheduler(config_path: Path) -> None:
+    """A2.5 T1 backoff wiring: the dream pipeline's outcome seam is bound to the
+    scheduler, so a REAL reflect/merge failure reports back into the retry
+    state (the report travels through the worker thread, never the event loop's
+    trigger path)."""
+    from mnemoseed_local.dream import DreamScheduler
+
+    with _boot(config_path) as client:
+        app = client.app
+        seam = app.state.dream_pipeline.on_outcome
+        assert seam is not None
+        assert getattr(seam, "__self__", None) is app.state.scheduler
+        assert getattr(seam, "__func__", None) is DreamScheduler.report_outcome
 
 
 def test_capture_recall_dream_config_audit_loop(config_path: Path) -> None:
@@ -173,3 +227,241 @@ def test_capture_recall_dream_config_audit_loop(config_path: Path) -> None:
         audit = client.get("/api/v1/audit", params={"action": "config.set"}).json()
         assert audit["total"] >= 1
         assert any(item["actor"] == "cli" for item in audit["items"])
+
+
+# ---------------------------------------------------------------- T1a: dream off the event loop
+
+
+def _ingest_turn(client: TestClient, session_id: str, ts: float, text: str) -> None:
+    response = client.post(
+        "/ingest",
+        json={
+            "host": HostId.CLAUDE_CODE.value,
+            "event": "user_prompt",
+            "session_id": session_id,
+            "profile_id": PROFILE,
+            "ts": ts,
+            "content": {"text": text},
+        },
+    )
+    assert response.status_code == 202, response.text
+
+
+def _wait_dream_idle(client: TestClient, timeout: float = 10.0) -> dict:
+    """Poll /memory/dream_status until the profile's dream returns to idle."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.post("/memory/dream_status", json={"profile_id": PROFILE}).json()
+        if body.get("state") == "idle":
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"dream never returned to idle; last status: {body}")
+
+
+def test_healthz_and_ingest_stay_responsive_during_dream(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1: a dream must never freeze the daemon surface.
+
+    A stub dream LLM that sleeps ~2s per reflect call runs inside the dream
+    chain; /healthz and /ingest must answer well under 500ms while that dream
+    is in flight. The pre-fix daemon ran the whole snapshot->reflect->merge
+    chain synchronously on the event loop, blocking both endpoints for the
+    entire dream.
+    """
+    # lower the pool floor so the single captured turn fires a dream event
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "[dream]\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
+        encoding="utf-8",
+    )
+    # swap the reflect stub for a sleeping subclass (the daemon resolves the
+    # dream LLM at boot and re-resolves per run through the same module seam)
+    import mnemoseed_local.dream.reflect as reflect_module
+
+    real_chat = reflect_module.StubReflectLLM.chat
+
+    class _SlowStubLLM(reflect_module.StubReflectLLM):
+        def chat(self, *, system: str, user: str) -> str:
+            time.sleep(2.0)
+            return real_chat(self, system=system, user=user)
+
+    monkeypatch.setattr(reflect_module, "StubReflectLLM", _SlowStubLLM)
+
+    with _boot(config_path) as client:
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+
+        # launch the manual dream in the background: its ~2s reflect keeps the
+        # dream in flight while the main thread probes the live surface
+        outcome: dict[str, object] = {}
+
+        def _dream_once() -> None:
+            body = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+            outcome["launched"] = body.get("launched")
+
+        thread = threading.Thread(target=_dream_once, daemon=True)
+        thread.start()
+        time.sleep(0.1)  # let the worker reach the reflect sleep
+
+        latencies: list[float] = []
+        deadline = time.monotonic() + 3.0
+        probe = 0
+        while time.monotonic() < deadline:
+            started = time.perf_counter()
+            healthz = client.get("/healthz")
+            latencies.append(time.perf_counter() - started)
+            assert healthz.status_code == 200
+            started = time.perf_counter()
+            _ingest_turn(client, f"probe-{probe}", 2.0 + probe, DURABLE_TEXT)
+            latencies.append(time.perf_counter() - started)
+            probe += 1
+            time.sleep(0.1)
+
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "the manual dream never completed"
+        assert outcome.get("launched") is True
+        assert max(latencies) < 0.5, f"surface blocked during the dream: {latencies}"
+
+
+def test_manual_dream_while_scheduled_trigger_in_flight_runs_reflect_once(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: a manual dream arriving while a scheduled (auto) dream is in flight
+    never double-runs the same snapshot.
+
+    The worker serializes the dream chain (at most one dream at a time) and
+    the trigger's overlap guard rejects the manual launch, so the reflect seam
+    executes exactly once per scheduled window and the manual run reports
+    ``launched: false``.
+    """
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "[dream]\nauto_trigger = true\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
+        encoding="utf-8",
+    )
+    import mnemoseed_local.dream.reflect as reflect_module
+
+    real_chat = reflect_module.StubReflectLLM.chat
+    calls: list[float] = []
+
+    class _CountingStubLLM(reflect_module.StubReflectLLM):
+        def chat(self, *, system: str, user: str) -> str:
+            calls.append(time.perf_counter())
+            time.sleep(0.4)
+            return real_chat(self, system=system, user=user)
+
+    monkeypatch.setattr(reflect_module, "StubReflectLLM", _CountingStubLLM)
+
+    with _boot(config_path) as client:
+        # session 1 settles -> pool fires -> the relay flush hands the event to
+        # the worker, which auto-launches the first dream (scheduled side)
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        # session 2 fires a second event for the same profile while the first
+        # dream is in flight (the overflow queue absorbs it, one dream at a time)
+        # distinct durable text: an identical sentence would score as a
+        # session-repetition (disposable) and never reach the pool
+        _ingest_turn(client, "sess-b", 2.0, "我决定把 CI 从 GitHub Actions 迁移到自建服务器")
+        settled_b = client.post("/session/end", json={"session_id": "sess-b", "profile_id": PROFILE})
+        assert settled_b.status_code == 200, settled_b.text
+        # the manual trigger arrives while a dream is in flight: rejected
+        manual = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+        assert manual["launched"] is False
+        _wait_dream_idle(client)
+        # exactly one reflect per scheduled window, executed sequentially
+        assert len(calls) == 2, f"expected one reflect per scheduled window, saw {len(calls)}"
+        assert calls[1] - calls[0] >= 0.4, "dream chains overlapped; the worker did not serialize"
+
+
+class _SlowSnapshotter:
+    """Snapshotter whose request blocks on the worker thread, keeping a manual
+    dream in flight so the queue can hold a second job behind it."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+        self.entered = threading.Event()
+
+    def request(self, profile_id: str, turn_range: TurnRange) -> SnapshotResult:
+        del profile_id, turn_range
+        self.entered.set()
+        time.sleep(self._delay)
+        return SnapshotResult(snapshot=None, ok=True)
+
+
+def _manual_event() -> PoolEvent:
+    """One pool-fired event held as pending_manual for a manual dream run."""
+    return PoolEvent(
+        kind=PoolEventKind.DREAM_TRIGGER,
+        profile_id=PROFILE,
+        turn_range=TurnRange(start=0, end=0),
+        balance=10.0,
+        fired_at=1.0,
+    )
+
+
+async def _wait_snapshot_entered(snapshotter: _SlowSnapshotter, limit: float = 2.0) -> None:
+    """Block until the worker reached the snapshotter (in a worker thread)."""
+    entered = await asyncio.to_thread(snapshotter.entered.wait, limit)
+    assert entered, "manual job never reached the snapshotter"
+
+
+async def test_worker_stop_resolves_queued_manual_job() -> None:
+    """A manual job still queued at shutdown never launched: its future
+    resolves False in finite time.
+
+    The pre-fix stop() cancelled the consumer task and never touched the
+    queue, leaving the queued job's pending future unresolved forever.
+    """
+    snapshotter = _SlowSnapshotter(0.5)
+    trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
+    trigger.handle_event(_manual_event())
+    trigger.handle_event(_manual_event())
+    worker = DreamWorker(trigger)
+    worker.start()
+    first = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    await _wait_snapshot_entered(snapshotter)
+    second = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    await asyncio.sleep(0.05)  # the second job lands in the queue behind the first
+    await asyncio.wait_for(worker.stop(), timeout=2.0)
+    # the in-flight chain ran to completion during executor shutdown
+    assert await asyncio.wait_for(first, timeout=1.0) is True
+    # the queued job was never launched: resolved False, not left pending
+    assert await asyncio.wait_for(second, timeout=1.0) is False
+
+
+async def test_worker_stop_waits_for_in_flight_manual_job() -> None:
+    """An in-flight manual job's future resolves with the real outcome after
+    the chain completes: stop() drains the chain instead of aborting it."""
+    snapshotter = _SlowSnapshotter(0.5)
+    trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
+    trigger.handle_event(_manual_event())
+    worker = DreamWorker(trigger)
+    worker.start()
+    job = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    await _wait_snapshot_entered(snapshotter)
+    started = time.monotonic()
+    await asyncio.wait_for(worker.stop(), timeout=2.0)
+    elapsed = time.monotonic() - started
+    # stop() waited for the remaining chain instead of returning immediately
+    assert elapsed >= 0.2, f"stop() returned before the chain finished: {elapsed:.3f}s"
+    assert await asyncio.wait_for(job, timeout=1.0) is True
+
+
+async def test_worker_stop_returns_in_finite_time_with_pending_jobs() -> None:
+    """stop() itself returns in finite time with both an in-flight and a
+    queued manual job pending, and every pending future resolves."""
+    snapshotter = _SlowSnapshotter(0.5)
+    trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
+    trigger.handle_event(_manual_event())
+    trigger.handle_event(_manual_event())
+    worker = DreamWorker(trigger)
+    worker.start()
+    first = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    await _wait_snapshot_entered(snapshotter)
+    second = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(worker.stop(), timeout=2.0)
+    assert await asyncio.wait_for(first, timeout=1.0) is True
+    assert await asyncio.wait_for(second, timeout=1.0) is False

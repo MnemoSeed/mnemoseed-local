@@ -19,9 +19,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from mnemoseed_local.storage.ports import PoolState, TurnRange
+
+if TYPE_CHECKING:
+    from mnemoseed_local.config import Config
 
 
 class PoolEventKind(StrEnum):
@@ -94,6 +97,7 @@ class ScorePool:
         dream_threshold: float = 10.0,
         forced_cap: float = 50.0,
         idle_window_sec: float = 5.0,
+        config: Config | None = None,
     ) -> None:
         self._clock = clock
         self._sink = sink
@@ -101,7 +105,17 @@ class ScorePool:
         self._dream_threshold = dream_threshold
         self._forced_cap = forced_cap
         self._idle_window_sec = idle_window_sec
+        self._config = config
         self._ledgers: dict[str, _Ledger] = {}
+
+    def _forced_cap_value(self) -> float:
+        """The forced-consolidation cap (T3a): the live dream.pool_forced_cap
+        config key when a Config is bound, the constructor value otherwise.
+        Read at every evaluation, so a configwrite change fires the SAME pool
+        at the new cap — no daemon restart."""
+        if self._config is None:
+            return self._forced_cap
+        return self._config.dream.pool_forced_cap
 
     def add_points(
         self,
@@ -131,7 +145,8 @@ class ScorePool:
         span = TurnRange(start, end)
 
         event: PoolEvent | None = None
-        if accumulator >= self._forced_cap:
+        forced_cap = self._forced_cap_value()
+        if accumulator >= forced_cap:
             event = PoolEvent(
                 kind=PoolEventKind.FORCED_CONSOLIDATION,
                 profile_id=profile_id,
@@ -185,7 +200,8 @@ class ScorePool:
             if ledger.range_start is None:
                 continue
             span = TurnRange(ledger.range_start, ledger.range_end)
-            if ledger.balance >= self._forced_cap:
+            forced_cap = self._forced_cap_value()
+            if ledger.balance >= forced_cap:
                 event = PoolEvent(
                     kind=PoolEventKind.FORCED_CONSOLIDATION,
                     profile_id=profile_id,

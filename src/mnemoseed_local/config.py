@@ -77,13 +77,6 @@ class LayerSpec:
     instances: dict[str, _InstanceOverride] = field(default_factory=dict)
 
 
-# FR-2.5b: monthly per-profile dream token budget in USD (default $5/month, NFR-2.2).
-# Defined here — AND mirrored as DEFAULT_MONTHLY_BUDGET_USD in dream/ledger.py —
-# because config cannot import the ledger (ledger -> delta -> snapshot -> config
-# would be a cycle); test_ledger_default_budget_matches_config_default pins them
-# equal.
-DEFAULT_DREAM_TOKEN_BUDGET_USD: float = 5.0
-
 #: Dream schedule trigger defaults (score-pool based, design/01 + PRD-02): a
 #: dream becomes eligible when the profile's score pool holds at least
 #: ``floor_pool_points`` (S points from scored capture turns, the design's
@@ -94,6 +87,26 @@ DEFAULT_DREAM_FLOOR_POOL_POINTS: float = 10.0
 DEFAULT_DREAM_IDLE_MIN_SEC: float = 900.0
 DEFAULT_DREAM_HARD_DEADLINE_SEC: float = 86400.0
 
+#: T3a (A2.5) tier / ensemble / threshold defaults (design/01 §4.7):
+#: ``hardware_tier`` is the three-way anchor (standard | lite | advanced);
+#: ``ensemble`` is the optional dual-reflect verification layer (off | verify |
+#: vote), default off — the lite tier locks it off (configwrite linkage);
+#: ``core_confidence_floor`` is the merge-boundary downgrade threshold in [0, 1]
+#: (core triples below it are deterministically routed to the isolated graph);
+#: ``delta_budget_ceiling_tokens`` is the dynamic delta clamp's ceiling, whose
+#: module constant in dream/delta.py is the value source (mirror + pin test);
+#: ``pool_forced_cap`` is the ScorePool forced-consolidation cap, >= the floor.
+DEFAULT_DREAM_HARDWARE_TIER: str = "standard"
+DEFAULT_DREAM_ENSEMBLE: str = "off"
+DEFAULT_DREAM_CORE_CONFIDENCE_FLOOR: float = 0.0
+DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS: int = 32000
+DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
+
+#: The T3a enum sets, shared by the config loader and the configwrite registry
+#: (a drift between the two is a validation split — one source, both consumers).
+DREAM_HARDWARE_TIERS: frozenset[str] = frozenset({"standard", "lite", "advanced"})
+DREAM_ENSEMBLE_MODES: frozenset[str] = frozenset({"off", "verify", "vote"})
+
 
 @dataclass(frozen=True)
 class DreamConfig:
@@ -102,9 +115,6 @@ class DreamConfig:
     ``auto_trigger`` decides whether the schedule triggers drive dreams directly
     (True) or are held as pending manual runs for ``mnemoseed dream --once``
     (False, the M1 default until reflection quality passes review).
-    ``token_budget_usd`` is the monthly ledger cap (FR-2.5b): once the projected
-    UTC-month spend exceeds it, dreams degrade to capture-only until the next
-    month rolls over.
     ``floor_pool_points`` / ``idle_min_sec`` / ``hard_deadline_sec`` are the
     A2 schedule trigger rules (hot-applied through the configwrite registry):
     score-pool floor+idle eligibility and the 24h hard deadline from the first
@@ -113,13 +123,26 @@ class DreamConfig:
     balance reaches ``floor_pool_points`` AND the profile has been idle for
     ``idle_min_sec``, and the pool drains on the fire (the same points never
     trigger twice).
+
+    T3a tier/threshold flags (design/01 §4.7): ``hardware_tier`` anchors the
+    three-way tier (standard | lite | advanced); ``ensemble`` selects the
+    optional dual-reflect verification layer (off | verify | vote, default
+    off — the lite tier locks it off); ``core_confidence_floor`` is the merge
+    boundary at which a core triple is deterministically downgraded to the
+    isolated graph; ``delta_budget_ceiling_tokens`` is the dynamic delta
+    clamp's ceiling (module constant is the value source); ``pool_forced_cap``
+    is the ScorePool forced-consolidation cap, always >= the floor.
     """
 
     auto_trigger: bool = False
-    token_budget_usd: float = DEFAULT_DREAM_TOKEN_BUDGET_USD
     floor_pool_points: float = DEFAULT_DREAM_FLOOR_POOL_POINTS
     idle_min_sec: float = DEFAULT_DREAM_IDLE_MIN_SEC
     hard_deadline_sec: float = DEFAULT_DREAM_HARD_DEADLINE_SEC
+    hardware_tier: str = DEFAULT_DREAM_HARDWARE_TIER
+    ensemble: str = DEFAULT_DREAM_ENSEMBLE
+    core_confidence_floor: float = DEFAULT_DREAM_CORE_CONFIDENCE_FLOOR
+    delta_budget_ceiling_tokens: int = DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS
+    pool_forced_cap: float = DEFAULT_DREAM_POOL_FORCED_CAP
 
 
 #: Decay sweep cadence (NFR-4.1: the batch runs once daily).
@@ -219,7 +242,7 @@ DEFAULT_LLM_ROUTES: dict[str, RoleLLMConfig] = {
     "dream": RoleLLMConfig(
         role="dream",
         driver="ollama",
-        model="llama3.1:8b",
+        model="qwen3.5:9b",
         params={"base_url": "http://localhost:11434"},
     ),
 }
@@ -386,12 +409,17 @@ def load_config(path: Path | None = None) -> Config:
     dream_raw = raw.get("dream")
     if dream_raw is not None:
         dream_table = _require_table(dream_raw, "dream")
+        if "token_budget_usd" in dream_table:
+            # T3b (design/01 §4.1): the FR-2.5b USD budget concept is removed;
+            # a stale key is a hard deprecation error, never a silent ignore.
+            raise ConfigError(
+                "dream.token_budget_usd",
+                "was deprecated and removed; the ledger records tokens only, "
+                "never a USD budget (delete the key)",
+            )
         auto_raw = dream_table.get("auto_trigger", False)
         if not isinstance(auto_raw, bool):
             raise ConfigError("dream.auto_trigger", "must be a boolean")
-        budget_raw = dream_table.get("token_budget_usd", DEFAULT_DREAM_TOKEN_BUDGET_USD)
-        if not isinstance(budget_raw, (int, float)) or isinstance(budget_raw, bool) or budget_raw <= 0:
-            raise ConfigError("dream.token_budget_usd", "must be a positive number")
         floor_raw = dream_table.get("floor_pool_points", DEFAULT_DREAM_FLOOR_POOL_POINTS)
         if not _is_positive_number(floor_raw):
             raise ConfigError("dream.floor_pool_points", "must be a positive number")
@@ -401,12 +429,64 @@ def load_config(path: Path | None = None) -> Config:
         deadline_raw = dream_table.get("hard_deadline_sec", DEFAULT_DREAM_HARD_DEADLINE_SEC)
         if not _is_non_negative_number(deadline_raw):
             raise ConfigError("dream.hard_deadline_sec", "must be a non-negative number")
+
+        # T3a (A2.5, design/01 §4.7): tier / ensemble / threshold keys. The
+        # enum sets live on this module and are shared with the configwrite
+        # registry so load-time and write-time validation cannot drift.
+        tier_raw = dream_table.get("hardware_tier", DEFAULT_DREAM_HARDWARE_TIER)
+        if not isinstance(tier_raw, str) or tier_raw not in DREAM_HARDWARE_TIERS:
+            raise ConfigError(
+                "dream.hardware_tier",
+                f"must be one of {', '.join(sorted(DREAM_HARDWARE_TIERS))}",
+            )
+        ensemble_raw = dream_table.get("ensemble", DEFAULT_DREAM_ENSEMBLE)
+        if not isinstance(ensemble_raw, str) or ensemble_raw not in DREAM_ENSEMBLE_MODES:
+            raise ConfigError("dream.ensemble", f"must be one of {', '.join(sorted(DREAM_ENSEMBLE_MODES))}")
+        if tier_raw == "lite" and ensemble_raw != "off":
+            raise ConfigError(
+                "dream.ensemble",
+                "the lite hardware tier locks the ensemble off (lit; use off)",
+            )
+        confidence_floor_raw = dream_table.get("core_confidence_floor", DEFAULT_DREAM_CORE_CONFIDENCE_FLOOR)
+        if not _is_non_negative_number(confidence_floor_raw) or float(confidence_floor_raw) > 1.0:
+            raise ConfigError("dream.core_confidence_floor", "must be a number in [0, 1]")
+        ceiling_raw = dream_table.get(
+            "delta_budget_ceiling_tokens", DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS
+        )
+        if not isinstance(ceiling_raw, int) or isinstance(ceiling_raw, bool) or ceiling_raw < 5000:
+            raise ConfigError("dream.delta_budget_ceiling_tokens", "must be an integer >= 5000")
+        forced_raw = dream_table.get("pool_forced_cap", DEFAULT_DREAM_POOL_FORCED_CAP)
+        if not _is_positive_number(forced_raw):
+            raise ConfigError("dream.pool_forced_cap", "must be a positive number")
+        if float(forced_raw) < float(confidence_floor_raw):
+            raise ConfigError(
+                "dream.pool_forced_cap",
+                "must be >= dream.core_confidence_floor",
+            )
+        # T3b (design/01 §4.8): the isolated graph instance is mandatory for a
+        # non-zero floor — the downgrade target must exist or a merge would fail
+        # (the Merger refuses a downgrade with no isolated instance). Rejected
+        # at load with a fix hint, never deferred to a silent runtime degrade.
+        if float(confidence_floor_raw) > 0.0:
+            graph_spec = storage.get("graph")
+            has_isolated = graph_spec is not None and "isolated" in graph_spec.instances
+            if not has_isolated:
+                raise ConfigError(
+                    "dream.core_confidence_floor",
+                    "requires the 'isolated' graph instance: add a "
+                    "[storage.graph.instances.isolated] table "
+                    '(driver = "sqlite_graph")',
+                )
         dream = DreamConfig(
             auto_trigger=auto_raw,
-            token_budget_usd=float(budget_raw),
             floor_pool_points=float(floor_raw),
             idle_min_sec=float(idle_raw),
             hard_deadline_sec=float(deadline_raw),
+            hardware_tier=tier_raw,
+            ensemble=ensemble_raw,
+            core_confidence_floor=float(confidence_floor_raw),
+            delta_budget_ceiling_tokens=int(ceiling_raw),
+            pool_forced_cap=float(forced_raw),
         )
 
         # T6 (FR-2.14): [dream.llm.<role>] overrides per role. Only structural
@@ -520,12 +600,26 @@ baseurl = "http://localhost:7788"
 #                        idle window — the pool never fires on a fixed 5s
 #   hard_deadline_sec  — force a dream once the oldest pending chunk waited
 #                        this long (24h default); skipped when nothing pending
+#   hardware_tier      — standard | lite | advanced (default standard): the
+#                        tier anchor; the lite tier locks the ensemble off
+#   ensemble           — off | verify | vote (default off): the optional
+#                        dual-reflect verification layer; lite locks it off
+#   core_confidence_floor — [0, 1] (default 0.0): core triples below it are
+#                        downgraded to the isolated graph at merge time
+#   delta_budget_ceiling_tokens — >= 5000 (default 32000): the dynamic delta
+#                        clamp's ceiling, read by the doctor's ctx-window check
+#   pool_forced_cap     — >= core_confidence_floor (default 50.0): the capture
+#                        pool's forced-consolidation cap
 # [dream]
 # auto_trigger = false
-# token_budget_usd = 5.0   # monthly ledger cap in USD; capture-only once spent (FR-2.5b)
 # floor_pool_points = 10.0
 # idle_min_sec = 900.0
 # hard_deadline_sec = 86400.0
+# hardware_tier = "standard"
+# ensemble = "off"
+# core_confidence_floor = 0.0
+# delta_budget_ceiling_tokens = 32000
+# pool_forced_cap = 50.0
 
 # Per-layer overrides (required under the custom preset):
 # [storage.vector]
@@ -534,10 +628,12 @@ baseurl = "http://localhost:7788"
 # [storage.graph]
 # driver = "sqlite_graph"
 #
-# Named multi-instance (D6): a second GraphStore under its own name.
-# [storage.graph.instances.isolated]
-# driver = "sqlite_graph"
-# path = "~/.mnemoseed-local/isolated.db"
+# Named multi-instance (D6): the isolated graph instance is MANDATORY
+# (design/01 §4.8) — tier-3 output and floor-downgraded core triples route
+# here, never to the main graph. A fresh init writes this table.
+[storage.graph.instances.isolated]
+driver = "sqlite_graph"
+path = "~/.mnemoseed-local/isolated.db"
 
 # Dream LLM role routing (A2 MVP): ONE role named "dream". The local default is
 # ollama (dream inference stays on the machine); the openai-compatible driver
@@ -548,7 +644,7 @@ baseurl = "http://localhost:7788"
 # Other params (base_url, max_tokens, ...) override the role's defaults.
 # [dream.llm.dream]
 # driver = "ollama"
-# model = "llama3.1:8b"
+# model = "qwen3.5:9b"
 # base_url = "http://localhost:11434"
 
 # The deep_reflection / short_increment / local_track roles were trimmed in the

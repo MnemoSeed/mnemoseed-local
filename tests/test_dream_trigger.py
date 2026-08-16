@@ -98,6 +98,31 @@ def test_merge_committed_returns_to_idle() -> None:
     assert trigger.status("p").state is DreamState.IDLE
 
 
+def test_dream_failed_resets_in_flight_dream() -> None:
+    """A dream attempt that ended without committing (reflect/merge degraded)
+    resets the in-flight bookkeeping so a retried event can launch again."""
+    trigger = DreamTrigger(snapshotter=_RecordingSnapshotter(), auto_trigger=True)
+    trigger.handle_event(_event())
+    trigger.on_snapshot_ready("p")
+    assert trigger.status("p").state is DreamState.DREAMING
+    trigger.on_dream_failed("p")
+    status = trigger.status("p")
+    assert status.state is DreamState.ACCUMULATING
+    assert status.current_range is None
+    # a retried event launches a fresh dream immediately
+    trigger.handle_event(_event(rng=TurnRange(0, 3)))
+    assert trigger.status("p").state is DreamState.SNAPSHOTTING
+
+
+def test_dream_failed_is_noop_when_nothing_in_flight() -> None:
+    """The failure seam never disturbs a profile with no dream in flight."""
+    trigger = DreamTrigger(snapshotter=_RecordingSnapshotter())
+    trigger.on_dream_failed("p")  # no profile record at all
+    trigger.notify_activity("p")
+    trigger.on_dream_failed("p")  # accumulating, nothing in flight
+    assert trigger.status("p").state is DreamState.ACCUMULATING
+
+
 def test_happy_path_completion_order() -> None:
     """The seam fakes record snapshot -> snapshot-ready -> reflect -> merge."""
     snap = _RecordingSnapshotter()

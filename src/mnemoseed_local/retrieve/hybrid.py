@@ -228,6 +228,10 @@ class HybridRetriever:
                 profile_id=profile_id,
                 min_decay=config.min_decay,
                 entities=filter_entities,
+                # Merged chunks are the fact's retained evidence scene, never
+                # fresh recall surface: the dream merge marks them consolidated
+                # (design/03 §4, same semantics as the Freshness Guard probe).
+                consolidated=False,
             ),
             config.vector_top_k,
         )

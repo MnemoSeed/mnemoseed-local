@@ -7,8 +7,8 @@ The Ebbinghaus-style exponential curve:
 λ is layered by memory type (design/01 §5): fact 0.01 (half-life ≈ 69 days),
 preference 0.005 (≈ 139 days), episode 0.03 (≈ 23 days). The defaults and the
 writable key set live in :mod:`mnemoseed_local.config` (the established home for
-tunable defaults, like the dream budget and LLM routes); this module carries
-the curve math and the λ resolution rule.
+tunable defaults, like the dream trigger keys and LLM routes); this module
+carries the curve math and the λ resolution rule.
 
 The base_confidence factor is a ceiling: the weight never exceeds the
 memory's trust at any horizon, and reinforcement events (which rebound toward

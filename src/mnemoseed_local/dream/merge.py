@@ -21,6 +21,14 @@ rewritten (append-only provenance). Otherwise a new deterministic-content-hash
 node is created. Re-running a merge — crash + ``resume_merge``, or a second
 boot — therefore never duplicates graph rows or salvage entries.
 
+T3b (design/01 §4.8): the isolated graph instance is MANDATORY. A missing
+``graph_isolated`` with any triple whose effective route needs it (a
+floor-downgraded core triple or a salvage triple) fails the pass TYPED before
+the first write — atomic, no partial commit, no stranded tier-3 rows. The
+isolated requirement is enforced upstream too: config load and configwrite
+reject a config with a non-zero floor and no isolated instance, and the daemon
+refuses to boot.
+
 Completion: after every triple of the pass commits, the Merger fires the
 ``on_committed`` seam exactly once (wired to trigger.on_merge_committed, which
 runs the safe-clear purger). Any failure returns a typed MergeOutcome with no
@@ -35,13 +43,16 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mnemoseed_local.dream.reflect import ReflectedTriple, ReflectionResult, Route
 from mnemoseed_local.dream.snapshot import Snapshot, SnapshotPhase
 from mnemoseed_local.schema.graph import GraphNode, NodeType
 from mnemoseed_local.schema.stamp import CognitiveTier, Provenance, ProvenanceEvent
 from mnemoseed_local.storage.ports import AuditEntry, AuditFilter, GraphStore, MetaStore, Page, TurnRange
+
+if TYPE_CHECKING:
+    from mnemoseed_local.config import Config
 
 logger = logging.getLogger("mnemoseed_local.dream.merge")
 
@@ -68,7 +79,6 @@ class MergeSummary:
     isolated: int
     salvage: int  # salvage triples enqueued for the re-view channel
     deflected: int  # anti-backflow drops (tier-3 evidence claimed "core")
-    stranded: int  # tier-3 output with no isolated graph instance configured
 
 
 @dataclass(frozen=True)
@@ -87,10 +97,11 @@ class Merger:
     """Write back a ReflectionResult across the graph double-instance.
 
     ``graph_main`` is the primary "main" graph; ``graph_isolated`` is the
-    separate tier-3 named instance. A missing isolated instance degrades:
-    tier-3 output is stranded with a warning (never polluting main) while the
-    salvage review channel still captures the entry. ``meta`` carries the
-    salvage queue in the append-only audit log.
+    mandatory isolated named instance (design/01 §4.8): floor-downgraded core
+    and salvage triples route here, never to main. A missing isolated instance
+    with any triple needing it fails the pass atomically before the first
+    write (never strands, never pollutes main). ``meta`` carries the salvage
+    queue in the append-only audit log.
     """
 
     def __init__(
@@ -101,12 +112,22 @@ class Merger:
         meta: MetaStore,
         on_committed: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.time,
+        config: Config | None = None,
     ) -> None:
         self._graph_main = graph_main
         self._graph_isolated = graph_isolated
         self._meta = meta
         self._on_committed = on_committed
         self._clock = clock
+        self._config = config
+
+    def _confidence_floor(self) -> float:
+        """The core-confidence floor (dream.core_confidence_floor, T3a): read
+        LIVE from the bound Config at every merge, so a configwrite change
+        applies to the next merge of this same instance — no daemon restart."""
+        if self._config is None:
+            return 0.0
+        return self._config.dream.core_confidence_floor
 
     def merge(self, snapshot: Snapshot, result: ReflectionResult) -> MergeOutcome:
         """Commit one reflection result. Never raises; a failure degrades into
@@ -124,6 +145,36 @@ class Merger:
 
     # ------------------------------------------------------------ routing
 
+    def _is_downgrade_candidate(self, triple: ReflectedTriple, floor: float) -> bool:
+        """A core triple the confidence floor would route to isolated.
+
+        Mirrors the loop's downgrade condition exactly, so the atomic pre-pass
+        and the routing loop can never drift: a tier-3 core triple is deflected
+        by the anti-backflow gate BEFORE the floor is consulted, so it is never
+        a downgrade candidate.
+        """
+        return (
+            triple.route is Route.CORE
+            and triple.confidence < floor
+            and not any(t is CognitiveTier.TIER_3 for t in triple.tiers)
+        )
+
+    def _effective_route(self, triple: ReflectedTriple, floor: float) -> Route | None:
+        """The route this triple actually commits under, after both engine
+        gates: the anti-backflow deflection first (a tier-3 core triple never
+        reaches main — effective route None), then the floor downgrade (a
+        below-floor core triple reroutes to ISOLATED)."""
+        if any(t is CognitiveTier.TIER_3 for t in triple.tiers) and triple.route is Route.CORE:
+            return None
+        if self._is_downgrade_candidate(triple, floor):
+            return Route.ISOLATED
+        return triple.route
+
+    def _needs_isolated(self, triple: ReflectedTriple, floor: float) -> bool:
+        """Whether this triple's effective route requires the isolated graph."""
+        route = self._effective_route(triple, floor)
+        return route is Route.ISOLATED or route is Route.SALVAGE
+
     def _commit_triples(self, snapshot: Snapshot, result: ReflectionResult) -> MergeSummary:
         created = 0
         reinforced = 0
@@ -131,9 +182,23 @@ class Merger:
         isolated = 0
         salvage = 0
         deflected = 0
-        stranded = 0
+        floor = self._confidence_floor()
+        # D-T3a-1 (extended T3b): the no-isolated failure is ATOMIC. Any triple
+        # whose EFFECTIVE route needs the isolated graph — a floor-downgraded
+        # core triple or a salvage triple — with no isolated instance fails
+        # typed BEFORE the first write: no partial commit, no stranded rows, no
+        # main-graph pollution. (Tier-3 core triples are deflected first, so
+        # they never count as needing isolated.)
+        if self._graph_isolated is None and any(
+            self._needs_isolated(triple, floor) for triple in result.triples
+        ):
+            raise ValueError(
+                "the 'isolated' graph instance is required (floor downgrade or "
+                "salvage) but not configured; add storage.graph.instances.isolated"
+            )
         for triple in result.triples:
-            if any(t is CognitiveTier.TIER_3 for t in triple.tiers) and triple.route is Route.CORE:
+            route = self._effective_route(triple, floor)
+            if route is None:
                 deflected += 1
                 logger.warning(
                     "anti-backflow: tier-3 triple (%s, %s, %s) deflected from the main graph",
@@ -142,27 +207,19 @@ class Merger:
                     triple.object,
                 )
                 continue
-            target: GraphStore | None
-            if triple.route is Route.CORE:
+            if route is Route.CORE:
                 target = self._graph_main
                 core += 1
             else:
+                # The atomic pre-pass above guarantees the downgrade / salvage
+                # target exists; the else branch never strands.
+                assert self._graph_isolated is not None
                 target = self._graph_isolated
-                if target is None:
-                    stranded += 1
-                    logger.warning(
-                        "no 'isolated' graph instance configured; tier-3 output stranded: (%s, %s, %s)",
-                        triple.subject,
-                        triple.predicate,
-                        triple.object,
-                    )
-                else:
-                    isolated += 1
-            if target is not None:
-                if self._write_triple(target, snapshot, triple):
-                    created += 1
-                else:
-                    reinforced += 1
+                isolated += 1
+            if self._write_triple(target, snapshot, triple):
+                created += 1
+            else:
+                reinforced += 1
             if triple.route is Route.SALVAGE:
                 self._enqueue_salvage(snapshot, triple)
                 salvage += 1
@@ -177,7 +234,6 @@ class Merger:
             isolated=isolated,
             salvage=salvage,
             deflected=deflected,
-            stranded=stranded,
         )
 
     # ------------------------------------------------------------ idempotent write

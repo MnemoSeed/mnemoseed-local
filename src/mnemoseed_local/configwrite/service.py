@@ -43,6 +43,8 @@ from typing import Any, Protocol
 
 from mnemoseed_local.config import (
     CONFIG_PATH,
+    DREAM_ENSEMBLE_MODES,
+    DREAM_HARDWARE_TIERS,
     LAMBDA_TARGETS,
     LLM_ROLES,
     Config,
@@ -88,9 +90,11 @@ class ConfigKey:
     """One writable config key and how to read/validate/apply it.
 
     ``validate`` normalizes the incoming wire value (raising ``ValueError`` on
-    a typed failure); ``read`` resolves the current effective value from a
-    ``Config``; ``apply`` live-updates the running ``Config`` after the patch
-    lands (frozen ``DreamConfig`` is replaced, role params are rebuilt).
+    a typed failure); ``cross_validate`` (optional) re-checks the value against
+    the CURRENT effective config (tier/ensemble linkage, floor/cap ordering)
+    and may raise ``ValueError``; ``read`` resolves the current effective value
+    from a ``Config``; ``apply`` live-updates the running ``Config`` after the
+    patch lands (frozen ``DreamConfig`` is replaced, role params are rebuilt).
     """
 
     key_path: str
@@ -100,6 +104,7 @@ class ConfigKey:
     apply: Callable[[Config, Any], None]
     live_apply: bool = True
     secret: bool = False
+    cross_validate: Callable[[Config, Any], None] | None = None
 
 
 # ---------------------------------------------------------------- validators
@@ -121,6 +126,86 @@ def _validate_non_negative_float(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError("must be a non-negative number")
     return float(value)
+
+
+def _validate_confidence_floor(value: Any) -> float:
+    """dream.core_confidence_floor: a probability in [0, 1]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
+        raise ValueError("must be a number in [0, 1]")
+    return float(value)
+
+
+def _validate_delta_ceiling(value: Any) -> int:
+    """dream.delta_budget_ceiling_tokens: an integer >= 5000 (the dynamic
+    delta clamp must always have room above the minimum viable window)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 5000:
+        raise ValueError("must be an integer >= 5000")
+    return value
+
+
+def _validate_forced_cap(value: Any) -> float:
+    """dream.pool_forced_cap: a positive number (its >= floor ordering is the
+    cross-validation's job)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError("must be a positive number")
+    return float(value)
+
+
+def _validate_choice(value: Any, choices: frozenset[str]) -> str:
+    """An enum-typed key: the value must be one of the shared config-level
+    choices (the load-time and write-time validators share the same sets, so
+    they can never drift apart)."""
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError(f"must be one of {', '.join(sorted(choices))}")
+    return value
+
+
+def _cross_validate_lite_ensemble(config: Config, value: str) -> None:
+    """The lite tier locks the ensemble off: writing ensemble != off while the
+    tier is lite, or switching to lite while ensemble != off, is rejected —
+    the linkage holds in BOTH directions."""
+    if value == "off":
+        return
+    if config.dream.hardware_tier == "lite":
+        raise ValueError("the lite hardware tier locks the ensemble off (use 'off')")
+
+
+def _cross_validate_tier_locks_ensemble(config: Config, value: str) -> None:
+    if value == "lite" and config.dream.ensemble != "off":
+        raise ValueError("the lite hardware tier locks the ensemble off (use 'off')")
+
+
+def _cross_validate_floor_vs_cap(config: Config, value: float) -> None:
+    """pool_forced_cap >= core_confidence_floor must hold after the write."""
+    if value < config.dream.core_confidence_floor:
+        raise ValueError("must be >= dream.core_confidence_floor")
+
+
+def _cross_validate_cap_vs_floor(config: Config, value: float) -> None:
+    if config.dream.pool_forced_cap < value:
+        raise ValueError("must be <= dream.pool_forced_cap")
+
+
+def _cross_validate_floor_requires_isolated(config: Config, value: float) -> None:
+    """T3b (design/01 §4.8): raising dream.core_confidence_floor above zero on
+    a config without the 'isolated' graph instance is rejected — the downgrade
+    target must exist (mirrors the load-time check, one rule on both sides)."""
+    if value <= 0.0:
+        return
+    graph_spec = config.storage.get("graph")
+    has_isolated = graph_spec is not None and "isolated" in graph_spec.instances
+    if not has_isolated:
+        raise ValueError(
+            "requires the 'isolated' graph instance: add a "
+            '[storage.graph.instances.isolated] table (driver = "sqlite_graph")'
+        )
+
+
+def _cross_validate_floor(config: Config, value: float) -> None:
+    """The floor's two write-time invariants: it must stay at or below
+    pool_forced_cap AND a non-zero floor requires the isolated graph instance."""
+    _cross_validate_cap_vs_floor(config, value)
+    _cross_validate_floor_requires_isolated(config, value)
 
 
 def _validate_lambda_map(value: Any) -> dict[str, float]:
@@ -205,48 +290,28 @@ def _validate_env_name_list(value: Any) -> str | None:
 
 
 def _dream_apply(config: Config, field: str, value: Any) -> None:
-    """Replace the frozen DreamConfig and mirror the change into config.raw."""
+    """Replace the frozen DreamConfig and mirror the change into config.raw.
+
+    The rebuild is kwargs-preserving: EVERY dream field (including the T3a
+    tier/threshold keys) is carried over, so a write to one key can never
+    silently reset the others — the exact failure the field-by-field branch
+    form was prone to as the config grew.
+    """
     current = config.dream
-    if field == "auto_trigger":
-        config.dream = DreamConfig(
-            auto_trigger=bool(value),
-            token_budget_usd=current.token_budget_usd,
-            floor_pool_points=current.floor_pool_points,
-            idle_min_sec=current.idle_min_sec,
-            hard_deadline_sec=current.hard_deadline_sec,
-        )
-    elif field == "token_budget_usd":
-        config.dream = DreamConfig(
-            auto_trigger=current.auto_trigger,
-            token_budget_usd=float(value),
-            floor_pool_points=current.floor_pool_points,
-            idle_min_sec=current.idle_min_sec,
-            hard_deadline_sec=current.hard_deadline_sec,
-        )
-    elif field == "floor_pool_points":
-        config.dream = DreamConfig(
-            auto_trigger=current.auto_trigger,
-            token_budget_usd=current.token_budget_usd,
-            floor_pool_points=float(value),
-            idle_min_sec=current.idle_min_sec,
-            hard_deadline_sec=current.hard_deadline_sec,
-        )
-    elif field == "idle_min_sec":
-        config.dream = DreamConfig(
-            auto_trigger=current.auto_trigger,
-            token_budget_usd=current.token_budget_usd,
-            floor_pool_points=current.floor_pool_points,
-            idle_min_sec=float(value),
-            hard_deadline_sec=current.hard_deadline_sec,
-        )
-    else:  # hard_deadline_sec
-        config.dream = DreamConfig(
-            auto_trigger=current.auto_trigger,
-            token_budget_usd=current.token_budget_usd,
-            floor_pool_points=current.floor_pool_points,
-            idle_min_sec=current.idle_min_sec,
-            hard_deadline_sec=float(value),
-        )
+    fields: dict[str, Any] = {
+        "auto_trigger": current.auto_trigger,
+        "floor_pool_points": current.floor_pool_points,
+        "idle_min_sec": current.idle_min_sec,
+        "hard_deadline_sec": current.hard_deadline_sec,
+        "hardware_tier": current.hardware_tier,
+        "ensemble": current.ensemble,
+        "core_confidence_floor": current.core_confidence_floor,
+        "delta_budget_ceiling_tokens": current.delta_budget_ceiling_tokens,
+        "pool_forced_cap": current.pool_forced_cap,
+    }
+    if value is not None:
+        fields[field] = value
+    config.dream = DreamConfig(**fields)
     raw_dream = config.raw.setdefault("dream", {})
     if value is None:
         raw_dream.pop(field, None)
@@ -366,14 +431,6 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         apply=lambda config, value: _dream_apply(config, "auto_trigger", value),
         live_apply=True,
     ),
-    "dream.token_budget_usd": ConfigKey(
-        key_path="dream.token_budget_usd",
-        value_type="positive number",
-        validate=_validate_positive_float,
-        read=lambda config: config.dream.token_budget_usd,
-        apply=lambda config, value: _dream_apply(config, "token_budget_usd", value),
-        live_apply=True,
-    ),
     # A2 schedule trigger keys: score-pool floor + idle eligibility and the 24h
     # hard deadline, hot-applied to the daemon scheduler loop (no restart).
     "dream.floor_pool_points": ConfigKey(
@@ -399,6 +456,53 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         read=lambda config: config.dream.hard_deadline_sec,
         apply=lambda config, value: _dream_apply(config, "hard_deadline_sec", value),
         live_apply=True,
+    ),
+    # T3a (A2.5, design/01 §4.7): tier / ensemble / threshold keys, all
+    # hot-applied to their consumers (Merger / DeltaPacker / ScorePool) via the
+    # live Config reference they hold at construction.
+    "dream.hardware_tier": ConfigKey(
+        key_path="dream.hardware_tier",
+        value_type="standard | lite | advanced",
+        validate=lambda value: _validate_choice(value, DREAM_HARDWARE_TIERS),
+        read=lambda config: config.dream.hardware_tier,
+        apply=lambda config, value: _dream_apply(config, "hardware_tier", value),
+        live_apply=True,
+        cross_validate=_cross_validate_tier_locks_ensemble,
+    ),
+    "dream.ensemble": ConfigKey(
+        key_path="dream.ensemble",
+        value_type="off | verify | vote",
+        validate=lambda value: _validate_choice(value, DREAM_ENSEMBLE_MODES),
+        read=lambda config: config.dream.ensemble,
+        apply=lambda config, value: _dream_apply(config, "ensemble", value),
+        live_apply=True,
+        cross_validate=_cross_validate_lite_ensemble,
+    ),
+    "dream.core_confidence_floor": ConfigKey(
+        key_path="dream.core_confidence_floor",
+        value_type="number in [0, 1]",
+        validate=_validate_confidence_floor,
+        read=lambda config: config.dream.core_confidence_floor,
+        apply=lambda config, value: _dream_apply(config, "core_confidence_floor", value),
+        live_apply=True,
+        cross_validate=_cross_validate_floor,
+    ),
+    "dream.delta_budget_ceiling_tokens": ConfigKey(
+        key_path="dream.delta_budget_ceiling_tokens",
+        value_type="integer >= 5000",
+        validate=_validate_delta_ceiling,
+        read=lambda config: config.dream.delta_budget_ceiling_tokens,
+        apply=lambda config, value: _dream_apply(config, "delta_budget_ceiling_tokens", value),
+        live_apply=True,
+    ),
+    "dream.pool_forced_cap": ConfigKey(
+        key_path="dream.pool_forced_cap",
+        value_type="positive number >= dream.core_confidence_floor",
+        validate=_validate_forced_cap,
+        read=lambda config: config.dream.pool_forced_cap,
+        apply=lambda config, value: _dream_apply(config, "pool_forced_cap", value),
+        live_apply=True,
+        cross_validate=_cross_validate_floor_vs_cap,
     ),
     # Decay engine (PRD-04 FR-4.1 / design/01 stage ⑤): the sweep's tunables
     # are live-applied — a λ edit reaches the NEXT sweep without a restart.
@@ -681,10 +785,14 @@ class ConfigWriteService:
                 "baseurl": self._config.baseurl,
                 "dream": {
                     "auto_trigger": self._config.dream.auto_trigger,
-                    "token_budget_usd": self._config.dream.token_budget_usd,
                     "floor_pool_points": self._config.dream.floor_pool_points,
                     "idle_min_sec": self._config.dream.idle_min_sec,
                     "hard_deadline_sec": self._config.dream.hard_deadline_sec,
+                    "hardware_tier": self._config.dream.hardware_tier,
+                    "ensemble": self._config.dream.ensemble,
+                    "core_confidence_floor": self._config.dream.core_confidence_floor,
+                    "delta_budget_ceiling_tokens": self._config.dream.delta_budget_ceiling_tokens,
+                    "pool_forced_cap": self._config.dream.pool_forced_cap,
                     "llm": {role: self._resolved_role(role) for role in LLM_ROLES},
                 },
                 "decay": {
@@ -743,6 +851,11 @@ class ConfigWriteService:
             validated = spec.validate(value)
         except ValueError as exc:
             raise ConfigWriteError(key_path, str(exc)) from exc
+        if spec.cross_validate is not None:
+            try:
+                spec.cross_validate(self._config, validated)
+            except ValueError as exc:
+                raise ConfigWriteError(key_path, str(exc)) from exc
         path = self._config_path()
         _patch_toml(path, key_path, validated)
         version_id = self._record(key_path, validated)

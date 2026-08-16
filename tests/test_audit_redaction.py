@@ -70,6 +70,7 @@ def test_role_configured_audit_does_not_echo_a_literal_key(tmp_path, monkeypatch
         'preset = "embedded"\n'
         f'[storage.vector]\nuri = "{(tmp_path / "chunks.lance").as_posix()}"\ndimensions = 64\n'
         f'[storage.graph]\npath = "{(tmp_path / "cortex.db").as_posix()}"\n'
+        f'[storage.graph.instances.isolated]\npath = "{(tmp_path / "isolated.db").as_posix()}"\n'
         f'[storage.meta]\npath = "{(tmp_path / "meta.db").as_posix()}"\n'
         '[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
         "[dream.llm.dream]\n"

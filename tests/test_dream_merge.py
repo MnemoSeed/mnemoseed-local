@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from mnemoseed_local.config import Config, DreamConfig
 from mnemoseed_local.dream import (
     ReflectedTriple,
     ReflectionResult,
@@ -170,6 +171,7 @@ def _merger(
     meta: SqliteMetaDriver,
     *,
     on_committed: _Recorder | None = None,
+    config: Config | None = None,
 ) -> Merger:
     return Merger(
         graph_main=main,  # type: ignore[arg-type]
@@ -177,6 +179,7 @@ def _merger(
         meta=meta,
         on_committed=on_committed,
         clock=lambda: 2000.0,
+        config=config,
     )
 
 
@@ -277,23 +280,52 @@ def test_anti_backflow_tier3_never_writes_main_even_if_route_core(
     assert _nodes(isolated) == []  # type: ignore[arg-type]
 
 
-def test_no_isolated_instance_strands_tier3_but_keeps_salvage_queue(
+def test_no_isolated_instance_fails_typed_before_any_write(
     graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
 ) -> None:
+    """AC2: the isolated instance is mandatory — a merge that needs it (salvage
+    / isolated routes) without it fails typed BEFORE the first write: nothing is
+    stranded silently and nothing is enqueued, so a fixed retry with the
+    instance configured replays the same snapshot cleanly."""
     main, isolated, meta = graphs  # type: ignore[misc]
     del isolated
     snap = _snap(_stamp("c1", "I prefer dark mode", tier=CognitiveTier.TIER_3))
     result = _reflect(snap, tmp_path)
 
     outcome = _merger(main, None, meta).merge(snap, result)
+    assert outcome.ok is False
+    assert outcome.committed is False
+    assert outcome.summary is None
+    assert outcome.error is not None and "isolated" in outcome.error
+    assert _nodes(main) == []  # type: ignore[arg-type]
+    # the salvage queue is untouched too: the pre-check failed before anything
+    # was enqueued
+    page = meta.audit_query(AuditFilter(actor=_PROFILE, action="salvage_queued"), Page(limit=100))
+    assert page.total == 0
+
+
+def test_floor_never_downgrades_a_deflected_tier3_core_claim(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """QA O-FIX-1: with the isolated instance present AND a confidence floor
+    set, a tier-3 triple claiming CORE is deflected by the anti-backflow gate
+    BEFORE the floor is consulted — it is never wrongly downgraded into the
+    isolated graph (the floor applies to core triples only, and this one was
+    deflected, not core)."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    hostile = _result(_triple(route=Route.CORE, tiers=(CognitiveTier.TIER_3,), confidence=0.4))
+    cfg = Config()
+    cfg.dream = DreamConfig(core_confidence_floor=0.9)
+
+    outcome = _merger(main, isolated, meta, config=cfg).merge(snap, hostile)
     assert outcome.ok
     assert outcome.summary is not None
-    assert outcome.summary.stranded == 1
+    assert outcome.summary.deflected == 1
     assert outcome.summary.isolated == 0
+    assert outcome.summary.core == 0
     assert _nodes(main) == []  # type: ignore[arg-type]
-    # the review channel still captured the salvage (lossless degrade, never main)
-    page = meta.audit_query(AuditFilter(actor=_PROFILE, action="salvage_queued"), Page(limit=100))
-    assert page.total == 1
+    assert _nodes(isolated) == []  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------- idempotency (NFR-2.3)
@@ -422,3 +454,166 @@ def test_salvage_queue_survives_store_reopen(
     asyncio.run(main2.close())
     asyncio.run(isolated2.close())
     asyncio.run(meta2.close())
+
+
+# ---------------------------------------------------------------- confidence floor (T3a / AC3)
+
+
+def _floor_merger(
+    main: object,
+    isolated: object,
+    meta: SqliteMetaDriver,
+    config: Config,
+    *,
+    on_committed: _Recorder | None = None,
+) -> Merger:
+    """Merger bound to a live Config (design/01 §4.7 hot-read seam)."""
+    return Merger(
+        graph_main=main,  # type: ignore[arg-type]
+        graph_isolated=isolated,  # type: ignore[arg-type]
+        meta=meta,
+        on_committed=on_committed,
+        config=config,
+        clock=lambda: 2000.0,
+    )
+
+
+def test_floor_downgrades_low_confidence_core_to_isolated(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    main, isolated, meta = graphs  # type: ignore[misc]
+    config = Config()
+    config.dream = DreamConfig(core_confidence_floor=0.7)
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    low = _result(_triple(route=Route.CORE, confidence=0.5))
+
+    outcome = _floor_merger(main, isolated, meta, config).merge(snap, low)
+    assert outcome.ok
+    assert outcome.summary is not None
+    assert outcome.summary.core == 0
+    assert outcome.summary.isolated == 1
+    assert _nodes(main) == []  # type: ignore[arg-type]
+    assert len(_nodes(isolated)) == 1  # type: ignore[arg-type]
+
+
+def test_floor_zero_keeps_current_behavior(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """floor == 0.0 must be byte-identical to the pre-T3a routing: a core
+    triple of ANY confidence still writes to the main graph."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    config = Config()  # default floor 0.0
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    low = _result(_triple(route=Route.CORE, confidence=0.5))
+
+    outcome = _floor_merger(main, isolated, meta, config).merge(snap, low)
+    assert outcome.ok
+    assert outcome.summary is not None
+    assert outcome.summary.core == 1
+    assert outcome.summary.isolated == 0
+    assert len(_nodes(main)) == 1  # type: ignore[arg-type]
+    assert _nodes(isolated) == []  # type: ignore[arg-type]
+
+
+def test_floor_without_isolated_instance_fails_typed_and_writes_nothing(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """A floor downgrade with no isolated graph instance is a typed merge
+    failure: never a silent drop, never a silent write to the main graph (the
+    scheduler backoff files the failed dream — T1b linkage)."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    del isolated
+    config = Config()
+    config.dream = DreamConfig(core_confidence_floor=0.7)
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    low = _result(_triple(route=Route.CORE, confidence=0.5))
+    done = _Recorder()
+
+    outcome = _floor_merger(main, None, meta, config, on_committed=done).merge(snap, low)
+    assert not outcome.ok
+    assert outcome.error is not None
+    assert "isolated" in outcome.error
+    assert not outcome.committed
+    assert done.calls == []
+    assert _nodes(main) == []  # type: ignore[arg-type]  # never a silent core write
+
+
+def test_floor_mixed_triples_without_isolated_never_writes_anything(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """D-T3a-1 regression: the no-isolated failure must be ATOMIC. A mixed
+    triple set (a core above the floor that would legitimately hit main, plus
+    a core below the floor that needs the downgrade) with no isolated instance
+    fails typed BEFORE any write — the above-floor triple must NOT leak into
+    the main graph. Per-triple in-loop detection wrote it first and only then
+    raised, permanently parking a node that a fixed retry would have sent to
+    isolated."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    del isolated
+    config = Config()
+    config.dream = DreamConfig(core_confidence_floor=0.7)
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    # the above-floor triple comes FIRST, exactly the order that exposed the
+    # partial write (high confidence hit main before the low one raised)
+    mixed = _result(
+        _triple(route=Route.CORE, confidence=0.9),
+        _triple(obj="vim", route=Route.CORE, confidence=0.3),
+    )
+    done = _Recorder()
+
+    outcome = _floor_merger(main, None, meta, config, on_committed=done).merge(snap, mixed)
+    assert not outcome.ok
+    assert outcome.error is not None
+    assert "isolated" in outcome.error
+    assert not outcome.committed
+    assert done.calls == []
+    assert _nodes(main) == []  # type: ignore[arg-type]  # zero pollution on failure
+
+
+def test_floor_mixed_triples_without_isolated_is_atomic_in_reverse_order(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """D-T3a-1: the atomic failure must not depend on the reflection's triple
+    order — the downgrade candidate leading is the same zero-write typed
+    failure."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    del isolated
+    config = Config()
+    config.dream = DreamConfig(core_confidence_floor=0.7)
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+    mixed = _result(
+        _triple(obj="vim", route=Route.CORE, confidence=0.3),
+        _triple(route=Route.CORE, confidence=0.9),
+    )
+
+    outcome = _floor_merger(main, None, meta, config).merge(snap, mixed)
+    assert not outcome.ok
+    assert outcome.error is not None
+    assert "isolated" in outcome.error
+    assert _nodes(main) == []  # type: ignore[arg-type]
+
+
+def test_floor_hot_applies_to_next_merge_without_restart(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """The Merger holds a live Config reference: a configwrite floor change
+    affects the NEXT merge of the SAME merger instance (no daemon restart)."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    del tmp_path
+    config = Config()  # floor 0.0: current behavior
+    merger = _floor_merger(main, isolated, meta, config)
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+
+    first = merger.merge(snap, _result(_triple(route=Route.CORE, confidence=0.5)))
+    assert first.ok
+    assert first.summary is not None and first.summary.core == 1
+
+    # hot-apply: the configwrite seam replaces config.dream on the SAME object
+    config.dream = DreamConfig(core_confidence_floor=0.9)
+    second = merger.merge(snap, _result(_triple(obj="vim", confidence=0.5)))
+    assert second.ok
+    assert second.summary is not None
+    assert second.summary.core == 0
+    assert second.summary.isolated == 1
+    assert len(_nodes(main)) == 1  # type: ignore[arg-type]  # only the pre-floor triple
+    assert len(_nodes(isolated)) == 1  # type: ignore[arg-type]  # the downgraded triple

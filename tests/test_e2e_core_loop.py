@@ -105,7 +105,7 @@ def test_full_core_loop(stores: tuple[Stores, Config]) -> None:
         resolve_llm=lambda: router.resolve("dream"),
         directory=snapshotter.directory,
         on_done=trigger.on_reflect_complete,
-        ledger=TokenLedger(meta=meta, budget_usd=config.dream.token_budget_usd),
+        ledger=TokenLedger(meta=meta),
     )
     merger = Merger(
         graph_main=built.graph,
@@ -160,15 +160,22 @@ def test_full_core_loop(stores: tuple[Stores, Config]) -> None:
     assert chunks, "no chunks captured"
     assert all(chunk.consolidated for chunk in chunks), "chunks not marked consolidated"
 
-    # ---- recall lists the consolidated memories (verbatim track)
-    # A query with no extractable entities skips the entity gate, so the
-    # verbatim chunks surface (the graph track's exact-entity seeds are covered
-    # by the retrieve unit tests).
+    # ---- recall after the dream: consolidated chunks exit the search surface
+    # design/03 §4 (A2.5 baseline fix): mark-consolidated keeps the verbatim
+    # chunk as evidence but removes it from recall. A query with no extractable
+    # entities skips the entity gate, so the vector track (every chunk now
+    # consolidated) and the graph track (no entity seeds) both return nothing:
+    # an honest empty result, never stale verbatim chunks. The evidence stays
+    # reachable through the provenance channel.
     memory = MemoryService(built, config)
     result = memory.recall(profile_id=PROFILE, query="pnpm", top_k=5)
-    entries = result["memory"]["entries"]
-    assert entries, "recall returned no entries"
-    assert any(entry["kind"] == "chunk" for entry in entries)
+    assert result["memory"]["entries"] == [], "consolidated chunks must exit the recall surface"
+    assert result["memory"]["coverage"]["vector_hits"] == 0
+    assert result["memory"]["coverage"]["graph_hits"] == 0
+    assert result["memory"]["coverage"]["profile_chunks"] == len(chunks)
+    audited = memory.audit(profile_id=PROFILE, chunk_id=chunks[0].chunk_id)
+    assert audited["target"] == {"type": "chunk", "id": chunks[0].chunk_id}
+    assert "asserted_by" in audited["provenance"]
 
     # ---- decay sweep over the same stores must not crash
     sweeper = DecaySweeper(built, config, clock=lambda: time.time() + 86400.0)

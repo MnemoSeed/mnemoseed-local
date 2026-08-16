@@ -16,10 +16,21 @@ from pathlib import Path
 from typing import Any
 
 from mnemoseed_local import __version__
-from mnemoseed_local.config import CONFIG_DIR, CONFIG_PATH, ConfigError, default_config_toml, load_config
+from mnemoseed_local.config import (
+    CONFIG_DIR,
+    CONFIG_PATH,
+    Config,
+    ConfigError,
+    default_config_toml,
+    load_config,
+)
 
 #: Default profile at the application boundary (no identity in the local MVP).
 DEFAULT_PROFILE = "default"
+
+#: Doctor ctx-window check (design/01 §4.8): the generation margin assumed when
+#: the dream route does not configure ``num_predict``.
+DREAM_MARGIN_TOKENS_DEFAULT = 2048
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -99,6 +110,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append(("daemon", False, "the local MVP refuses a non-loopback baseurl at boot"))
         return _doctor_report(checks)
 
+    checks.append(_dream_ctx_window_check(config))
+
+    # T3b (design/01 §4.8): the isolated graph instance is mandatory. Checked
+    # on the config's declared graph instances (before store resolution), so a
+    # config that would boot the daemon but strand tier-3 output is reported
+    # here with a fix hint, never silently.
+    graph_instances = config.layer_instances("graph")
+    has_isolated = "isolated" in graph_instances
+    isolated_detail = (
+        "isolated graph instance present"
+        if has_isolated
+        else "missing; add a [storage.graph.instances.isolated] table "
+        "(driver = \"sqlite_graph\") or run 'mnemoseed init'"
+    )
+    checks.append(("isolated graph", has_isolated, isolated_detail))
+
     from mnemoseed_local.llm import LLMError, RoleRouter
     from mnemoseed_local.storage.factory import build_stores
     from mnemoseed_local.storage.ports import StorageError
@@ -138,6 +165,81 @@ def _doctor_report(checks: list[tuple[str, bool, str]]) -> int:
     else:
         print("doctor: all checks passed")
     return 1 if failed else 0
+
+
+def _delta_budget_ceiling_tokens(config: Config) -> int:
+    """Single-point read of the dream delta ceiling for the doctor check.
+
+    The check's delta component reads the ``dream.delta_budget_ceiling_tokens``
+    config key (T3a), so lowering the ceiling via configwrite makes a tight
+    window pass without touching num_ctx.
+    """
+    return config.dream.delta_budget_ceiling_tokens
+
+
+def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
+    """Design/01 §4.8: the dream route's context window must fit the cached
+    prefix, the packed delta ceiling, and the generation margin.
+
+    An unconfigured ``num_ctx`` is only a hint (the default route works without
+    it); a configured one is checked against
+    ``estimate_tokens(cache_prefix) + delta ceiling + margin`` and fails with a
+    fix hint when the window is exceeded.
+    """
+    from mnemoseed_local.dream.delta import estimate_tokens
+    from mnemoseed_local.dream.prompts import build_cache_prefix
+
+    route = config.llm["dream"]
+    # AC5 (T3a): the ctx-window check (and its num_ctx / num_predict hints) is
+    # ollama-specific — num_ctx is an ollama server knob. A non-ollama route is
+    # skipped: the provider's own context window is out of doctor's reach, so a
+    # failure here would be a false alarm on a healthy route.
+    if route.driver != "ollama":
+        return (
+            "dream ctx window",
+            True,
+            f"route driver {route.driver!r} is not ollama; ctx-window check skipped",
+        )
+    params = route.params
+    num_ctx_raw = params.get("num_ctx")
+    if num_ctx_raw is None:
+        return (
+            "dream ctx window",
+            True,
+            "num_ctx is not configured; set num_ctx under [dream.llm.dream] "
+            "so doctor can verify the window fits",
+        )
+    try:
+        num_ctx = int(num_ctx_raw)
+    except (TypeError, ValueError):
+        return (
+            "dream ctx window",
+            False,
+            f"num_ctx must be an integer, got {num_ctx_raw!r}",
+        )
+    num_predict_raw = params.get("num_predict", DREAM_MARGIN_TOKENS_DEFAULT)
+    try:
+        margin = int(num_predict_raw)
+    except (TypeError, ValueError):
+        return (
+            "dream ctx window",
+            False,
+            f"num_predict must be an integer, got {num_predict_raw!r}",
+        )
+    prefix_tokens = estimate_tokens(build_cache_prefix())
+    ceiling = _delta_budget_ceiling_tokens(config)
+    needed = prefix_tokens + ceiling + margin
+    if needed <= num_ctx:
+        return (
+            "dream ctx window",
+            True,
+            f"prefix+delta+margin={needed} <= num_ctx={num_ctx}",
+        )
+    return (
+        "dream ctx window",
+        False,
+        f"prefix+delta+margin={needed} > num_ctx={num_ctx}; lower the delta ceiling or raise num_ctx",
+    )
 
 
 def cmd_recall(args: argparse.Namespace) -> int:

@@ -6,7 +6,7 @@ patch -> versioned meta-store record -> audit -> live-apply flow without the
 HTTP layer:
 
 - the key-path registry is seeded with the keys that exist today
-  (dream.auto_trigger, dream.token_budget_usd, the A2 schedule trigger keys,
+  (dream.auto_trigger, the A2 schedule trigger keys,
   and the single dream role's driver/model/base_url/api_key_env/max_tokens
   fields) and an unknown key is a typed error naming the key;
 - every write is a surgical line-oriented TOML patch: comments, layout and
@@ -58,7 +58,6 @@ def _config_toml(tmp_path: Path) -> Path:
         "\n"
         "# Dream-engine section\n"
         "[dream]\n"
-        "token_budget_usd = 5.0\n"
         "\n"
         "[dream.llm.dream]\n"
         'driver = "stub"\n'
@@ -93,7 +92,6 @@ def test_registry_seeded_with_writable_keys() -> None:
     """FR-7.11: the registry carries every key the system writes today."""
     expected = {
         "dream.auto_trigger",
-        "dream.token_budget_usd",
         "dream.floor_pool_points",
         "dream.idle_min_sec",
         "dream.hard_deadline_sec",
@@ -102,6 +100,15 @@ def test_registry_seeded_with_writable_keys() -> None:
         for field in ("driver", "model", "base_url", "api_key_env", "max_tokens"):
             expected.add(f"dream.llm.{role}.{field}")
     assert expected <= set(CONFIG_KEY_REGISTRY)
+
+
+def test_token_budget_usd_is_not_a_registry_key(tmp_path) -> None:
+    """AC1: the removed dream.token_budget_usd key is NOT writable — a set
+    against it is a typed unknown-key error, never a silent no-op."""
+    assert "dream.token_budget_usd" not in CONFIG_KEY_REGISTRY
+    service, _ = _service(tmp_path)
+    with pytest.raises(ConfigWriteError, match=r"config\[dream\.token_budget_usd\].*unknown"):
+        service.set("dream.token_budget_usd", 5.0, actor="console")
 
 
 def test_unknown_key_is_typed_error_naming_the_key(tmp_path) -> None:
@@ -119,7 +126,6 @@ def test_set_patches_dream_table_preserving_comments(tmp_path) -> None:
     text = path.read_text(encoding="utf-8")
     # the flag landed inside [dream], and the file's comments/layout survived
     assert "# Dream-engine section" in text
-    assert "token_budget_usd = 5.0" in text
     assert "auto_trigger = true" in text
     # unrelated role tables are untouched
     assert 'driver = "ollama"' in text
@@ -142,12 +148,12 @@ def test_set_inserts_dream_table_when_missing(tmp_path) -> None:
     text = path.read_text(encoding="utf-8")
     # drop the [dream] table (keep the role tables): the flag must create a new
     # [dream] table instead of leaking into a role table
-    text = text.replace("[dream]\ntoken_budget_usd = 5.0\n\n", "")
+    text = text.replace("[dream]\n\n", "")
     path.write_text(text, encoding="utf-8")
     service = ConfigWriteService(load_config(path), None, clock=lambda: 1_700_000_000.0)
     service.set("dream.auto_trigger", True, actor="console")
     assert load_config(path).dream.auto_trigger is True
-    assert load_config(path).dream.token_budget_usd == 5.0
+    assert load_config(path).dream.floor_pool_points == 10.0  # sibling defaults intact
 
 
 def test_set_patches_role_table_and_in_memory_llm(tmp_path) -> None:
@@ -205,7 +211,6 @@ def test_set_role_fields_accumulate_no_blank_lines(tmp_path) -> None:
         'preset = "embedded"\n'
         "\n"
         "[dream]\n"
-        "token_budget_usd = 5.0\n"
         "\n"
         "[dream.llm.dream]\n"
         'driver = "stub"\n'
@@ -277,10 +282,12 @@ def test_set_auto_trigger_requires_boolean(tmp_path) -> None:
         service.set("dream.auto_trigger", "yes", actor="console")
 
 
-def test_set_token_budget_requires_positive_number(tmp_path) -> None:
+def test_set_token_budget_is_unknown_key(tmp_path) -> None:
+    """AC1: dream.token_budget_usd was removed; a write against it is a typed
+    unknown-key error naming the key."""
     service, _ = _service(tmp_path)
-    with pytest.raises(ConfigWriteError, match=r"config\[dream\.token_budget_usd\]"):
-        service.set("dream.token_budget_usd", -1, actor="console")
+    with pytest.raises(ConfigWriteError, match=r"config\[dream\.token_budget_usd\].*unknown"):
+        service.set("dream.token_budget_usd", 5.0, actor="console")
 
 
 def test_set_max_tokens_requires_positive_int(tmp_path) -> None:
@@ -465,28 +472,26 @@ def test_reconcile_hand_edit_is_mirror_drift_never_rebaseline(tmp_path) -> None:
     service, path = _service(tmp_path, meta=meta)
     service.reconcile_boot()
     # a user hand-edits the file while the daemon is down
-    text = path.read_text(encoding="utf-8").replace(
-        "token_budget_usd = 5.0\n", "token_budget_usd = 5.0\nauto_trigger = true\n"
-    )
+    text = path.read_text(encoding="utf-8").replace('model = "stub"\n', 'model = "hand-edited"\n')
     path.write_text(text, encoding="utf-8")
 
     service = ConfigWriteService(load_config(path), meta, clock=lambda: 1_700_000_000.0)
     result = service.reconcile_boot()
     assert result["changed"] is True
     assert result["reason"] == "hand_edit"
-    assert result["mirror_rewritten"] == ["dream.auto_trigger"]
+    assert result["mirror_rewritten"] == ["dream.llm.dream.model"]
     # DB wins on the live config and the mirror line is regenerated from it
-    assert service._config.dream.auto_trigger is False
-    assert "auto_trigger = true" not in path.read_text(encoding="utf-8")
-    assert "auto_trigger = false" in path.read_text(encoding="utf-8")
+    assert service._config.llm["dream"].model == "stub"
+    assert 'model = "hand-edited"' not in path.read_text(encoding="utf-8")
+    assert 'model = "stub"' in path.read_text(encoding="utf-8")
     # the DB was never rebaselined from the file
-    assert meta.get_config("dream.auto_trigger").value["value"] is False
+    assert meta.get_config("dream.llm.dream.model").value["value"] == "stub"
     assert len(_audit_entries(meta, "config_import")) == 1  # still exactly one import
     drift = _audit_entries(meta, "config_mirror_drift")
     assert len(drift) == 1
     assert drift[0].actor == "daemon"
     assert drift[0].detail["drifted"] is True
-    assert drift[0].detail["keys_rewritten"] == ["dream.auto_trigger"]
+    assert drift[0].detail["keys_rewritten"] == ["dream.llm.dream.model"]
 
 
 def test_reconcile_db_value_wins_over_file_value_at_boot(tmp_path) -> None:
@@ -572,7 +577,7 @@ def test_get_resolves_config_with_env_names_only(tmp_path) -> None:
     body = service.get()
     config = body["config"]
     assert config["preset"] == "embedded"
-    assert config["dream"]["token_budget_usd"] == 5.0
+    assert "token_budget_usd" not in config["dream"]  # AC1: the removed key never surfaces
     assert config["dream"]["floor_pool_points"] == 10.0
     assert config["dream"]["idle_min_sec"] == 900.0
     assert config["dream"]["hard_deadline_sec"] == 86400.0

@@ -29,9 +29,17 @@ import pytest
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind, ScorePool
 from mnemoseed_local.config import Config, ConfigError, DreamConfig, load_config
 from mnemoseed_local.configwrite.service import CONFIG_KEY_REGISTRY, ConfigWriteService
-from mnemoseed_local.dream import DreamEligibility, DreamScheduler
+from mnemoseed_local.dream import (
+    DREAM_RETRY_BASE_S,
+    DREAM_RETRY_CAP_S,
+    DREAM_RETRY_MAX,
+    DREAM_RETRY_MULT,
+    DreamEligibility,
+    DreamScheduler,
+)
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.ports import (
+    AuditEntry,
     Capability,
     ChunkFilter,
     Page,
@@ -75,6 +83,7 @@ class _FakeMeta:
         self._states: dict[str, PoolState] = {}
         for profile in self.profiles:
             self._states[profile] = PoolState(balance=float(balances.get(profile, 0.0)) if balances else 0.0)
+        self.audit: list[AuditEntry] = []
 
     def list_profiles(self) -> list[object]:
         return [type("P", (), {"profile_id": p})() for p in self.profiles]
@@ -96,6 +105,19 @@ class _FakeMeta:
 
     def pool_states(self) -> dict[str, PoolState]:
         return dict(self._states)
+
+    def audit_append(self, entry: AuditEntry) -> None:
+        self.audit.append(entry)
+
+
+class _RecordingSeam:
+    """DreamTrigger-shaped recording sink for scheduler emissions."""
+
+    def __init__(self, sink: list[PoolEvent]) -> None:
+        self.sink = sink
+
+    def handle_event(self, event: PoolEvent) -> None:
+        self.sink.append(event)
 
 
 class _FakeStores:
@@ -508,3 +530,133 @@ def test_pool_self_fire_uses_config_idle_window_and_drain_stops_double_service()
     scheduler = DreamScheduler(_FakeStores(chunks, profiles=["p"], meta=meta), config, clock=clock)
     assert scheduler.eligibility("p") is None
     assert scheduler.tick() == []
+
+
+# ---------------------------------------------------------------- failure backoff retry (A2.5 T1)
+
+
+def test_failed_dream_retries_with_backoff_then_stops_and_audits() -> None:
+    """AC2a: after a reflect failure the scheduler re-emits the SAME window on
+    an exponential backoff — the fired fingerprint is never a permanent block
+    and the retry never re-scores the pool. After DREAM_RETRY_MAX consecutive
+    failures it stops and records a give-up audit event; pending chunks are
+    never lost and the drained pool is never re-drained."""
+    clock = _Clock(start=1000.0)
+    chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
+    meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
+    stores = _FakeStores(chunks, profiles=["p"], meta=meta)
+    emitted: list[PoolEvent] = []
+    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+
+    # initial fire: floor + idle, balance 12.0
+    first = scheduler.tick()
+    assert len(first) == 1
+    assert first[0].reason == "floor_idle"
+    assert len(emitted) == 1
+    # the dream's pool fire drained the balance (persisted row) before reflect;
+    # the drained pool can never re-fire the floor on its own
+    meta.pool_credit("p", 0.0, TurnRange(0, 9))
+    assert scheduler.tick() == []
+
+    # reflect fails (the pipeline reports it back); after the BASE interval the
+    # SAME window re-emits with a drained balance — no re-scoring, no re-drain
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S)
+    retry1 = scheduler.tick()
+    assert len(retry1) == 1
+    assert retry1[0].turn_range == TurnRange(0, 9)
+    assert retry1[0].pool_points == pytest.approx(0.0)
+    assert len(emitted) == 2
+    assert meta.pool_state("p").balance == pytest.approx(0.0)
+    assert [c for c in chunks if not c.consolidated] == chunks  # pending unchanged
+
+    # second consecutive failure: the backoff doubles (BASE * MULT)
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S * DREAM_RETRY_MULT)
+    retry2 = scheduler.tick()
+    assert len(retry2) == 1
+    assert len(emitted) == 3
+
+    # third consecutive failure reaches MAX: no further retries, the give-up is
+    # recorded on the existing audit channel, pending stays, pool stays drained
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_CAP_S)
+    assert scheduler.tick() == []
+    assert scheduler.tick() == []
+    assert len(emitted) == 3
+    give_ups = [entry for entry in meta.audit if entry.action == "dream_retry_give_up"]
+    assert len(give_ups) == 1
+    assert give_ups[0].detail["attempts"] == DREAM_RETRY_MAX
+    assert give_ups[0].detail["turn_range"] == {"start": 0, "end": 9}
+    assert all(not c.consolidated for c in chunks)
+    assert meta.pool_state("p").balance == pytest.approx(0.0)
+
+
+def test_success_after_failure_resets_the_backoff_streak() -> None:
+    """AC2b: one successful dream clears the retry streak; the next failure
+    starts a FRESH attempt budget — it never inherits the old failure count."""
+    clock = _Clock(start=1000.0)
+    chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
+    meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
+    stores = _FakeStores(chunks, profiles=["p"], meta=meta)
+    emitted: list[PoolEvent] = []
+    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+
+    assert len(scheduler.tick()) == 1
+    meta.pool_credit("p", 0.0, TurnRange(0, 9))
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S)
+    assert len(scheduler.tick()) == 1  # first backoff retry re-emitted
+    assert len(emitted) == 2
+
+    # the retried dream SUCCEEDS: the streak resets, so nothing re-emits even
+    # long past every backoff interval
+    scheduler.report_outcome("p", TurnRange(0, 9), True, None)
+    clock.advance(DREAM_RETRY_CAP_S)
+    assert scheduler.tick() == []
+
+    # a fresh failure starts a fresh streak: the FIRST retry lands at BASE
+    # again (an inherited count would require 2*BASE and never fire here)
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S)
+    fresh = scheduler.tick()
+    assert len(fresh) == 1
+    assert fresh[0].turn_range == TurnRange(0, 9)
+    assert len(emitted) == 3
+
+
+def test_retry_waits_for_outcome_while_worker_is_busy() -> None:
+    """AC2c: once a retry is re-emitted, the scheduler waits for its outcome —
+    while the worker is busy (the dream has not failed or succeeded yet), ticks
+    never stack another emission for the same profile. The next re-fire happens
+    only after the next failure report."""
+    clock = _Clock(start=1000.0)
+    chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
+    meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
+    stores = _FakeStores(chunks, profiles=["p"], meta=meta)
+    emitted: list[PoolEvent] = []
+    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+
+    assert len(scheduler.tick()) == 1
+    meta.pool_credit("p", 0.0, TurnRange(0, 9))
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S)
+    assert len(scheduler.tick()) == 1  # retry re-emitted; its outcome is pending
+    assert len(emitted) == 2
+
+    # the worker stays busy with that dream: the clock sails far past every
+    # backoff interval, yet not one tick stacks another emission
+    clock.advance(DREAM_RETRY_CAP_S * 8)
+    for _ in range(5):
+        assert scheduler.tick() == []
+    assert len(emitted) == 2
+
+    # the busy dream finally fails: exactly one re-fire lands after the doubled
+    # backoff, and no further emission follows without a new failure
+    scheduler.report_outcome("p", TurnRange(0, 9), False, "llm unavailable")
+    clock.advance(DREAM_RETRY_BASE_S * DREAM_RETRY_MULT)
+    assert len(scheduler.tick()) == 1
+    assert len(emitted) == 3
+    clock.advance(DREAM_RETRY_CAP_S)
+    assert scheduler.tick() == []
+    assert len(emitted) == 3

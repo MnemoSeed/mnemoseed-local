@@ -22,6 +22,47 @@ from mnemoseed_local.llm.types import (
     Usage,
 )
 
+#: Ollama /api/chat option names the driver forwards from role params into the
+#: request body's ``options`` field (design/01 §4.8). Only whitelisted keys are
+#: forwarded, so non-option params (base_url, timeout, ...) never leak into
+#: options. num_ctx / num_predict are the required members (the doctor
+#: ctx-window check and the generation cap); the rest are the documented
+#: sampling/runtime options.
+_OLLAMA_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        "num_ctx",
+        "num_predict",
+        "num_keep",
+        "num_batch",
+        "num_gpu",
+        "num_thread",
+        "num_gqa",
+        "seed",
+        "temperature",
+        "top_k",
+        "top_p",
+        "min_p",
+        "tfs_z",
+        "typical_p",
+        "repeat_last_n",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "mirostat",
+        "mirostat_tau",
+        "mirostat_eta",
+        "penalize_newline",
+        "stop",
+        "numa",
+        "main_gpu",
+        "low_vram",
+        "f16_kv",
+        "vocab_only",
+        "use_mmap",
+        "use_mlock",
+    }
+)
+
 
 @register(LLM_DRIVERS)
 class OllamaLLM:
@@ -35,7 +76,7 @@ class OllamaLLM:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "llama3.1:8b",
+        model: str = "qwen3.5:9b",
         timeout: float = 60.0,
         **kwargs: Any,
     ) -> None:
@@ -47,7 +88,7 @@ class OllamaLLM:
         self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
 
     def chat(self, *, system: str, user: str) -> ChatResult:
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
@@ -55,6 +96,13 @@ class OllamaLLM:
             ],
             "stream": False,
         }
+        # Options seam (design/01 §4.8): role params configure the request
+        # options (num_ctx, num_predict, ...). Only configured option params
+        # are forwarded, so an unconfigured route keeps the exact legacy
+        # request body (no empty "options" key, byte-identical serialization).
+        options = self._ollama_options()
+        if options:
+            payload["options"] = options
         try:
             response = self._client.post("/api/chat", json=payload)
             response.raise_for_status()
@@ -66,6 +114,10 @@ class OllamaLLM:
         message = body.get("message")
         text = message.get("content", "") if isinstance(message, dict) else ""
         return ChatResult(text=text, usage=_usage_from(body), model=self.model, driver="ollama")
+
+    def _ollama_options(self) -> dict[str, Any]:
+        """The whitelisted ollama options present in the role params."""
+        return {key: self.params[key] for key in _OLLAMA_OPTION_KEYS if key in self.params}
 
     def check(self) -> HealthReport:
         try:

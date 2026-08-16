@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import queue
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -45,7 +47,14 @@ from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
 from mnemoseed_local.config import Config
 from mnemoseed_local.dream.snapshot import SnapshotResult
 from mnemoseed_local.schema.stamp import ChunkStamp
-from mnemoseed_local.storage.ports import ChunkFilter, Page, PoolState, TurnRange, VectorStore
+from mnemoseed_local.storage.ports import (
+    AuditEntry,
+    ChunkFilter,
+    Page,
+    PoolState,
+    TurnRange,
+    VectorStore,
+)
 
 logger = logging.getLogger("mnemoseed_local.dream.trigger")
 
@@ -243,6 +252,22 @@ class DreamTrigger:
         elif rec.state is DreamState.ACCUMULATING and rec.dream_in_flight:
             self._finish(profile_id, rec)
 
+    def on_dream_failed(self, profile_id: str) -> None:
+        """A dream attempt ended without committing (reflect/merge degraded).
+
+        Resets the in-flight bookkeeping so a retried event can launch a fresh
+        dream; the journaled snapshot stays the recovery source of truth and
+        nothing is purged (the safe-clear only fires on merge-commit). No-op
+        for a profile with no dream in flight. Runs on the dream worker thread,
+        like every other trigger mutation.
+        """
+        rec = self._profiles.get(profile_id)
+        if rec is None or not rec.dream_in_flight:
+            return
+        rec.state = DreamState.ACCUMULATING
+        rec.dream_in_flight = False
+        rec.current_range = None
+
     # ------------------------------------------------------------ recovery (NFR-2.3)
 
     def resume(self, profile_id: str, turn_range: TurnRange) -> bool:
@@ -366,6 +391,30 @@ SCHEDULER_INTERVAL_S = 60.0
 #: Bounded read page for the pending-chunk probe.
 _SCHED_PAGE_LIMIT = 10_000
 
+# ---------------------------------------------------------------- A2.5 failure backoff (T1)
+#
+# A fired dream drains the pool AT TRIGGER TIME, and the tick fingerprint marks
+# its window as emitted. If that dream then fails (reflect degraded /
+# LLMUnavailable / merge degraded), the drained pool cannot re-earn the floor
+# and the unchanged fingerprint blocks every later tick — the pending chunks
+# would sit forever (design/02 §4.3). The constants below are the retry layer:
+# a failed window re-fires on an exponential schedule (BASE * MULT^(n-1),
+# capped), and after MAX consecutive failures the scheduler stops and records a
+# give-up audit event. A success resets the streak. Re-sends never re-score the
+# pool: the balance stays drained and the re-emitted event carries 0.
+
+#: Base backoff interval (seconds) after the first failed dream.
+DREAM_RETRY_BASE_S: float = 60.0
+
+#: Exponential multiplier applied per consecutive failure.
+DREAM_RETRY_MULT: float = 2.0
+
+#: Ceiling for a single backoff interval (seconds).
+DREAM_RETRY_CAP_S: float = 3600.0
+
+#: Consecutive failures after which the scheduler stops retrying and audits.
+DREAM_RETRY_MAX: int = 3
+
 
 @dataclass(frozen=True)
 class DreamEligibility:
@@ -377,6 +426,24 @@ class DreamEligibility:
     idle_sec: float
     first_chunk_at: float
     turn_range: TurnRange  # the pending window the dream should cover
+
+
+@dataclass
+class _RetryState:
+    """Scheduler-side bookkeeping for one profile's failed-dream retry streak."""
+
+    reason: str  # the reason the failed window was first emitted
+    turn_range: TurnRange
+    attempts: int  # consecutive failures so far
+    next_at: float  # earliest re-emission time; inf while an outcome is pending
+    given_up: bool = False
+    last_error: str | None = None
+
+
+def _retry_interval(attempts: int) -> float:
+    """Backoff for a streak of ``attempts`` consecutive failures: BASE,
+    2*BASE, 4*BASE, ... capped at CAP."""
+    return min(DREAM_RETRY_CAP_S, DREAM_RETRY_BASE_S * (DREAM_RETRY_MULT ** (attempts - 1)))
 
 
 class DreamScheduler:
@@ -405,6 +472,8 @@ class DreamScheduler:
         self._trigger = trigger
         self._clock = clock
         self._last: dict[str, tuple[str, int, int]] = {}
+        self._retry: dict[str, _RetryState] = {}
+        self._outcomes: queue.Queue[tuple[str, TurnRange, bool, str | None, float]] = queue.Queue()
 
     # ------------------------------------------------------------ rules
 
@@ -468,33 +537,161 @@ class DreamScheduler:
     # ------------------------------------------------------------ emission
 
     def tick(self) -> list[DreamEligibility]:
-        """Emit newly eligible profiles to the trigger (dedup by window).
+        """Emit newly eligible profiles to the trigger (dedup by window), then
+        re-emit failed windows whose backoff elapsed.
 
         Returns the emitted eligibilities. A fingerprint of the pending window
         (reason + turn range) is stored per profile; an unchanged window is
         never re-emitted, so the manual pending queue does not accumulate
         duplicate events for the same backlog — the pool drain after a dream is
         what clears the balance, and only re-earned points over a fresh window
-        re-emit.
+        re-emit. A dream that FAILED (reported through ``report_outcome``) is
+        the one deliberate exception: its window re-fires on the exponential
+        backoff below.
         """
         emitted: list[DreamEligibility] = []
+        self._drain_outcomes()
         for eligible in self.due_profiles():
             fingerprint = (eligible.reason, eligible.turn_range.start, eligible.turn_range.end)
             if self._last.get(eligible.profile_id) == fingerprint:
                 continue
             self._last[eligible.profile_id] = fingerprint
             emitted.append(eligible)
-            if self._trigger is not None:
-                self._trigger.handle_event(
-                    PoolEvent(
-                        kind=PoolEventKind.DREAM_TRIGGER,
-                        profile_id=eligible.profile_id,
-                        turn_range=eligible.turn_range,
-                        balance=eligible.pool_points,
-                        fired_at=self._clock(),
-                    )
-                )
+            self._emit(eligible)
+        emitted.extend(self._retry_due())
         return emitted
+
+    def _emit(self, eligible: DreamEligibility) -> None:
+        """Deliver one eligibility to the trigger as a synthetic pool event."""
+        if self._trigger is not None:
+            self._trigger.handle_event(
+                PoolEvent(
+                    kind=PoolEventKind.DREAM_TRIGGER,
+                    profile_id=eligible.profile_id,
+                    turn_range=eligible.turn_range,
+                    balance=eligible.pool_points,
+                    fired_at=self._clock(),
+                )
+            )
+
+    def report_outcome(
+        self,
+        profile_id: str,
+        turn_range: TurnRange,
+        ok: bool,
+        error: str | None = None,
+    ) -> None:
+        """Outcome seam for one dream (the daemon wires the dream pipeline here).
+
+        Called on the dream WORKER thread; the report is drained on the next
+        tick so every retry-state mutation stays on the tick thread. A success
+        clears the retry streak; a failure schedules the backoff re-fire (or,
+        at MAX consecutive failures, stops and records the give-up audit).
+        """
+        self._outcomes.put((profile_id, turn_range, ok, error, self._clock()))
+
+    # ------------------------------------------------------------ outcome drain (A2.5 T1)
+
+    def _drain_outcomes(self) -> None:
+        """Apply every worker-thread outcome report since the last tick."""
+        while True:
+            try:
+                profile_id, turn_range, ok, error, reported_at = self._outcomes.get_nowait()
+            except queue.Empty:
+                return
+            if ok:
+                self._retry.pop(profile_id, None)
+            else:
+                self._record_failure(profile_id, turn_range, error, reported_at)
+
+    def _record_failure(
+        self,
+        profile_id: str,
+        turn_range: TurnRange,
+        error: str | None,
+        reported_at: float,
+    ) -> None:
+        """Schedule (or advance) the retry streak for one failed window.
+
+        A failure for a window the scheduler never emitted (manual run, pool
+        fire, boot recovery) has no fingerprint to re-arm: the hard deadline
+        stays that window's backstop. A scheduler-emitted window re-fires with
+        the reason it was originally emitted, so the retry is a deliberate
+        same-window re-send — the pool balance is already drained and stays
+        drained. After MAX consecutive failures the window is marked given-up
+        and the give-up lands on the audit channel.
+        """
+        state = self._retry.get(profile_id)
+        if state is None:
+            fingerprint = self._last.get(profile_id)
+            if fingerprint is None:
+                return
+            state = _RetryState(
+                reason=fingerprint[0],
+                turn_range=turn_range,
+                attempts=0,
+                next_at=0.0,
+                last_error=error,
+            )
+            self._retry[profile_id] = state
+        else:
+            if state.given_up:
+                # a fresh emission re-armed the profile: start a new streak
+                state.attempts = 0
+                state.given_up = False
+            state.turn_range = turn_range
+            state.last_error = error
+        state.attempts += 1
+        if state.attempts >= DREAM_RETRY_MAX:
+            state.given_up = True
+            state.next_at = math.inf
+            self._audit_give_up(profile_id, state)
+            return
+        state.next_at = reported_at + _retry_interval(state.attempts)
+
+    def _retry_due(self) -> list[DreamEligibility]:
+        """Re-emit every failed window whose backoff elapsed and whose outcome
+        is not still pending. One re-fire per failure: after re-emitting, the
+        state waits (``next_at = inf``) for the next outcome report, so a busy
+        worker never stacks duplicate dreams for the same profile."""
+        now = self._clock()
+        emitted: list[DreamEligibility] = []
+        for profile_id in sorted(self._retry):
+            state = self._retry[profile_id]
+            if state.given_up or state.next_at > now:
+                continue
+            state.next_at = math.inf  # outcome pending: no further re-fire
+            eligible = DreamEligibility(
+                profile_id=profile_id,
+                reason=state.reason,
+                pool_points=0.0,  # drained at the original fire; never re-drained
+                idle_sec=0.0,
+                first_chunk_at=0.0,
+                turn_range=state.turn_range,
+            )
+            emitted.append(eligible)
+            self._emit(eligible)
+        return emitted
+
+    def _audit_give_up(self, profile_id: str, state: _RetryState) -> None:
+        """Record the retry-exhausted failure on the append-only audit channel."""
+        try:
+            self._meta.audit_append(
+                AuditEntry(
+                    actor="dream",
+                    action="dream_retry_give_up",
+                    detail={
+                        "profile_id": profile_id,
+                        "reason": state.reason,
+                        "turn_range": {"start": state.turn_range.start, "end": state.turn_range.end},
+                        "attempts": state.attempts,
+                        "last_error": state.last_error or "",
+                    },
+                    at=self._clock(),
+                )
+            )
+        except Exception:  # noqa: BLE001 - an audit failure never breaks the scheduler
+            logger.warning("give-up audit failed for %s; the scheduler continues", profile_id)
 
     async def run_forever(self) -> None:
         """The daemon-owned periodic loop over the trigger rules.
@@ -539,12 +736,14 @@ class DreamScheduler:
 
 
 class _MetaProbe(Protocol):
-    """The minimal meta surface the scheduler probes: profile discovery and
-    the score-pool balance read (the canonical persisted pool row)."""
+    """The minimal meta surface the scheduler probes: profile discovery, the
+    score-pool balance read (the canonical persisted pool row), and the
+    append-only audit seam for give-up records."""
 
     def list_profiles(self) -> list[Any]: ...
     def pool_state(self, profile_id: str) -> PoolState: ...
     def pool_states(self) -> dict[str, Any]: ...
+    def audit_append(self, entry: AuditEntry) -> None: ...
 
 
 def _vector_of(stores: object) -> VectorStore:

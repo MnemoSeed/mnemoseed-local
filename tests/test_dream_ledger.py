@@ -1,5 +1,10 @@
 """Monthly per-profile dream token ledger (PRD-02 T5b; FR-2.5b / NFR-2.2).
 
+T3b (A2.5 batch 3): the USD budget concept is removed (design/01 §4.1). The
+ledger is pure token bookkeeping: it RECORDS what a dream consumed and reads
+the current month's counter; there is no budget gate, no USD projection, no
+refusal audit action. Auto-recovery falls out of the UTC year-month key.
+
 Testable behaviors through the public surface:
 
 - UTC year-month bucketing is deterministic (the auto-recovery key).
@@ -7,39 +12,27 @@ Testable behaviors through the public surface:
 - usage() reads the current month's counter; unknown months are zero.
 - per-profile and per-month keys never mix.
 - clock rollover: a new UTC month opens a fresh zero counter (auto-recovery).
-- USD projection equals prior usage plus this dream's exact cost arithmetic.
-- within_budget is the FR-2.5b gate predicate (projected spend > budget defers).
-- status() is the observability seam: current-month usage + budget limit.
-- record_refusal() appends the audit trail (FR-2.5b capture-only mode).
+- status() is the observability seam: current-month token usage only.
+- the ledger has no budget knobs (AC1): budget_usd / within_budget /
+  record_refusal no longer exist.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from mnemoseed_local.config import DEFAULT_DREAM_TOKEN_BUDGET_USD
-from mnemoseed_local.dream.delta import PriceTable
-from mnemoseed_local.dream.ledger import (
-    DEFAULT_MONTHLY_BUDGET_USD,
-    LedgerStatus,
-    TokenLedger,
-    year_month_for,
-)
-from mnemoseed_local.storage.ports import AuditEntry
+from mnemoseed_local.dream.ledger import LedgerStatus, TokenLedger, year_month_for
 
 # 2026-08-01T00:00:00Z and 2026-09-01T00:00:00Z (UTC, pinned deterministically).
 _AUG = 1785542400.0
 _SEP = 1788220800.0
 
-_DEFAULT_PRICE = PriceTable()
-
 
 class _FakeMeta:
-    """MetaStore-shaped double for the ledger's two port calls + the audit seam."""
+    """MetaStore-shaped double for the ledger's two port calls."""
 
     def __init__(self) -> None:
         self.counters: dict[tuple[str, str], int] = {}
-        self.audit: list[AuditEntry] = []
 
     def add_token_usage(self, profile_id: str, year_month: str, tokens: int) -> None:
         key = (profile_id, year_month)
@@ -47,9 +40,6 @@ class _FakeMeta:
 
     def token_usage(self, profile_id: str, year_month: str) -> int:
         return self.counters.get((profile_id, year_month), 0)
-
-    def audit_append(self, entry: AuditEntry) -> None:
-        self.audit.append(entry)
 
 
 class _MutableClock:
@@ -110,83 +100,45 @@ def test_per_profile_and_per_month_isolation() -> None:
     assert ledger.usage("bob") == 5
 
 
-def test_month_rollover_reopens_budget_and_resets_usage() -> None:
-    """FR-2.5b auto-recovery: the counter is keyed by UTC year-month, so a fresh
-    month reads zero — no rollover job, no persisted "spent" flag."""
+def test_month_rollover_reopens_a_fresh_zero_counter() -> None:
+    """Auto-recovery: the counter is keyed by UTC year-month, so a fresh month
+    reads zero — no rollover job, no persisted "spent" flag."""
     clock = _MutableClock(_AUG)
     ledger = TokenLedger(_FakeMeta(), clock=clock)
     ledger.record("alice", delta_tokens=1000, output_tokens=2000)
     assert ledger.usage("alice") == 3000
     clock.ts = _SEP
     assert ledger.usage("alice") == 0
-    assert ledger.within_budget("alice", delta_tokens=1000) is True
-
-
-# ---------------------------------------------------------------- USD projection + gate
-
-
-def test_projection_math_is_exact_for_pending_dream() -> None:
-    meta = _FakeMeta()
-    price = PriceTable(input_usd_per_m=0.14, cache_read_usd_per_m=0.028, output_usd_per_m=0.28)
-    ledger = TokenLedger(meta, budget_usd=5.0, price=price, clock=_clock_at(_AUG))
-    ledger.record("alice", delta_tokens=20000)  # prior month usage metered at input rate
-    projected = ledger.projection("alice", delta_tokens=1000, prefix_tokens=500, output_tokens=250)
-    expected = (
-        20000 * price.input_usd_per_m / 1e6
-        + (1000 * price.input_usd_per_m + 500 * price.cache_read_usd_per_m + 250 * price.output_usd_per_m)
-        / 1e6
-    )
-    assert projected == pytest.approx(expected)
-
-
-def test_within_budget_is_the_gate_predicate() -> None:
-    meta = _FakeMeta()
-    price = PriceTable(input_usd_per_m=0.14, cache_read_usd_per_m=0.028, output_usd_per_m=0.28)
-    ledger = TokenLedger(meta, budget_usd=0.001, price=price, clock=_clock_at(_AUG))
-    assert ledger.within_budget("alice", delta_tokens=1000) is True  # ~$0.00014
-    assert ledger.within_budget("alice", delta_tokens=9000) is False  # ~$0.00126 > $0.001
-
-
-def test_usage_usd_sums_recorded_tokens_at_input_rate() -> None:
-    meta = _FakeMeta()
-    ledger = TokenLedger(meta, price=PriceTable(), clock=_clock_at(_AUG))
-    ledger.record("alice", delta_tokens=5000, output_tokens=1000)
-    assert ledger.usage_usd("alice") == pytest.approx(6000 * _DEFAULT_PRICE.input_usd_per_m / 1e6)
 
 
 # ---------------------------------------------------------------- observability
 
 
-def test_status_exposes_usage_and_budget_limit() -> None:
+def test_status_exposes_token_usage_only() -> None:
     meta = _FakeMeta()
-    ledger = TokenLedger(meta, budget_usd=5.0, clock=_clock_at(_AUG))
+    ledger = TokenLedger(meta, clock=_clock_at(_AUG))
     ledger.record("alice", delta_tokens=5000, output_tokens=1000)
     status = ledger.status("alice")
     assert isinstance(status, LedgerStatus)
     assert status.profile_id == "alice"
     assert status.year_month == "2026-08"
     assert status.used_tokens == 6000
-    assert status.used_usd == pytest.approx(6000 * _DEFAULT_PRICE.input_usd_per_m / 1e6)
-    assert status.budget_usd == 5.0
-    assert status.remaining_usd == pytest.approx(5.0 - 6000 * _DEFAULT_PRICE.input_usd_per_m / 1e6)
+    assert not hasattr(status, "budget_usd")
+    assert not hasattr(status, "remaining_usd")
 
 
-def test_record_refusal_appends_audit() -> None:
-    meta = _FakeMeta()
-    ledger = TokenLedger(meta, budget_usd=0.01, clock=_clock_at(_AUG))
-    ledger.record_refusal("alice", delta_tokens=100, prefix_tokens=50, output_tokens=25)
-    assert len(meta.audit) == 1
-    entry = meta.audit[0]
-    assert isinstance(entry, AuditEntry)
-    assert entry.action == "token_budget_cap"
-    assert entry.detail["year_month"] == "2026-08"
-    assert entry.detail["delta_tokens"] == 100
-    assert entry.detail["budget_usd"] == 0.01
+# ---------------------------------------------------------------- no budget (AC1)
 
 
-# ---------------------------------------------------------------- default parity
-
-
-def test_ledger_default_budget_matches_config_default() -> None:
-    """FR-2.5b default $5/month is the same number config exposes as a table."""
-    assert DEFAULT_MONTHLY_BUDGET_USD == DEFAULT_DREAM_TOKEN_BUDGET_USD == 5.0
+def test_ledger_has_no_budget_knobs() -> None:
+    """AC1: the ledger records tokens only — the FR-2.5b USD gate surface is
+    gone (constructor kwargs, gate predicates, refusal audit action)."""
+    with pytest.raises(TypeError):
+        TokenLedger(_FakeMeta(), budget_usd=5.0)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        TokenLedger(_FakeMeta(), price=object())  # type: ignore[call-arg]
+    ledger = TokenLedger(_FakeMeta(), clock=_clock_at(_AUG))
+    assert not hasattr(ledger, "within_budget")
+    assert not hasattr(ledger, "usage_usd")
+    assert not hasattr(ledger, "projection")
+    assert not hasattr(ledger, "record_refusal")

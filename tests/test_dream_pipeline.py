@@ -31,6 +31,7 @@ from mnemoseed_local.dream import (
 from mnemoseed_local.dream.merge import MergeOutcome
 from mnemoseed_local.dream.pipeline import DreamPipeline
 from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
+from mnemoseed_local.llm.types import LLMUnavailable
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.ports import TurnRange
 
@@ -59,6 +60,25 @@ class _SpyMerger:
     def merge(self, snapshot: Snapshot, result: ReflectionResult) -> MergeOutcome:
         self.calls.append((snapshot, result))
         return MergeOutcome(ok=True, committed=True)
+
+
+class _FailingMerger:
+    """Merger whose typed outcome is a merge degradation (never a raise)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Snapshot, ReflectionResult]] = []
+
+    def merge(self, snapshot: Snapshot, result: ReflectionResult) -> MergeOutcome:
+        self.calls.append((snapshot, result))
+        return MergeOutcome(ok=False, error="graph write failed")
+
+
+class _FailingLLM:
+    """ReflectLLM seam that always raises the typed LLMUnavailable (FR-2.6)."""
+
+    def chat(self, *, system: str, user: str) -> str:
+        del system, user
+        raise LLMUnavailable("model unavailable")
 
 
 class _EmptyStore:
@@ -145,14 +165,16 @@ def _pipeline(
     *,
     snapshotter: object | None = None,
     trigger: DreamTrigger | None = None,
-    reflector: _SpyReflector | None = None,
-    merger: _SpyMerger | None = None,
+    reflector: object | None = None,
+    merger: object | None = None,
+    on_outcome: object | None = None,
 ) -> DreamPipeline:
     return DreamPipeline(
         trigger=trigger or DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=True),
         snapshotter=snapshotter if snapshotter is not None else _NoActive(),  # type: ignore[arg-type]
         reflector=reflector or _SpyReflector(ReflectOutcome(ok=True, result=_result())),
         merger=merger or _SpyMerger(),
+        on_outcome=on_outcome,  # type: ignore[arg-type]
     )
 
 
@@ -282,3 +304,61 @@ def test_pipeline_on_snapshot_ready_advances_trigger_then_runs(tmp_path: Path) -
     # machine parks at DREAMING with the chain already handed to the merger
     assert trigger.status(_PROFILE).state is DreamState.DREAMING
     assert merger.calls
+
+
+# ---------------------------------------------------------------- outcome seam (A2.5 T1 backoff)
+
+
+def test_pipeline_reports_reflect_failure_to_outcome_seam(tmp_path: Path) -> None:
+    """The REAL reflect failure path (a stub LLM raising LLMUnavailable, FR-2.6)
+    invokes the outcome seam with ok=False — the seam the daemon wires to the
+    scheduler's retry backoff. Never a raise, never a merge."""
+    del tmp_path
+    snap = _snap(_stamp("I prefer dark mode"))
+    outcomes: list[tuple[str, TurnRange, bool, str | None]] = []
+    reflector = ReflectOrchestrator(llm=_FailingLLM(), sleep=lambda _: None)
+    merger = _SpyMerger()
+    pipeline = _pipeline(
+        reflector=reflector,
+        merger=merger,
+        on_outcome=lambda profile_id, rng, ok, err: outcomes.append((profile_id, rng, ok, err)),
+    )
+
+    pipeline.run(snap)
+
+    assert merger.calls == []  # degraded: nothing handed to the split writer
+    assert outcomes == [(_PROFILE, _RANGE, False, "model unavailable")]
+
+
+def test_pipeline_reports_merge_failure_to_outcome_seam(tmp_path: Path) -> None:
+    """A merge-boundary degradation (typed ok=False, never a raise) also reports
+    ok=False through the outcome seam, so the failed window is re-scheduled."""
+    snap = _snap(_stamp("I prefer dark mode"))
+    outcomes: list[tuple[str, TurnRange, bool, str | None]] = []
+    reflector = ReflectOrchestrator(llm=StubReflectLLM(), directory=tmp_path / "dreams")
+    pipeline = _pipeline(
+        reflector=reflector,
+        merger=_FailingMerger(),
+        on_outcome=lambda profile_id, rng, ok, err: outcomes.append((profile_id, rng, ok, err)),
+    )
+
+    pipeline.run(snap)
+
+    assert outcomes == [(_PROFILE, _RANGE, False, "graph write failed")]
+
+
+def test_pipeline_reports_success_to_outcome_seam(tmp_path: Path) -> None:
+    """A committed dream reports ok=True through the outcome seam, so the
+    scheduler can reset the profile's retry streak."""
+    snap = _snap(_stamp("I prefer dark mode"))
+    outcomes: list[tuple[str, TurnRange, bool, str | None]] = []
+    reflector = ReflectOrchestrator(llm=StubReflectLLM(), directory=tmp_path / "dreams")
+    pipeline = _pipeline(
+        reflector=reflector,
+        merger=_SpyMerger(),
+        on_outcome=lambda profile_id, rng, ok, err: outcomes.append((profile_id, rng, ok, err)),
+    )
+
+    pipeline.run(snap)
+
+    assert outcomes == [(_PROFILE, _RANGE, True, None)]

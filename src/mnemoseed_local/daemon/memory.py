@@ -36,7 +36,7 @@ import logging
 import time
 import uuid
 from dataclasses import replace
-from typing import Annotated, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
@@ -46,6 +46,9 @@ from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
+
+if TYPE_CHECKING:
+    from mnemoseed_local.daemon.app import DreamWorker
 from mnemoseed_local.retrieve.assemble import (
     AssembledContext,
     AssembledEntry,
@@ -616,12 +619,14 @@ def _trigger_payload(status: TriggerStatus) -> dict[str, Any]:
 async def memory_dream_once(req: DreamRequest, request: Request) -> dict[str, Any]:
     """One manual dream cycle (FR-2.8 ``dream --once``).
 
-    ``async def`` so the whole snapshot -> reflect -> merge -> safe-clear chain
-    runs on the app event-loop thread: the daemon's sqlite connections are bound
-    to that thread and refuse cross-thread use.
+    The launch decision is made on the dream worker thread (the /memory surface
+    must never block on the snapshot -> reflect -> merge chain); the handler
+    awaits the worker's decision so the response keeps the same ``launched`` /
+    ``state`` contract the synchronous path had.
     """
+    worker: DreamWorker = request.app.state.dream_worker
+    launched = await worker.submit_dream_once(req.profile_id)
     trigger: DreamTrigger = request.app.state.dream
-    launched = trigger.dream_once(req.profile_id)
     status = trigger.status(req.profile_id)
     payload = _trigger_payload(status)
     payload["launched"] = launched

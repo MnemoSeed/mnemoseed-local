@@ -17,6 +17,7 @@ instead of double-writing.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Protocol
 
 from mnemoseed_local.dream.merge import Merger
@@ -27,6 +28,7 @@ from mnemoseed_local.dream.snapshot import (
     resume_boundary,
 )
 from mnemoseed_local.dream.trigger import DreamTrigger
+from mnemoseed_local.storage.ports import TurnRange
 
 logger = logging.getLogger("mnemoseed_local.dream.pipeline")
 
@@ -43,7 +45,10 @@ class DreamPipeline:
     ``reflector`` and ``merger`` are the seams to the T3/T4 engines (injected
     here on the drain path, not assembled inside hot-path code). ``trigger``
     advances the state machine at each completion seam and owns the committer
-    that fires the safe-clear purger after a committed merge.
+    that fires the safe-clear purger after a committed merge. ``on_outcome`` is
+    the A2.5 backoff seam: it is invoked on the dream worker thread with the
+    final (ok/error) of every attempt so the scheduler can re-fire failed
+    windows on its exponential backoff.
     """
 
     def __init__(
@@ -53,11 +58,15 @@ class DreamPipeline:
         snapshotter: _Snapshotter,
         reflector: ReflectOrchestrator,
         merger: Merger,
+        on_outcome: Callable[[str, TurnRange, bool, str | None], None] | None = None,
     ) -> None:
         self._trigger = trigger
         self._snapshotter = snapshotter
         self._reflector = reflector
         self._merger = merger
+        # Wired after construction: the scheduler is built after the pipeline in
+        # the daemon lifespan, exactly like ``FileSnapshotter.on_ready``.
+        self.on_outcome = on_outcome
 
     def on_snapshot_ready(self, profile_id: str) -> None:
         """Trigger seam: a fresh snapshot completed capture, the state machine
@@ -89,6 +98,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.ok,
             )
+            self._fail(snapshot, outcome.error)
             return
         self._merge(snapshot, outcome.result)
 
@@ -100,6 +110,7 @@ class DreamPipeline:
                 "merge-boundary snapshot %s lacks REFLECT_DONE; staying journaled",
                 snapshot.snapshot_id,
             )
+            self._fail(snapshot, "merge-boundary snapshot lacks REFLECT_DONE")
             return
         result = result_from_payload(snapshot.reflect_result)
         if result is None:
@@ -107,6 +118,7 @@ class DreamPipeline:
                 "merge-boundary snapshot %s has no recoverable result; staying journaled",
                 snapshot.snapshot_id,
             )
+            self._fail(snapshot, "merge-boundary snapshot has no recoverable result")
             return
         self._merge(snapshot, result)
 
@@ -126,6 +138,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 len(result.overflow_chunk_ids),
             )
+            self._fail(snapshot, "reflect covered a truncated delta with overflow; merge deferred")
             return
         outcome = self._merger.merge(snapshot, result)
         if not outcome.ok:
@@ -134,3 +147,16 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.error,
             )
+            self._fail(snapshot, outcome.error)
+            return
+        if self.on_outcome is not None:
+            self.on_outcome(snapshot.profile_id, snapshot.turn_range, True, None)
+
+    def _fail(self, snapshot: Snapshot, error: str | None) -> None:
+        """One dream attempt ended without committing: the trigger drops its
+        in-flight bookkeeping (so a retried event can launch again) and the
+        outcome seam reports the failure to the scheduler's retry backoff.
+        Never a raise; the journal stays the source of truth."""
+        self._trigger.on_dream_failed(snapshot.profile_id)
+        if self.on_outcome is not None:
+            self.on_outcome(snapshot.profile_id, snapshot.turn_range, False, error)

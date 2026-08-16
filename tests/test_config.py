@@ -4,7 +4,6 @@ STORAGE_MODE shortcut, and validation errors that name the offending key."""
 import pytest
 
 from mnemoseed_local.config import (
-    DEFAULT_DREAM_TOKEN_BUDGET_USD,
     DEFAULT_PRESET,
     Config,
     ConfigError,
@@ -211,30 +210,40 @@ def test_dream_auto_trigger_must_be_boolean(tmp_path, monkeypatch):
         load_config(p)
 
 
-def test_dream_token_budget_usd_defaults_to_five(tmp_path, monkeypatch):
+def test_dream_token_budget_usd_load_raises_deprecation_error(tmp_path, monkeypatch):
+    """AC1: the USD budget concept is removed (design/01 §4.1); a config that
+    still carries dream.token_budget_usd fails with a deprecation error naming
+    the key — a stale file can never silently run a budgetless engine."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, 'preset = "embedded"\n[dream]\ntoken_budget_usd = 5.0\n')
+    with pytest.raises(ConfigError, match=r"config\[dream\.token_budget_usd\].*deprecated and removed"):
+        load_config(p)
+
+
+def test_dream_config_has_no_token_budget_field(tmp_path, monkeypatch):
+    """AC1: the resolved DreamConfig exposes no token_budget_usd field."""
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     cfg = load_config(tmp_path / "missing.toml")
-    assert cfg.dream.token_budget_usd == DEFAULT_DREAM_TOKEN_BUDGET_USD == 5.0
+    assert not hasattr(cfg.dream, "token_budget_usd")
 
 
-def test_dream_token_budget_usd_parses(tmp_path, monkeypatch):
+def test_default_config_toml_omits_token_budget_usd() -> None:
+    """AC1: the init template carries no budget key (the template is the doc
+    for the removed FR-2.5b cap)."""
+    assert "token_budget_usd" not in default_config_toml()
+
+
+def test_default_config_toml_writes_the_isolated_graph_instance(tmp_path, monkeypatch) -> None:
+    """AC2: the init template writes an ACTIVE storage.graph.instances.isolated
+    table (not a comment), so a fresh init resolves the isolated instance."""
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n[dream]\ntoken_budget_usd = 12.5\n')
-    assert load_config(p).dream.token_budget_usd == 12.5
+    _write(p, default_config_toml())
+    cfg = load_config(p)
+    assert "isolated" in cfg.layer_instances("graph")
 
 
-def test_dream_token_budget_usd_negative_names_key(tmp_path, monkeypatch):
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    p = tmp_path / "config.toml"
-    _write(p, "[dream]\ntoken_budget_usd = -1\n")
-    with pytest.raises(ConfigError, match=r"config\[dream.token_budget_usd\]"):
-        load_config(p)
-
-
-def test_dream_token_budget_usd_must_be_number(tmp_path, monkeypatch):
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    p = tmp_path / "config.toml"
-    _write(p, '[dream]\ntoken_budget_usd = "five"\n')
-    with pytest.raises(ConfigError, match=r"config\[dream.token_budget_usd\]"):
-        load_config(p)
+def test_default_config_toml_dream_model_is_qwen3_5_9b() -> None:
+    """AC3: the default dream model aligns on qwen3.5:9b."""
+    assert 'model = "qwen3.5:9b"' in default_config_toml()

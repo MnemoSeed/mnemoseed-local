@@ -58,7 +58,7 @@ def test_defaults_follow_the_local_ollama_track(monkeypatch) -> None:
     cfg = load_config(Path("/nonexistent/config.toml"))
     dream = cfg.llm["dream"]
     assert dream.driver == "ollama"
-    assert dream.model == "llama3.1:8b"
+    assert dream.model == "qwen3.5:9b"
     assert dream.params["base_url"] == "http://localhost:11434"
     assert set(cfg.llm) == set(LLM_ROLES)
 
@@ -119,7 +119,7 @@ def test_legacy_role_tables_are_accepted_ignored_with_deprecation_warning(
         cfg = load_config(p)
     assert set(cfg.llm) == {"dream"}
     assert cfg.llm["dream"].driver == "ollama"  # defaults intact
-    assert cfg.llm["dream"].model == "llama3.1:8b"
+    assert cfg.llm["dream"].model == "qwen3.5:9b"
     assert "deprecated" in caplog.text.lower()
 
 
@@ -143,7 +143,7 @@ def test_dream_llm_partial_override_inherits_driver_and_model(tmp_path, monkeypa
     cfg = load_config(p)
     dream = cfg.llm["dream"]
     assert dream.driver == "ollama"  # inherited
-    assert dream.model == "llama3.1:8b"  # inherited
+    assert dream.model == "qwen3.5:9b"  # inherited
     assert dream.params["api_key_env"] == "MY_ALT_KEY"
 
 

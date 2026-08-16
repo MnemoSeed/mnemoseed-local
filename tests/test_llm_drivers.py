@@ -159,7 +159,7 @@ def test_ollama_chat_sends_native_api_chat() -> None:
         return httpx.Response(
             200,
             json={
-                "model": "llama3.1:8b",
+                "model": "qwen3.5:9b",
                 "message": {"role": "assistant", "content": "[]"},
                 "usage": {"prompt_eval_count": 9, "eval_count": 3},
             },
@@ -170,7 +170,7 @@ def test_ollama_chat_sends_native_api_chat() -> None:
     result = llm.chat(system="sys", user="usr")
     assert result.text == "[]"
     assert result.driver == "ollama"
-    assert sent["body"]["model"] == "llama3.1:8b"
+    assert sent["body"]["model"] == "qwen3.5:9b"
     assert sent["body"]["stream"] is False
     assert sent["body"]["messages"] == [
         {"role": "system", "content": "sys"},
@@ -202,6 +202,53 @@ def test_ollama_server_error_is_typed_unavailable() -> None:
     llm._client = _client("http://127.0.0.1:11434", handler)
     with pytest.raises(LLMUnavailable):
         llm.chat(system="s", user="u")
+
+
+def test_ollama_forwards_num_ctx_and_num_predict_options() -> None:
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/chat"
+        sent["body"] = _body(request)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "[]"}})
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434", num_ctx=8192, num_predict=2048)
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    llm.chat(system="sys", user="usr")
+    assert sent["body"]["options"] == {"num_ctx": 8192, "num_predict": 2048}
+
+
+def test_ollama_non_option_params_never_enter_options() -> None:
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["body"] = _body(request)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "[]"}})
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434", num_ctx=4096, max_tokens=99)
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    llm.chat(system="sys", user="usr")
+    assert sent["body"]["options"] == {"num_ctx": 4096}
+
+
+def test_ollama_payload_unchanged_without_options_params() -> None:
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["body"] = _body(request)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "[]"}})
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    llm.chat(system="sys", user="usr")
+    assert sent["body"] == {
+        "model": "qwen3.5:9b",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "usr"},
+        ],
+        "stream": False,
+    }
 
 
 # ---------------------------------------------------------------- registration side effect

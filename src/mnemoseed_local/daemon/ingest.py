@@ -58,11 +58,12 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
         drain(req.session_id)
     # The dream chain then runs off the hot path, AFTER the drain persisted the
     # chunks: the ScorePool relay buffered any fired dream events during scoring
-    # and flushing here hands them to the trigger, so a launched dream's snapshot
-    # actually contains the turns that scored it (no empty-capture race).
+    # and flushing here hands them to the worker, so a launched dream's snapshot
+    # actually contains the turns that scored it (no empty-capture race). The
+    # flush only enqueues — the dream chain itself runs on the worker thread.
     relay = getattr(request.app.state, "dream_relay", None)
     if relay is not None:
-        relay.flush()
+        await relay.flush()
     return {
         "status": "settled",
         "session_id": req.session_id,

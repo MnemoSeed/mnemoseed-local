@@ -25,18 +25,15 @@ count); T6 must calibrate the budget against provider-reported usage before
 relying on the 32k cap as a hard cost bound.
 
 Cost telemetry is the NFR-2.2 substrate: DeltaReport carries per-dream token
-counts and an estimated USD cost from a configurable per-role price table
-(input / cache-read / output USD per million tokens). Defaults follow design/02
-section 6's short-increment track: DeepSeek V4 Flash via Fireworks at
-$0.14/M input, $0.028/M cache read, $0.28/M output (verified against the
-provider catalog).
+counts (delta, cache prefix, overflow, provider-reported output) — T3b removed
+the USD price model, the report is pure token bookkeeping.
 Pure arithmetic, no network.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from mnemoseed_local.dream.prompts import (
     PROMPT_VERSION,
@@ -48,6 +45,9 @@ from mnemoseed_local.dream.prompts import (
 from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
 from mnemoseed_local.llm.types import Usage
 
+if TYPE_CHECKING:
+    from mnemoseed_local.config import Config
+
 # The no-arg packer resolves its budget from the pending backlog (FR-2.5):
 # budget = clamp(backlog tokens, 5k, 32k) — measured before every dream, no
 # feedback loop, no persisted state (design/02 section 6). DEFAULT_DELTA_BUDGET
@@ -58,14 +58,19 @@ DELTA_BUDGET_FLOOR_TOKENS = 5000
 DELTA_BUDGET_CEILING_TOKENS = 32000
 
 
-def resolve_delta_budget(backlog_tokens: int) -> int:
+def resolve_delta_budget(backlog_tokens: int, *, ceiling_tokens: int | None = None) -> int:
     """FR-2.5: clamp the pending backlog into the 5k..32k delta budget band.
 
     The floor keeps micro-backlogs above the pathological empty-delta edge; the
     ceiling bounds the single-dream cloud cost to ~$0.0045 at short-increment
     pricing (NFR-2.2). Pure local arithmetic over a directly-observable backlog.
+
+    ``ceiling_tokens`` (T3a) overrides the module constant — the dynamic
+    ceiling becomes configurable while the constant stays the default value
+    source for the dream.delta_budget_ceiling_tokens config key.
     """
-    return max(DELTA_BUDGET_FLOOR_TOKENS, min(DELTA_BUDGET_CEILING_TOKENS, backlog_tokens))
+    ceiling = DELTA_BUDGET_CEILING_TOKENS if ceiling_tokens is None else ceiling_tokens
+    return max(DELTA_BUDGET_FLOOR_TOKENS, min(ceiling, backlog_tokens))
 
 
 _CJK_RANGES: tuple[tuple[int, int], ...] = (
@@ -91,39 +96,6 @@ def estimate_tokens(text: str) -> int:
     cjk = sum(1 for ch in text if _is_cjk(ch))
     other = len(text) - cjk
     return cjk + (other + 3) // 4
-
-
-# ---------------------------------------------------------------- cost model
-
-
-@dataclass(frozen=True)
-class PriceTable:
-    """Per-role cloud pricing for the delta cost model (USD per million tokens).
-
-    Defaults follow design/02 section 6's short-increment track: DeepSeek V4
-    Flash via Fireworks — $0.14/M input, $0.028/M cache read, $0.28/M output.
-    """
-
-    input_usd_per_m: float = 0.14
-    cache_read_usd_per_m: float = 0.028
-    output_usd_per_m: float = 0.28
-
-
-def estimate_cost_usd(
-    *,
-    delta_tokens: int,
-    prefix_tokens: int,
-    price: PriceTable,
-    output_tokens: int = 0,
-) -> float:
-    """Pure per-dream cloud cost estimate (NFR-2.2 substrate). The delta is
-    billed as fresh input, the cache-resident prefix at the cache-read rate, and
-    output at the configured output rate (zero before the call completes)."""
-    return (
-        delta_tokens * price.input_usd_per_m
-        + prefix_tokens * price.cache_read_usd_per_m
-        + output_tokens * price.output_usd_per_m
-    ) / 1_000_000.0
 
 
 # ---------------------------------------------------------------- graph digest seam
@@ -172,12 +144,11 @@ class DeltaRequest:
 
 @dataclass(frozen=True)
 class DeltaReport:
-    """Per-dream cost telemetry (NFR-2.2 substrate; surfaced by T6/console)."""
+    """Per-dream token telemetry (NFR-2.2 substrate; surfaced by T6/console)."""
 
     delta_tokens: int
     prefix_tokens: int
     overflow_count: int
-    estimated_cost_usd: float
     budget_tokens: int = 0  # FR-2.5: the resolved budget that produced this report
     provider_usage: Usage | None = None  # T6: provider-reported tokens, when the driver reports them
 
@@ -201,32 +172,38 @@ class DeltaPacker:
     FR-2.5: the no-arg packer resolves its budget dynamically from the pending
     backlog (``budget = clamp(backlog, 5k, 32k)``) before packing; an explicit
     ``budget_tokens`` still binds exactly as before (regression fence).
+
+    T3a: a bound ``config`` replaces the clamp's ceiling with the live
+    ``dream.delta_budget_ceiling_tokens`` key, hot-applied to the next pack.
     """
 
     def __init__(
         self,
         *,
         budget_tokens: int | None = None,
-        price: PriceTable | None = None,
         graph_digest: GraphDigest | None = None,
+        config: Config | None = None,
     ) -> None:
         # None means "dynamic FR-2.5 resolution at pack time"; an explicit int
         # keeps the legacy fixed-budget contract of every historic caller.
         self._budget = budget_tokens
-        self._price = price if price is not None else PriceTable()
         self._digest = graph_digest if graph_digest is not None else NullGraphDigest()
+        self._config = config
 
-    @property
-    def price(self) -> PriceTable:
-        """The active price table (for report / telemetry consumers)."""
-        return self._price
+    def _ceiling(self) -> int:
+        """The dynamic clamp's ceiling (T3a): the live config key when bound,
+        the module constant otherwise (the constant remains the value source
+        for the key's default)."""
+        if self._config is None:
+            return DELTA_BUDGET_CEILING_TOKENS
+        return self._config.dream.delta_budget_ceiling_tokens
 
     def _resolve_budget(self, snapshot: Snapshot) -> int:
         """Explicit budget wins; otherwise measure the backlog and clamp it."""
         if self._budget is not None:
             return self._budget
         backlog = estimate_tokens(render_chunk_blocks(snapshot.chunks))
-        return resolve_delta_budget(backlog)
+        return resolve_delta_budget(backlog, ceiling_tokens=self._ceiling())
 
     def pack(self, snapshot: Snapshot) -> DeltaRequest:
         """Assemble the delta request: pack whole chunks up to the budget,
@@ -260,15 +237,10 @@ class DeltaPacker:
         )
 
     def report(self, request: DeltaRequest) -> DeltaReport:
-        """Per-dream cost telemetry for a packed request (NFR-2.2 substrate)."""
+        """Per-dream token telemetry for a packed request (NFR-2.2 substrate)."""
         return DeltaReport(
             delta_tokens=request.delta_tokens,
             prefix_tokens=request.prefix_tokens,
             overflow_count=len(request.overflow_chunk_ids),
-            estimated_cost_usd=estimate_cost_usd(
-                delta_tokens=request.delta_tokens,
-                prefix_tokens=request.prefix_tokens,
-                price=self._price,
-            ),
             budget_tokens=request.budget_tokens,
         )

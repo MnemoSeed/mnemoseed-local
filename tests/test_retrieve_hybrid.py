@@ -76,6 +76,7 @@ def _chunk(
     time_bucket: str | None = None,
     entities: tuple[str, ...] = (),
     tools: tuple[str, ...] = (),
+    consolidated: bool = False,
     profile: str = _PROFILE,
 ) -> ChunkStamp:
     return ChunkStamp(
@@ -101,7 +102,7 @@ def _chunk(
         ),
         decay_weight=decay,
         score=0.5,
-        consolidated=False,
+        consolidated=consolidated,
         ingested_at=1.0,
         turn_start=1,
         turn_end=2,
@@ -231,6 +232,40 @@ def test_vector_track_excludes_decay_below_floor(stack) -> None:
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_high" in ids
     assert "c_low" not in ids
+
+
+def test_vector_track_excludes_consolidated_chunks(stack) -> None:
+    """AC1: a chunk the dream merge marked consolidated exits the recall
+    surface — retained as evidence, never re-surfaced as a candidate — while
+    unconsolidated chunks keep appearing (status quo)."""
+    _write(
+        stack,
+        _chunk("c_merged", "the LanceDb loader caches vectors", decay=0.9, entities=("LanceDb",)),
+    )
+    stack.vector.mark_consolidated(["c_merged"])
+    _write(
+        stack,
+        _chunk("c_fresh", "the LanceDb loader caches vectors fresh", decay=0.9, entities=("LanceDb",)),
+    )
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    ids = {c.id for c in _chunk_candidates(result)}
+    assert "c_fresh" in ids
+    assert "c_merged" not in ids
+
+
+def test_consolidated_chunk_not_duplicated_by_graph_node(stack) -> None:
+    """AC2: one fact kept both as a merged chunk (consolidated) and its graph
+    node double — recall surfaces the graph node only, never the chunk."""
+    _write(
+        stack,
+        _chunk("c_digest", "prefers vim for edits", decay=0.9, entities=("LanceDb",)),
+    )
+    stack.vector.mark_consolidated(["c_digest"])
+    stack.graph.upsert_node(_node("g_digest", NodeType.PREFERENCE, ("LanceDb",), decay=0.9))
+    result = _recall(stack, "prefers vim for edits", _query_cues(("LanceDb",)))
+    ids = {c.id for c in result.candidates}
+    assert "g_digest" in ids
+    assert "c_digest" not in ids
 
 
 def test_vector_track_scopes_to_profile(stack) -> None:
