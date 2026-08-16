@@ -93,3 +93,19 @@
 - 五任务 QA 全过；`uv run pytest -q`、`ruff check`、`ruff format --check`、`mypy src` 干净；
 - 脚本 `--dry-run` 人工走查留证；OpenCode 插件真实宿主联调为人工验证项（收口记录）；
 - 单 commit 收口（orchestrator 执行）：`phase A3: install scripts, opencode hook adapter, MCP gateway skeleton, CI alignment, model-missing UX`。
+
+## 收口记录（2026-08-17）
+
+- 收口 commit：`640340e`（21 文件，+2768/-6）。最终 1000 passed / 5 skipped（57.72s），ruff/format/mypy 干净；基线 908 → 增量 +92。
+- QA 逐任务对抗验收：T5 PASS（7/7 变异击杀）、T3 PASS（6/6 变异击杀 + daemon-down 实弹转录）、T4 PASS、**T1 FAIL→修复后 PASS**（D-T1-1：ps1 未知参数落入 `$args` 静默放行，`-DryRunn` 型拼写错误会走真实安装路径 → `param()` 后硬拒 leftover `$args`，pwsh7/PS5.1 双复验）、**T2 FAIL→修复后 PASS**（D-T2-1/2/3：settle 触发组 / settle-once 抑重 / 运行期 HOST_ID 三枚插件变异存活——静态契约只钉注释表与注册键 → 补 4 枚代码级钉（case 三元组、dedup/rollback 哨卫、HOST_ID 常量行、端点调用点计数），复跑三变异全击杀；实现侧无需改动，附 NIT-4 一并吸收）。
+- 人工验证留证：脚本 dry-run 双 shell 走查（本机两次 + 隔离 HOME 零副作用快照比对）；hook CLI 全周期（XDG 重定向，安装字节级一致 / 幂等 / 卸载 / status 三态 / 真实配置目录只读性）；`mcp` 管道握手转录（initialize → initialized → tools/list → daemon-down 时 tools/call isError:true 循环存活，EOF 退出 0）；wheel 产物 plugin.ts 字节级一致。
+- 待办人工验证项：真实 OpenCode 会话中插件端联调（安装至个人 `~/.config/opencode` 属用户侧操作，未由本流程代劳）；CI `install-script-smoke` job 首次远端运行。
+
+## QA 观察项存档（非阻断，供 Phase B 分诊）
+
+1. `install.sh --tier=`（空等号式）被接受为"未指定"，与裸 `--tier` 报错不对称——无危害，提示不打印而已。
+2. `hosts/install.daemon_reachable` 把任意 HTTP 响应（含 5xx）视为可达——传输层可达的读法成立，语义级健康判定留给 later。
+3. `install.sh` exec 位无法在 Windows 侧落 git；CI 与用户均经 `sh install.sh` 调用，影响为零。
+4. T5 消息文案收敛：doctor 与 `up` 共享同一 `_dream_model_check` 文案源（`error: ollama server unreachable (<error>); start ollama first`），单一出处。
+5. T2 插件目录采用 `plugin/`（单数）——OpenCode 源码 glob 同时认 `plugin/` 与 `plugins/`；文档写复数，源码两者皆自动发现，已在 install.py 注释内说明。
+6. hook status 的 daemon 探测只触 `/healthz`（健康内容不解析）。
