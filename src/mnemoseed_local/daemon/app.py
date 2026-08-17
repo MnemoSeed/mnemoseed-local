@@ -59,6 +59,7 @@ from mnemoseed_local.dream import (
     TokenLedger,
     resume_boundary,
 )
+from mnemoseed_local.dream.pipeline import RunCompletion
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -73,6 +74,7 @@ from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.schema.turn import Turn, TurnRole
 from mnemoseed_local.storage.factory import Stores, build_stores
 from mnemoseed_local.storage.ports import (
+    AuditEntry,
     AuditFilter,
     CapabilityIssue,
     GraphStore,
@@ -426,7 +428,42 @@ def _build_capture(
         on_committed=trigger.on_merge_committed,
         config=config,
     )
-    pipeline = DreamPipeline(trigger=trigger, snapshotter=snapshotter, reflector=reflector, merger=merger)
+
+    def _record_run_completion(completion: RunCompletion) -> None:
+        """The user-facing dream log: complete the run row (finish + metered
+        tokens) and land a queryable audit entry. Best-effort — a journal
+        surface failure never disturbs a committed merge."""
+        try:
+            stores.meta.finish_dream_run(
+                completion.run_id,
+                finished_at=completion.finished_at,
+                tokens=completion.tokens,
+                cost=0.0,
+                dropped_count=0,
+            )
+            stores.meta.audit_append(
+                AuditEntry(
+                    actor="dream",
+                    action="dream_committed",
+                    detail={
+                        "run_id": completion.run_id,
+                        "profile_id": completion.profile_id,
+                        "duration_s": round(completion.finished_at - completion.started_at, 1),
+                        "tokens": completion.tokens,
+                    },
+                    at=completion.finished_at,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("run-completion journal failed for %s: %s", completion.run_id, exc)
+
+    pipeline = DreamPipeline(
+        trigger=trigger,
+        snapshotter=snapshotter,
+        reflector=reflector,
+        merger=merger,
+        on_run_committed=_record_run_completion,
+    )
     worker = DreamWorker(trigger)
     relay = _DreamRelay(worker)
     snapshotter.on_ready = pipeline.on_snapshot_ready

@@ -770,6 +770,20 @@ class MetaStore(Protocol):
         """
         raise NotImplementedError
 
+    def finish_dream_run(
+        self,
+        run_id: str,
+        *,
+        finished_at: float,
+        tokens: int,
+        cost: float,
+        dropped_count: int,
+    ) -> None:
+        """The dream log surface: complete a run row with finish time, metered
+        tokens and cost at merge commit. Unknown run ids are a silent no-op
+        (same contract as update_dream_run_model)."""
+        raise NotImplementedError
+
     def add_token_usage(self, profile_id: str, year_month: str, tokens: int) -> None:
         """FR-2.5b: atomically increment a profile's monthly dream-token counter."""
         raise NotImplementedError

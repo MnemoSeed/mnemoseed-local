@@ -380,6 +380,24 @@ def test_dream_run_model_recorded_after_resolution(driver):
     driver.update_dream_run_model("no-such-run", "kimi-k3")
 
 
+def test_dream_run_finish_completes_the_row(driver):
+    """The dream log surface: a committed run must carry finished_at / tokens /
+    cost as a complete record (live finding: rows stopped at "started" forever,
+    tokens=0, finished_at NULL — the finish call simply did not exist)."""
+    driver.record_dream_run(DreamRun(run_id="run-fin", session_id="s1", started_at=100.0))
+    driver.finish_dream_run("run-fin", finished_at=200.0, tokens=1234, cost=0.0, dropped_count=0)
+    run = driver.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0]
+    assert run.finished_at == 200.0
+    assert run.tokens == 1234
+    assert run.cost == 0.0
+    assert run.dropped_count == 0
+    # a second finish overwrites cleanly (idempotent seam at the caller level)
+    driver.finish_dream_run("run-fin", finished_at=300.0, tokens=200, cost=0.0, dropped_count=0)
+    assert driver.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0].tokens == 200
+    # unknown run ids follow the same silent no-op contract the model marker uses
+    driver.finish_dream_run("no-such-run", finished_at=400.0, tokens=1, cost=0.0, dropped_count=0)
+
+
 # ---------------------------------------------------------------- migrations
 
 

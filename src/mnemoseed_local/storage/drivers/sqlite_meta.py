@@ -501,6 +501,21 @@ class SqliteMetaDriver:
             (model_id, run_id),
         )
 
+    def finish_dream_run(
+        self,
+        run_id: str,
+        *,
+        finished_at: float,
+        tokens: int,
+        cost: float,
+        dropped_count: int,
+    ) -> None:
+        """Complete a run row at merge commit (finish time + metered totals)."""
+        self._conn.execute(
+            "UPDATE dream_runs SET finished_at = ?, tokens = ?, cost = ?, dropped_count = ? WHERE run_id = ?",
+            (iso8601_utc(finished_at), int(tokens), float(cost), int(dropped_count), run_id),
+        )
+
     # ------------------------------------------------------------ dream token ledger (FR-2.5b)
 
     def add_token_usage(self, profile_id: str, year_month: str, tokens: int) -> None:

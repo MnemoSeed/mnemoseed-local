@@ -318,6 +318,22 @@ def test_dream_run_model_update_records_resolved_model(stack) -> None:
     stack.meta.update_dream_run_model("no-such-run", "kimi-k3")  # unknown run: silent no-op
 
 
+def test_dream_run_finish_completes_the_row(stack) -> None:
+    """The dream log surface: a committed run completes with finish time and
+    metered totals (the completion parity of the model pin at reflect start)."""
+    stack.meta.record_dream_run(DreamRun(run_id="run-fin", session_id="s1", started_at=100.0))
+    stack.meta.finish_dream_run("run-fin", finished_at=200.0, tokens=1234, cost=0.0, dropped_count=0)
+    run = stack.meta.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0]
+    assert run.finished_at == 200.0
+    assert run.tokens == 1234
+    assert run.dropped_count == 0
+    # re-finish overwrites cleanly; unknown run ids follow the model pin's
+    # silent no-op contract
+    stack.meta.finish_dream_run("run-fin", finished_at=300.0, tokens=200, cost=0.0, dropped_count=0)
+    assert stack.meta.list_dream_runs(DreamRunFilter(session_id="s1"), Page(0, 50)).items[0].tokens == 200
+    stack.meta.finish_dream_run("no-such-run", finished_at=400.0, tokens=1, cost=0.0, dropped_count=0)
+
+
 def test_schema_version_and_migrate_forward_only(stack) -> None:
     """meta's head is v8 (frozen v1 schema + v3 profile_score_pool + v4
     dream_token_ledger + v6 identity users/token_hash + v7 profile archive

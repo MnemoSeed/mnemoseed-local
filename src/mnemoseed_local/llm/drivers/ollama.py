@@ -134,10 +134,22 @@ class OllamaLLM:
 
 
 def _usage_from(body: Any) -> Usage | None:
+    """Ollama's native /api/chat reports token counts at the RESPONSE ROOT
+    (prompt_eval_count / eval_count), never inside a "usage" key — the driver's
+    previous nested-only read silently dropped every provider token (verified
+    against live ollama 0.32). A {"usage": {...}} body stays honored for nested
+    shapes some middleware emits."""
+    prompt = body.get("prompt_eval_count")
+    completion = body.get("eval_count")
+    if prompt is not None or completion is not None:
+        return Usage(
+            prompt_tokens=int(prompt) if prompt is not None else None,
+            completion_tokens=int(completion) if completion is not None else None,
+        )
     data = body.get("usage")
     if not isinstance(data, dict):
         return None
     return Usage(
-        prompt_tokens=data.get("prompt_eval_count"),
-        completion_tokens=data.get("eval_count"),
+        prompt_tokens=data.get("prompt_eval_count", data.get("prompt_tokens")),
+        completion_tokens=data.get("eval_count", data.get("completion_tokens")),
     )

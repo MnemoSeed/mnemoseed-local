@@ -168,6 +168,7 @@ def _pipeline(
     reflector: object | None = None,
     merger: object | None = None,
     on_outcome: object | None = None,
+    on_run_committed: object | None = None,
 ) -> DreamPipeline:
     return DreamPipeline(
         trigger=trigger or DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=True),
@@ -175,6 +176,7 @@ def _pipeline(
         reflector=reflector or _SpyReflector(ReflectOutcome(ok=True, result=_result())),
         merger=merger or _SpyMerger(),
         on_outcome=on_outcome,  # type: ignore[arg-type]
+        on_run_committed=on_run_committed,  # type: ignore[arg-type]
     )
 
 
@@ -220,6 +222,122 @@ def test_pipeline_reflect_failure_degrades_never_merges(tmp_path: Path) -> None:
 
     assert reflector.calls == [snap]  # reflect was attempted, then degraded
     assert merger.calls == []  # nothing handed to the split writer
+
+
+# ------------------------------------------------------------- run completion (dream log)
+
+
+def test_committed_merge_reports_run_completion(tmp_path: Path) -> None:
+    """The dream journal surface (user-facing log): a committed dream reports
+    one completion record carrying run id, epoch finish time and the token
+    total (delta + provider-reported completion, the same formula the monthly
+    ledger meters)."""
+    import time
+
+    from mnemoseed_local.dream.delta import DeltaReport
+    from mnemoseed_local.llm.types import Usage
+    from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+
+    def _snap_() -> Snapshot:
+        return Snapshot(
+            snapshot_id=_SNAP_ID,
+            profile_id=_PROFILE,
+            turn_range=_RANGE,
+            chunks=(
+                SnapshotChunk.from_stamp(
+                    ChunkStamp(
+                        chunk_id="c1",
+                        profile_id=_PROFILE,
+                        text="I prefer dark mode",
+                        cognitive_tier=CognitiveTier.TIER_1,
+                        model_id="test-model",
+                        cues=Cues(entities=[]),
+                        provenance=Provenance(asserted_by="user", session_id="s1", source="manual"),
+                        turn_start=0,
+                        turn_end=1,
+                    )
+                ),
+            ),
+            created_at=time.time(),
+            phases=frozenset({"snapshot_done"}),
+        )
+
+    report = DeltaReport(
+        delta_tokens=1000,
+        prefix_tokens=200,
+        overflow_count=0,
+        provider_usage=Usage(prompt_tokens=900, completion_tokens=50),
+    )
+    reflector = _SpyReflector(ReflectOutcome(ok=True, result=_result(), report=report))
+    completions: list[object] = []
+    pipeline = _pipeline(
+        reflector=reflector,
+        merger=_SpyMerger(),
+        on_run_committed=lambda rc: completions.append(rc),
+    )
+
+    pipeline.run(_snap_())
+
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion.run_id == _SNAP_ID
+    assert completion.profile_id == _PROFILE
+    assert abs(completion.finished_at - time.time()) < 60
+    assert completion.finished_at > 0
+    # tokens: delta estimate + provider-reported completion (ledger formula)
+    assert completion.tokens == 1050
+
+
+def test_degraded_reflect_never_reports_run_completion() -> None:
+    completions: list[object] = []
+    pipeline = _pipeline(
+        reflector=_SpyReflector(ReflectOutcome(ok=False, error="model unreachable")),
+        on_run_committed=lambda rc: completions.append(rc),
+    )
+    pipeline.run(_snap(_stamp("I prefer dark mode")))
+    assert completions == []
+
+
+def test_deferred_merge_never_reports_run_completion() -> None:
+    """An empty result produced from a truncated delta defers the merge (the
+    safe-clear guard): the dream did not commit, so no completion record."""
+    empty_overflow_result = ReflectionResult(
+        snapshot_id=_SNAP_ID,
+        profile_id=_PROFILE,
+        turn_range=_RANGE,
+        prompt_version="v1",
+        triples=(),
+        overflow_chunk_ids=("c1",),
+    )
+    completions: list[object] = []
+    pipeline = _pipeline(
+        reflector=_SpyReflector(ReflectOutcome(ok=True, result=empty_overflow_result)),
+        on_run_committed=lambda rc: completions.append(rc),
+    )
+    pipeline.run(_snap(_stamp("long enough text to pack")))
+    assert completions == []
+
+
+def test_already_committed_merge_never_reports_run_completion() -> None:
+    """The merger's own marker gate (idempotent re-entry via a journal reload):
+    a skipped merge must not double-count in the dream log."""
+    committed_snap = _snap(_stamp("I prefer dark mode"))
+    committed_snap = committed_snap.__class__(
+        **{**committed_snap.__dict__, "phases": frozenset({"snapshot_done", "merge_done"})}
+    )
+
+    class _SkippedMerger:
+        def merge(self, snapshot, result):
+            return MergeOutcome(ok=True, skipped=True)
+
+    completions: list[object] = []
+    pipeline = _pipeline(
+        reflector=_SpyReflector(ReflectOutcome(ok=True, result=_result())),
+        merger=_SkippedMerger(),  # type: ignore[arg-type]
+        on_run_committed=lambda rc: completions.append(rc),
+    )
+    pipeline.run(_snap(_stamp("I prefer dark mode")))
+    assert completions == []
 
 
 # ---------------------------------------------------------------- merge-boundary recovery

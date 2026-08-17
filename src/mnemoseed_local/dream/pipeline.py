@@ -17,9 +17,12 @@ instead of double-writing.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
+from mnemoseed_local.dream.delta import DeltaReport
 from mnemoseed_local.dream.merge import Merger
 from mnemoseed_local.dream.reflect import ReflectionResult, ReflectOrchestrator, result_from_payload
 from mnemoseed_local.dream.snapshot import (
@@ -31,6 +34,32 @@ from mnemoseed_local.dream.trigger import DreamTrigger
 from mnemoseed_local.storage.ports import TurnRange
 
 logger = logging.getLogger("mnemoseed_local.dream.pipeline")
+
+
+@dataclass(frozen=True)
+class RunCompletion:
+    """One committed dream's completion record for the dream log surface.
+
+    ``run_id`` mirrors the snapshot id (the run row's registered id). ``tokens``
+    is delta estimate + provider-reported completion — the same total the
+    monthly ledger meters (0 when the usage side is unknowable, e.g. a
+    merge-boundary journal recovery).
+    """
+
+    run_id: str
+    profile_id: str
+    started_at: float
+    finished_at: float
+    tokens: int
+
+
+def _completion_tokens(report: DeltaReport | None) -> int:
+    if report is None:
+        return 0
+    completion = 0
+    if report.provider_usage is not None and report.provider_usage.completion_tokens is not None:
+        completion = report.provider_usage.completion_tokens
+    return report.delta_tokens + completion
 
 
 class _Snapshotter(Protocol):
@@ -59,11 +88,13 @@ class DreamPipeline:
         reflector: ReflectOrchestrator,
         merger: Merger,
         on_outcome: Callable[[str, TurnRange, bool, str | None], None] | None = None,
+        on_run_committed: Callable[[RunCompletion], None] | None = None,
     ) -> None:
         self._trigger = trigger
         self._snapshotter = snapshotter
         self._reflector = reflector
         self._merger = merger
+        self._on_run_committed = on_run_committed
         # Wired after construction: the scheduler is built after the pipeline in
         # the daemon lifespan, exactly like ``FileSnapshotter.on_ready``.
         self.on_outcome = on_outcome
@@ -100,7 +131,7 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error)
             return
-        self._merge(snapshot, outcome.result)
+        self._merge(snapshot, outcome.result, outcome.report)
 
     def _run_merge_boundary(self, snapshot: Snapshot) -> None:
         """Recovered at the merge boundary: merge ONLY, re-loading the persisted
@@ -120,9 +151,14 @@ class DreamPipeline:
             )
             self._fail(snapshot, "merge-boundary snapshot has no recoverable result")
             return
-        self._merge(snapshot, result)
+        self._merge(snapshot, result, None)
 
-    def _merge(self, snapshot: Snapshot, result: ReflectionResult) -> None:
+    def _merge(
+        self,
+        snapshot: Snapshot,
+        result: ReflectionResult,
+        report: DeltaReport | None = None,
+    ) -> None:
         if not result.triples and result.overflow_chunk_ids:
             # Engine-side insurance (D1, FR-2.5 never-drop invariant): the
             # result is empty BECAUSE the delta was truncated, so committing it
@@ -149,6 +185,23 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error)
             return
+        if outcome.committed and self._on_run_committed is not None:
+            now = time.time()
+            completion = RunCompletion(
+                run_id=snapshot.snapshot_id,
+                profile_id=snapshot.profile_id,
+                started_at=snapshot.created_at,
+                finished_at=now,
+                tokens=_completion_tokens(report),
+            )
+            logger.info(
+                "dream committed for %s (run %s): %.1fs, tokens=%d",
+                completion.profile_id,
+                completion.run_id,
+                completion.finished_at - completion.started_at,
+                completion.tokens,
+            )
+            self._on_run_committed(completion)
         if self.on_outcome is not None:
             self.on_outcome(snapshot.profile_id, snapshot.turn_range, True, None)
 

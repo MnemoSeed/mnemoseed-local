@@ -181,6 +181,40 @@ def test_ollama_chat_sends_native_api_chat() -> None:
     assert result.usage.completion_tokens == 3
 
 
+def test_ollama_chat_reads_native_root_token_counts() -> None:
+    """Live-wire shape: ollama's native /api/chat reports token counts and
+    durations at the RESPONSE ROOT (prompt_eval_count / eval_count /
+    total_duration), never inside a "usage" key. The driver's usage record must
+    read them (live grepp: before this fix usage was always None and every
+    dream logged zero provider tokens)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/chat"
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen3.5:9b",
+                "created_at": "2026-08-17T12:38:23.6Z",
+                "message": {"role": "assistant", "content": "[]"},
+                "done": True,
+                "done_reason": "stop",
+                "total_duration": 7144577800,
+                "load_duration": 6665313800,
+                "prompt_eval_count": 91,
+                "prompt_eval_duration": 172078000,
+                "eval_count": 27,
+                "eval_duration": 303467000,
+            },
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    result = llm.chat(system="sys", user="usr")
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 91
+    assert result.usage.completion_tokens == 27
+
+
 def test_ollama_check_reports_tags() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/tags"
