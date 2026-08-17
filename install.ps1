@@ -14,12 +14,13 @@
        print a manual-download hint and exit non-zero)
     2. headless ollama server    (serve the dream route invisibly: register a
        logon scheduled task `OllamaHeadlessServe` running `ollama serve`,
-       back up the stock Startup-folder tray shortcut (reversible, into
-       ~/.mnemoseed-local/backups/), and start a serve now when the API is
-       not yet live. Best-effort: a scheduling failure only prints a hint —
-       the stock tray still serves the API as before. Linux/macOS already get
-       a background service from ollama's own installers (systemd), so
-       install.sh needs no such step)
+       and start a serve now when the API is not yet live. The stock
+       tray-autostart shortcut is only noted in a hint — the installer never
+       relocates another product's autostart; the tray GUI stays a
+       user-owned, optional surface. Best-effort: a scheduling
+       failure only prints a hint — the stock tray still serves the API as
+       before. Linux/macOS already get a background service from ollama's
+       own installers (systemd), so install.sh needs no such step)
     3. detect / install uv       (official installer; well-known install dir is
        prepended to the current process PATH)
     4. install / upgrade the CLI (uv tool install | uv tool upgrade)
@@ -75,7 +76,6 @@ $UvBinDir = Join-Path $env:USERPROFILE '.local\bin'
 $OllamaBinDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
 $OllamaServeTaskName = 'OllamaHeadlessServe'
 $OllamaTrayStartupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk'
-$BackupDir = Join-Path $ConfigHome 'backups'
 $DefaultModel = 'qwen3.5:9b'
 
 # --- helpers ---------------------------------------------------------------
@@ -184,10 +184,10 @@ if ($DryRun) {
     }
     if (Test-Path -LiteralPath $OllamaTrayStartupLnk) {
         Write-Host "    probe: stock Startup-folder tray shortcut FOUND ($OllamaTrayStartupLnk)"
-        Write-Host "    plan:  move it to $BackupDir (reversible) so the tray GUI does not auto-start"
+        Write-Host '    plan:  print a hint only (mnemoseed never relocates another product''s autostart; the tray stays user-owned)'
     } else {
         Write-Host '    probe: no stock Startup-folder tray shortcut'
-        Write-Host '    plan:  nothing to suppress'
+        Write-Host '    plan:  nothing to note'
     }
     try {
         $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
@@ -259,16 +259,18 @@ if (Test-CommandExists 'ollama') {
 #
 # The dream route talks to ollama over plain localhost HTTP; no user ever
 # needs the desktop tray. This step makes the invisible-server default real:
-# a logon scheduled task runs `ollama serve` (best-effort restarts), the
-# stock Startup-folder tray shortcut is backed up (reversible) so the tray
-# GUI does not auto-start, and a serve is started now when the API is still
-# down. Best-effort throughout: any scheduling failure prints one hint line
-# and never fails the install — the stock tray keeps serving the API anyway.
+# a logon scheduled task runs `ollama serve` (best-effort restarts), and a
+# serve is started now when the API is still down. The stock Startup-folder
+# tray shortcut is only reported in a hint — mnemoseed never relocates
+# another product's autostart; the tray GUI stays a user-owned, optional
+# surface (and its child serve is the stock path that also works). Best-
+# effort throughout: any scheduling failure prints one hint line and never
+# fails the install.
 
 Write-Host '[2/8] headless ollama server'
 
 function Install-HeadlessOllamaServe {
-    param([string]$TaskName, [string]$TrayLnk, [string]$BackupRoot)
+    param([string]$TaskName, [string]$TrayLnk)
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($null -ne $task) {
         Write-Host "      scheduled task $TaskName already registered - skipping"
@@ -288,14 +290,8 @@ function Install-HeadlessOllamaServe {
         }
     }
     if (Test-Path -LiteralPath $TrayLnk) {
-        try {
-            New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
-            $target = Join-Path $BackupRoot 'Ollama.lnk'
-            Move-Item -LiteralPath $TrayLnk -Destination $target -Force
-            Write-Host "      stock tray autostart moved to $target (restore by moving it back) - tray GUI will not auto-start"
-        } catch {
-            Write-Host "      note: could not suppress the stock tray autostart ($($_.Exception.Message)); it is harmless (the tray also starts the server)"
-        }
+        Write-Host "      note: the stock tray GUI is registered for autostart ($TrayLnk); mnemoseed does not need it — delete"
+        Write-Host "      that shortcut yourself if you want no tray UI (mnemoseed never relocates it for you)."
     }
     try {
         $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
@@ -317,7 +313,7 @@ function Install-HeadlessOllamaServe {
     }
 }
 
-Install-HeadlessOllamaServe -TaskName $OllamaServeTaskName -TrayLnk $OllamaTrayStartupLnk -BackupRoot $BackupDir
+Install-HeadlessOllamaServe -TaskName $OllamaServeTaskName -TrayLnk $OllamaTrayStartupLnk
 
 # --- step 3: uv -------------------------------------------------------------
 

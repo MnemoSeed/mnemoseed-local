@@ -24,14 +24,14 @@ CLI. Install script + MCP gateway + packaging polish land in Phase A3.
 
 One command, zero dependencies to prepare: the orchestrator detects and
 installs ollama + uv when missing, registers ollama as a headless background
-server (no desktop app required — on Windows a logon scheduled task runs
-`ollama serve` and the stock tray-autostart is backed up to
-`~/.mnemoseed-local/backups/`; Linux gets the systemd service from ollama's
-own installer; the tray GUI stays optional and restorable), installs the
-`mnemoseed-local` CLI via `uv tool`, runs `init` + `doctor`, and — only after
-your confirmation — pulls the dream model. Idempotent; pass `--dry-run` /
-`-DryRun` to preview the plan with no side effects, and `--yes` / `-Yes` to
-skip the model-pull prompt.
+server (on Windows a logon scheduled task runs `ollama serve`; Linux gets the
+systemd service from ollama's own installer; the stock tray GUI stays a
+user-owned, optional surface — the installer only hints at it, never
+relocates another product's autostart), installs the `mnemoseed-local` CLI
+via `uv tool`, runs `init` + `doctor`, and — only after your confirmation —
+pulls the dream model. Idempotent; pass `--dry-run` / `-DryRun` to preview
+the plan with no side effects, and `--yes` / `-Yes` to skip the model-pull
+prompt.
 
 Windows (PowerShell 5.1+):
 
