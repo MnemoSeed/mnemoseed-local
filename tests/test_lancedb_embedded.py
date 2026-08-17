@@ -285,6 +285,27 @@ def test_search_session_and_entity_filters(store, embedder):
     assert {hit.chunk.chunk_id for hit in multi_entity} == {"e1", "e2"}
 
 
+def test_search_entity_filter_tolerates_chunks_without_entity_cues(store, embedder):
+    """D2 writer/reader seam: a chunk stored with NO entity cues carries
+    entities_filter = '' — missing evidence, not a contradiction. The recall
+    surface (entities_allow_missing=True) keeps it alongside positive matches;
+    the listing/strict default (flag off) still excludes it."""
+    _write(store, embedder, _make("e_noent", "rocket launch tower", session="s4", entities=()))
+    _write(store, embedder, _make("e_ent", "monsoon launch pad", session="s5", entities=("space",)))
+    query = embedder.embed("launch")
+
+    strict = store.search(query.dense, query.sparse, ChunkFilter(profile_id="alice", entities=("space",)), 5)
+    assert {hit.chunk.chunk_id for hit in strict} == {"e_ent"}
+
+    tolerant = store.search(
+        query.dense,
+        query.sparse,
+        ChunkFilter(profile_id="alice", entities=("space",), entities_allow_missing=True),
+        5,
+    )
+    assert {hit.chunk.chunk_id for hit in tolerant} == {"e_ent", "e_noent"}
+
+
 def test_search_ingested_time_window(store, embedder):
     _write(store, embedder, _make("old", "ancient text", ingested_at=100.0))
     _write(store, embedder, _make("mid", "middle text", ingested_at=200.0))

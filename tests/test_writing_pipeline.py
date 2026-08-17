@@ -5,6 +5,7 @@ inner ScoringPipeline. Outcomes land in stats.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
 import pytest
@@ -138,6 +139,31 @@ def test_submit_stays_o1_write_happens_on_drain() -> None:
     assert len(outcomes) == 1
     assert outcomes[0].kind is WriteOutcomeKind.NEW_CHUNK
     assert len(store.upserts) == 1
+
+
+def test_default_clock_stamps_are_epoch_domain() -> None:
+    """D3 (live-drain finding): persisted stamp timestamps — ``ingested_at``,
+    ``provenance.asserted_at``, provenance event times — are epoch fields: the
+    decay sweeper, ingest-time windows and provenance audit all read epochs.
+    A monotonic default clock mixes domains: the chunk's baseline lands at
+    ~boot-uptime seconds, which the next decay sweep misreads as ~57 years of
+    staleness and silently zeroes (observed live: capture -> boot sweep ->
+    decay_weight 1.0 -> 0.0).
+    """
+    store = _FakeVectorStore()
+    inner = ScoringPipeline(
+        scorer=TurnScorer(embedder=SyntheticEmbedder()), pool=ScorePool(clock=time.monotonic)
+    )
+    # NO clock injection — the production serving shape (daemon wiring).
+    pipe = WritingPipeline(store, inner)
+    pipe.submit_turn(_turn("我 review 喜欢简洁"))
+
+    assert [o.kind for o in pipe.drain(SESSION)] == [WriteOutcomeKind.NEW_CHUNK]
+
+    stamp = store.upserts[0]
+    assert abs(stamp.ingested_at - time.time()) < 300
+    assert abs(stamp.provenance.asserted_at - time.time()) < 300
+    assert abs(stamp.provenance.history[0].at - time.time()) < 300
 
 
 def test_stats_track_outcome_kinds() -> None:

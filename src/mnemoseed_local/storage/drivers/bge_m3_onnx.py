@@ -115,6 +115,12 @@ class BgeM3OnnxEmbedder:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._encoder_repo = encoder_repo
         self._sparse_repo = sparse_repo
+        # repo-relative artifact names (the fetch paths — the Xenova encoder
+        # lives under the repo's onnx/ subdirectory); the local cache keeps
+        # basenames only, so the on-disk/resume layout is flat
+        self._encoder_model = encoder_model
+        self._encoder_tokenizer = encoder_tokenizer
+        self._sparse_filename = sparse_filename
         self._model_file = self._dir / Path(encoder_model).name
         self._tokenizer_file = self._dir / Path(encoder_tokenizer).name
         self._sparse_file = self._dir / Path(sparse_filename).name
@@ -144,9 +150,9 @@ class BgeM3OnnxEmbedder:
         machine with the model cached never needs the network.
         """
         downloads = (
-            (self._tokenizer_file.name, self._tokenizer_file, self._encoder_repo),
-            (self._model_file.name, self._model_file, self._encoder_repo),
-            (self._sparse_file.name, self._sparse_file, self._sparse_repo),
+            (self._encoder_tokenizer, self._tokenizer_file, self._encoder_repo),
+            (self._encoder_model, self._model_file, self._encoder_repo),
+            (self._sparse_filename, self._sparse_file, self._sparse_repo),
         )
         for filename, dest, repo in downloads:
             if not self._is_complete(dest):

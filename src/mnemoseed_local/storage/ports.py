@@ -68,7 +68,13 @@ class WeightUpdate:
 
 @dataclass(frozen=True)
 class ChunkFilter:
-    """Metadata filter for vector reads. profile_id is always explicit."""
+    """Metadata filter for vector reads. profile_id is always explicit.
+
+    ``entities_allow_missing`` is the recall-surface reading of the entity
+    gate (D2): a chunk with NO stored entity cues is absence of evidence, not
+    a contradiction, so it stays matchable. The default (strict exact-tag
+    matching) governs listing/audit surfaces.
+    """
 
     profile_id: str
     min_decay: float = 0.0
@@ -80,6 +86,7 @@ class ChunkFilter:
     entities: tuple[str, ...] = ()
     consolidated: bool | None = None
     needs_reconcile: bool | None = None  # console reconcile-queue filter (PRD-07)
+    entities_allow_missing: bool = False
 
 
 @dataclass(frozen=True)

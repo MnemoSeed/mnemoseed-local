@@ -229,6 +229,92 @@ def test_capture_recall_dream_config_audit_loop(config_path: Path) -> None:
         assert any(item["actor"] == "cli" for item in audit["items"])
 
 
+def test_daemon_write_context_fills_entity_cues_from_turn_text() -> None:
+    """D2 writer fill (live-drain finding): capture-written chunks must carry
+    the entity cues the recall-side entity gate reads — the /memory/remember
+    path already extracts cues from the pinned text; the funnel path must not
+    write entity-less stamps, or every entity-bearing query excludes them."""
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id=PROFILE,
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        steps=[
+            TurnStep(role=TurnRole.USER, content="以后调试 MnemoSeed capture 链路一律先检查缓存"),
+        ],
+    )
+
+    ctx = _daemon_write_context(turn)
+
+    assert "MnemoSeed" in ctx.entities
+
+
+def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
+    """D2 end-to-end on the serving surface: a durable turn drained into the
+    store must be reachable by a query whose cues extract entities (the
+    scenario that 100%-missed before the fix)."""
+    with _boot(config_path) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "以后调试 MnemoSeed capture 链路一律先检查缓存完整性"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        settled = client.post(
+            "/session/end",
+            json={"session_id": SESSION, "profile_id": PROFILE},
+        )
+        assert settled.status_code == 200, settled.text
+
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "MnemoSeed 缓存完整性", "top_k": 5},
+        ).json()
+        assert recall["memory"]["entries"], recall
+
+
+def test_capture_stamps_epoch_domain_timestamps(config_path: Path) -> None:
+    """D3 serving-surface assertion: a turn drained through the daemon must
+    land epoch-domain ``ingested_at`` so the decay sweeper's epoch baseline
+    never misreads it (live observed: monotonic stamp -> sweep zeroed the
+    fresh chunk)."""
+    import lancedb
+
+    with _boot(config_path) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert response.status_code == 202, response.text
+        settled = client.post(
+            "/session/end",
+            json={"session_id": SESSION, "profile_id": PROFILE},
+        )
+        assert settled.status_code == 200, settled.text
+
+        db = lancedb.connect(str(config_path.parent / "chunks.lance"))
+        arrow = db.open_table("chunks").to_arrow()
+        ingested_at = float(arrow.column("ingested_at").to_pylist()[-1])
+        assert abs(ingested_at - time.time()) < 300
+
+
 # ---------------------------------------------------------------- T1a: dream off the event loop
 
 

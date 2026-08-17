@@ -228,6 +228,9 @@ class HybridRetriever:
                 profile_id=profile_id,
                 min_decay=config.min_decay,
                 entities=filter_entities,
+                # Recall-surface entity tolerance mirrors the post-filter below:
+                # missing stored cues are absence of evidence, never excluded.
+                entities_allow_missing=True,
                 # Merged chunks are the fact's retained evidence scene, never
                 # fresh recall surface: the dream merge marks them consolidated
                 # (design/03 §4, same semantics as the Freshness Guard probe).
@@ -240,7 +243,10 @@ class HybridRetriever:
             chunk = hit.chunk
             if chunk.decay_weight < config.min_decay:
                 continue
-            if entities and not _entity_overlap(entities, chunk.cues.entities):
+            # Empty stored entity cues mean "no entity evidence" (e.g. written
+            # before the daemon filled them), never a contradiction: the gate
+            # only excludes positive mismatches (D2).
+            if entities and chunk.cues.entities and not _entity_overlap(entities, chunk.cues.entities):
                 continue
             semantic = max(0.0, min(1.0, float(hit.similarity)))
             breakdown = _breakdown(

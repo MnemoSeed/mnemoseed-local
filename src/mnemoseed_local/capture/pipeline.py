@@ -316,7 +316,10 @@ class WritingPipeline:
         writer: StampWriter | None = None,
         context: Callable[[Turn], WriteContext] | None = None,
         embedder: Embedder | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        # epoch domain: the clock stamps persisted fields (ingested_at /
+        # provenance times), which every downstream consumer (decay sweep,
+        # ingest windows, audit) reads as epoch (D3)
+        clock: Callable[[], float] = time.time,
     ) -> None:
         resolved_embedder = embedder if embedder is not None else cast(Embedder, SyntheticEmbedder())
         self._inner = (

@@ -187,10 +187,57 @@ def _closed_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def test_bootstrap_requests_repo_relative_artifact_names(tmp_path, monkeypatch) -> None:
+    """Wire contract: each artifact is fetched under its repo-relative path.
+
+    The Xenova encoder lives at ``onnx/model_quantized.onnx`` on Hugging Face;
+    requesting the bare basename 404s (found by live drain probing: every
+    embedding call failed at the lazy bootstrap until this was fixed). The
+    local cache directory still keys files by basename (resume layout is
+    unchanged).
+    """
+    requested: list[tuple[str, str]] = []
+
+    def _fake_url(repo: str, filename: str) -> str:
+        requested.append((repo, filename))
+        return "http://127.0.0.1:1/unroutable"
+
+    monkeypatch.setattr(bge_m3_onnx, "_model_url", _fake_url)
+    embedder = BgeM3OnnxEmbedder(model_dir=tmp_path / "models")
+
+    with pytest.raises(bge_m3_onnx.ModelDownloadError):
+        embedder.ensure_downloaded()
+
+    # stops at the first failing artifact — and that artifact must already be
+    # addressed by its repo-relative name, not the flattened basename
+    assert requested == [("Xenova/bge-m3", "tokenizer.json")]
+
+    def _seed_complete(name: str) -> None:
+        # a cached file carrying no sidecars counts as a legacy complete
+        # download (the failed fetches above left .partial markers behind)
+        path = tmp_path / "models" / name
+        path.write_bytes(b"cached")
+        path.with_name(name + ".partial").unlink(missing_ok=True)
+
+    requested.clear()
+    _seed_complete("tokenizer.json")
+    with pytest.raises(bge_m3_onnx.ModelDownloadError):
+        embedder.ensure_downloaded()
+    assert requested == [("Xenova/bge-m3", "onnx/model_quantized.onnx")]
+
+    requested.clear()
+    _seed_complete("model_quantized.onnx")
+    with pytest.raises(bge_m3_onnx.ModelDownloadError):
+        embedder.ensure_downloaded()
+    assert requested == [("BAAI/bge-m3", "sparse_linear.pt")]
+
+
 def test_bootstrap_fresh_download_from_local_server(artifact_server, tmp_path, monkeypatch) -> None:
     artifacts = {
         "tokenizer.json": b'{"tokenizer": true}',
-        "model_quantized.onnx": b"model-bytes-" * 4096,
+        # repo-relative path: the quantized encoder lives under the repo's
+        # onnx/ subdirectory on Hugging Face, never at the repo root
+        "onnx/model_quantized.onnx": b"model-bytes-" * 4096,
         "sparse_linear.pt": b"sparse-state",
     }
     _ArtifactHandler.artifacts = artifacts
@@ -201,11 +248,14 @@ def test_bootstrap_fresh_download_from_local_server(artifact_server, tmp_path, m
     embedder.ensure_downloaded()
 
     for name, payload in artifacts.items():
-        path = tmp_path / "models" / name
+        # the local cache keeps every artifact at the top level, keyed by its
+        # basename regardless of the repo-relative path it was fetched from
+        local_name = name.rsplit("/", 1)[-1]
+        path = tmp_path / "models" / local_name
         assert path.read_bytes() == payload
-        assert (tmp_path / "models" / (name + ".complete")).exists()
-        assert (tmp_path / "models" / (name + ".partial")).exists() is False
-    model = artifacts["model_quantized.onnx"]
+        assert (tmp_path / "models" / (local_name + ".complete")).exists()
+        assert (tmp_path / "models" / (local_name + ".partial")).exists() is False
+    model = artifacts["onnx/model_quantized.onnx"]
     assert (len(model), len(model)) in progress, "progress callback must report the full model size"
 
     # complete artifacts skip any re-request on the next boot
@@ -221,7 +271,7 @@ def test_bootstrap_resumes_interrupted_download(artifact_server, tmp_path, monke
     payload = b"model-bytes-" * 8192
     _ArtifactHandler.artifacts = {
         "tokenizer.json": b'{"tokenizer": true}',
-        "model_quantized.onnx": payload,
+        "onnx/model_quantized.onnx": payload,
         "sparse_linear.pt": b"sparse-state",
     }
     _local_url(artifact_server, monkeypatch)
@@ -236,7 +286,7 @@ def test_bootstrap_resumes_interrupted_download(artifact_server, tmp_path, monke
 
     assert partial.read_bytes() == payload
     assert (parts / "model_quantized.onnx.complete").exists()
-    assert ("model_quantized.onnx", "bytes=64-") in _ArtifactHandler.ranges
+    assert ("onnx/model_quantized.onnx", "bytes=64-") in _ArtifactHandler.ranges
 
 
 def test_bootstrap_complete_file_without_marker_is_not_redownloaded(
@@ -250,7 +300,7 @@ def test_bootstrap_complete_file_without_marker_is_not_redownloaded(
     (tmp_path / "models" / "model_quantized.onnx").write_bytes(payload)
     _ArtifactHandler.artifacts = {
         "tokenizer.json": b'{"tokenizer": true}',
-        "model_quantized.onnx": payload,
+        "onnx/model_quantized.onnx": payload,
         "sparse_linear.pt": b"sparse-state",
     }
     _local_url(artifact_server, monkeypatch)

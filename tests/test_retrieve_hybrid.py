@@ -225,6 +225,19 @@ def test_entity_filter_blocks_token_overlap_without_cue_entity(stack) -> None:
     assert "c_noent" not in ids
 
 
+def test_vector_track_keeps_chunks_missing_entity_cues(stack) -> None:
+    """D2 (live-drain finding): chunks whose stored entity cues are EMPTY —
+    written before the daemon filled them, or written by paths with nothing to
+    extract — mean 'no entity evidence', never a contradiction. The entity
+    gate must only exclude positive mismatches."""
+    _write(stack, _chunk("c_untagged", "the LanceDb loader caches vectors", decay=0.9, entities=()))
+    _write(stack, _chunk("c_tagged", "the LanceDb retrieval loader", decay=0.9, entities=("LanceDb",)))
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    ids = {c.id for c in _chunk_candidates(result)}
+    assert "c_untagged" in ids
+    assert "c_tagged" in ids
+
+
 def test_vector_track_excludes_decay_below_floor(stack) -> None:
     _write(stack, _chunk("c_high", "LanceDb loader", decay=0.9, entities=("LanceDb",)))
     _write(stack, _chunk("c_low", "LanceDb loader", decay=0.2, entities=("LanceDb",)))

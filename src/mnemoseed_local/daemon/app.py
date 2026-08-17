@@ -68,8 +68,9 @@ from mnemoseed_local.llm.types import (
     LLMError,
     LLMUnavailable,
 )
+from mnemoseed_local.retrieve.cues import extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
-from mnemoseed_local.schema.turn import Turn
+from mnemoseed_local.schema.turn import Turn, TurnRole
 from mnemoseed_local.storage.factory import Stores, build_stores
 from mnemoseed_local.storage.ports import (
     AuditFilter,
@@ -186,11 +187,25 @@ def _migrations_payload(stores: Stores) -> dict[str, int]:
 
 
 def _daemon_write_context(turn: Turn) -> WriteContext:
-    """Per-write encoding context on the serving path (FR-1.6)."""
+    """Per-write encoding context on the serving path (FR-1.6).
+
+    Entity cues are extracted from the turn's user/assistant text — the same
+    corpus that stamps the chunk — mirroring the /memory/remember path, which
+    extracts cues from the pinned text. Without this fill every capture chunk
+    reads as no-entity-evidence to the recall-side entity gate, and every
+    entity-bearing query silently excludes the whole capture surface (D2).
+    """
+    text = " ".join(
+        step.content
+        for step in turn.steps
+        if step.role in (TurnRole.USER, TurnRole.ASSISTANT) and step.content
+    )
+    entities = tuple(extract_cues(text).cues.entities) if text else ()
     return WriteContext(
         profile_id=turn.profile_id,
         host=turn.host.value,
         cognitive_tier=CognitiveTier.TIER_1,
+        entities=entities,
     )
 
 

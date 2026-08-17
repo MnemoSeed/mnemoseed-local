@@ -563,7 +563,12 @@ class LanceDbEmbeddedStore:
                     f"OR entities_filter LIKE {_escape('%,' + entity)} "
                     f"OR entities_filter LIKE {_escape('%,' + entity + ',%')})"
                 )
-            parts.append("(" + " OR ".join(contains) + ")")
+            group = " OR ".join(contains)
+            if filter.entities_allow_missing:
+                # Recall-surface tolerance (D2): an empty stored filter means
+                # "no entity evidence", never a contradiction.
+                group = "entities_filter = '' OR " + group
+            parts.append("(" + group + ")")
         if filter.consolidated is not None:
             parts.append("consolidated = " + ("true" if filter.consolidated else "false"))
         if filter.needs_reconcile is not None:
