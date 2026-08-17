@@ -12,17 +12,25 @@
   Orchestration order (identical to install.sh):
     1. detect / install ollama   (winget Ollama.Ollama; when winget is absent,
        print a manual-download hint and exit non-zero)
-    2. detect / install uv       (official installer; well-known install dir is
+    2. headless ollama server    (serve the dream route invisibly: register a
+       logon scheduled task `OllamaHeadlessServe` running `ollama serve`,
+       back up the stock Startup-folder tray shortcut (reversible, into
+       ~/.mnemoseed-local/backups/), and start a serve now when the API is
+       not yet live. Best-effort: a scheduling failure only prints a hint —
+       the stock tray still serves the API as before. Linux/macOS already get
+       a background service from ollama's own installers (systemd), so
+       install.sh needs no such step)
+    3. detect / install uv       (official installer; well-known install dir is
        prepended to the current process PATH)
-    3. install / upgrade the CLI (uv tool install | uv tool upgrade)
-    4. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
-    5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
+    4. install / upgrade the CLI (uv tool install | uv tool upgrade)
+    5. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
+    6. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
        the script never changes config keys itself
-    6. ollama pull <dream model> (the dream route's model from config.toml
+    7. ollama pull <dream model> (the dream route's model from config.toml
        [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
-    7. final mnemoseed-local doctor re-check + next steps
+    8. final mnemoseed-local doctor re-check + next steps
        (mnemoseed-local up; mnemoseed-local hook install opencode for the
        OpenCode host adapter)
 
@@ -65,6 +73,9 @@ if ([string]::IsNullOrEmpty($env:MNEMOSEED_LOCAL_HOME)) {
 $ConfigPath = Join-Path $ConfigHome 'config.toml'
 $UvBinDir = Join-Path $env:USERPROFILE '.local\bin'
 $OllamaBinDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
+$OllamaServeTaskName = 'OllamaHeadlessServe'
+$OllamaTrayStartupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk'
+$BackupDir = Join-Path $ConfigHome 'backups'
 $DefaultModel = 'qwen3.5:9b'
 
 # --- helpers ---------------------------------------------------------------
@@ -162,7 +173,31 @@ if ($DryRun) {
             Write-Host '    plan:  winget NOT FOUND - would print a manual-download hint (https://ollama.com/download) and exit non-zero'
         }
     }
-    Write-Host '[2] uv'
+    Write-Host '[2] headless ollama server (invisible daemon; the desktop app stays optional)'
+    $serveTask = Get-ScheduledTask -TaskName $OllamaServeTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $serveTask) {
+        Write-Host "    probe: scheduled task $OllamaServeTaskName EXISTS"
+        Write-Host '    plan:  skip registration'
+    } else {
+        Write-Host "    probe: scheduled task $OllamaServeTaskName NOT FOUND"
+        Write-Host "    plan:  register logon task running ``ollama serve`` (restart 3x/1min on failure)"
+    }
+    if (Test-Path -LiteralPath $OllamaTrayStartupLnk) {
+        Write-Host "    probe: stock Startup-folder tray shortcut FOUND ($OllamaTrayStartupLnk)"
+        Write-Host "    plan:  move it to $BackupDir (reversible) so the tray GUI does not auto-start"
+    } else {
+        Write-Host '    probe: no stock Startup-folder tray shortcut'
+        Write-Host '    plan:  nothing to suppress'
+    }
+    try {
+        $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
+        Write-Host '    probe: ollama API is live (127.0.0.1:11434)'
+        Write-Host '    plan:  skip starting a serve now'
+    } catch {
+        Write-Host '    probe: ollama API is down'
+        Write-Host "    plan:  start ``ollama serve`` now (hidden window) so the dream route works immediately"
+    }
+    Write-Host '[3] uv'
     $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
     if ($null -ne $uvCmd) {
         Write-Host "    probe: uv command FOUND at $($uvCmd.Source)"
@@ -171,7 +206,7 @@ if ($DryRun) {
         Write-Host '    probe: uv command NOT FOUND'
         Write-Host "    plan:  install via the official installer (https://astral.sh/uv/install.ps1), then prepend $UvBinDir to the current process PATH"
     }
-    Write-Host '[3] mnemoseed-local CLI'
+    Write-Host '[4] mnemoseed-local CLI'
     $cliCmd = Get-Command mnemoseed-local -ErrorAction SilentlyContinue
     if ($null -ne $cliCmd) {
         Write-Host "    probe: mnemoseed-local command FOUND at $($cliCmd.Source)"
@@ -180,18 +215,18 @@ if ($DryRun) {
         Write-Host '    probe: mnemoseed-local command NOT FOUND'
         Write-Host '    plan:  would run `uv tool install mnemoseed-local`'
     }
-    Write-Host '[4] init'
+    Write-Host '[5] init'
     Write-Host "    plan:  would run ``mnemoseed-local init`` when $ConfigPath does not exist; skipped when present"
-    Write-Host '[5] doctor (first pass)'
+    Write-Host '[6] doctor (first pass)'
     Write-Host '    plan:  would run `mnemoseed-local doctor` (output shown verbatim), then compare the hardware-tier detail'
     Write-Host '           (`recommended tier "<tier>"` vs `current tier "<tier>"`; a hint is printed when they differ; config is never changed)'
     if ($Tier -ne '') {
         Write-Host "    plan:  -Tier $Tier given - would print the hint-only ``config set dream.hardware_tier $Tier`` instruction"
     }
-    Write-Host '[6] model pull (requires confirmation)'
+    Write-Host '[7] model pull (requires confirmation)'
     Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
     Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
-    Write-Host '[7] final doctor + guidance'
+    Write-Host '[8] final doctor + guidance'
     Write-Host '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
     Write-Host '           (`mnemoseed-local up`; `mnemoseed-local hook install opencode` for the OpenCode host adapter)'
     Write-Host ''
@@ -220,9 +255,73 @@ if (Test-CommandExists 'ollama') {
     Write-Host '      installed'
 }
 
-# --- step 2: uv -------------------------------------------------------------
+# --- step 2: headless ollama server -------------------------------------------
+#
+# The dream route talks to ollama over plain localhost HTTP; no user ever
+# needs the desktop tray. This step makes the invisible-server default real:
+# a logon scheduled task runs `ollama serve` (best-effort restarts), the
+# stock Startup-folder tray shortcut is backed up (reversible) so the tray
+# GUI does not auto-start, and a serve is started now when the API is still
+# down. Best-effort throughout: any scheduling failure prints one hint line
+# and never fails the install — the stock tray keeps serving the API anyway.
 
-Write-Host '[2/7] uv'
+Write-Host '[2/8] headless ollama server'
+
+function Install-HeadlessOllamaServe {
+    param([string]$TaskName, [string]$TrayLnk, [string]$BackupRoot)
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -ne $task) {
+        Write-Host "      scheduled task $TaskName already registered - skipping"
+    } else {
+        try {
+            $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+            if (-not (Test-Path -LiteralPath $ollamaExe)) { throw "ollama.exe not found at $ollamaExe" }
+            $action = New-ScheduledTaskAction -Execute $ollamaExe -Argument 'serve'
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+            [void](Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
+                -Description 'Headless ollama API server (mnemoseed-local dream engine): background-only, no desktop app required.')
+            Write-Host "      registered logon task $TaskName (ollama serve, background-only)"
+        } catch {
+            Write-Host "      note: could not register the headless-serve task ($($_.Exception.Message)); the stock tray still serves the API"
+        }
+    }
+    if (Test-Path -LiteralPath $TrayLnk) {
+        try {
+            New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+            $target = Join-Path $BackupRoot 'Ollama.lnk'
+            Move-Item -LiteralPath $TrayLnk -Destination $target -Force
+            Write-Host "      stock tray autostart moved to $target (restore by moving it back) - tray GUI will not auto-start"
+        } catch {
+            Write-Host "      note: could not suppress the stock tray autostart ($($_.Exception.Message)); it is harmless (the tray also starts the server)"
+        }
+    }
+    try {
+        $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
+        Write-Host '      ollama API already live - skipping immediate start'
+    } catch {
+        try {
+            $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+            Start-Process -FilePath $ollamaExe -ArgumentList 'serve' -WindowStyle Hidden
+            $deadline = (Get-Date).AddSeconds(20)
+            $live = $false
+            while ((Get-Date) -lt $deadline -and -not $live) {
+                Start-Sleep -Seconds 2
+                try { $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3; $live = $true } catch {}
+            }
+            if ($live) { Write-Host '      ollama serve started (background)' } else { throw 'serve did not answer within 20s' }
+        } catch {
+            Write-Host "      note: ollama serve is not live yet ($($_.Exception.Message)); start it manually anytime with: ollama serve"
+        }
+    }
+}
+
+Install-HeadlessOllamaServe -TaskName $OllamaServeTaskName -TrayLnk $OllamaTrayStartupLnk -BackupRoot $BackupDir
+
+# --- step 3: uv -------------------------------------------------------------
+
+Write-Host '[3/8] uv'
 if (Test-CommandExists 'uv') {
     Write-Host '      found - skipping install'
 } else {
@@ -257,7 +356,7 @@ Add-ToProcessPath $UvBinDir
 
 # --- step 3: the mnemoseed-local CLI ---------------------------------------
 
-Write-Host '[3/7] mnemoseed-local CLI'
+Write-Host '[4/8] mnemoseed-local CLI'
 if (Test-CommandExists 'mnemoseed-local') {
     Write-Host '      found - upgrading via uv tool...'
     & uv tool upgrade mnemoseed-local
@@ -273,7 +372,7 @@ if (-not (Test-CommandExists 'mnemoseed-local')) {
 
 # --- step 4: init ------------------------------------------------------------
 
-Write-Host '[4/7] init'
+Write-Host '[5/8] init'
 if (Test-Path -LiteralPath $ConfigPath) {
     Write-Host "      $ConfigPath already exists - skipping"
 } else {
@@ -283,7 +382,7 @@ if (Test-Path -LiteralPath $ConfigPath) {
 
 # --- step 5: doctor (first pass) + hardware-tier hint ------------------------
 
-Write-Host '[5/7] doctor (first pass)'
+Write-Host '[6/8] doctor (first pass)'
 $firstDoctor = Invoke-Doctor
 if ($firstDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor reported failures (expected before the model pull) - continuing')
@@ -292,7 +391,7 @@ Show-TierHints $firstDoctor.Text
 
 # --- step 6: confirmation-gated model pull -----------------------------------
 
-Write-Host '[6/7] dream model pull'
+Write-Host '[7/8] dream model pull'
 $model = Get-DreamModel $ConfigPath
 if ($model -eq $DefaultModel) {
     Write-Host "      model to pull: $model (built-in default - the dream route's check target)"
@@ -324,7 +423,7 @@ if (-not $confirmed) {
 
 # --- step 7: final doctor + guidance -----------------------------------------
 
-Write-Host '[7/7] doctor (final re-check)'
+Write-Host '[8/8] doctor (final re-check)'
 $finalDoctor = Invoke-Doctor
 if ($finalDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`')
