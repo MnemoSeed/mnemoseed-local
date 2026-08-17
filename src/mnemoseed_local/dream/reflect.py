@@ -149,6 +149,34 @@ def _split_response(response: str | ChatResult) -> tuple[str, Usage | None]:
     return response, None
 
 
+def _loads_json_array(text: str) -> list[Any]:
+    """Tolerant reflect-output parse (D4 resilience, service-root stability).
+
+    Strict parse first; on failure, fall back to the widest [..] bracket span
+    in the text — small/quantized models reliably wrap their answers in
+    markdown fences (```json) or preface them with chatter, and a strict
+    json.loads otherwise degrades an answer the model actually produced.
+    Anything that parses to a non-list is still an error; text with no
+    parseable array is an error (typed failure drives the retry lane).
+    """
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, list):
+            return payload
+        raise ValueError("reflect output is not a JSON array")
+    except (json.JSONDecodeError, ValueError) as strict_error:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end > start:
+            try:
+                payload = json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, list):
+                return payload
+        raise strict_error
+
+
 def _with_provider_usage(report: DeltaReport, usage: Usage | None) -> DeltaReport:
     """Attach provider-reported usage to a report; identity (unchanged) when
     the provider reported none (T6 additive seam, NFR-2.2)."""
@@ -436,7 +464,7 @@ class ReflectOrchestrator:
             try:
                 response = llm.chat(system=request.cache_prefix, user=request.delta)
                 text, provider_usage = _split_response(response)
-                payload = json.loads(text)
+                payload = _loads_json_array(text)
                 if not isinstance(payload, list):
                     raise ValueError("reflect output is not a JSON array")
                 result = self._assemble(

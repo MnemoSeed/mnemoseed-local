@@ -390,6 +390,32 @@ def test_reflect_persists_marker_and_keeps_source_immutable(tmp_path: Path) -> N
     assert SnapshotPhase.REFLECT_DONE.value not in snap.phases
 
 
+def test_reflect_output_parser_tolerates_fenced_and_prefaced_json() -> None:
+    """D4 resilience (service-root stability): small/quantized models very
+    reliably wrap their extraction in markdown fences (```json) or preface it
+    with chatter — strict json.loads was degrading answers the model actually
+    produced (0.6b/8b live evidence on the reflect contract). The parser must
+    recover the widest [..] span without ever accepting garbage."""
+    from mnemoseed_local.dream.reflect import _loads_json_array
+
+    # strict path untouched
+    assert _loads_json_array('[{"subject":"u"}]') == [{"subject": "u"}]
+    # markdown fence (the 0.6b live shape)
+    fenced = '```json\n[{"subject": "u", "object": "教练"}]\n```'
+    assert _loads_json_array(fenced)[0]["object"] == "教练"
+    # chatter preceding the array
+    prefaced = 'here goes the answer\n[{"subject": "u"}]\n(~extra tail~)'
+    assert _loads_json_array(prefaced) == [{"subject": "u"}]
+    # bracket inside string content must not break the span choice
+    inner = '[{"subject": "a[1]", "object": "[x]"}]'
+    assert _loads_json_array(inner)[0]["object"] == "[x]"
+    # garbage stays an error (the retry lane must never be fed trash)
+    with pytest.raises(ValueError):
+        _loads_json_array("totally not json at all")
+    with pytest.raises(ValueError, match="not a JSON array"):
+        _loads_json_array('{"subject": "u"}')
+
+
 def test_reflect_marker_gate_makes_rerun_idempotent(tmp_path: Path) -> None:
     snap = _snap(_stamp("c1", "I prefer dark mode"), phases=_COMPLETE)
     llm = _CountingLLM(StubReflectLLM())
