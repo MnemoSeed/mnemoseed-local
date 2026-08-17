@@ -78,12 +78,14 @@ class OllamaLLM:
         base_url: str = "http://localhost:11434",
         model: str = "qwen3.5:9b",
         timeout: float = 60.0,
+        think: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = ""
         self.model = model
         self.timeout = float(timeout)
+        self.think = think
         self.params: dict[str, Any] = kwargs
         self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
 
@@ -96,6 +98,14 @@ class OllamaLLM:
             ],
             "stream": False,
         }
+        # D4 standalone top-level seam (NOT an "options" member): thinking is
+        # pure parasitism for the dream reflect's structured extraction — a
+        # thinking model can burn the whole num_predict budget on internal
+        # thinking and leave message.content EMPTY (72s/zero-JSON-per-attempt
+        # observed live on qwen3.5:9b; think=false takes 2.5s and returns a
+        # valid JSON array).
+        if self.think is not None:
+            payload["think"] = bool(self.think)
         # Options seam (design/01 §4.8): role params configure the request
         # options (num_ctx, num_predict, ...). Only configured option params
         # are forwarded, so an unconfigured route keeps the exact legacy

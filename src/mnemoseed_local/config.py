@@ -243,7 +243,22 @@ DEFAULT_LLM_ROUTES: dict[str, RoleLLMConfig] = {
         role="dream",
         driver="ollama",
         model="qwen3.5:9b",
-        params={"base_url": "http://localhost:11434"},
+        params={
+            "base_url": "http://localhost:11434",
+            # Reflect is structured extraction — thinking models would burn the
+            # whole generation budget on internal thinking and return EMPTY
+            # content ("Expecting value: line 1 column 1", D4 live finding on
+            # qwen3.5:9b). The factory default pins thinking OFF for the dream
+            # route; a user-deliberate `think = true` still wins at the file.
+            "think": False,
+            # ollama's lazy default num_ctx is 4096 — silently smaller than any
+            # packed delta (floor 5000), so a dream on real session volume
+            # always starved to empty output (D4 compounding). Ship a working
+            # 16k window by default; the ctx-window doctor check then reports
+            # honestly whether the delta ceiling fits (tier-coherent overrides
+            # live on dream.delta_budget_ceiling_tokens + this key).
+            "num_ctx": 16384,
+        },
     ),
 }
 

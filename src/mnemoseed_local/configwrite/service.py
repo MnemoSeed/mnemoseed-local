@@ -399,7 +399,8 @@ def _role_applier(role: str, field: str) -> Callable[[Config, Any], None]:
 
 
 def _role_key_specs(role: str) -> dict[str, ConfigKey]:
-    """The six writable fields of one dream role (design/02 section 6)."""
+    """The writable fields of one dream role (design/02 section 6; ``think``
+    landed with the D4 thinking-output fix)."""
     fields: dict[str, tuple[str, Callable[[Any], Any], bool]] = {
         "driver": ("string", _validate_nonempty_str, False),
         "model": ("string", _validate_nonempty_str, False),
@@ -407,6 +408,7 @@ def _role_key_specs(role: str) -> dict[str, ConfigKey]:
         "api_key_env": ("env-var names or secrets: reference", _validate_env_name_list, True),
         "max_tokens": ("positive integer", _validate_optional_positive_int, False),
         "provider": ("string", _validate_optional_str, False),
+        "think": ("boolean", _validate_bool, False),
     }
     return {
         f"dream.llm.{role}.{field}": ConfigKey(
@@ -814,6 +816,7 @@ class ConfigWriteService:
             "api_key_env": _redact_env_names(cfg.params.get("api_key_env")),
             "max_tokens": cfg.params.get("max_tokens"),
             "provider": cfg.params.get("provider"),
+            "think": cfg.params.get("think"),
         }
 
     def versions(self) -> list[dict[str, Any]]:

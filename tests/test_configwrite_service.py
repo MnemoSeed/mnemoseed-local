@@ -99,7 +99,25 @@ def test_registry_seeded_with_writable_keys() -> None:
     for role in LLM_ROLES:
         for field in ("driver", "model", "base_url", "api_key_env", "max_tokens"):
             expected.add(f"dream.llm.{role}.{field}")
+        # D4: think is the seventh writable role field (factory default pins
+        # it false — thinking would starve the reflect's structured output)
+        expected.add(f"dream.llm.{role}.think")
     assert expected <= set(CONFIG_KEY_REGISTRY)
+
+
+def test_think_role_field_roundtrip(tmp_path) -> None:
+    """D4: think is writable via the registry, applies live to the route's
+    params, mirrors into the file, and rejects non-boolean values."""
+    service, path = _service(tmp_path)
+    assert service._config.llm["dream"].params["think"] is False  # factory default (D4)
+    result = service.set("dream.llm.dream.think", True, actor="console")
+    assert result["ok"] is True
+    assert load_config(path).llm["dream"].params["think"] is True
+    assert service._config.llm["dream"].params["think"] is True
+    service.set("dream.llm.dream.think", False, actor="console")
+    assert load_config(path).llm["dream"].params["think"] is False
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream.think", "maybe", actor="console")
 
 
 def test_token_budget_usd_is_not_a_registry_key(tmp_path) -> None:

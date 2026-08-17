@@ -215,6 +215,46 @@ def test_ollama_chat_reads_native_root_token_counts() -> None:
     assert result.usage.completion_tokens == 27
 
 
+def test_ollama_chat_forwards_think_option() -> None:
+    """D4 (live reflect finding): a default-on thinking model (qwen3.5) burns
+    the whole num_predict budget on internal thinking for structure-extraction
+    prompts, leaving message.content EMPTY (json.loads('') blows up and 3
+    retries/72s each degrade the dream). The dream reflect route must be able
+    to pin think=false: structured extraction needs no thinking ~38x fewer
+    tokens and a parseable answer (live-verified on qwen3.5:9b)."""
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/chat"
+        sent["body"] = _body(request)
+        return httpx.Response(
+            200, json={"model": "qwen3.5:9b", "message": {"role": "assistant", "content": "[]"}}
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434", think=False)
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    result = llm.chat(system="sys", user="usr")
+    assert result.text == "[]"
+    assert sent["body"]["think"] is False
+
+
+def test_ollama_chat_omits_think_key_by_default() -> None:
+    """The default path never introduces a think key: routes that do not
+    configure it keep the exact legacy request body (byte-stable)."""
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["body"] = _body(request)
+        return httpx.Response(
+            200, json={"model": "qwen3.5:9b", "message": {"role": "assistant", "content": "[]"}}
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    llm.chat(system="s", user="u")
+    assert "think" not in sent["body"]
+
+
 def test_ollama_check_reports_tags() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/tags"

@@ -247,3 +247,34 @@ def test_default_config_toml_writes_the_isolated_graph_instance(tmp_path, monkey
 def test_default_config_toml_dream_model_is_qwen3_5_9b() -> None:
     """AC3: the default dream model aligns on qwen3.5:9b."""
     assert 'model = "qwen3.5:9b"' in default_config_toml()
+
+
+def test_default_dream_route_pins_think_off(tmp_path, monkeypatch) -> None:
+    """D4 (live reflect finding): the factory dream route pins think=False in
+    its params — a thinking model burns its whole generation budget on inner
+    thinking and returns EMPTY content for structured-extraction prompts
+    (qwen3.5:9b live evidence; every reflect retried then degraded). The pin
+    ships in the default route so every config resolves it, while a deliberate
+    `think = true` in the file still wins."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    from mnemoseed_local.config import DEFAULT_LLM_ROUTES
+
+    assert DEFAULT_LLM_ROUTES["dream"].params["think"] is False
+    cfg = load_config(tmp_path / "missing-config.toml")
+    assert cfg.llm["dream"].params["think"] is False
+    p = tmp_path / "config.toml"
+    _write(p, "[dream.llm.dream]\nthink = true\n")
+    assert load_config(p).llm["dream"].params["think"] is True
+
+
+def test_default_dream_route_ships_a_working_num_ctx(tmp_path, monkeypatch) -> None:
+    """D4 compounding: ollama's own num_ctx default of 4096 is smaller than
+    any packed delta floor (5000), so real-volume dreams always squeezed the
+    output to nothing. The factory route must ship a working window; a bigger
+    num_ctx in the file still wins."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(tmp_path / "missing-config.toml")
+    assert cfg.llm["dream"].params["num_ctx"] == 16384
+    p = tmp_path / "config.toml"
+    _write(p, "[dream.llm.dream]\nnum_ctx = 36864\n")
+    assert load_config(p).llm["dream"].params["num_ctx"] == 36864

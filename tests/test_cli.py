@@ -144,14 +144,22 @@ def _mock_doctor_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 _ISOLATED_BLOCK = '[storage.graph.instances.isolated]\ndriver = "sqlite_graph"\n'
 
 
-def test_doctor_hints_when_num_ctx_unset(cli_home: Path, monkeypatch, capsys) -> None:
+def test_doctor_reports_default_delta_ceiling_window_gap_on_factory_num_ctx(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    """D4 compounding: the factory route now ships num_ctx=16384, so the
+    ollama 4096 silent-squeeze trap can no longer pass unnoticed; with the
+    32000 delta ceiling still in place the doctor check FAILS honestly with
+    the actionable hint (tier-coherent pairing lives on
+    dream.delta_budget_ceiling_tokens — never in the driver)."""
     cli_home.mkdir(parents=True, exist_ok=True)
     (cli_home / "config.toml").write_text('preset = "embedded"\n' + _ISOLATED_BLOCK, encoding="utf-8")
     _mock_doctor_backend(cli_home, monkeypatch)
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
-    assert "all checks passed" in out
-    assert "num_ctx is not configured" in out
+    assert "ctx window" in out
+    assert "num_ctx=16384" in out
+    assert "lower the delta ceiling or raise num_ctx" in out
 
 
 def test_doctor_reports_small_num_ctx_with_fix_hint(cli_home: Path, monkeypatch, capsys) -> None:
@@ -263,7 +271,18 @@ def test_doctor_reports_missing_isolated_instance_with_fix_hint(cli_home: Path, 
 
 def _write_doctor_config(cli_home: Path, extra: str = "") -> None:
     cli_home.mkdir(parents=True, exist_ok=True)
-    (cli_home / "config.toml").write_text('preset = "embedded"\n' + _ISOLATED_BLOCK + extra, encoding="utf-8")
+    # these tests exercise the model/tier checks, not the ctx window — give
+    # the config a window-coherent num_ctx so the honest D4 default (factory
+    # 16384 vs 32000 delta ceiling) doesn't wash the target check's outcome;
+    # when `extra` opens the role table itself, the key lands inside it
+    # instead of declaring the table twice
+    window = "num_ctx = 40000\n"
+    if "[dream.llm.dream]" not in extra:
+        window = "[dream.llm.dream]\n" + window
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n' + _ISOLATED_BLOCK + extra + window,
+        encoding="utf-8",
+    )
 
 
 def _router_class(report: HealthReport) -> type:
