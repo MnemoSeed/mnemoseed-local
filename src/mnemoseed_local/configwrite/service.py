@@ -409,6 +409,9 @@ def _role_key_specs(role: str) -> dict[str, ConfigKey]:
         "max_tokens": ("positive integer", _validate_optional_positive_int, False),
         "provider": ("string", _validate_optional_str, False),
         "think": ("boolean", _validate_bool, False),
+        # ollama context knobs; the doctor ctx-window check hints at these
+        "num_ctx": ("positive integer", _validate_optional_positive_int, False),
+        "num_predict": ("positive integer", _validate_optional_positive_int, False),
     }
     return {
         f"dream.llm.{role}.{field}": ConfigKey(
@@ -817,6 +820,8 @@ class ConfigWriteService:
             "max_tokens": cfg.params.get("max_tokens"),
             "provider": cfg.params.get("provider"),
             "think": cfg.params.get("think"),
+            "num_ctx": cfg.params.get("num_ctx"),
+            "num_predict": cfg.params.get("num_predict"),
         }
 
     def versions(self) -> list[dict[str, Any]]:

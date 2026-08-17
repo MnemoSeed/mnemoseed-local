@@ -120,6 +120,21 @@ def test_think_role_field_roundtrip(tmp_path) -> None:
         service.set("dream.llm.dream.think", "maybe", actor="console")
 
 
+def test_num_ctx_and_num_predict_are_writable_role_fields(tmp_path) -> None:
+    """The doctor ctx-window check hints at these keys — they must be
+    writable via config set (registry), the live route and the file."""
+    service, path = _service(tmp_path)
+    service.set("dream.llm.dream.num_ctx", 36864, actor="console")
+    service.set("dream.llm.dream.num_predict", 4096, actor="console")
+    assert load_config(path).llm["dream"].params["num_ctx"] == 36864
+    assert load_config(path).llm["dream"].params["num_predict"] == 4096
+    assert service._config.llm["dream"].params["num_ctx"] == 36864
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream.num_ctx", 0, actor="console")
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream.num_predict", "big", actor="console")
+
+
 def test_token_budget_usd_is_not_a_registry_key(tmp_path) -> None:
     """AC1: the removed dream.token_budget_usd key is NOT writable — a set
     against it is a typed unknown-key error, never a silent no-op."""
