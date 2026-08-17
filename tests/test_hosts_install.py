@@ -172,27 +172,43 @@ def test_cli_hook_install_status_uninstall_cycle(
     monkeypatch.setattr(install, "daemon_reachable", lambda base_url, timeout=2.0: True)
 
     target = tmp_path / PLUGIN_RELATIVE
-    assert main(["hook", "install"]) == 0
+    assert main(["hook", "install", "opencode"]) == 0
     out = capsys.readouterr().out
     assert target.is_file()
     assert str(target) in out
     assert "restart opencode" in out
 
-    assert main(["hook", "install"]) == 0
+    assert main(["hook", "install", "opencode"]) == 0
     assert "up to date" in capsys.readouterr().out
 
-    assert main(["hook", "status"]) == 0
+    assert main(["hook", "status", "opencode"]) == 0
     out = capsys.readouterr().out
     assert "installed (matches shipped plugin)" in out
     assert "daemon: reachable" in out
 
-    assert main(["hook", "uninstall"]) == 0
+    assert main(["hook", "uninstall", "opencode"]) == 0
     assert not target.exists()
     assert "uninstalled" in capsys.readouterr().out
 
-    assert main(["hook", "status"]) == 0
+    assert main(["hook", "status", "opencode"]) == 0
     out = capsys.readouterr().out
     assert "not installed" in out
+
+
+def test_cli_hook_requires_an_explicit_host(capsys: pytest.CaptureFixture[str]) -> None:
+    """No default host: `hook install` alone must refuse and name the choice —
+    the user consciously picks which agent's config they are writing into."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["hook", "install"])
+    assert excinfo.value.code == 2
+
+
+def test_cli_hook_rejects_an_unknown_host() -> None:
+    """Only shipped adapters are valid; an unknown host is a hard parse error,
+    not a silent opencode fallback."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["hook", "install", "codex_cli"])
+    assert excinfo.value.code == 2
 
 
 def test_cli_hook_status_reports_unreachable_daemon(
@@ -202,7 +218,7 @@ def test_cli_hook_status_reports_unreachable_daemon(
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(install, "daemon_reachable", lambda base_url, timeout=2.0: False)
-    assert main(["hook", "status"]) == 0
+    assert main(["hook", "status", "opencode"]) == 0
     out = capsys.readouterr().out
     assert "not installed" in out
     assert "daemon: unreachable" in out

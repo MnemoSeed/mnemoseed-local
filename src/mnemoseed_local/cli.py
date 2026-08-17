@@ -571,13 +571,16 @@ def cmd_config_rollback(args: argparse.Namespace) -> int:
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
-    """OpenCode host hook management (design/01 §4.5).
+    """Host hook management (design/01 §4.5).
 
-    Local filesystem operations only — the daemon REST write path is never
-    touched. ``status`` adds a read-only /healthz reachability probe.
+    ``args.host`` selects the adapter (only "opencode" ships today — the
+    parser's choices enforce it). Local filesystem operations only — the
+    daemon REST write path is never touched. ``status`` adds a read-only
+    /healthz reachability probe.
     """
     from mnemoseed_local.hosts import install as hook
 
+    assert args.host == "opencode"  # parser choices pin this
     if args.hook_command == "install":
         path, changed = hook.install_plugin()
         if changed:
@@ -711,12 +714,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_uninstall.add_argument("--purge", action="store_true", help="delete the data files too")
     p_uninstall.add_argument("--yes", action="store_true", help="skip the purge confirmation")
 
-    p_hook = sub.add_parser("hook", help="manage the OpenCode host hook (plugin auto-discovery)")
+    p_hook = sub.add_parser("hook", help="manage a host hook (host adapter plugin lifecycle)")
     p_hook.add_argument(
         "hook_command",
         choices=("install", "uninstall", "status"),
-        help="install writes the plugin into the opencode config root; "
+        help="install writes the plugin into the host config root; "
         "uninstall removes it; status reports the install state and daemon reachability",
+    )
+    p_hook.add_argument(
+        "host",
+        choices=("opencode",),
+        help="the host whose hook to manage (no default — installing a hook "
+        "writes into that host's config directory, so the choice is always "
+        "explicit; only opencode ships today, claude_code/codex planned)",
     )
 
     p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")

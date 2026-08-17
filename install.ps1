@@ -23,8 +23,8 @@
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
     7. final mnemoseed-local doctor re-check + next steps
-       (mnemoseed-local up; mnemoseed-local hook install for the OpenCode
-       host adapter)
+       (mnemoseed-local up; mnemoseed-local hook install opencode for the
+       OpenCode host adapter)
 
   Idempotent: every step skips when already satisfied. Every failed external
   install operation prints a one-line reason to stderr and exits non-zero.
@@ -193,7 +193,7 @@ if ($DryRun) {
     Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
     Write-Host '[7] final doctor + guidance'
     Write-Host '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
-    Write-Host '           (`mnemoseed-local up`; `mnemoseed-local hook install` for the OpenCode host adapter)'
+    Write-Host '           (`mnemoseed-local up`; `mnemoseed-local hook install opencode` for the OpenCode host adapter)'
     Write-Host ''
     Write-Host 'dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed'
     exit 0
@@ -333,5 +333,5 @@ Write-Host ''
 Write-Host 'installation complete.'
 Write-Host 'next steps:'
 Write-Host '  mnemoseed-local up            # start the daemon'
-Write-Host '  mnemoseed-local hook install  # install the OpenCode host adapter'
+  Write-Host '  mnemoseed-local hook install opencode  # install the OpenCode host adapter'
 exit 0
