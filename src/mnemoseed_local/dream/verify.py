@@ -50,8 +50,15 @@ logger = logging.getLogger("mnemoseed_local.dream.verify")
 
 VERIFY_PROMPT_VERSION = "v1"
 
+#: Room left under the verifier window for the verdict array itself (the same
+#: "generation margin" shape the dream-side ctx check uses).
+VERIFY_MARGIN_TOKENS = 2048
+
 _VERIFIED_ACTION = "ensemble_verified"
 _FALLBACK_ACTION = "ensemble_verify_fallback"
+
+#: The config role the judging seat materializes from (config.py LLM_ROLES).
+_VERIFIER_ROLE = "dream_verifier"
 
 #: Bounded verdict word map (casefolded). Words outside it are garbage.
 _VERDICT_WORDS: dict[str, bool] = {
@@ -81,6 +88,13 @@ Do not output any other text, explanation, or markdown.
 """
 
 _USER_HEADER = "Verify these candidate triples against their evidence (deterministic candidate order):\n\n"
+
+
+def build_verify_prefix() -> str:
+    """The fixed side of the verify prompt (system + user header), exactly as
+    sent to the judge — the doctor ctx-window check's estimate target (mirrors
+    prompts.build_cache_prefix)."""
+    return _SYSTEM_TEMPLATE + _USER_HEADER
 
 
 class _CoverageError(Exception):
@@ -207,6 +221,12 @@ class TripleVerifier:
         model = str(getattr(llm, "model", "") or "")
         by_id = {c.chunk_id: c for c in snapshot.chunks}
         user = _USER_HEADER + _render_candidates(judged, by_id)
+        window_error = self._window_overflow(user)
+        if window_error is not None:
+            # B1.1: never hand ollama a prompt it will silently truncate — a
+            # truncated judge is worse than none, so overflow degrades honestly
+            # (A's original + audit), exactly like every other B failure shape.
+            return self._fallback(snapshot, result, model, "window_exceeded", window_error)
         try:
             response = llm.chat(system=_SYSTEM_TEMPLATE, user=user)
         except LLMUnavailable as exc:
@@ -266,6 +286,27 @@ class TripleVerifier:
             },
         )
         return replace(result, triples=tuple(new_triples))
+
+    def _window_overflow(self, user: str) -> str | None:
+        """The pre-call ctx guard (B1.1, live finding Q7): estimate the rendered
+        verify prompt against the verifier route's num_ctx, live-read from the
+        shared Config so a configwrite window raise hot-applies to the next run.
+        Ollama-only (its server-side knob); unconfigured num_ctx carries no
+        guard target — the doctor check owns that hint (dream-route precedent)."""
+        route = self._config.llm.get(_VERIFIER_ROLE)
+        if route is None or route.driver != "ollama":
+            return None
+        num_ctx = route.params.get("num_ctx")
+        if not isinstance(num_ctx, int) or isinstance(num_ctx, bool):
+            return None
+        needed = estimate_tokens(_SYSTEM_TEMPLATE + user) + VERIFY_MARGIN_TOKENS
+        if needed <= num_ctx:
+            return None
+        return (
+            f"estimated verify prompt {needed} tokens exceeds the verifier route's "
+            f"num_ctx={num_ctx}; raise dream.llm.dream_verifier num_ctx or lower "
+            "dream.delta_budget_ceiling_tokens"
+        )
 
     def _fallback(
         self,

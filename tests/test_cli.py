@@ -402,7 +402,11 @@ def test_doctor_verifier_check_skips_when_ensemble_off(cli_home: Path, monkeypat
 
 
 def test_doctor_verifier_present_when_verify_on(cli_home: Path, monkeypatch, capsys) -> None:
-    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    # B1.1: belt-and-braces config — the ctx-window check must clear too
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "verify"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+    )
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr(
         "mnemoseed_local.llm.RoleRouter",

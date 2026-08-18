@@ -185,6 +185,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # B1 T3: same model-missing honesty for the verify judging seat when the
     # user opted into ensemble=verify.
     checks.append(_ensemble_verifier_check(config))
+
+    # B1.1 (live finding Q7): the verify seat's context window must fit its
+    # judging load — the check that would have caught the 16384-vs-18287 gap.
+    checks.append(_verifier_ctx_window_check(config))
     return _doctor_report(checks)
 
 
@@ -347,6 +351,62 @@ def _ensemble_verifier_check(config: Config) -> tuple[str, bool, str]:
         )
     ok, detail = _role_model_check(config, "dream_verifier")
     return ("ensemble verifier", ok, detail)
+
+
+def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
+    """B1.1 (live finding Q7): the verify seat's ctx window must fit its judging load.
+
+    Static sanity with its assumption labeled: candidates repeat their evidence
+    blocks per judge item (2026-08-18 live: 25 candidates over a 1.7k delta
+    rendered an 18.3k verify prompt — nearly 11x the delta), so the formula
+    double-covers the delta ceiling, and the TripleVerifier's per-run estimate
+    guard is the exact instrument on top of it. Dormant (ensemble off) or
+    non-ollama / unconfigured routes skip like the dream-side check does.
+    """
+    if config.dream.ensemble != "verify":
+        return (
+            "verifier ctx window",
+            True,
+            f"ensemble mode {config.dream.ensemble!r}; verifier ctx-window check skipped",
+        )
+    route = config.llm["dream_verifier"]
+    if route.driver != "ollama":
+        return (
+            "verifier ctx window",
+            True,
+            f"route driver {route.driver!r} is not ollama; ctx-window check skipped",
+        )
+    num_ctx_raw = route.params.get("num_ctx")
+    if num_ctx_raw is None:
+        return (
+            "verifier ctx window",
+            True,
+            "num_ctx is not configured; set num_ctx under [dream.llm.dream_verifier] "
+            "so doctor can verify the window fits",
+        )
+    try:
+        num_ctx = int(num_ctx_raw)
+    except (TypeError, ValueError):
+        return ("verifier ctx window", False, f"num_ctx must be an integer, got {num_ctx_raw!r}")
+    from mnemoseed_local.dream.delta import estimate_tokens
+    from mnemoseed_local.dream.verify import VERIFY_MARGIN_TOKENS, build_verify_prefix
+
+    prefix_tokens = estimate_tokens(build_verify_prefix())
+    ceiling = config.dream.delta_budget_ceiling_tokens
+    needed = prefix_tokens + 2 * ceiling + VERIFY_MARGIN_TOKENS
+    if needed <= num_ctx:
+        return (
+            "verifier ctx window",
+            True,
+            f"prefix+2x ceiling+margin={needed} <= num_ctx={num_ctx}",
+        )
+    return (
+        "verifier ctx window",
+        False,
+        f"prefix+2x delta ceiling+margin={needed} > num_ctx={num_ctx}; raise "
+        "dream.llm.dream_verifier num_ctx or lower dream.delta_budget_ceiling_tokens "
+        "(large extractions otherwise fall back unverified: window_exceeded)",
+    )
 
 
 def _hardware_tier_check(config: Config) -> tuple[str, bool, str]:
