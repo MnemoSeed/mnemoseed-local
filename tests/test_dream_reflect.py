@@ -655,3 +655,106 @@ def test_reflect_on_run_started_reports_pinned_model_for_each_run(tmp_path: Path
     assert reflector.reflect(snap_a).ok
     assert reflector.reflect(snap_b).ok
     assert pinned == [(snap_a.snapshot_id, "kimi-k3"), (snap_b.snapshot_id, "deepseek-v4-flash")]
+
+
+# ---------------------------------------------------------------- D4 field-level coercion
+#
+# Live finding (2026-08 model matrix): small/local models emit schema-sloppy
+# fields in whole-attempt modes — qwen3.5:9b renders tiers as "tier_1" /
+# "tier-1" strings, gemma4:e4b renders confidence as "high". Strict parsing
+# silently dropped EVERY such mention (a parseable array of all-skipped items
+# returns an empty result with ok=True). The D4 tolerance extends from the
+# array-span fallback to FIELD-LEVEL coercion — bounded: digit/word forms only,
+# garbage still drops, never coerced into meaning it did not say.
+
+
+class _SloppyLLM:
+    """Returns one canned schema-sloppy response (the live failure shapes)."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def chat(self, *, system: str, user: str) -> str:
+        return self._text
+
+
+def test_reflect_coerces_tier_word_forms(tmp_path: Path) -> None:
+    """qwen3.5:9b's live shape: tiers as "tier_1" / "tier-1" word forms (plus
+    digit strings and bare ints) — all coerce to the same CognitiveTier."""
+    raw = (
+        '[{"subject": "user", "predicate": "prefers", "object": "pnpm",'
+        ' "tiers": ["tier_1"], "chunk_ids": ["c1"], "confidence": 0.8,'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "decided", "object": "uv",'
+        ' "tiers": ["tier-1"], "chunk_ids": ["c2"], "confidence": 0.8,'
+        ' "route": "core", "preference": false},'
+        '{"subject": "user", "predicate": "uses", "object": "vim",'
+        ' "tiers": ["Tier 2", "2"], "chunk_ids": ["c2"], "confidence": 0.8,'
+        ' "route": "salvage", "preference": false}]'
+    )
+    orchestrator = ReflectOrchestrator(llm=_SloppyLLM(raw), directory=tmp_path, sleep=lambda _: None)
+    outcome = orchestrator.reflect(_snap(_stamp("c1", "I prefer pnpm"), _stamp("c2", "I decided uv")))
+    assert outcome.ok
+    assert outcome.result is not None
+    by_object = {t.object: t for t in outcome.result.triples}
+    assert set(by_object) == {"pnpm", "uv", "vim"}
+    assert by_object["pnpm"].tiers == (CognitiveTier.TIER_1,)
+    assert by_object["uv"].tiers == (CognitiveTier.TIER_1,)
+    assert by_object["vim"].tiers == (CognitiveTier.TIER_2,)
+    assert by_object["vim"].route is Route.SALVAGE
+
+
+def test_reflect_coerces_confidence_words_and_numeric_strings(tmp_path: Path) -> None:
+    """gemma4:e4b's live shape: confidence self-assessed as words — mapped,
+    numeric strings parsed, numbers still clamped to [0, 0.95]."""
+    raw = (
+        '[{"subject": "user", "predicate": "prefers", "object": "high-one",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": "high",'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "medium-one",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": "medium",'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "low-one",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": "low",'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "numeric-one",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": "0.6",'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "overconfident",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": 1.0,'
+        ' "route": "core", "preference": true}]'
+    )
+    orchestrator = ReflectOrchestrator(llm=_SloppyLLM(raw), directory=tmp_path, sleep=lambda _: None)
+    outcome = orchestrator.reflect(_snap(_stamp("c1", "I prefer things")))
+    assert outcome.ok
+    assert outcome.result is not None
+    conf = {t.object: t.confidence for t in outcome.result.triples}
+    assert conf == {
+        "high-one": 0.85,
+        "medium-one": 0.7,
+        "low-one": 0.5,
+        "numeric-one": 0.6,
+        "overconfident": 0.95,
+    }
+
+
+def test_reflect_still_drops_outright_garbage_fields(tmp_path: Path) -> None:
+    """Coercion is bounded: a tier without a 1-3 digit and a confidence word
+    outside the known map stay unparseable — those mentions drop while their
+    well-formed siblings survive (never coerced into meaning not said)."""
+    raw = (
+        '[{"subject": "user", "predicate": "prefers", "object": "good",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": 0.8,'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "bad-tier",'
+        ' "tiers": ["top"], "chunk_ids": ["c1"], "confidence": 0.8,'
+        ' "route": "core", "preference": true},'
+        '{"subject": "user", "predicate": "prefers", "object": "bad-conf",'
+        ' "tiers": [1], "chunk_ids": ["c1"], "confidence": "very high",'
+        ' "route": "core", "preference": true}]'
+    )
+    orchestrator = ReflectOrchestrator(llm=_SloppyLLM(raw), directory=tmp_path, sleep=lambda _: None)
+    outcome = orchestrator.reflect(_snap(_stamp("c1", "I prefer things")))
+    assert outcome.ok
+    assert outcome.result is not None
+    assert [t.object for t in outcome.result.triples] == ["good"]

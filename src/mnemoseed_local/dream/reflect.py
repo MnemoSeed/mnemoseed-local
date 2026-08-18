@@ -185,6 +185,72 @@ def _with_provider_usage(report: DeltaReport, usage: Usage | None) -> DeltaRepor
     return report.with_provider_usage(usage)
 
 
+# ---------------------------------------------------------------- field-level coercion (D4)
+#
+# Live finding (2026-08 model matrix): small/local models emit schema-sloppy
+# FIELDS in whole-attempt modes — qwen3.5:9b renders tiers as "tier_1" /
+# "tier-1" strings, gemma4:e4b renders confidence as "high". Strict parsing
+# silently dropped EVERY such mention (a parseable array of all-skipped items
+# returned an empty result with ok=True). Coercion is bounded: digits and a
+# fixed word map only — anything else is still garbage and drops the mention.
+
+_TIER_DIGIT_RE = re.compile(r"[1-3]")
+
+#: Self-assessed confidence words observed live, mapped to the clamped scale.
+_CONFIDENCE_WORDS: dict[str, float] = {
+    "high": 0.85,
+    "medium": 0.7,
+    "mid": 0.7,
+    "low": 0.5,
+}
+
+
+def _coerce_tier(value: Any) -> CognitiveTier:
+    """Coerce one tier field: an int (strict path), a digit string ("2"), or a
+    digit-bearing word form ("tier_1" / "tier-1" / "Tier 2"). Values with no
+    1-3 digit are garbage (ValueError drops the mention upstream)."""
+    if isinstance(value, bool):
+        raise ValueError(f"tier must not be a bool: {value!r}")
+    if isinstance(value, int):
+        return CognitiveTier(value)
+    text = str(value).strip()
+    try:
+        return CognitiveTier(int(text))
+    except ValueError:
+        pass
+    match = _TIER_DIGIT_RE.search(text)
+    if match:
+        return CognitiveTier(int(match.group(0)))
+    raise ValueError(f"tier is not coercible: {value!r}")
+
+
+def _coerce_confidence(value: Any) -> float:
+    """Coerce one confidence field: a number (strict path), a numeric string
+    ("0.6"), or a self-assessed word in the fixed map ("high"/"medium"/"low").
+    Anything else is garbage (ValueError drops the mention upstream)."""
+    if isinstance(value, bool):
+        raise ValueError(f"confidence must not be a bool: {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().casefold()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    if text in _CONFIDENCE_WORDS:
+        return _CONFIDENCE_WORDS[text]
+    raise ValueError(f"confidence is not coercible: {value!r}")
+
+
+def _list_field(raw: Any) -> list[Any]:
+    """A repeated field the model sometimes renders singular ("tier_1" where a
+    list is asked): normalize to a list so a bare string is never iterated by
+    character."""
+    if isinstance(raw, list):
+        return raw
+    return [raw]
+
+
 # Stripped personal color: emotional/flavor intensifiers, sentence-final tone
 # particles, and honorific/role-play mannerisms an anima renders. These are
 # never stored with a fact (design/02 section 5).
@@ -577,9 +643,9 @@ def _parse_triple(
         subject = str(item["subject"]).strip()
         predicate = str(item["predicate"]).strip()
         obj = str(item["object"]).strip()
-        tiers = tuple(sorted({CognitiveTier(int(t)) for t in item["tiers"]}, key=int))
-        chunk_ids = tuple(sorted({str(c) for c in item["chunk_ids"]}))
-        confidence = max(0.0, min(0.95, float(item["confidence"])))
+        tiers = tuple(sorted({_coerce_tier(t) for t in _list_field(item["tiers"])}, key=int))
+        chunk_ids = tuple(sorted({str(c) for c in _list_field(item["chunk_ids"])}))
+        confidence = max(0.0, min(0.95, _coerce_confidence(item["confidence"])))
         route = Route(str(item["route"]))
         preference = bool(item.get("preference", False))
         polarity = str(item.get("polarity", "positive"))
