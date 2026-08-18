@@ -107,10 +107,10 @@ def test_ping_returns_empty_result() -> None:
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_three_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_four_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
-    assert {tool["name"] for tool in tools} == {"recall", "remember", "dream_once"}
+    assert {tool["name"] for tool in tools} == {"recall", "remember", "dream_once", "recent_sessions"}
     for tool in tools:
         assert tool["description"]
         schema = tool["inputSchema"]
@@ -123,6 +123,11 @@ def test_tools_list_has_exactly_the_three_tools_with_valid_schemas() -> None:
     assert recall["inputSchema"]["properties"]["top_k"]["type"] == "integer"
     remember = next(tool for tool in tools if tool["name"] == "remember")
     assert remember["inputSchema"]["required"] == ["text"]
+    # B2: the time-ordered resume surface takes no required arguments
+    recent = next(tool for tool in tools if tool["name"] == "recent_sessions")
+    assert "required" not in recent["inputSchema"]
+    assert recent["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
+    assert recent["inputSchema"]["properties"]["n_per_session"]["type"] == "integer"
 
 
 # ---------------------------------------------------------------- tools/call
@@ -185,6 +190,36 @@ def test_call_dream_once_without_arguments_key() -> None:
     assert code == 0
     assert responses[0]["result"]["isError"] is False
     assert client.calls == [("/memory/dream_once", {"profile_id": "default"})]
+
+
+def test_call_recent_sessions_maps_arguments_to_the_daemon_endpoint() -> None:
+    """B2: recent_sessions proxies to POST /session/recent with the wire key
+    names (n_sessions -> sessions, n_per_session -> per_session)."""
+    payload = {"profile_id": "default", "sessions": [{"session_id": "s1", "latest_at": 2.0, "chunks": []}]}
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [
+            _request(
+                8,
+                "tools/call",
+                {"name": "recent_sessions", "arguments": {"n_sessions": 3, "n_per_session": 5}},
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert json.loads(responses[0]["result"]["content"][0]["text"]) == payload
+    assert client.calls == [("/session/recent", {"profile_id": "default", "sessions": 3, "per_session": 5})]
+
+
+def test_call_recent_sessions_without_arguments_sends_profile_only() -> None:
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [_request(8, "tools/call", {"name": "recent_sessions"})],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert client.calls == [("/session/recent", {"profile_id": "default"})]
 
 
 def test_unknown_tool_is_structured_error_and_loop_survives() -> None:

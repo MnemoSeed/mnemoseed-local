@@ -10,7 +10,8 @@ Protocol surface (MCP ``2024-11-05`` shape):
   protocolVersion is accepted; the gateway always reports its own);
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
-- ``tools/list`` -> the three daemon tools (recall / remember / dream_once);
+- ``tools/list`` -> the daemon tools (recall / remember / dream_once /
+  recent_sessions — the last one is the B2 time-ordered resume surface);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -83,6 +84,26 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Launch exactly one dream consolidation cycle; returns the launched/state payload.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "recent_sessions",
+        "description": "Fetch the most recent sessions' verbatim tails from mnemoseed-local — "
+        "use it to re-anchor on where the previous conversation ended "
+        "(time-ordered resume, newest session group first).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "n_sessions": {
+                    "type": "integer",
+                    "description": "how many recent session groups to return (default 2, max 5)",
+                },
+                "n_per_session": {
+                    "type": "integer",
+                    "description": "verbatim tail size per session, in chunks (default 20, max 100)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 #: Sentinel: no request id could be salvaged from a broken line.
@@ -121,6 +142,13 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             )
         elif name == "dream_once":
             payload = client.post("/memory/dream_once", {"profile_id": client.profile_id})
+        elif name == "recent_sessions":
+            recent_body: dict[str, Any] = {"profile_id": client.profile_id}
+            if arguments.get("n_sessions") is not None:
+                recent_body["sessions"] = arguments["n_sessions"]
+            if arguments.get("n_per_session") is not None:
+                recent_body["per_session"] = arguments["n_per_session"]
+            payload = client.post("/session/recent", recent_body)
         else:
             return _error_result(f"unknown tool: {name!r}")
     except (DaemonUnavailableError, DaemonRestError) as exc:

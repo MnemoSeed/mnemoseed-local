@@ -143,6 +143,68 @@ class DreamRequest(BaseModel):
     profile_id: ProfileRef
 
 
+class SessionRecentRequest(BaseModel):
+    """Request body for POST /session/recent (B2 time-ordered resume)."""
+
+    profile_id: ProfileRef
+    sessions: int = Field(default=2, ge=1, le=5)
+    per_session: int = Field(default=20, ge=1, le=100)
+
+
+def _group_session_tails(
+    chunks: list[ChunkStamp],
+    *,
+    per_session: int,
+    sessions: int,
+) -> list[dict[str, Any]]:
+    """Group ingested_at-DESC chunks into per-session tails (B2 semantics).
+
+    Newest session group first (first-seen order over the newest-first page is
+    exactly recency order); each group's tail is its LAST ``per_session``
+    chunks, listed ascending — the reading order. The endpoint never guesses
+    which session is "closed": at most ``sessions`` groups come back and the
+    caller recognizes its own current one as the still-growing newest group."""
+    groups: list[dict[str, Any]] = []
+    by_session: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        # a chunk without a session label (e.g. a manual pin) still lands in a
+        # visible shared group instead of breaking the grouping
+        session_id = chunk.provenance.session_id or "?"
+        group = by_session.get(session_id)
+        if group is None:
+            if len(groups) >= sessions:
+                continue  # an older session than the capped set; the page is newest-first
+            group = {
+                "session_id": session_id,
+                "latest_at": chunk.ingested_at,
+                "chunks_desc": [],
+            }
+            by_session[session_id] = group
+            groups.append(group)
+        group["chunks_desc"].append(chunk)
+    payload: list[dict[str, Any]] = []
+    for group in groups:
+        tail = group["chunks_desc"][:per_session]
+        tail.reverse()  # ascending: the tail in reading order
+        payload.append(
+            {
+                "session_id": group["session_id"],
+                "latest_at": group["latest_at"],
+                "chunks": [
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "text": chunk.text,
+                        "ingested_at": chunk.ingested_at,
+                        "turn_start": chunk.turn_start,
+                        "turn_end": chunk.turn_end,
+                    }
+                    for chunk in tail
+                ],
+            }
+        )
+    return payload
+
+
 # ---------------------------------------------------------------- service
 
 
@@ -443,6 +505,29 @@ class MemoryService:
         events.sort(key=lambda event: event["when"], reverse=True)
         return {"events": events}
 
+    # ------------------------------------------------------------ session resume (B2)
+
+    def session_recent(
+        self,
+        *,
+        profile_id: str,
+        per_session: int = 20,
+        sessions: int = 2,
+    ) -> dict[str, Any]:
+        """B2 time-ordered resume: the newest sessions' verbatim chunk tails.
+
+        Read-only over the store's ingested_at-desc listing (lancedb driver
+        guarantee); the page window is a pragmatic guardrail against very long
+        sessions diluting the older group out of view."""
+        limit = min(2000, sessions * per_session * 4)
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
+        )
+        return {
+            "profile_id": profile_id,
+            "sessions": _group_session_tails(page.items, per_session=per_session, sessions=sessions),
+        }
+
     # ------------------------------------------------------------ export
 
     def export(self, *, profile_id: str, offset: int = 0, limit: int = 50) -> dict[str, Any]:
@@ -572,6 +657,19 @@ def memory_timeline(req: TimelineRequest, request: Request) -> dict[str, Any]:
 def memory_export(req: ExportRequest, request: Request) -> dict[str, Any]:
     service: MemoryService = request.app.state.memory
     return service.export(profile_id=req.profile_id, offset=req.offset, limit=req.limit)
+
+
+@router.post("/session/recent")
+def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any]:
+    """B2 (PRD-B2): time-ordered session tails for the resume seam — the
+    "continue where the last conversation ended" surface, verbatim chunks,
+    newest session group first, tails ascending."""
+    service: MemoryService = request.app.state.memory
+    return service.session_recent(
+        profile_id=req.profile_id,
+        per_session=req.per_session,
+        sessions=req.sessions,
+    )
 
 
 @router.post("/memory/forget_this")
