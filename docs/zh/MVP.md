@@ -19,7 +19,8 @@ mnemoseed-local = **本地单用户 MVP 守护进程**：
 1. **包骨架**：`pyproject.toml`（dist 名 `mnemoseed-local`，模块
    `mnemoseed_local`，CLI 入口 `mnemoseed-local`），python_requires>=3.12，
    最小依赖集；uv 管理；`src/mnemoseed_local/__init__.py`
-   （`__version__="0.1.0"`）。
+   （`__version__`；2026-08-18 用户拍板：开发期版本线归位 `0.0.1`，原 A1 记录
+   `0.1.0` 作废）。
 2. **config**：`config.py` + `configwrite/`（注册表裁剪到 MVP 实际使用：
    storage + dream + decay + llm 路由键；不含 registry/providers）。
    单 profile `default` 硬编码（只参考主仓库 identity 理解签名，不移植账号）。

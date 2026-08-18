@@ -6,7 +6,7 @@ fallback driver kept). No accounts, no console: profile is hardcoded to
 ``default`` at the application boundary.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 
 def health() -> bool:

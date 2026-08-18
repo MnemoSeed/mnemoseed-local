@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnemoseed-local"
-version = "0.1.0"
+version = "0.0.1"
 description = "Local single-user memory daemon for coding agents — capture, dream, decay, retrieve"
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }
