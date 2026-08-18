@@ -55,4 +55,4 @@
 
 - **B2 时序接续面**：2026-08-18 开工并收口（commit `1edda80`，1082 passed / 3 skipped）。`POST /session/recent` + MCP `recent_sessions(n_sessions?, n_per_session?)` 落位；hook 自动注入形态存挂起（依赖宿主插件上下文注入能力验证）。
 - **装机实测（同日，用户授权）**：版本线归位 `0.0.1`（`1c9fe80`）；`uv tool install --force .` 装机；daemon 换新构建重启（B1+B1.1+B2 全部在位：config 表面见 `dream_verifier` 路由、`/session/recent` 对 live 数据返回真实 session 分组尾部）；`opencode.json` 注册 MCP 网关（绝对 exe 路径，主机名含空格走数组直传）；**live smoke 抓出真缺陷并修复**：stdio 道宿主页码（cp936）下 ensure_ascii=False 帧成乱码、text-mode \n→\r\n 双坑——`7023746` 强制双道 UTF-8 + 不换行翻译（回归测试复现了 live 同指纹的解码错位 byte 0xa1@1035）；仓根新增 `AGENTS.md`（session-start 记忆纪律 + 开发门禁，`c6e9db3`）。门禁复验 1083 passed / 3 skipped。**待用户动作：重启 opencode 使 `mcp` 配置生效**（配置仅在启动时加载）。
-- **B3 评测臂**：（待开工）
+- **B3 评测臂**：2026-08-18 开工并收口。`eval/` 子包四件齐：canary 工厂（确定性双语语料 + 纯函数匹配器）、scratch rig（1:1 生产接线 + 界外零写入守卫）、度量/报告（canary_recall / noise_pollution / verify replay / 成本面，JSON 累积入数据目录 `eval/`）、矩阵入口（`python -m mnemoseed_local.eval matrix|canary`，探活跳过/退出码语义钉死）。1133 passed / 3 skipped（+50），门禁全净。live 矩阵首跑待用户授权（收口记录见 PRD-B3）。
