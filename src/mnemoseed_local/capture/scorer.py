@@ -1,15 +1,19 @@
-"""F2 persistence classifier + F3 importance scorer (FR-1.3 / FR-1.4 / FR-1.9).
+"""F2 durability annotator + F3 importance scorer (FR-1.3 / FR-1.4 / FR-1.9).
 
 ``TurnScorer.score_turn`` runs the capture funnel's classification and scoring
 inside one deterministic call:
 
-- F2 - durability: reject phatic/vented/time-scoped turns, keep preferences,
-  decisions, personal rules and stances, plus strong-markerless anchors via an
-  embedding fallback. A near-verbatim session repeat is always disposable.
+- F2 - durability ANNOTATION: labels phatic/vented/time-scoped turns
+  DISPOSABLE and preferences, decisions, personal rules and stances DURABLE,
+  plus strong-markerless anchors via an embedding fallback. A near-verbatim
+  session repeat is always labeled disposable. The verdict is metadata only
+  (carried on the ScoredTurn + stats telemetry) — it NEVER gates persistence:
+  the verbatim contract (design/01 §4) stores every conversational turn.
 - F3 - importance: S = w1*arousal_saturated + w2*novelty + w3*causal_chain on a
   0..10 scale (so the pool thresholds read as points). Arousal saturates at a
   cap; valence lives only in the ``cues.emotion`` field and never reaches S or
-  provenance confidence. An explicit importance_hint max-merges into S.
+  provenance confidence. An explicit importance_hint max-merges into S. Every
+  turn's S credits the score pool.
 
 Causal chains count distinct connectives plus decision / habit-rule markers,
 capped at a constant per turn.
@@ -29,10 +33,10 @@ from mnemoseed_local.storage.ports import Embedder
 
 
 class Durability(StrEnum):
-    """F2 verdict for one scored turn."""
+    """F2 annotation for one scored turn (metadata only — never a gate)."""
 
-    DURABLE = "durable"  # worth persisting to long-term memory
-    DISPOSABLE = "disposable"  # mechanical / phatic / vented; drop
+    DURABLE = "durable"  # annotated as holding long-term-memory value
+    DISPOSABLE = "disposable"  # annotated as mechanical / phatic / vented
 
 
 @dataclass(frozen=True)

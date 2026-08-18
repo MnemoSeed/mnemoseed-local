@@ -151,13 +151,19 @@ def _user_text(turn: Turn) -> str:
 @dataclass
 class ScoringStats:
     """Cumulative F1-F3 funnel telemetry across every drained turn of a
-    ScoringPipeline. ``dropped_reasons`` counts DISPOSABLE verdicts per reason;
-    ``pool_triggers`` counts dream/forced events fired by the score pool."""
+    ScoringPipeline.
+
+    Verbatim contract (design/01 §4): EVERY conversational turn is kept — the
+    durability counters below are ANNOTATION telemetry (how the F2 classifier
+    labeled the turns), never drop counters. ``durable_flagged`` counts DURABLE
+    verdicts; ``disposable_flagged`` / ``disposable_reasons`` count DISPOSABLE
+    verdicts per reason. ``pool_triggers`` counts dream/forced events fired by
+    the score pool."""
 
     turns_in: int = 0
-    durable_kept: int = 0
-    dropped: int = 0
-    dropped_reasons: dict[str, int] = field(default_factory=dict)
+    durable_flagged: int = 0
+    disposable_flagged: int = 0
+    disposable_reasons: dict[str, int] = field(default_factory=dict)
     pool_triggers: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
@@ -187,10 +193,12 @@ class ScoringPipeline:
     """Full funnel tail: O(1) submit, then strip -> score -> pool on drain.
 
     ``submit_turn`` appends to the delegate buffer, so /ingest stays O(1). The
-    consumer side strips each pending turn (F1), classifies and scores it
-    (F2/F3), keeps DURABLE turns in the buffer, drops DISPOSABLE turns with a
-    reason, and credits the score pool with each durable turn's S. Recent text
-    per profile feeds the scorer's novelty / repetition terms.
+    consumer side strips each pending turn (F1) and classifies + scores it
+    (F2/F3). Verbatim contract (design/01 §4): EVERY turn is kept in the
+    buffer — the F2 durability verdict is annotation metadata on the ScoredTurn
+    (surfaced as stats telemetry), never a persistence gate; the score pool is
+    credited with EVERY turn's S. Recent text per profile feeds the scorer's
+    novelty / repetition terms.
     """
 
     def __init__(
@@ -225,7 +233,12 @@ class ScoringPipeline:
         self._stripper.reload_rules(ruleset)
 
     def drain(self, session_id: str) -> list[ScoredTurn]:
-        """Process pending turns of one session; returns newly durable results."""
+        """Process pending turns of one session; returns the newly scored turns.
+
+        Verbatim contract: every turn is scored, retained, and its S credited
+        to the pool; the F2 durability verdict only lands as annotation
+        telemetry — nothing is ever dropped here.
+        """
         raw = self._delegate.turns(session_id)
         stripped_done = len(self._stripped.get(session_id, []))
         results: list[ScoredTurn] = []
@@ -248,19 +261,19 @@ class ScoringPipeline:
             next_recent = [*recent, _user_text(stripped.turn)]
             self._recent[turn.profile_id] = next_recent[-self._recent_capacity :]
             if scored.durability.durability is Durability.DURABLE:
-                self._stats.durable_kept += 1
-                self._scored.setdefault(session_id, []).append(scored)
-                fired = self._pool.add_points(
-                    turn.profile_id,
-                    scored.importance,
-                    TurnRange(turn.turn_index, turn.turn_index),
-                )
-                self._stats.pool_triggers += len(fired)
-                results.append(scored)
+                self._stats.durable_flagged += 1
             else:
-                self._stats.dropped += 1
+                self._stats.disposable_flagged += 1
                 reason = scored.durability.reasons[0] if scored.durability.reasons else "default-deferral"
-                self._stats.dropped_reasons[reason] = self._stats.dropped_reasons.get(reason, 0) + 1
+                self._stats.disposable_reasons[reason] = self._stats.disposable_reasons.get(reason, 0) + 1
+            self._scored.setdefault(session_id, []).append(scored)
+            fired = self._pool.add_points(
+                turn.profile_id,
+                scored.importance,
+                TurnRange(turn.turn_index, turn.turn_index),
+            )
+            self._stats.pool_triggers += len(fired)
+            results.append(scored)
         return results
 
     def turns(self, session_id: str) -> list[ScoredTurn]:
@@ -303,9 +316,10 @@ class WritingPipeline:
 
     ``submit_turn`` stays an O(1) append through the inner ScoringPipeline —
     the /ingest hot path never touches embeddings or the store. The consumer
-    side (``drain`` / ``turns``) first scores the pending turns, then sends the
-    durable ones through the StampWriter, recording per-outcome telemetry.
-    Read paths drain first so a producer cannot bypass the write path.
+    side (``drain`` / ``turns``) first scores the pending turns, then sends
+    EVERY scored turn through the StampWriter (verbatim contract), recording
+    per-outcome telemetry. Read paths drain first so a producer cannot bypass
+    the write path.
     """
 
     def __init__(

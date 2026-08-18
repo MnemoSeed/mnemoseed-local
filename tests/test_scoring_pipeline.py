@@ -1,13 +1,17 @@
 """F1 -> F2/F3 -> buffer wiring: ScoringPipeline combines stripper, scorer,
-score pool and the durable-turn buffer. Submit stays an O(1) append; scoring,
-pooling and dropping all run on the lazy drain side so /ingest stays untouched.
+score pool and the scored-turn buffer. Submit stays an O(1) append; scoring
+and pooling run on the lazy drain side so /ingest stays untouched.
+
+Verbatim contract (design/01 stage 4): EVERY conversational turn is kept —
+the F2 durability verdict is an annotation on the ScoredTurn (plus stats
+telemetry), never a persistence gate; the F2/F3 scoring only feeds the pool.
 """
 
 from __future__ import annotations
 
 from mnemoseed_local.capture.pipeline import InMemoryCapturePipeline, ScoringPipeline
 from mnemoseed_local.capture.pool import PoolEventKind, ScorePool
-from mnemoseed_local.capture.scorer import TurnScorer
+from mnemoseed_local.capture.scorer import Durability, TurnScorer
 from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 
@@ -67,18 +71,25 @@ def test_submit_stays_o1_and_scoring_happens_on_drain() -> None:
     assert pipe.pool.stats(PROFILE).turns_pooled == 1
 
 
-def test_drain_drops_disposable_and_keeps_durable() -> None:
+def test_drain_keeps_every_turn_verbatim_and_annotates_durability() -> None:
+    """The verbatim contract: a venting turn (DISPOSABLE annotation) and a
+    preference turn (DURABLE annotation) are BOTH retained and BOTH credit the
+    pool — the F2 verdict never gates persistence, it only annotates."""
     pipe = _pipeline()
     pipe.submit_turn(_turn("这 bug 烦死了", index=0))
     pipe.submit_turn(_turn("我 review 喜欢简洁", index=1))
     results = pipe.drain(SESSION)
-    assert len(results) == 1
-    assert results[0].turn.turn_index == 1
+    assert len(results) == 2
+    assert [r.turn.turn_index for r in results] == [0, 1]
+    assert results[0].durability.durability is Durability.DISPOSABLE
+    assert results[1].durability.durability is Durability.DURABLE
     stats = pipe.stats
     assert stats.turns_in == 2
-    assert stats.durable_kept == 1
-    assert stats.dropped == 1
-    assert "venting-marker" in stats.dropped_reasons or "venting" in stats.dropped_reasons
+    assert stats.durable_flagged == 1
+    assert stats.disposable_flagged == 1
+    assert "venting-marker" in stats.disposable_reasons
+    # both turns' S credit the pool: the scorer only feeds pool accumulation
+    assert pipe.pool.stats(PROFILE).turns_pooled == 2
 
 
 def test_drain_is_idempotent() -> None:
@@ -110,14 +121,18 @@ def test_pool_accumulates_over_drain_and_fires_on_idle() -> None:
 
 def test_stats_are_observable_and_cumulative() -> None:
     pipe = _pipeline()
-    pipe.submit_turn(_turn("这 bug 烦死了"))
-    pipe.submit_turn(_turn("好的"))
-    pipe.drain(SESSION)
+    pipe.submit_turn(_turn("这 bug 烦死了", index=0))
+    pipe.submit_turn(_turn("好的", index=1))
+    results = pipe.drain(SESSION)
+    # phatic/vented turns stay retained too (verbatim contract): their
+    # DISPOSABLE verdicts surface as annotation telemetry only
+    assert len(results) == 2
     stats = pipe.stats
     assert stats.turns_in == 2
-    assert stats.durable_kept == 0
-    assert stats.dropped == 2
-    assert sum(stats.dropped_reasons.values()) == 2
+    assert stats.durable_flagged == 0
+    assert stats.disposable_flagged == 2
+    assert sum(stats.disposable_reasons.values()) == 2
+    assert pipe.pool.stats(PROFILE).turns_pooled == 2
     # compression telemetry survives (benchmark reads pipeline.stats)
     assert stats.bytes_in > 0
     assert stats.rules_hit == {}

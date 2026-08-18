@@ -44,9 +44,10 @@ mnemoseed-local = **本地单用户 MVP 守护进程**：
 
 dream 触发基于**分数池**（主仓库 design/01 + PRD-02），不是轮次计数：
 
-- 每个 durable 捕获轮次把其 S 重要性（arousal / novelty / causal 分量，
+- 每个捕获轮次把其 S 重要性（arousal / novelty / causal 分量，
   0..10 分制）累加进该 profile 的 ScorePool（MetaStore `profile_score_pool`
-  每行持久化，`pool_state` 读取余额）。
+  每行持久化，`pool_state` 读取余额）；轮次原文一律 verbatim 入库
+  （F2 durability 判定只作元数据注解，绝不过滤落库）。
 - **floor+idle**：池余额 ≥ `dream.floor_pool_points`（默认 10.0）且空闲 ≥
   `dream.idle_min_sec`（900s）→ 触发 dream。
 - **hard deadline**：最老 pending（未合并）chunk 等待 ≥ `dream.hard_deadline_sec`

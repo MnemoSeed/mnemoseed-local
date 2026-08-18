@@ -1,7 +1,8 @@
-# MnemoSeed-Local · MVP 设计稿（v1.3，定稿）
+# MnemoSeed-Local · MVP 设计稿（v1.3，定稿 + v1.4 修正注记）
 
 > 本文汇总本轮所有方向讨论的可执行结论，为 Phase A 已实施部分做设计确认，并约束后续 Phase A2.5 / A3+ 展开。未含任何具体人名；决策日期只标版本发布时间。
 > v1.3 相对 v1.2：吸收盲审结论（PASS-WITH-CONDITIONS，9 项 MUST 全部处置）——vote 模式改为诚实成本版、isolated 实例必需化、dream 事件循环卸载与 consolidated 检索过滤列入基线修正；budget 概念整体移除（账本只记录 token）；硬件档位扩为 standard/lite/advanced 三档；新增 Phase A2.5 基线修正包。
+> v1.4 修正注记：verbatim 契约落码——F2 durability 判定降为纯元数据注解（DISPOSABLE turn 曾被实现误丢弃，现全量逐字入库，scorer 的 S 仅供积分池积累）。
 
 ## 1. 定位与边界
 
@@ -47,12 +48,12 @@
    - **budget 概念整体移除**（终版语义）：MVP 无任何 budget 上限；`dream.token_budget_usd` 键移除（旧配置给出 deprecation 报错）；token 账本只**记录**每个 run/路由的 token 消耗（append-only 遥测），不做封顶、无"超支后 capture-only"；移除 delta 的云端价目 USD 估算（SaaS 时代遗物）。未来 BYOK 阶段只保留一种例外：**用户自设用量上限**（防成本暴增，opt-in）；平台侧 budget 属于未来 SaaS（SaaS 无 BYOK），与本仓无关。
 2. **底座选择**：照搬主仓 pluggable / ports-adapters 结构；schema / consolidate / decay / 审计红线一律保留原样，不允许私改；**room for refactor**：基线代码与本稿冲突处，以本稿为准做修正（含必要重构），修正单元列 Phase A2.5。
 3. **做梦触发器**（用户拍板版本）：
-   - `dream.floor_pool_points`（float，默认 `10.0`）：ScorePool 积分下限——每个 durable 捕获轮次按 S = 情绪 × 新颖 × 因果（0–10 分制）打分入池，余额达下限且空闲 ≥ idle 才做梦；
+   - `dream.floor_pool_points`（float，默认 `10.0`）：ScorePool 积分下限——每个捕获轮次按 S = 情绪 × 新颖 × 因果（0–10 分制）打分入池，余额达下限且空闲 ≥ idle 才做梦；
    - `dream.idle_min_sec`（默认 `900`）；
    - `dream.hard_deadline_sec`（默认 `86400`）：自最老 pending chunk 入池计时，满 24h 不论下限是否到达都强制做梦一次；**池内无 pending 则完全不跑**。daemon 构造 ScorePool 时直接绑定上述 config 值；触发即 drain（同批分数永不重复触发）。
    - **失败退避**：reflect 失败 / LLMUnavailable 时重置触发指纹并按指数退避重发（带上限 + 审计），杜绝"池已 drain、指纹不变、pending 永久积压"的死锁。
    - ScorePool 的防溢出强制触发上限曾硬编码 `forced_cap=50`：注册表化为 `dream.pool_forced_cap`（默认 `50.0`，须 ≥ floor，校验拦截）。
-4. **Verbatim 直达**（已写入 MVP spec）：每个 turn 原文逐字进 chunk；合并前即可检索（Freshness Guard 探测 `consolidated=false`），dream merge 后退出搜索面（`consolidated=true`，原文保留为证据链、可按 provenance 追溯取回但不进向量召回）。**主检索轨（hybrid vector track）同样过滤 `consolidated=false`**，杜绝 chunk+node 双表示重复命中。检索面 = 合并产物 graph nodes + 未合并 verbatim chunks——MVP 阶段记忆一定可找回。
+4. **Verbatim 直达**（已写入 MVP spec）：每个 turn 原文逐字进 chunk（stripper 只剥 reasoning / tool use 等噪声单元；**F2 durability 判定只作元数据注解、绝不过滤落库**，scorer 的 S 仅供积分池积累——v1.4 起代码与契约对齐，此点前实现曾误把 DISPOSABLE turn 丢弃）；合并前即可检索（Freshness Guard 探测 `consolidated=false`），dream merge 后退出搜索面（`consolidated=true`，原文保留为证据链、可按 provenance 追溯取回但不进向量召回）。**主检索轨（hybrid vector track）同样过滤 `consolidated=false`**，杜绝 chunk+node 双表示重复命中。检索面 = 合并产物 graph nodes + 未合并 verbatim chunks——MVP 阶段记忆一定可找回。
 5. **摄取主通道**（优先级已拍板）：
    - ① **宿主 hook**：**OpenCode 为开发/测试默认宿主、首发适配**；Claude Code 与 Codex 第二优先级；Cursor 类 IDE 第三优先级。**hook 适配必须映射宿主会话生命周期**：消息事件 → `/ingest`；会话结束/空闲 → `/session/end`（或 pre-compact → `/flush`），只推 `/ingest` 会永不 drain。
    - ② 宿主方言文件观察（jsonl/sqlite 文件 watch，闲时约 30s 级轮询校验）：备胎第一位；
