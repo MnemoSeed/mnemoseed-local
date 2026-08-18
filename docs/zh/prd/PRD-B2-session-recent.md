@@ -30,3 +30,11 @@
 
 - 两任务 QA 过；全量门禁干净；单 commit 收口：`phase B2: session recent surface -- daemon endpoint + MCP recent_sessions`。
 - 收口后在 `PRD-B2-roadmap.md` 的批次启动记录回填。远期"hook 自动注入"形态（依赖宿主插件上下文注入能力验证）不在本包，存路线图挂起项。
+
+## 收口记录（2026-08-18）
+
+- 收口 commit：`1edda80`（5 文件，+407/-3）。最终 1082 passed / 3 skipped（71.00s），ruff/format/mypy 干净；基线 1073 → 增量 +9。
+- TDD 批次：T1（daemon 端点 + 分组纯函数）+ T2（MCP 工具面）同包并进，7 红 → 绿。
+- 收口自纠三枚：(1) verbatim 通道原文带角色前缀（`user: ...`）——测试预期对齐存储真相并在断言注释里钉死"前缀正是 agent 回锚所需"；(2) 全量回归暴露 `test_registry.py` 全清驱动注册表的既有坑（字母序在其后的 daemon-boot 模块须防御性重注册）——补 test_preset_embedded 同款 `_ensure_registered` fixture；(3) `Provenance.session_id` 为 `str | None`——无会话标签 chunk 归 `"?"` 共享组保可见性。
+- 对抗自验：分组倒序/组内升序/尾裁不裁头/组数上限/空 profile/422 越界/参数透传/无参默认 八枚语义钉全过。
+- 下一步：B3 评测臂（路线图第二刀）。MCP 网关侧注册进真实 `opencode.json` 属用户侧操作，联调留证待补。

@@ -53,4 +53,5 @@
 
 ## 批次启动记录
 
-- （待填：B2 开工日期 / 收口 commit）
+- **B2 时序接续面**：2026-08-18 开工并收口（commit `1edda80`，1082 passed / 3 skipped）。`POST /session/recent` + MCP `recent_sessions(n_sessions?, n_per_session?)` 落位；hook 自动注入形态存挂起（依赖宿主插件上下文注入能力验证）。
+- **B3 评测臂**：（待开工）
