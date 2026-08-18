@@ -21,7 +21,7 @@ from typing import Any
 from mnemoseed_local.config import CONFIG_DIR
 from mnemoseed_local.eval.metrics import CanaryMetrics, CostMetrics, VerifyMetrics
 
-REPORT_SCHEMA_VERSION = "v1"
+REPORT_SCHEMA_VERSION = "v1.1"
 
 
 @dataclass(frozen=True)
@@ -33,15 +33,32 @@ class SkippedCell:
 
 
 @dataclass(frozen=True)
+class ReportedTriple:
+    """One merged node's eval surface (v1.1 payload — full triple dump so a
+    later RULER revision can re-judge recall offline, no GPU rerun)."""
+
+    graph: str  # "main" | "isolated"
+    node_id: str
+    subject: str
+    predicate: str
+    object: str
+    polarity: str
+    confidence: float
+
+
+@dataclass(frozen=True)
 class CellReport:
     """One (cell × material) scored block. ``canary`` is None for replay
-    materials (no embedded ground truth — recall/pollution are canary-only)."""
+    materials (no embedded ground truth — recall/pollution are canary-only).
+    ``triples`` is the full merged graph payload (v1.1; empty for replay runs
+    that produced nothing, unknown on v1 reports)."""
 
     cell_id: str
     material: str
     canary: CanaryMetrics | None
     verify: VerifyMetrics
     cost: CostMetrics
+    triples: tuple[ReportedTriple, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +163,18 @@ def report_to_dict(report: EvalReport) -> dict[str, Any]:
                 "canary": _canary_to_dict(cell.canary) if cell.canary is not None else None,
                 "verify": _verify_to_dict(cell.verify),
                 "cost": _cost_to_dict(cell.cost),
+                "triples": [
+                    {
+                        "graph": t.graph,
+                        "node_id": t.node_id,
+                        "subject": t.subject,
+                        "predicate": t.predicate,
+                        "object": t.object,
+                        "polarity": t.polarity,
+                        "confidence": t.confidence,
+                    }
+                    for t in cell.triples
+                ],
             }
             for cell in report.cells
         ],
@@ -164,6 +193,19 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
                 canary=None if cell["canary"] is None else _canary_from_dict(cell["canary"]),
                 verify=_verify_from_dict(cell["verify"]),
                 cost=_cost_from_dict(cell["cost"]),
+                # v1 reports carry no payload field: tolerate (empty triples).
+                triples=tuple(
+                    ReportedTriple(
+                        graph=str(t["graph"]),
+                        node_id=str(t["node_id"]),
+                        subject=str(t["subject"]),
+                        predicate=str(t["predicate"]),
+                        object=str(t["object"]),
+                        polarity=str(t["polarity"]),
+                        confidence=float(t["confidence"]),
+                    )
+                    for t in cell.get("triples", [])
+                ),
             )
             for cell in data["cells"]
         ),

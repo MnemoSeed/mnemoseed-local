@@ -108,3 +108,29 @@
   3. verify/token 指标跨材料污染（见 T3）。
 - 门禁复验：**1133 passed / 3 skipped**（基线 1083 → +50），ruff / ruff format / mypy（84 files）干净；`python -m mnemoseed_local.eval canary` stub 自检 PASS（off + verify 两通路 recall=1.0 pollution=0）；`.eval-rigs/` 入 gitignore。
 - **待用户授权后另跑**：live 矩阵首跑（6 模型 × off/verify 默认 roster；B 默认 `gemma4:e4b`，`--verifier` 翻向得 B1 双向配对列），首份报告落 `<数据目录>/eval/`，数值 bar 据首跑结果钉回本 PRD。
+
+## live 首跑实测记录（2026-08-18，全矩阵 12 cell × 5 材料，用户授权）
+
+报告：`~/.mnemoseed-local/eval/2026-08-18T16-37-50Z-12cells-5materials.json`（12 cell，canary + 4 份真实 session journal 复放，零 skipped，总时长约 50 分钟）。
+
+**首跑先抓到的是尺的偏差，不是模型的全灭**（验尸证据：rig stores 保全，逐 cell 读出 core 三元组与 canary truth 对照）：
+
+1. **matcher 系统性过严（尺偏差，属本包，必修）**：谓词要求 canonical 等值，但 live 模型合法渲染千姿百态——decided 类被渲染为 `plans to use`/`switch`/`use`/`plan`/`decide`/`打算`/`switch_to`，has_habit 类为 `runs before committing`/`writes first`/`execute`/`run`/`write`，prefers 类为 `prefer`/`偏爱`，believes 类为 `believe`/`think`；对象侧 `vacuum` 式改写（单复数、”for good“ 尾巴、zh→en 同义改写如 `主干开发`→`main branch for development`）使全短语子串命中近乎全灭而大量"提对了"的事实被误杀——canary recall 全矩阵 0.00–0.12 里**绝大部分是尺杀，非模型杀**。
+2. **真实模型行为发现（不受尺偏差污染的部分）**：
+   - **qwen3.5:9b 保守精准**：off 态 pollution=0、core=7（全事实类，variety 覆盖四类谓词渲染）；
+   - **gemma4:e4b 高召回高污染**：off 态 pollution=6 实锤（META 同步×2、机械句 `先/这样`、客套 `表达/辛苦`、Umbrella 断言 `has millions of active users` 全进 core）；
+   - **校验层真实减排**：e4b 污染 6 → 经 e4b 自校验后 1（META 同步漏网）——双模型机制的第一枚量化收益证据；
+   - **60s 超时墙真实存在**：qwen3:4b / qwen3:8b / gemma4:12b 在 canary 与部分 replay 上批量撞 4×60s reflect 超时（tokens=0 行成串）——B4 档位定版必须正视的硬数据；
+   - 判定座速度谱（e4b 判定 8–16s/轮；12b 反射 250s+ 撞墙）——B1"判定比生成简单"的结论再获数据支撑。
+
+## 批次增量 B3.1 · 尺修正（2026-08-18 立项，用户拍板）
+
+依据：首跑验尸发现 1；原则：**尺是确定性纯函数 + 裁选答案键**（curated answer keys），绝不引入 LLM 裁判；"fuzz 属于 bar，不属于 matcher" 的界线修订为：**同义改写与形态变体归入答案键枚举（有限、可审计、PRD 记录），判定逻辑本身保持确定性**。
+
+1. **matcher 语义修订**（`eval/canary.py`，TDD 先行）：
+   - 谓词匹配 = **类别根集命中**：canon 四类谓词类别根集（含 live 已观测渲染：`prefer/decide/plan/use/switch/run/write/execute/believe/think/打算/偏爱/…`），节点谓词归一化入类后比较类别；
+   - 对象匹配 = **词条子集覆盖**（英式短语）∪ 子串（中文短语）：双侧 casefold + 形态归一（单复数尾 s 有界修剪）+ 停词剔除；fact 级 `accepted_objects` 答案键吸收同义改写（初值 = 首跑验尸观测到的合法渲染，本 PRD 记录点名）；
+   - polarity 判定不变；覆盖护栏（stub 可抽取）不变。
+2. **报告三元组载荷**（`eval/report.py` → `eval_version v1.1`）：CellReport 增 `triples` 全量（route/graph/subject/predicate/object/polarity/confidence/node_id），reader 对 v1 无该字段容忍（→ 空）；**尺子再升级时可离线重打分，不重烧 GPU**。
+3. **离线重打分**（`eval/rescore.py` + `__main__ rescore`）：读 v1.1 报告 + canary seed 重建 truth → 重算 recall 面指标（pollution 维度依赖 chunk 归因，不可离线重算，保留原报告值并如实标注）。
+4. **live 矩阵重跑**（用户已授权）：同 roster 同材料重跑，新旧两报对照表入本 PRD 收口记录。

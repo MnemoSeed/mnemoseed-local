@@ -31,6 +31,7 @@ from mnemoseed_local.eval.matrix import (
     default_matrix,
     list_cells,
     matrix_exit_code,
+    parse_extra_route,
     run_matrix,
     summary_lines,
 )
@@ -40,6 +41,7 @@ from mnemoseed_local.eval.report import default_out_dir, write_report
 def _matrix_command(args: argparse.Namespace) -> int:
     models = [m.strip() for m in args.models.split(",") if m.strip()] or list(ROSTER_DEFAULT)
     ensembles = [e.strip() for e in args.ensemble.split(",") if e.strip()]
+    extra_routes = [parse_extra_route(spec) for spec in args.extra_route]
     cells = default_matrix(
         roster=models,
         ensembles=ensembles,
@@ -47,6 +49,7 @@ def _matrix_command(args: argparse.Namespace) -> int:
         base_url=args.base_url,
         num_ctx=args.num_ctx,
         delta_budget_tokens=args.delta_budget,
+        extra_routes=extra_routes,
     )
     if args.list:
         for cell_id in list_cells(cells):
@@ -103,6 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     matrix.add_argument("--models", default=",".join(ROSTER_DEFAULT), help="comma-separated ollama tags")
     matrix.add_argument("--ensemble", default="off,verify", help="comma-separated ensemble modes")
     matrix.add_argument("--verifier", default="gemma4:e4b", help="uniform verifier seat model")
+    matrix.add_argument(
+        "--extra-route",
+        action="append",
+        default=[],
+        metavar="driver|model|base_url[|key_env[|timeout[|max_tokens]]]",
+        help="cloud anchor seat (repeatable); key_env is an ENV-VAR NAME, never a key",
+    )
     matrix.add_argument("--base-url", default=DEFAULT_BASE_URL, help="ollama server base url")
     matrix.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX, help="ollama num_ctx per seat")
     matrix.add_argument("--delta-budget", type=int, default=32000, help="explicit delta budget per cell")

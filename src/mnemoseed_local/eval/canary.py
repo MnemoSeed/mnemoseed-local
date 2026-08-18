@@ -23,6 +23,7 @@ cycling), never left to luck.
 from __future__ import annotations
 
 import random
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -45,10 +46,9 @@ class CanaryFact:
     """One ground-truth fact plus the signature a correct extraction must show."""
 
     fact_id: str
-    predicate: str  # canonical: prefers | has_habit | decided | believes
+    predicate: str  # fact class: prefers | has_habit | decided | believes
     polarity: str  # "positive" | "negative"
-    phrasings: tuple[str, ...]  # object match = any alternative (casefold substring)
-    alt_predicates: tuple[str, ...] = ()  # tolerated predicate renderings
+    phrasings: tuple[str, ...]  # object match = any alternative hit (see matches_fact)
 
 
 @dataclass(frozen=True)
@@ -80,56 +80,206 @@ class CanarySession:
 
 
 # ---------------------------------------------------------------- matcher
+#
+# B3.1 revision (first-run autopsy, 2026-08-18): live models render predicates
+# creatively ("plans to use", "runs before committing", "偏爱", "think") and
+# rewrite objects ("trunk-based development" -> "main branch"). The v1 ruler
+# (exact predicate + full-phrase substring) killed honest extractions. The
+# revision is STILL a deterministic pure function with curated answer keys:
+#
+# - predicate: class root-set membership (creative-but-honest renderings land
+#   in their fact class);
+# - object: EN token-subset coverage (casefold, bounded singular trim, stopwords
+#   dropped) OR zh substring (whitespace-free) — synonyms live only in the
+#   corpus pools as enumerated phrasing alternatives, never in the matcher;
+# - polarity: exact, unchanged.
+
+#: Fact-class predicate roots: canonical words + creative renderings that live
+#: models actually produced in the first matrix run (PRD-B3 B3.1 table).
+PREDICATE_CLASS_ROOTS: dict[str, frozenset[str]] = {
+    "prefers": frozenset(
+        {
+            "prefers",
+            "prefer",
+            "preferred",
+            "likes",
+            "like",
+            "loves",
+            "love",
+            "enjoys",
+            "enjoy",
+            "偏爱",
+            "喜欢",
+            "喜爱",
+        }
+    ),
+    "has_habit": frozenset(
+        {
+            "has_habit",
+            "habit",
+            "runs",
+            "run",
+            "writes",
+            "write",
+            "reviews",
+            "review",
+            "rebases",
+            "rebase",
+            "executes",
+            "execute",
+            "always",
+            "usually",
+            "runs before committing",
+            "writes first",
+            "每次",
+            "总是",
+            "通常",
+        }
+    ),
+    "decided": frozenset(
+        {
+            "decided",
+            "decide",
+            "decides",
+            "plan",
+            "plans",
+            "plans to use",
+            "uses",
+            "use",
+            "switch",
+            "switches",
+            "switch_to",
+            "switched_to",
+            "commits",
+            "commit",
+            "committed_to",
+            "develop",
+            "develops",
+            "决定",
+            "打算",
+            "用",
+            "切换",
+        }
+    ),
+    "believes": frozenset(
+        {
+            "believes",
+            "believe",
+            "think",
+            "thinks",
+            "thought",
+            "supports",
+            "support",
+            "认为",
+            "相信",
+            "坚持",
+            "坚信",
+        }
+    ),
+}
+
+#: EN object-matching stopwords dropped from both sides before subset coverage.
+_OBJECT_STOPWORDS: frozenset[str] = frozenset(
+    {"a", "an", "the", "for", "to", "of", "in", "on", "with", "from", "and", "by"}
+)
+
+_CJK_RE = re.compile(r"[一-鿿]")
+
+
+def _class_of(predicate: str) -> str | None:
+    """Normalize a rendered predicate into its fact class (None when garbage)."""
+    normalized = predicate.strip().casefold()
+    for fact_class, roots in PREDICATE_CLASS_ROOTS.items():
+        if normalized in roots:
+            return fact_class
+    return None
+
+
+def _trim_token(token: str) -> str:
+    """Bounded singular trim: drop one trailing 's' (guarded: length > 3 and
+    no 'ss' tail, so 'class'/'pass'/'stress' stay whole)."""
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _object_tokens(text: str) -> frozenset[str]:
+    tokens = frozenset(re.split(r"[^0-9a-z]+", text.casefold()))
+    return frozenset(_trim_token(t) for t in tokens if t and t not in _OBJECT_STOPWORDS)
+
+
+def _phrase_hit(phrase: str, obj: str) -> bool:
+    """One phrasing alternative vs one node object: zh substring on whitespace-
+    free text; otherwise EN token-subset coverage (every phrase token present
+    in the object's trimmed token set)."""
+    if _CJK_RE.search(phrase):
+        compact_phrase = re.sub(r"\s+", "", phrase.casefold())
+        compact_obj = re.sub(r"\s+", "", obj.casefold())
+        return compact_phrase in compact_obj
+    phrase_tokens = _object_tokens(phrase)
+    if not phrase_tokens:
+        return False
+    return phrase_tokens <= _object_tokens(obj)
 
 
 def matches_fact(props: Mapping[str, Any], fact: CanaryFact) -> bool:
     """Pure-function match: does one core node's prop triple evidence ``fact``?
 
-    Match = predicate within {predicate} ∪ alt_predicates (exact, casefold)
-    AND polarity equal AND object containing any phrasing alternative
-    (casefold substring). Anything else is a miss — no fuzzy scoring here;
-    fuzz belongs to the bar, not the matcher.
+    Match = the node's predicate lands in the fact's CLASS ROOT SET (exact
+    casefold membership, never fuzzy) AND polarity equal AND any phrasing
+    alternative hits (zh substring or EN token-subset coverage).
     """
-    predicate = str(props.get("predicate", "")).strip().casefold()
-    accepted = {fact.predicate.casefold(), *(p.casefold() for p in fact.alt_predicates)}
-    if predicate not in accepted:
+    if _class_of(str(props.get("predicate", ""))) != fact.predicate:
         return False
     polarity = str(props.get("polarity", "positive")).strip().casefold()
     if polarity != fact.polarity.casefold():
         return False
-    obj = str(props.get("object", "")).casefold()
-    return any(p.casefold() in obj for p in fact.phrasings)
+    obj = str(props.get("object", ""))
+    return any(_phrase_hit(phrase, obj) for phrase in fact.phrasings)
 
 
 # ---------------------------------------------------------------- corpus pools
 #
-# Each fact class carries bilingual ITEM pairs ((en object, zh object)); the
-# phrasing alternatives are exactly the two pool strings, so every generated
-# fact turn contains its own key by construction (self-consistency invariant).
+# Each fact class carries bilingual ITEM triples ((en object, zh object,
+# curated extra accepted renderings)); the first two strings are guaranteed
+# embedded in the generated turn text (self-consistency invariant), the extras
+# are KNOWN-HONEST rewrites observed in live matrix runs — the curated answer
+# keys (PRD-B3 B3.1). Adding a rendering requires a live observation + a PRD
+# line; the matcher itself never gets fuzzier.
 
-_PREF_ITEMS: tuple[tuple[str, str], ...] = (
-    ("pour-over coffee", "手冲咖啡"),
-    ("mechanical keyboards", "机械键盘"),
-    ("static types in python", "Python 里的静态类型"),
-    ("dark mode", "深色模式"),
+_PREF_ITEMS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("pour-over coffee", "手冲咖啡", ()),
+    ("mechanical keyboards", "机械键盘", ()),
+    ("static types in python", "Python 里的静态类型", ("static type", "static types")),
+    ("dark mode", "深色模式", ()),
 )
-_HABIT_ITEMS: tuple[tuple[str, str], ...] = (
-    ("run the full test suite before committing", "提交前跑完整测试套件"),
-    ("write the changelog entry first", "先写变更日志再动手"),
-    ("review the diff line by line", "逐行审查 diff"),
-    ("rebase before opening the PR", "开 PR 前 rebase"),
+_HABIT_ITEMS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("run the full test suite before committing", "提交前跑完整测试套件", ("full test suite",)),
+    ("write the changelog entry first", "先写变更日志再动手", ("changelog entry",)),
+    ("review the diff line by line", "逐行审查 diff", ("diff review", "review the diff")),
+    ("rebase before opening the PR", "开 PR 前 rebase", ()),
 )
-_DECIDE_ITEMS: tuple[tuple[str, str], ...] = (
-    ("pnpm for dependency management", "pnpm 管理依赖"),
-    ("trunk-based development", "主干开发"),
-    ("a time-series database for logs", "时序数据库来存日志"),
-    ("uv for python packaging", "uv 管理 Python 包"),
+_DECIDE_ITEMS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("pnpm for dependency management", "pnpm 管理依赖", ("pnpm",)),
+    ("trunk-based development", "主干开发", ("main branch", "main trunk", "trunk")),
+    ("a time-series database for logs", "时序数据库来存日志", ("time-series database", "时序数据库")),
+    ("uv for python packaging", "uv 管理 Python 包", ()),
 )
-_BELIEVE_ITEMS: tuple[tuple[str, str], ...] = (
-    ("small models are enough with a verify pass", "小模型配合校验就够用"),
-    ("type safety pays for itself", "类型安全值回成本"),
-    ("offline-first beats cloud lock-in", "离线优先胜过云锁定"),
-    ("verbatim memory is the last line of defense", "原文记忆是最后的防线"),
+_BELIEVE_ITEMS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "small models are enough with a verify pass",
+        "小模型配合校验就够用",
+        (
+            "small model with verification sufficient",
+            "small model combination with verification",
+            "small models with validation suffice",
+            "small models are enough with verification",
+            "small model with validation is sufficient",
+        ),
+    ),
+    ("type safety pays for itself", "类型安全值回成本", ("type safety pays", "type safety")),
+    ("offline-first beats cloud lock-in", "离线优先胜过云锁定", ()),
+    ("verbatim memory is the last line of defense", "原文记忆是最后的防线", ()),
 )
 
 #: (en template, zh template) pairs per predicate class; ``{x}`` is the item.
@@ -152,19 +302,11 @@ _TEMPLATES: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
-_FACT_ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
+_FACT_ITEMS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]] = {
     "prefers": _PREF_ITEMS,
     "has_habit": _HABIT_ITEMS,
     "decided": _DECIDE_ITEMS,
     "believes": _BELIEVE_ITEMS,
-}
-
-#: Tolerated predicate renderings seen on live small models (bounded, honest).
-_ALT_PREDICATES: dict[str, tuple[str, ...]] = {
-    "prefers": ("likes", "loves", "enjoys"),
-    "has_habit": (),
-    "decided": ("committed_to", "switched_to"),
-    "believes": ("thinks", "supports"),
 }
 
 _FACT_CLASSES: tuple[str, ...] = ("prefers", "has_habit", "decided", "believes")
@@ -230,8 +372,8 @@ def _build_fact_turns(
                 fact_id=fact_id,
                 predicate=predicate,
                 polarity="positive",
-                phrasings=item,
-                alt_predicates=_ALT_PREDICATES[predicate],
+                # the item's (en, zh) strings + its curated rewrite answer keys
+                phrasings=(item[0], item[1], *item[2]),
             )
         )
     return turns, facts

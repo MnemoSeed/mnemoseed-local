@@ -185,11 +185,16 @@ def test_matches_fact_negative_paths() -> None:
     assert matches_fact(no_phrase, fact) is False
 
 
-def test_matches_fact_alt_predicates() -> None:
+def test_matches_fact_class_roots() -> None:
     session = canary_session(11, facts=8, noise=0)
-    fact = next(f for f in session.facts if f.alt_predicates)
-    props = _props(predicate=fact.alt_predicates[0], object=fact.phrasings[0], polarity=fact.polarity)
-    assert matches_fact(props, fact) is True
+    pref = next(f for f in session.facts if f.predicate == "prefers")
+    # creative-but-honest renderings land in the prefers class (B3.1 roots)
+    for rendering in ("prefer", "likes", "loves", "偏爱", "enjoys"):
+        props = _props(predicate=rendering, object=pref.phrasings[0], polarity=pref.polarity)
+        assert matches_fact(props, pref) is True, rendering
+    # the canonical class word itself still matches
+    props = _props(predicate="prefers", object=pref.phrasings[0], polarity=pref.polarity)
+    assert matches_fact(props, pref) is True
 
 
 def test_canary_sessions_plural_deterministic() -> None:
