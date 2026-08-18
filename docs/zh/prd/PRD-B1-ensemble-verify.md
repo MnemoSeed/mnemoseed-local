@@ -76,6 +76,21 @@
 - 对抗自验增量（收口前变异击杀向）：string-digit index 正向 coercion、bool index、负 index 三枚补钉；三重审计第一面（`llm_role_configured` 携 `role == "dream_verifier"`）在 daemon 集成层钉死。
 - 待办人工验证项：双模型串行双向配对实测（qwen3.5:9b ↔ gemma 互换 A/B）跑真实 sessions 并复核校验位默认型号 `gemma4:e4b`（设计稿 §8 原标 gemma 4 12b 为估算值，live D4 矩阵已实测 e4b）；真实 OpenCode 会话端 verify 联调留证。
 
+## 人工验证记录（2026-08-18，双模型串行双向配对实测）
+
+形态：harness（temp 脚本，未入仓）直组**生产链类**——live 仓 4 枚 pending chunks（1707 tok 真实 sessions 材料，turns 0-1）经真 vector 驱动 `snapshot_read` 只读取出，同一冻结快照跑两向：`DeltaPacker→ReflectOrchestrator(真 ollama)→journal→TripleVerifier(真 ollama)→audit`；merge 不跑、store 零写入、live daemon 全程在线未动；双座均 `think=False + num_ctx=36864`（1:1 镜像 live dream 窗口）。证据 JSON 转录于 temp 工作目录。
+
+**机制实弹（引擎侧全过）**：
+1. verify 相位实裁：B=qwen3.5:9b 裁 A=gemma4:e4b 的 25 枚 core 候选 → 18 accept / **7 reject→isolated**，`ensemble_verified` 审计全字段落盘（judged/accepted/rejected/rejected_keys/tokens）；reject 判定谱人工抽查合理（类别化摘要、session-meta、噪声）。
+2. 零 core 短路实弹：A=qwen3.5:9b 空提取（`[]`，completion=2）→ B 零调用零审计（设计语义）。
+3. 两模型 verdict JSON 均严格合规（18k prompt 下 343 / 355 completion token），判定词表/覆盖检查实模型一次通过；journal 载荷即验证后结果（rejudge 靠 d2 journal 原样还原候选集，交叉自证）。
+
+**模型行为发现**：
+1. **A 侧召回不对称（重大）**：qwen3.5:9b 对本材料**两次稳定空提取**（同 prompt=1875，completion=2，~21s）；gemma4:e4b 同材料富提取 25 枚（54.6s / 2938 completion）。live graph.db 已存 16 nodes（qwen 历史提取正常工作）→ 属**材料相关欠抽取，非全局失效**。单一模型欠抽取时校验层无米下锅（design 预期内：verify 滤噪声不补召回）。
+2. B 斜视判定一致率 **80%**（20/25）：共同拒绝 3（phase-meta / gemma-observes / goal-junk），qwen 独严 4（类别化摘要），gemma 独严 1；分歧全部 reject→isolated 保档，永不灭档。
+3. 判定座速度：B=gemma4:e4b **32.9s** vs B=qwen3.5:9b **86.4s**（同一 18k 判定 prompt）——决策 1"判定任务比生成简单、小档校验位够用"实测成立；gemma4:e4b 校验位默认型号**复核通过**（2.6× 快 + 合理拒绝谱 + 有独立主见）。
+4. A 侧成本反转：A=gemma4:e4b 54.6s 富提取；A=qwen3.5:9b 20.8s 空提取。
+
 ## QA 观察项存档（非阻断，供后续分诊）
 
 1. verify 单次调用不重试：瞬时 ollama 抖动会损失该轮的交叉验证（回退兜底兜底正确性，不兜底验证信号）。若实测回退率高，立项加一次 in-process 重试。
@@ -84,3 +99,5 @@
 4. `dream_runs.model` 只钉 A 模型；校验位型号在 `ensemble_verified`/`ensemble_verify_fallback` audit detail 的 `verifier_model` 里溯源（本条为记录——若要表级归因，随 vote 的 journal 扩展一起做）。
 5. daemon boot 无条件物化校验位路由（ensemble=off 也建实例）：构造无网络 I/O、零运行成本；坏路由的 warning 在 off 态也会出现一行——如实报。
 6. init 模板注释段的"every durable capture turn"旧措辞已顺手对齐 v1.4（capture 语义无变化，仅文案）；README/README zh 的"状态"小节仍停在 A3 前夜口径（装脚本/MCP 网关写作"land in Phase A3"），待一次文档 pass 一并清算。
+7. **校验位窗口缺口（人工验证发现，行动项候选）**：25 候选实裁 prompt=18287 tok，**超出工厂默认 verifier num_ctx=16384**——大提取量下判定会被 ollama 静默截断；doctor 只查 dream 侧 ctx（`cache_prefix + delta + 生成余量 ≤ num_ctx`），无校验位 ctx 检查。后续任务：verifier 默认窗口随 `delta_budget_ceiling_tokens` 对齐 / doctor 增校验位 ctx 一致性检查。
+8. qwen3.5:9b 材料相关欠抽取需后续真实批次 watch（本次 1707-tok session-meta 类材料两次稳定空提取；历史 16 nodes 证明其正常工作）：若复发率高，单独立项（prompt 或 A 侧选型），不在本包。
