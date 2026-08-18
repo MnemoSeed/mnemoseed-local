@@ -236,6 +236,29 @@ def handle_line(client: DaemonClient, line: str) -> dict[str, Any] | None:
     return handle_message(client, message)
 
 
+def _force_utf8_lane(stream: TextIO, *, newline: bool) -> None:
+    """Pin one stdio lane to UTF-8 JSON-RPC wire form, whatever the host locale.
+
+    MCP frames carry non-ASCII payloads (verbatim Chinese memory text, em-dash
+    punctuation in descriptions). On a host whose stdio encoding is not UTF-8
+    (Windows cp936 / cp1252), a stream left at the locale default mojibake's
+    every such payload — and a Windows text-mode stdout additionally rewrites
+    each \\n to \\r\\n, breaking strict newline-delimited framing. Real pipes
+    get reconfigured in place (encoding only on input; encoding + untranslated
+    newline on output); StringIO-style streams (tests, embedders) have no
+    ``reconfigure`` and pass through untouched."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        if newline:
+            reconfigure(encoding="utf-8", newline="")
+        else:
+            reconfigure(encoding="utf-8")
+    except (OSError, ValueError):  # a hostile stream never kills the gateway
+        pass
+
+
 def serve(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
@@ -248,6 +271,8 @@ def serve(
     """
     in_stream = stdin if stdin is not None else sys.stdin
     out_stream = stdout if stdout is not None else sys.stdout
+    _force_utf8_lane(in_stream, newline=False)
+    _force_utf8_lane(out_stream, newline=True)
     daemon = client if client is not None else build_client()
     try:
         for raw in in_stream:

@@ -351,3 +351,27 @@ def test_cli_mcp_verb_runs_the_stdio_loop(monkeypatch: pytest.MonkeyPatch) -> No
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert len(responses) == 1
     assert responses[0]["result"]["serverInfo"]["name"] == "mnemoseed-local"
+
+
+# ---------------------------------------------------------------- stdio lane encoding (live finding)
+
+
+def test_serve_forces_utf8_and_untranslated_newlines_on_stdio_lanes() -> None:
+    """Live finding (2026-08-18 go-live smoke): on a host whose stdio locale is
+    not UTF-8 (Windows cp936), the gateway wrote responses in the host
+    codepage — any non-ASCII payload (Chinese memory text, em-dash in a
+    description) arrived MOJIBAKE'd, and the tools/list handshake itself broke
+    the client's UTF-8 decode. The gateway must force UTF-8 + untranslated \\n
+    on BOTH lanes regardless of the host locale."""
+    raw_in = io.BytesIO((_request(1, "tools/list") + "\n").encode("utf-8"))
+    raw_out = io.BytesIO()
+    # stand-ins for host-locale pipe streams (cp936: the zh-CN Windows trap)
+    stdin = io.TextIOWrapper(raw_in, encoding="cp936")
+    stdout = io.TextIOWrapper(raw_out, encoding="cp936", newline="")
+    code = server.serve(stdin=stdin, stdout=stdout, client=StubClient())
+    assert code == 0
+    stdout.flush()
+    wire = raw_out.getvalue()
+    assert b"\r\n" not in wire  # no CRLF translation on the wire
+    text = wire.decode("utf-8")  # the whole frame decodes as UTF-8
+    assert "—" in text  # the B2 em-dash survives (mojibake would have died on decode)
