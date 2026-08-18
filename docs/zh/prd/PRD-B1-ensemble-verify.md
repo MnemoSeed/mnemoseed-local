@@ -99,5 +99,5 @@
 4. `dream_runs.model` 只钉 A 模型；校验位型号在 `ensemble_verified`/`ensemble_verify_fallback` audit detail 的 `verifier_model` 里溯源（本条为记录——若要表级归因，随 vote 的 journal 扩展一起做）。
 5. daemon boot 无条件物化校验位路由（ensemble=off 也建实例）：构造无网络 I/O、零运行成本；坏路由的 warning 在 off 态也会出现一行——如实报。
 6. init 模板注释段的"every durable capture turn"旧措辞已顺手对齐 v1.4（capture 语义无变化，仅文案）；README/README zh 的"状态"小节仍停在 A3 前夜口径（装脚本/MCP 网关写作"land in Phase A3"），待一次文档 pass 一并清算。
-7. **校验位窗口缺口（人工验证发现，行动项候选）**：25 候选实裁 prompt=18287 tok，**超出工厂默认 verifier num_ctx=16384**——大提取量下判定会被 ollama 静默截断；doctor 只查 dream 侧 ctx（`cache_prefix + delta + 生成余量 ≤ num_ctx`），无校验位 ctx 检查。后续任务：verifier 默认窗口随 `delta_budget_ceiling_tokens` 对齐 / doctor 增校验位 ctx 一致性检查。
+7. **校验位窗口缺口（人工验证发现）→ 已处置（B1.1，commit `0d38559`）**：运行期守卫——TripleVerifier 调用 B 前对其渲染完的 prompt 做窗口估算（live 读 `dream_verifier` 路由的 num_ctx，ollama-only、未配置跳过），超窗即时回退（新 reason `window_exceeded`，绝不把会被静默截断的判定交给 B）；doctor 新增 "verifier ctx window" 检查（verify-only / ollama-only：prefix + 2×delta ceiling + margin ≤ num_ctx，2× 证据扇出系数与 live finding 一并写入提示文案）。1073 passed / 3 skipped，ruff/format/mypy 干净。
 8. qwen3.5:9b 材料相关欠抽取需后续真实批次 watch（本次 1707-tok session-meta 类材料两次稳定空提取；历史 16 nodes 证明其正常工作）：若复发率高，单独立项（prompt 或 A 侧选型），不在本包。
