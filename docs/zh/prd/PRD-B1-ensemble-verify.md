@@ -68,3 +68,19 @@
 - 三任务 QA 全过；`uv run pytest -q`、`ruff check`、`ruff format --check`、`mypy src` 干净；
 - 单 commit 收口（orchestrator 执行）：`phase B1: ensemble verify runtime — verifier role, verify phase with fallback, triple audit`。
 - 收口后人工验证项：双模型串行双向配对实测（qwen3.5:9b ↔ gemma 互换 A/B）跑真实 sessions，复核校验位默认型号；真实 OpenCode 会话端联调记录。
+
+## 收口记录（2026-08-18）
+
+- 收口 commit：`10d82da`（15 文件，+1400/-32）。最终 1064 passed / 3 skipped（70.29s），ruff/format/mypy 干净；基线 1028 → 增量 +36。
+- 批次执行：T1（5 红 → 全绿，含 2 枚钉死断言随角色集扩张更新：LLM_ROLES 元组、legacy 容忍面、router 序）→ T2（21 红 → 全绿；1 枚测试预期自纠：非数组顶层 verdict 被最宽括号兜底修复为 [] 后按 coverage_mismatch 归类——与 reflect 输出巷同源，语义诚实）→ T3（8 红 → 全绿；1 枚测试基建自纠：dream_once 语义 = 消费池事件，测试须把 floor 降到单次触发线，与既有 daemon 测试同形）。
+- 对抗自验增量（收口前变异击杀向）：string-digit index 正向 coercion、bool index、负 index 三枚补钉；三重审计第一面（`llm_role_configured` 携 `role == "dream_verifier"`）在 daemon 集成层钉死。
+- 待办人工验证项：双模型串行双向配对实测（qwen3.5:9b ↔ gemma 互换 A/B）跑真实 sessions 并复核校验位默认型号 `gemma4:e4b`（设计稿 §8 原标 gemma 4 12b 为估算值，live D4 矩阵已实测 e4b）；真实 OpenCode 会话端 verify 联调留证。
+
+## QA 观察项存档（非阻断，供后续分诊）
+
+1. verify 单次调用不重试：瞬时 ollama 抖动会损失该轮的交叉验证（回退兜底兜底正确性，不兜底验证信号）。若实测回退率高，立项加一次 in-process 重试。
+2. verifier 覆盖不齐 = 整轮回退（all-or-nothing），不做逐条降级：部分缺失时放弃全部 B 信号，属保守浪费而非损坏。
+3. `ensemble=vote` 仍无运行期消费端（配置层接受写入，运行时按 off 处理）——键语义继续为声明性配置，立项机制改动时再补消费端。
+4. `dream_runs.model` 只钉 A 模型；校验位型号在 `ensemble_verified`/`ensemble_verify_fallback` audit detail 的 `verifier_model` 里溯源（本条为记录——若要表级归因，随 vote 的 journal 扩展一起做）。
+5. daemon boot 无条件物化校验位路由（ensemble=off 也建实例）：构造无网络 I/O、零运行成本；坏路由的 warning 在 off 态也会出现一行——如实报。
+6. init 模板注释段的"every durable capture turn"旧措辞已顺手对齐 v1.4（capture 语义无变化，仅文案）；README/README zh 的"状态"小节仍停在 A3 前夜口径（装脚本/MCP 网关写作"land in Phase A3"），待一次文档 pass 一并清算。
