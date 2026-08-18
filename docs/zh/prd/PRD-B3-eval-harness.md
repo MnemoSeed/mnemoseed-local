@@ -134,3 +134,35 @@
 2. **报告三元组载荷**（`eval/report.py` → `eval_version v1.1`）：CellReport 增 `triples` 全量（route/graph/subject/predicate/object/polarity/confidence/node_id），reader 对 v1 无该字段容忍（→ 空）；**尺子再升级时可离线重打分，不重烧 GPU**。
 3. **离线重打分**（`eval/rescore.py` + `__main__ rescore`）：读 v1.1 报告 + canary seed 重建 truth → 重算 recall 面指标（pollution 维度依赖 chunk 归因，不可离线重算，保留原报告值并如实标注）。
 4. **live 矩阵重跑**（用户已授权）：同 roster 同材料重跑，新旧两报对照表入本 PRD 收口记录。
+
+### B3.1 收口记录（2026-08-19 收口，同日两次 live 跑 + 一次离线重判）
+
+- **门禁复验**：**1181 passed / 3 skipped**（B3 基线 1133 → +48），ruff / ruff format / mypy（85 files）全净。批次内自纠 1 枚：`__main__ rescore` 入口 PRD 已承诺却漏接线，本收口前补上（TDD：入口测试先行）。
+- **报告**：旧=`2026-08-18T16-37-50Z-12cells-5materials.json`（v1 尺）；新=`2026-08-18T19-00-49Z-14cells-5materials.json`（**v1.1，同 roster 同材料 + 云锚 Kimi-K3 ×2**，零 skipped）；补跑=`2026-08-18T19-32-11Z-12cells-1materials.json`（纯 canary 对照，同日补采）。
+
+**canary-00 新旧对照**（recall；△=补充事实；"墙"=4×60s reflect 超时 tokens=0）：
+
+| cell | 旧（v1 尺） | 新（B3.1 尺） | 备注 |
+|---|---|---|---|
+| qwen3_5_9b+off | 0.125 (core=7) | 0.00 (main=0, iso=10) | △另跑 recall=**1.00** core=8：形状不稳（见发现 2） |
+| qwen3_5_9b+verify | 0.00 (core=7) | 0.00 (tok=522, t=4.3s) | 确定性零产出，两跑同指纹（见发现 3） |
+| gemma4_e4b+off | 0.00 (poll=6) | **0.625** (poll=1) | 旧尺全杀→新尺正当计入 |
+| gemma4_e4b+verify | 0.00 (poll=1) | **0.75** (judged=9/9) | 同上 |
+| qwen3_5_4b+off | 0.00 (poll=1) | 0.00 (poll=2) | △另跑 0.75 (poll=4)——方差 |
+| qwen3_5_4b+verify | 0.00 (poll=5) | **0.625** (poll=0) | △另跑 0.00 (poll=5)——方差 |
+| qwen3_8b+off | 0.00（墙 256s） | **0.50** (poll=2, t=181s) | 旧跑撞墙，新跑通过 |
+| qwen3_8b+verify | 0.00 (poll=2) | 0.00（墙 256s） | △另跑 0.625——方差 |
+| qwen3_4b ×2 | 0.00（墙） | 0.00（墙） | 三跑同指纹（发现 4） |
+| gemma4_12b ×2 | 0.00（墙） | 0.00（墙） | 三跑同指纹（发现 4） |
+| kimi_k3+off | — | **0.50** (poll=0, core=8, tok=5427, t=54.7s) | 高端云锚就位 |
+| kimi_k3+verify | — | 0.00 (tok=0, t=9.5s) | http 级快失败（发现 5） |
+
+**收口发现（如实）**：
+
+1. **尺修正达目的且没放水**：非撞墙 cell 上新渲染被正当计入（e4b off 0→0.625、e4b verify 0→0.75、qwen3_5_4b verify 0→0.625、qwen3_8b off 0→0.5）；autopsy negatives 13 行全拒的护栏按构造在（T1 测试钉死），e4b 校验层减排（off 态 pollution 6 → verify 后 1）新跑复现。
+2. **单跑数值不能当 bar（重大）**：qwen3_5_9b+off 同日两跑 1.00 ↔ 0.00 摆动——验尸（v1.1 载荷直读）：坏跑把 10 枚三元组全部渲染成"predicate 把整句话打包 + object='None' 串"的退化形状，reflect 正确判 SALVAGE、merge 正确停进 isolated（护栏工作正常），但主图为空、recall=0。**模型输出形状不稳是召回方差的大头，不是模型杀也不是尺杀**。bar 定版须多跑取共识或只认确定性 cell。
+3. **qwen3_5:9b + verify 席确定性零产出**（tok=522, t≈4.3s，两跑同指纹）：B1"材料相关欠抽取"的确定性复发，非随机。**立项候选**：B4 前单独查 reflect 提示词 × verify 回路配对（不进本包）。
+4. **60s 超时墙依旧钉死** qwen3:4b / gemma4:12b（三跑同指纹 tokens=0 ×4）——B4 档位定版的硬输入，`dream.capture_only` 硬模式裁定必据此。
+5. **云锚链路打通**：Kimi-K3 以 `openai_compatible` extra-route 进矩阵（key 走环境变量名，报告/单元无任何密料），off 态 recall=0.50 pollution=0 提供高端参考点；verify 席 9.5s 零 token 快失败（Http 级，非撞墙），云座 × 本地校验配对待查。
+6. **离线重打分实测**：`python -m mnemoseed_local.eval rescore` 对 19:00Z 报告 70 cell 重判 **零偏差**（同尺确定性复核成立）；旧 v1 报告无载荷不可重判——v1.1 载荷的存在理由被同一事实反向证明。
+

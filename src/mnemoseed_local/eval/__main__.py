@@ -1,6 +1,6 @@
 """``uv run python -m mnemoseed_local.eval`` — the eval harness entry (B3 T4).
 
-NOT a product surface: no ``mnemoseed`` CLI verb, no daemon endpoint. Two
+NOT a product surface: no ``mnemoseed`` CLI verb, no daemon endpoint. Three
 subcommands:
 
 - ``matrix``: roster x ensemble over the material catalog; reports accumulate
@@ -10,6 +10,8 @@ subcommands:
   the bidirectional pair column (B1 live-record shape).
 - ``canary``: seconds-fast stub-seat self-check (recall must be 1.0, noise
   pollution 0) — the pre-live gate proving the harness itself is sound.
+- ``rescore``: offline re-judge of a v1.1 report's recall after a ruler
+  revision — the embedded triple payload + rebuilt canary truth, no GPU.
 
 Exit codes are ``matrix.matrix_exit_code`` semantics: missing models are
 skips (0), material/run failures are failures (1).
@@ -98,6 +100,20 @@ def _canary_command(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+def _rescore_command(args: argparse.Namespace) -> int:
+    """Offline re-judge of a v1.1 report's recall surface (B3.1 T2) — the
+    embedded triple payload + rebuilt canary truth, zero GPU."""
+    from mnemoseed_local.eval.rescore import rescore_report
+
+    out = rescore_report(
+        Path(args.report),
+        canary_seed=args.seed,
+        out_dir=Path(args.out) if args.out else None,
+    )
+    print(f"rescored: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mnemoseed_local.eval", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -126,9 +142,16 @@ def main(argv: list[str] | None = None) -> int:
     canary.add_argument("--seed", type=int, default=DEFAULT_CANARY_SEED, help="canary factory seed")
     canary.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
 
+    rescore = sub.add_parser("rescore", help="re-judge a v1.1 report's recall offline (no GPU)")
+    rescore.add_argument("report", help="path to the v1.1 report JSON")
+    rescore.add_argument("--seed", type=int, default=DEFAULT_CANARY_SEED, help="canary factory seed")
+    rescore.add_argument("--out", default=None, help="output dir (default: beside the source report)")
+
     args = parser.parse_args(argv)
     if args.command == "matrix":
         return _matrix_command(args)
+    if args.command == "rescore":
+        return _rescore_command(args)
     return _canary_command(args)
 
 

@@ -123,3 +123,16 @@ def test_rescore_session_determinism(stub_report, tmp_path: Path) -> None:
     _, path = stub_report
     a = rescore_report(path, canary_seed=7)
     assert load_report(a).cells[0].canary.canary_recall == 1.0
+
+
+def test_rescore_entry_point(stub_report) -> None:
+    """PRD-B3 B3.1 item 3: the offline rescore is reachable from the harness
+    entry (``python -m mnemoseed_local.eval rescore <report>``), not only as a
+    library function."""
+    from mnemoseed_local.eval.__main__ import main
+
+    _, path = stub_report
+    assert main(["rescore", str(path), "--seed", "7"]) == 0
+    produced = list(path.parent.glob(f"*-{path.stem}-rescored.json"))
+    assert len(produced) == 1
+    assert load_report(produced[0]).cells[0].canary.canary_recall == 1.0
