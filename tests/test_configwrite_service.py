@@ -135,6 +135,26 @@ def test_num_ctx_and_num_predict_are_writable_role_fields(tmp_path) -> None:
         service.set("dream.llm.dream.num_predict", "big", actor="console")
 
 
+def test_verifier_role_keys_are_writable_and_bump_their_own_generation(tmp_path) -> None:
+    """B1 T1: the dream_verifier role rides the same registry surface as the
+    dream role — writes hot-apply to the live route and the file, validate
+    through the shared role validators, and bump only its own generation."""
+    service, path = _service(tmp_path)
+    result = service.set("dream.llm.dream_verifier.model", "gemma4:e4b-alt", actor="console")
+    assert result["ok"] is True
+    assert load_config(path).llm["dream_verifier"].model == "gemma4:e4b-alt"
+    assert service._config.llm["dream_verifier"].model == "gemma4:e4b-alt"
+    assert service.generation == 1
+    assert service.generation_for("dream_verifier") == 1
+    assert service.generation_for("dream") == 0  # the dream route is untouched
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream_verifier.driver", "  ", actor="console")
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream_verifier.api_key_env", "sk-proj-literal", actor="console")
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream_verifier.think", "maybe", actor="console")
+
+
 def test_token_budget_usd_is_not_a_registry_key(tmp_path) -> None:
     """AC1: the removed dream.token_budget_usd key is NOT writable — a set
     against it is a typed unknown-key error, never a silent no-op."""

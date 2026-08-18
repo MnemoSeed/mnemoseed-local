@@ -198,13 +198,15 @@ class DecayConfig:
     lambda_per_type: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LAMBDA_PER_TYPE))
 
 
-# A2 MVP (single dream driver): the ONE dream LLM role. The cloud
-# deep_reflection / short_increment split is trimmed for the local single-user
-# daemon; the role remains a pipeline-internal parameter so a future split can
-# re-open it without a schema change. Any legacy [dream.llm.deep_reflection] /
+# A2 MVP + B1: the dream LLM roles. The cloud deep_reflection / short_increment
+# split is trimmed for the local single-user daemon; roles remain a
+# pipeline-internal parameter so a future split can re-open them without a
+# schema change. "dream" generates (model A); "dream_verifier" is the ensemble
+# verify judging seat (model B, design/01 decision 1) — dormant unless
+# dream.ensemble=verify. Any legacy [dream.llm.deep_reflection] /
 # [dream.llm.short_increment] tables are tolerated on load and ignored with a
 # warning, never applied.
-LLM_ROLES: tuple[str, ...] = ("dream",)
+LLM_ROLES: tuple[str, ...] = ("dream", "dream_verifier")
 
 #: Removed role names (A2 trim): recognized for deprecation tolerance.
 LEGACY_ROLES: frozenset[str] = frozenset({"deep_reflection", "short_increment", "local_track"})
@@ -212,7 +214,8 @@ LEGACY_ROLES: frozenset[str] = frozenset({"deep_reflection", "short_increment", 
 #: Wording shared by the loader warning, the admin surface, and the wire: a
 #: legacy table or a write targeting a removed role answers the same message.
 LOCAL_TRACK_DEPRECATION = (
-    "[dream.llm.<legacy-role>] was deprecated and removed; the A2 local MVP uses a single 'dream' role"
+    "[dream.llm.<legacy-role>] was deprecated and removed; the local MVP routes dreams through the "
+    "'dream' role (plus 'dream_verifier' when ensemble verify is enabled)"
 )
 
 
@@ -257,6 +260,23 @@ DEFAULT_LLM_ROUTES: dict[str, RoleLLMConfig] = {
             # 16k window by default; the ctx-window doctor check then reports
             # honestly whether the delta ceiling fits (tier-coherent overrides
             # live on dream.delta_budget_ceiling_tokens + this key).
+            "num_ctx": 16384,
+        },
+    ),
+    # B1 ensemble verify (design/01 decision 1): the judging seat (model B).
+    # Verification is a cheaper task than generation, so the factory defaults
+    # to the small judge model on the same local track; it stays dormant until
+    # dream.ensemble is flipped to "verify" (off by default, lite tier locked).
+    "dream_verifier": RoleLLMConfig(
+        role="dream_verifier",
+        driver="ollama",
+        model="gemma4:e4b",
+        params={
+            "base_url": "http://localhost:11434",
+            # Judging is structured output too: thinking burns the whole
+            # generation budget on inner thinking and returns EMPTY content
+            # (same D4 failure shape as the dream route).
+            "think": False,
             "num_ctx": 16384,
         },
     ),
@@ -605,9 +625,10 @@ baseurl = "http://localhost:7788"
 # Dream-engine manual-first discipline (PRD-02 FR-2.8): keep dreams manual
 # until reflection quality passes review, then flip to automatic. The A2
 # schedule triggers (hot-applied via `mnemoseed-local config set`) are
-# score-pool based (design/01 + PRD-02): every durable capture turn credits its
-# S importance (arousal / novelty / causal components, 0..10 scale) into the
-# profile's score pool, and a dream becomes eligible once the pool reaches
+# score-pool based (design/01 + PRD-02): every capture turn credits its S
+# importance (arousal / novelty / causal components, 0..10 scale) into the
+# profile's score pool (every turn is also stored verbatim — scoring never
+# drops text), and a dream becomes eligible once the pool reaches
 #   floor_pool_points  — the pool-points floor (design's 10-point scale); the
 #                        capture pool's self-fire threshold (dream_threshold)
 #   idle_min_sec       — the profile must have been idle at least this long
@@ -650,16 +671,23 @@ baseurl = "http://localhost:7788"
 driver = "sqlite_graph"
 path = "~/.mnemoseed-local/isolated.db"
 
-# Dream LLM role routing (A2 MVP): ONE role named "dream". The local default is
-# ollama (dream inference stays on the machine); the openai-compatible driver
-# is the fallback for a cloud/remote endpoint. API keys are referenced by
-# ENV-VAR NAME or a secrets:mnemoseed/dream/dream reference — never a literal
-# key here; the router resolves the value from the process environment / the
-# local secret store at materialization time.
+# Dream LLM role routing: role "dream" generates (model A); role
+# "dream_verifier" is the ensemble verify judging seat (model B, dormant unless
+# dream.ensemble = "verify"). The local default is ollama (dream inference
+# stays on the machine); the openai-compatible driver is the fallback for a
+# cloud/remote endpoint. API keys are referenced by ENV-VAR NAME or a
+# secrets:mnemoseed/dream/<role> reference — never a literal key here; the
+# router resolves the value from the process environment / the local secret
+# store at materialization time.
 # Other params (base_url, max_tokens, ...) override the role's defaults.
 # [dream.llm.dream]
 # driver = "ollama"
 # model = "qwen3.5:9b"
+# base_url = "http://localhost:11434"
+#
+# [dream.llm.dream_verifier]
+# driver = "ollama"
+# model = "gemma4:e4b"
 # base_url = "http://localhost:11434"
 
 # The deep_reflection / short_increment / local_track roles were trimmed in the

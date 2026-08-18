@@ -48,8 +48,10 @@ def _write(path: Any, text: str) -> None:
 # ---------------------------------------------------------------- config defaults
 
 
-def test_default_roles_are_exactly_the_single_dream_role() -> None:
-    assert LLM_ROLES == ("dream",)
+def test_default_roles_are_exactly_the_dream_and_verifier_roles() -> None:
+    """B1 (ensemble verify): the second LLM role is the judging model B
+    (design/01 decision 1). No third role until vote lands as a journal change."""
+    assert LLM_ROLES == ("dream", "dream_verifier")
     assert set(DEFAULT_LLM_ROUTES) == set(LLM_ROLES)
 
 
@@ -61,6 +63,22 @@ def test_defaults_follow_the_local_ollama_track(monkeypatch) -> None:
     assert dream.model == "qwen3.5:9b"
     assert dream.params["base_url"] == "http://localhost:11434"
     assert set(cfg.llm) == set(LLM_ROLES)
+
+
+def test_verifier_role_defaults_follow_the_small_judge_track(monkeypatch) -> None:
+    """B1 (design/01 decision 1): verification is a judging task — simpler and
+    cheaper than generation — so the factory verifier route defaults to the
+    small judge model on the same local ollama track. Judging is structured
+    output: thinking is pinned OFF and a working ctx window ships by default
+    (same D4 failure shape as the dream route)."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(Path("/nonexistent/config.toml"))
+    verifier = cfg.llm["dream_verifier"]
+    assert verifier.driver == "ollama"
+    assert verifier.model == "gemma4:e4b"
+    assert verifier.params["base_url"] == "http://localhost:11434"
+    assert verifier.params["think"] is False
+    assert verifier.params["num_ctx"] == 16384
 
 
 def test_default_key_references_are_env_var_names_never_literals() -> None:
@@ -94,6 +112,27 @@ def test_dream_llm_table_parses(tmp_path, monkeypatch) -> None:
     assert dream.params["base_url"] == "http://127.0.0.1:11434"
 
 
+def test_dream_verifier_llm_table_parses(tmp_path, monkeypatch) -> None:
+    """B1: a [dream.llm.dream_verifier] override table parses per role; an
+    untouched verifier keeps the factory judge-model route."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(
+        p,
+        'preset = "embedded"\n'
+        "[dream.llm.dream_verifier]\n"
+        'driver = "openai_compatible"\n'
+        'model = "judge-model"\n'
+        'api_key_env = "MNEMOSEED_VERIFIER_API_KEY"\n',
+    )
+    cfg = load_config(p)
+    verifier = cfg.llm["dream_verifier"]
+    assert verifier.driver == "openai_compatible"
+    assert verifier.model == "judge-model"
+    assert verifier.params["api_key_env"] == "MNEMOSEED_VERIFIER_API_KEY"
+    assert cfg.llm["dream"].driver == "ollama"
+
+
 def test_legacy_role_tables_are_accepted_ignored_with_deprecation_warning(
     tmp_path, monkeypatch, caplog
 ) -> None:
@@ -117,7 +156,7 @@ def test_legacy_role_tables_are_accepted_ignored_with_deprecation_warning(
     )
     with caplog.at_level("WARNING", logger="mnemoseed_local.config"):
         cfg = load_config(p)
-    assert set(cfg.llm) == {"dream"}
+    assert set(cfg.llm) == {"dream", "dream_verifier"}
     assert cfg.llm["dream"].driver == "ollama"  # defaults intact
     assert cfg.llm["dream"].model == "qwen3.5:9b"
     assert "deprecated" in caplog.text.lower()
@@ -362,7 +401,7 @@ def test_router_check_unconfigured_role_is_failed_health() -> None:
 
 def test_router_roles_in_config_order() -> None:
     router = _router(Config().llm)
-    assert router.roles() == ("dream",)
+    assert router.roles() == ("dream", "dream_verifier")
 
 
 def test_router_audit_logs_role_configured_once_env_name_never_value() -> None:

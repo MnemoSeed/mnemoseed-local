@@ -57,6 +57,7 @@ from mnemoseed_local.dream import (
     Merger,
     ReflectOrchestrator,
     TokenLedger,
+    TripleVerifier,
     resume_boundary,
 )
 from mnemoseed_local.dream.pipeline import RunCompletion
@@ -83,9 +84,11 @@ from mnemoseed_local.storage.ports import (
 
 logger = logging.getLogger("mnemoseed_local.daemon")
 
-# The single dream role the reflect boundary runs (A2 MVP): the role stays a
-# pipeline-internal param so a future deep/short split can re-open it.
+# The dream role the reflect boundary runs (A2 MVP), and the B1 ensemble
+# verify judging seat (design/01 decision 1): roles stay pipeline-internal
+# params so a future deep/short split can re-open them.
 _REFLECT_ROLE = "dream"
+_VERIFIER_ROLE = "dream_verifier"
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -136,6 +139,21 @@ def _build_dream_llm(router: RoleRouter) -> DreamLLM:
     except LLMError as exc:
         logger.warning(
             "dream route unavailable at boot (%s); dreams degrade to capture-only until the route is fixed",
+            exc,
+        )
+        return _UnavailableLLM(str(exc))
+
+
+def _build_verifier_llm(router: RoleRouter) -> DreamLLM:
+    """Materialize the ensemble verify judging seat (B1), same degrade-typed
+    boot discipline as the dream route. A broken verifier route never crashes
+    boot and never blocks a dream: the verify phase falls back to the
+    unverified reflect result with an audit record (design/01 decision 1)."""
+    try:
+        return router.resolve(_VERIFIER_ROLE)
+    except LLMError as exc:
+        logger.warning(
+            "verifier route unavailable at boot (%s); ensemble verify falls back to A's original reflect",
             exc,
         )
         return _UnavailableLLM(str(exc))
@@ -411,6 +429,18 @@ def _build_capture(
     def _resolve_dream_llm() -> DreamLLM:
         return _build_dream_llm(router)
 
+    def _resolve_verifier_llm() -> DreamLLM:
+        return _build_verifier_llm(router)
+
+    ledger = TokenLedger(meta=stores.meta)
+    verifier = TripleVerifier(
+        llm=_resolve_verifier_llm(),
+        resolve_llm=_resolve_verifier_llm,
+        config=config,
+        meta=stores.meta,
+        ledger=ledger,
+    )
+
     reflector = ReflectOrchestrator(
         llm=_resolve_dream_llm(),
         resolve_llm=_resolve_dream_llm,
@@ -419,7 +449,8 @@ def _build_capture(
         on_done=trigger.on_reflect_complete,
         on_unavailable=_reflect_unavailable,
         on_run_started=lambda run_id, model: stores.meta.update_dream_run_model(run_id, model),
-        ledger=TokenLedger(meta=stores.meta),
+        ledger=ledger,
+        verifier=verifier,
     )
     merger = Merger(
         graph_main=stores.graph,

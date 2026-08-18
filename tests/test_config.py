@@ -278,3 +278,11 @@ def test_default_dream_route_ships_a_working_num_ctx(tmp_path, monkeypatch) -> N
     p = tmp_path / "config.toml"
     _write(p, "[dream.llm.dream]\nnum_ctx = 36864\n")
     assert load_config(p).llm["dream"].params["num_ctx"] == 36864
+
+
+def test_default_config_toml_documents_the_verifier_role() -> None:
+    """B1 T1: the init template shows the verifier role next to the dream role
+    so a user opting into ensemble=verify discovers the route without reading
+    source."""
+    assert "[dream.llm.dream_verifier]" in default_config_toml()
+    assert 'model = "gemma4:e4b"' in default_config_toml()

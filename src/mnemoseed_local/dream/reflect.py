@@ -141,6 +141,19 @@ class ChatLLM(Protocol):
     def chat(self, *, system: str, user: str) -> str | ChatResult: ...
 
 
+class Verifier(Protocol):
+    """Structural seam for the ensemble verify pass (B1, design/01 decision 1).
+
+    Implemented by ``dream.verify.TripleVerifier``; declared here so the
+    orchestrator depends on the narrow shape only (verify.py imports reflect.py
+    helpers — importing it back would be a cycle). The verifier judges A's
+    folded core triples and returns the result merge should see; on ANY
+    failure it returns A's original result (fallback + audit), so this call
+    never raises into the reflect boundary."""
+
+    def verify(self, snapshot: Snapshot, result: ReflectionResult) -> ReflectionResult: ...
+
+
 def _split_response(response: str | ChatResult) -> tuple[str, Usage | None]:
     """Normalize a ChatLLM response: (text, provider usage). A plain str is
     treated as text with no provider-reported usage."""
@@ -465,6 +478,7 @@ class ReflectOrchestrator:
         packer: DeltaPacker | None = None,
         ledger: TokenLedger | None = None,
         resolve_llm: Callable[[], ChatLLM] | None = None,
+        verifier: Verifier | None = None,
     ) -> None:
         self._llm = llm
         # F2 hot-apply seam: when wired, every reflect pass materializes the
@@ -484,6 +498,11 @@ class ReflectOrchestrator:
         self._backoff_base = backoff_base
         self._packer = packer if packer is not None else DeltaPacker()
         self._ledger = ledger
+        # B1 ensemble verify seam (design/01 decision 1): when wired AND the
+        # live config mode says verify, model B judges A's folded core triples
+        # between assembly and the atomic journal write — FALL-SOFT by
+        # contract, a verifier failure lands A's original result + audit.
+        self._verifier = verifier
 
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
         """Run one reflect pass. The marker gate makes a completed reflect a
@@ -565,6 +584,12 @@ class ReflectOrchestrator:
             self._sleep(self._backoff(attempt))
 
         assert result is not None
+        if self._verifier is not None:
+            # B1: verify rides the SAME reflect run — the journaled payload
+            # below is whatever the verifier returned (verified result, or A's
+            # original on fallback), so merge / crash-resume see exactly one
+            # consistent outcome and REFLECT_DONE marker semantics never change.
+            result = self._verifier.verify(snapshot, result)
         tracked_report = _with_provider_usage(report, provider_usage)
         if self._ledger is not None:
             # Token metering (T5b / T3b): the dream consumed the packed delta

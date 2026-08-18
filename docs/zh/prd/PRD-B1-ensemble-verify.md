@@ -1,0 +1,70 @@
+# PRD · Phase B1 ensemble verify 运行期消费端
+
+> 依据：`docs/zh/design/mvp-design.md` v1.3 决策 1（ensemble 校验层诚实成本版：**verify = 模型 B 逐条验证模型 A 的产出；B 失败/格式崩坏的回退 = 采用 A 原样 + 审计记录**）、决策 7（`dream.ensemble` 为注册表热键，本包补上它的运行期消费端）；A2.5 QA 观察项 9（`dream.ensemble`/`hardware_tier` 键尚无运行期消费端）。Phase 2 启动指令：先落地 verify 运行期消费端，再用持续累积的真实 sessions 跑双模型串行双向配对实测。
+> 基线：commit `851b04a`，复验 1028 passed / 3 skipped（73.30s，2026-08-18）。
+> 门禁：每任务 TDD；子代理从不提交；每任务完成后经对抗性 QA 验收，FAIL 打回重做。
+> 执行顺序：**T1 → T2 → T3 串行**（T1 钉角色/配置管线，T2 引擎落 reflect 构造缝，T3 daemon + doctor 集成缝）。
+> vote 模式**不在本包范围**（journal 双相位 + combiner 的机制改动另行立项，见设计稿决策 1）。
+
+## 语义定版（本包拍板，写死进测试）
+
+1. **送裁范围**：仅 `route == core` 的 folded triple 送 B 裁。isolated/salvage 已在主图之外——无可保护对象；B 永不升级任何路由、永不删除任何产出。
+2. **否决定去**：reject → 确定性改道 `Route.ISOLATED`（绝不投票消灭，与决策 1 vote 侧"分歧 → isolated"同哲学）。accept → 原样。
+3. **回退全集（采用 A 原样，整轮粒度）**：B LLMUnavailable / JSON 解析失败 / 覆盖不齐（缺号、多号、重号、垃圾 verdict 值、非数组顶层）。单次调用、**B 不重试**——校验层不是关键路径，回退代价低，与决策 1"B 失败回退 A 原样"对齐。
+4. **零受审短路**：无 core triple → 不调用 B、不审计。
+5. **三重审计**（actor 均按既有 dream 路径惯例）：
+   - `llm_role_configured`（role=`dream_verifier`，RoleRouter 物化时既有面自动落地）；
+   - `ensemble_verified`（actor `dream`）：{run_id, verifier_model, verify_prompt_version, judged, accepted, rejected, rejected_keys（subject|predicate|object 痕迹）, tokens}；
+   - `ensemble_verify_fallback`（actor `dream`）：{run_id, verifier_model, reason ∈ {llm_unavailable, malformed_output, coverage_mismatch}, detail 单句}。
+6. **journal/resume 零改动**：验证发生在 reflect retry 循环成功组装后、`_finalize` 前；落盘载荷 = 验证后结果，`REFLECT_DONE` 单标记语义不变，merge/safe-clear 不感知。
+7. **账本**：verifier prompt（`estimate_tokens` 估算）+ completion token 附加记账（与 reflect 同一月度计数器，append-only 遥测语义不变）。
+8. **档位门控不变**：lite + ensemble≠off 拒绝写入的既有校验面不动；verify 默认关闭（`off`）。
+
+## 任务 T1 · `dream_verifier` 角色管线
+
+- 设计依据：决策 1（校验位的唯一配置增量 = 第二个 LLM 路由）；决策 6（api_key_env 全展示面 redact 惯例对新角色一体适用）。
+- 范围：
+  1. `LLM_ROLES` 增 `"dream_verifier"`；`DEFAULT_LLM_ROUTES` 增默认路由：`ollama / gemma4:e4b`，params `{base_url, think=False, num_ctx=16384}`——判定任务比生成简单（决策 1），校验位默认小档模型；型号在本包收口后的 live 双向配对实测复核。
+  2. 派生面零代码：loader 角色循环（config.py:515）、configwrite `_role_key_specs` 循环（service.py:547）、secret-ref 校验（`secrets:mnemoseed/dream/dream_verifier`，config.py:352）全部自动——本任务补钉死测试。
+  3. init 模板注释段补 `[dream.llm.dream_verifier]` 示例（与 dream 段同款注释形态）。
+  4. 更新既有钉死测试：`test_llm_routing.py`（LLM_ROLES 断言、`DEFAULT_LLM_ROUTES` 断言）、`test_configwrite_service.py`（角色键注册面）等因角色集扩张而失效的断言。
+- AC：
+  - `config set dream.llm.dream_verifier.model ...` 热生效（generation 递增，RoleRouter 下次 resolve 拿新实例，与 dream 角色同 seam）；
+  - 非法 driver / 字面量 api key / 非法 base_url 写入被拒（复用既有校验面，逐型反例）；
+  - 全新 init 生成的 config 含 `dream_verifier` 默认路由；全量回归绿。
+
+## 任务 T2 · 验证相位引擎（`dream/verify.py`）+ reflect 集成
+
+- 设计依据：决策 1（verify 语义）、决策 7（热读 seam，镜像 `Merger._confidence_floor` / `DeltaPacker._ceiling` 活读惯例）；红线（溯源不可变：reject 只改道不删除）。
+- 范围：
+  1. 新模块 `src/mnemoseed_local/dream/verify.py`：
+     - `VERIFY_PROMPT_VERSION = "v1"`；
+     - 系统模板：judge 指令（只评判"证据是否支撑该 triple"；拿不准即 accept；输出严格 JSON verdict 数组，无其他文本）；
+     - 用户面文法：`<candidate>` 块（index / subject / predicate / object / route / confidence + 该 triple 证据 chunk 块，复用 `render_chunk_block`），候选序 = folded triples 序（确定性）；
+     - `TripleVerifier`：注入 `llm`（boot 兜底）+ `resolve_llm`（每轮钉定，镜像 reflect 的 F2 seam）+ `config`（活引用，`ensemble` 热读）+ `ledger` + `meta`（审计 sink）+ `sleep`；`verify(snapshot, result) -> ReflectionResult`，off 时原样直返且 B 零调用；
+     - verdict 解析：顶层数组 `[{"index", "verdict"}]`；`index` 走有界数字 coercion（D4 同哲学）；`verdict` 有界词表 {accept, accepted, reject, rejected}（casefold）；其他一律 malformed；
+     - 应用：`dataclasses.replace` 逐枚改道 + 重建 result。
+  2. `ReflectOrchestrator` 增可选 `verifier` 参数（结构 Protocol 定义在 reflect.py，避免 import 环）；集成点 = retry 循环成功后、ledger/`_finalize` 前。`llm`/`resolve_llm` 缺失时 verifier 不动作（off 语义）。
+- AC：
+  - 四主用例：全 accept 原样；单 reject 改道 isolated（其余字段不变）；非 core 不送裁（B 收到候选数 = core 数）；零 core 零调用零审计；
+  - 回退路径逐型：LLMUnavailable / 垃圾 JSON / 缺号 / 多号 / 重号 / 垃圾 verdict 值——均返回 A 原样 + `ensemble_verify_fallback` 正确 reason；reflect 边界照常 `REFLECT_DONE` finalize；
+  - `ensemble_verified` 审计 detail 字段钉死；verifier token 附加记账断言；
+  - off→verify 热切换：下一轮 dream 生效，off 期 B 零调用；
+  - 全量回归绿 + ruff/format/mypy 干净。
+
+## 任务 T3 · daemon 接线 + `stub_verifier` 驱动 + doctor 校验位检查
+
+- 范围：
+  1. `llm/drivers/stub_verifier.py`：`StubVerifyLLM`（解析 `<candidate>` 文法：证据 chunk 块 ≥1 → accept，否则 reject；lazy import 防环，镜像 stub.py 先例）注册驱动 `stub_verifier`（测试用件，永不作生产默认）。
+  2. `daemon/app.py`：`_VERIFIER_ROLE = "dream_verifier"`；`_build_verifier_llm(router)`（typed degrade 镜像 `_build_dream_llm`，坏路由不炸 boot）；`TripleVerifier(...)` 构造（meta=config 同源、共享 ledger）；注入 reflector。
+  3. doctor 新增 "ensemble verifier" 检查：仅 `dream.ensemble == verify` 且校验位路由为 ollama 时生效（off / 非 ollama 显式 skip）；复用 T5 的模型存在性判定函数（名称规格化同源）；缺失 → FAIL 附 `ollama pull <model>`；服务器不可达 → FAIL 附启动提示。**`up` 预检不阻断**——校验位缺失按设计回退为未验证 dream，不是不可运行状态。
+- AC：
+  - daemon 级集成：ensemble=verify + `stub`/`stub_verifier` 双路由全链路 dream 跑通；`/api/v1/audit` 可见 `ensemble_verified`；reject（证据空）用例节点落 isolated；
+  - doctor 三态 + 两 skip 用例；
+  - 全量回归绿 + ruff/format/mypy 干净。
+
+## 完成定义（整包）
+
+- 三任务 QA 全过；`uv run pytest -q`、`ruff check`、`ruff format --check`、`mypy src` 干净；
+- 单 commit 收口（orchestrator 执行）：`phase B1: ensemble verify runtime — verifier role, verify phase with fallback, triple audit`。
+- 收口后人工验证项：双模型串行双向配对实测（qwen3.5:9b ↔ gemma 互换 A/B）跑真实 sessions，复核校验位默认型号；真实 OpenCode 会话端联调记录。

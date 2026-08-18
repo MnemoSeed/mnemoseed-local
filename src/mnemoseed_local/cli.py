@@ -181,6 +181,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # A3 T5 model-missing UX: the ollama dream route's model must be pulled.
     model_ok, model_detail = _dream_model_check(config)
     checks.append(("dream model", model_ok, model_detail))
+
+    # B1 T3: same model-missing honesty for the verify judging seat when the
+    # user opted into ensemble=verify.
+    checks.append(_ensemble_verifier_check(config))
     return _doctor_report(checks)
 
 
@@ -289,24 +293,24 @@ def models_contain(models: list[str], configured: str) -> bool:
     return any(model in wanted for model in models)
 
 
-def _dream_model_check(config: Config) -> tuple[bool, str]:
-    """A3 T5 (design/01 §6 Phase A3): the ollama dream route's model must be pulled.
+def _role_model_check(config: Config, role: str) -> tuple[bool, str]:
+    """The ollama model-presence check for one LLM role, reused by every seat.
 
     Compare the configured ``route.model`` against the server's ``GET
     /api/tags`` inventory (via the driver's ``check()`` probe; name comparison
     goes through ``models_contain``). A missing model fails with the pull hint
     and an unreachable server fails with a start-ollama hint — never a silent
     pull. A non-ollama route skips the check (same precedent as the ctx-window
-    check: the provider's model inventory is out of doctor's reach). ``up``
-    calls the same helper as a pre-flight before booting the daemon.
+    check: the provider's model inventory is out of doctor's reach). Single
+    wording source for the dream-model and ensemble-verifier checks.
     """
-    route = config.llm["dream"]
+    route = config.llm[role]
     if route.driver != "ollama":
         return True, f"route driver {route.driver!r} is not ollama; model presence check skipped"
     from mnemoseed_local.llm import LLMError, RoleRouter
 
     try:
-        llm = RoleRouter(routes=config.llm, audit=None).resolve("dream")
+        llm = RoleRouter(routes=config.llm, audit=None).resolve(role)
     except LLMError as exc:
         return False, str(exc)
     report = llm.check()
@@ -317,6 +321,32 @@ def _dream_model_check(config: Config) -> tuple[bool, str]:
     if models_contain(models, route.model):
         return True, f"model {route.model!r} present"
     return False, f"model {route.model!r} not pulled; run: ollama pull {route.model}"
+
+
+def _dream_model_check(config: Config) -> tuple[bool, str]:
+    """A3 T5 (design/01 §6 Phase A3): the ollama dream route's model must be pulled.
+
+    ``up`` calls the same helper as a pre-flight before booting the daemon.
+    """
+    return _role_model_check(config, "dream")
+
+
+def _ensemble_verifier_check(config: Config) -> tuple[str, bool, str]:
+    """B1 T3: the ensemble verify judging seat's model must be pulled when the
+    user opted into verify mode.
+
+    Dormant (ensemble off) or non-ollama routes skip. A missing model FAILS
+    doctor with the pull hint — never a silent pull — while the runtime
+    fallback stays the safety net (the dream still ships A's unverified result
+    + audit; doctor is the honest report, not a boot gate)."""
+    if config.dream.ensemble != "verify":
+        return (
+            "ensemble verifier",
+            True,
+            f"ensemble mode {config.dream.ensemble!r}; verifier model check skipped",
+        )
+    ok, detail = _role_model_check(config, "dream_verifier")
+    return ("ensemble verifier", ok, detail)
 
 
 def _hardware_tier_check(config: Config) -> tuple[str, bool, str]:

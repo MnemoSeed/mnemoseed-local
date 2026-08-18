@@ -344,6 +344,78 @@ def _wait_dream_idle(client: TestClient, timeout: float = 10.0) -> dict:
     raise AssertionError(f"dream never returned to idle; last status: {body}")
 
 
+# ---------------------------------------------------------------- B1 T3: ensemble verify (daemon wiring)
+
+
+def _enable_ensemble_verify(config_path: Path, *, verifier_table: str) -> None:
+    # one [dream] table only (TOML); the near-zero floor + idle makes the
+    # single captured turn fire the pool event dream_once consumes
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[dream]\nensemble = "verify"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + verifier_table,
+        encoding="utf-8",
+    )
+
+
+def test_ensemble_verify_judges_the_run_and_audits_the_verdict(config_path: Path) -> None:
+    """B1 T3 daemon integration: with dream.ensemble=verify the dream_verifier
+    role materializes per run, judges the reflected core triples, and audits
+    the verdict — the run itself still commits (verification is a layer, never
+    a gate)."""
+    _enable_ensemble_verify(
+        config_path,
+        verifier_table='[dream.llm.dream_verifier]\ndriver = "stub_verifier"\nmodel = "stubjudge"\n',
+    )
+    with _boot(config_path) as client:
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        dream = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+        assert dream["launched"] is True
+        _wait_dream_idle(client)
+
+        verified = client.get("/api/v1/audit", params={"action": "ensemble_verified"}).json()
+        assert verified["total"] == 1, verified
+        detail = verified["items"][0]["detail"]
+        assert detail["verifier_model"] == "stubjudge"
+        assert detail["judged"] >= 1  # the stub-extracted decided marker was judged
+        assert detail["rejected"] == 0  # every stub triple is evidence-backed
+        # the judged run committed (no fallback, no blocked merge)
+        committed = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()
+        assert committed["total"] >= 1
+        fallback = client.get("/api/v1/audit", params={"action": "ensemble_verify_fallback"}).json()
+        assert fallback["total"] == 0
+        # triple audit surface 1: the router materialized the judge role
+        configured = client.get("/api/v1/audit", params={"action": "llm_role_configured"}).json()
+        assert any(item["detail"].get("role") == "dream_verifier" for item in configured["items"])
+
+
+def test_ensemble_verify_broken_judge_route_falls_back_and_audits(config_path: Path) -> None:
+    """B1 T3 (design/01 decision 1): a verifier route that cannot materialize
+    degrades typed — the dream ships A's original result, the merge commits,
+    and the fallback lands an audit record with the reason."""
+    _enable_ensemble_verify(
+        config_path,
+        verifier_table='[dream.llm.dream_verifier]\ndriver = "no_such_driver"\nmodel = "gone"\n',
+    )
+    with _boot(config_path) as client:
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        dream = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+        assert dream["launched"] is True
+        _wait_dream_idle(client)
+
+        fallback = client.get("/api/v1/audit", params={"action": "ensemble_verify_fallback"}).json()
+        assert fallback["total"] == 1, fallback
+        assert fallback["items"][0]["detail"]["reason"] == "llm_unavailable"
+        committed = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()
+        assert committed["total"] >= 1
+        verified = client.get("/api/v1/audit", params={"action": "ensemble_verified"}).json()
+        assert verified["total"] == 0
+
+
 def test_healthz_and_ingest_stay_responsive_during_dream(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

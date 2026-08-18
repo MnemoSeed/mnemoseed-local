@@ -363,6 +363,116 @@ def test_doctor_report_lists_new_checks_in_order(cli_home: Path, monkeypatch, ca
     assert out.index("hardware tier") < out.index("storage")
 
 
+# ------------------------------------------- B1 T3: doctor "ensemble verifier" check
+
+
+class _PerRoleLLM:
+    def __init__(self, report: HealthReport) -> None:
+        self._report = report
+
+    def check(self) -> HealthReport:
+        return self._report
+
+
+def _per_role_router_class(reports: dict[str, HealthReport]) -> type:
+    """A RoleRouter stub resolving each role to its own canned health probe
+    (the dream route and the verify judging seat probe different models)."""
+
+    class _PerRoleRouter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def resolve(self, role: str) -> _PerRoleLLM:
+            return _PerRoleLLM(reports[role])
+
+    return _PerRoleRouter
+
+
+def _verify_line(out: str) -> str:
+    return next(line for line in out.splitlines() if "ensemble verifier" in line)
+
+
+def test_doctor_verifier_check_skips_when_ensemble_off(cli_home: Path, monkeypatch, capsys) -> None:
+    """The verifier judging seat is dormant with the ensemble off (factory
+    default): the check reports the skip, never a false alarm."""
+    _write_doctor_config(cli_home)  # default ensemble = "off"
+    _mock_doctor_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    assert "skipped" in _verify_line(capsys.readouterr().out)
+
+
+def test_doctor_verifier_present_when_verify_on(cli_home: Path, monkeypatch, capsys) -> None:
+    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=True, detail={"models": ["gemma4:e4b"]}),
+            }
+        ),
+    )
+    assert main(["doctor"]) == 0
+    assert "[  ok] ensemble verifier: model 'gemma4:e4b' present" in capsys.readouterr().out
+
+
+def test_doctor_verifier_missing_model_fails_with_pull_hint(cli_home: Path, monkeypatch, capsys) -> None:
+    """Opted-in verify with a missing judge model is a FAIL with the pull hint
+    — never a silent pull (the runtime fallback is the safety net, doctor is
+    the honest report)."""
+    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+            }
+        ),
+    )
+    assert main(["doctor"]) == 1
+    line = _verify_line(capsys.readouterr().out)
+    assert "model 'gemma4:e4b' not pulled; run: ollama pull gemma4:e4b" in line
+
+
+def test_doctor_verifier_server_unreachable_fails_without_pull_advice(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=False, detail={"error": "connection refused"}),
+            }
+        ),
+    )
+    assert main(["doctor"]) == 1
+    line = _verify_line(capsys.readouterr().out)
+    assert "ollama server unreachable (connection refused); start ollama first" in line
+    assert "ollama pull" not in line
+
+
+def test_doctor_verifier_skips_non_ollama_verifier_route(cli_home: Path, monkeypatch, capsys) -> None:
+    """A non-ollama verifier route skips the inventory check (same precedent
+    as the dream model and ctx-window checks: the provider's model inventory
+    is out of doctor's reach)."""
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "openai_compatible"\nmodel = "judge"\n',
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    line = _verify_line(capsys.readouterr().out)
+    assert "not ollama" in line
+    assert "skipped" in line
+
+
 # ------------------------------------------- A3 T5: model name normalization
 
 

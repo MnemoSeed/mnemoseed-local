@@ -8,7 +8,10 @@ boundary. T3 ships the reflection orchestrator: the de-biasing prompt template
 and the deterministic offline ReflectLLM seam. T4 ships the split writer: the
 Merger routing triples to the graph double-instance with idempotent write-back
 and the salvage review queue, plus the DreamPipeline that drives a dream across
-the reflect -> merge -> commit chain off the ingest hot path.
+the reflect -> merge -> commit chain off the ingest hot path. B1 ships the
+ensemble verify phase: model B judges model A's folded core triples (reject ->
+reroute to isolated, never delete), falling back to A's original result with
+an audit record on any verifier failure.
 """
 
 from __future__ import annotations
@@ -78,6 +81,11 @@ from mnemoseed_local.dream.trigger import (
     Snapshotter,
     TriggerStatus,
 )
+from mnemoseed_local.dream.verify import (
+    VERIFY_PROMPT_VERSION,
+    StubVerifyLLM,
+    TripleVerifier,
+)
 
 __all__ = [
     "DELTA_BUDGET_CEILING_TOKENS",
@@ -120,8 +128,11 @@ __all__ = [
     "SnapshotResult",
     "Snapshotter",
     "StubReflectLLM",
+    "StubVerifyLLM",
     "TokenLedger",
     "TriggerStatus",
+    "TripleVerifier",
+    "VERIFY_PROMPT_VERSION",
     "build_cache_prefix",
     "build_reflect_prompt",
     "estimate_tokens",
