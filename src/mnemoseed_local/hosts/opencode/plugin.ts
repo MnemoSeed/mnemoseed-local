@@ -13,6 +13,8 @@
 //   event session.idle|error            -> flush             -> POST /flush
 //   event session.deleted               -> session_end       -> POST /session/end
 //   experimental.session.compacting     -> flush             -> POST /flush
+//   chat.system.transform (first call per session) -> session_recall_read -> POST /session/recent
+//   citation guard in postAssistantIngest -> memory_reinforce -> POST /memory/reinforce
 //
 // Invariants: HostId is always "opencode"; every daemon call is
 // fire-and-forget (the host session is never blocked); every failure is
@@ -20,7 +22,9 @@
 // (env MNEMOSEED_LOCAL_DEBUG: failures escalate to console.error + a JSONL
 // sink, and every daemon POST's status is inspected — a swallowed non-2xx is
 // how the settle-sealing bug hid); requests time out after 2s via
-// AbortSignal.
+// AbortSignal. The ONLY awaited network call is the session-tails read inside
+// the transform handler, bounded by AbortSignal and fail-open, at most once
+// per session (B2.1 T1).
 //
 // Type reference only (NOT a runtime import — the plugin is dependency-free):
 //   import type { Plugin } from "@opencode-ai/plugin"
@@ -38,6 +42,32 @@ const TIMEOUT_MS = 2000
 const FETCH_TIMEOUT_MS = 1500
 const DEDUP_CAP = 1000
 const MAX_TOOL_OUTPUT_CHARS = 20000
+
+// ---- B2.1 T1/T3 session-start recall injection + consumption guard. The
+// whole mechanism is deterministic and model-free: the injected replay is the
+// daemon's verbatim recent tails, needles are plain normalized substring
+// fingerprints, and the budget is a hard char cap. Nothing here calls out to
+// any model — the only network touch is the daemon read (and the fire-and-
+// forget POSTs it feeds).
+const SESSION_TAIL_SESSIONS = 2
+const SESSION_TAIL_PER_SESSION = 8
+const MAX_INJECT_CHARS = 4000
+const MIN_SLICE_CHARS = 200
+const NEEDLE_HEAD_LEN = 24
+const NEEDLE_MIN_CONTENT = 32
+const NEEDLE_MID_THRESHOLD = 48
+const RECALL_FENCE_OPEN = "<mnemoseed-memory-recall>"
+const RECALL_FENCE_CLOSE = "</mnemoseed-memory-recall>"
+const RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
+const RECALL_DISCLAIMER =
+  "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
+// QA re-review NIT-1: the daemon's ReinforceRequest caps each id list at
+// max_length=64 (src/mnemoseed_local/daemon/memory.py) — one oversized POST
+// would 422 AFTER the cited set is already marked, dropping the whole batch
+// to a permanent no-retry. Split hits into <=64-id batches, one POST each.
+// Unreachable today (2 x 8 injected chunks max), pinned so a constant change
+// cannot rot it silently.
+const REINFORCE_BATCH_SIZE = 64
 
 // ---- opt-in observability lane (senior QA finding 12b, 2026-08-19): three
 // silent-failure dogfoods in one day proved console.debug alone is
@@ -138,6 +168,213 @@ function unparkAssistant(sessionID: string, messageID: string): void {
   if (set === undefined) return
   set.delete(messageID)
   if (set.size === 0) pendingAssistant.delete(sessionID)
+}
+
+// ---- B2.1 T1/T3 session-start recall injection (attempt-once + consumption
+// guard). `injectedSessions` is the per-session attempt gate: marked
+// SYNCHRONOUSLY before the first await so concurrent first-turn transforms can
+// never double-inject; it never evicts (no seen()-style cap) — the only
+// removal is the explicit session.deleted cleanup.
+const injectedSessions = new Map<string, true>()
+// sessionID -> needle -> chunk ids: the consumption fingerprint registry, one
+// entry per INJECTED slice (needles derive from the exact sanitized/sliced
+// text that actually entered the block — never from budget-dropped content).
+const injectedRegistry = new Map<string, Map<string, Set<string>>>()
+// sessionID -> chunk ids already counted as consumed: at most one reinforce
+// per chunk per session (bounded FP, PRD-B2.1).
+const citedChunks = new Map<string, Set<string>>()
+
+function normalizeRecallText(text: string): string {
+  // One role-prefix strip (the verbatim channel labels turns), then collapse
+  // whitespace to single spaces and lowercase — needle building and the
+  // consumption matcher share this exact shape.
+  return String(text)
+    .replace(/^(user|assistant|tool|system):\s*/, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+}
+
+function needlesOf(text: string): string[] {
+  // Substring fingerprints of the normalized content: a 24-char head window
+  // once the content is long enough, plus a centered 24-char window for
+  // longer content (a mid-quote citation still matches). JS string length
+  // semantics; dedupe via a Set.
+  const normalized = normalizeRecallText(text)
+  if (normalized.length < NEEDLE_MIN_CONTENT) return []
+  const needles = new Set<string>()
+  needles.add(normalized.slice(0, NEEDLE_HEAD_LEN))
+  if (normalized.length >= NEEDLE_MID_THRESHOLD) {
+    const center = Math.floor(normalized.length / 2)
+    const start = Math.max(0, center - Math.floor(NEEDLE_HEAD_LEN / 2))
+    needles.add(normalized.slice(start, start + NEEDLE_HEAD_LEN))
+  }
+  return Array.from(needles)
+}
+
+function sanitizeRecallText(text: string): string {
+  // Fence integrity (TA-5): chunk text may literally carry the fence markers
+  // (self-dogfood hits this); replace BOTH literals with the ‹› form in one
+  // pass so the assembled block carries exactly one open/close fence pair.
+  return text.replaceAll(/<\/?mnemoseed-memory-recall>/g, RECALL_FENCE_SANITIZED)
+}
+
+function sessionTailId(group: any): string {
+  // The group header's short id: the session_id's last dash-segment (long
+  // opencode session ids are unreadable noise in the system prompt).
+  const id = typeof group?.session_id === "string" ? group.session_id : ""
+  const dash = id.lastIndexOf("-")
+  return dash >= 0 ? id.slice(dash + 1) : id
+}
+
+function isoEnded(group: any): string {
+  const latestAt = typeof group?.latest_at === "number" ? group.latest_at : NaN
+  return Number.isFinite(latestAt) ? new Date(latestAt * 1000).toISOString() : ""
+}
+
+function registerNeedles(
+  registry: Map<string, Set<string>>,
+  text: string,
+  chunkId: string,
+): void {
+  if (!chunkId) return
+  for (const needle of needlesOf(text)) {
+    let ids = registry.get(needle)
+    if (ids === undefined) {
+      ids = new Set<string>()
+      registry.set(needle, ids)
+    }
+    ids.add(chunkId)
+  }
+}
+
+function buildRecallInjection(
+  groups: any[],
+): { block: string; registry: Map<string, Set<string>> } | null {
+  // Accrue newest-first (groups in payload order, chunks within a group
+  // reversed) against a char budget whose final assembled block must stay
+  // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line and the
+  // group headers — the wrapper is accounted up front. A boundary chunk keeps
+  // only its newest tail slice (prefixed with the "…" marker) when the
+  // leftover can still hold MIN_SLICE_CHARS; otherwise it is dropped along
+  // with everything older. Dropped chunks register NO needles. Needles derive
+  // from the EXACT included (sanitized, possibly sliced) text per chunk.
+  if (!Array.isArray(groups)) return null
+  const registry = new Map<string, Set<string>>()
+  const lines: string[] = []
+  let remaining =
+    MAX_INJECT_CHARS -
+    (RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length)
+  if (remaining < MIN_SLICE_CHARS) return null
+  lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
+  let committedGroup = false
+  for (const group of groups) {
+    const chunks = Array.isArray(group?.chunks) ? [...group.chunks].reverse() : []
+    if (chunks.length === 0) continue
+    const header = `<session-tail id="${sessionTailId(group)}" ended="${isoEnded(group)}">`
+    const groupFixed = header.length + 1 + "</session-tail>".length + 1
+    if (groupFixed > remaining) break
+    remaining -= groupFixed
+    const groupChunks: string[] = [] // collected newest-first, rendered ascending
+    let gotChunk = false
+    for (const chunk of chunks) {
+      const text = sanitizeRecallText(typeof chunk?.text === "string" ? chunk.text : "")
+      if (!text) continue
+      const lineCost = text.length + 1
+      if (lineCost <= remaining) {
+        registerNeedles(
+          registry,
+          text,
+          typeof chunk?.chunk_id === "string" ? chunk.chunk_id : "",
+        )
+        groupChunks.push(text)
+        remaining -= lineCost
+        gotChunk = true
+        continue
+      }
+      const sliceBudget = remaining - 2 // reserve the "…" marker and the newline
+      if (sliceBudget < MIN_SLICE_CHARS) break
+      const slicedText = text.slice(-sliceBudget)
+      registerNeedles(registry, slicedText, typeof chunk?.chunk_id === "string" ? chunk.chunk_id : "")
+      groupChunks.push("…" + slicedText)
+      remaining = 0
+      gotChunk = true
+      break
+    }
+    if (!gotChunk) break
+    lines.push(header)
+    for (let i = groupChunks.length - 1; i >= 0; i--) lines.push(groupChunks[i])
+    lines.push("</session-tail>")
+    committedGroup = true
+  }
+  if (!committedGroup) return null
+  lines.push(RECALL_FENCE_CLOSE)
+  const block = lines.join("\n")
+  if (block.length > MAX_INJECT_CHARS) return null
+  return { block, registry }
+}
+
+async function fetchSessionTails(sessionID: string): Promise<any> {
+  // The ONE awaited network call in the whole hook (invariant): the daemon
+  // read that feeds the injection, bounded by AbortSignal and fail-open.
+  try {
+    const response = await fetch(BASE_URL + "/session/recent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        profile_id: PROFILE_ID,
+        sessions: SESSION_TAIL_SESSIONS,
+        per_session: SESSION_TAIL_PER_SESSION,
+        exclude_session_id: sessionID,
+      }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      debugLog("session/recent rejected", { sessionID, status: response.status })
+      return null
+    }
+    const data = await response.json()
+    if (!Array.isArray(data?.sessions)) {
+      debugLog("session/recent malformed", { sessionID })
+      return null
+    }
+    return data
+  } catch (error) {
+    console.debug("mnemoseed-local: session/recent failed:", error)
+    debugLog("session/recent failed", { sessionID, error: String(error) })
+    return null
+  }
+}
+
+async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<void> {
+  // B2.1 T1 gate semantics (PRD): a falsy session or a non-array system burns
+  // NOTHING (the host may invoke the transform with an empty shape on a
+  // warmup call — that must not cost the session its first-turn replay); once
+  // armed, the attempt is consumed no matter what the read returns. The body
+  // is wrapped in try/catch because this is the ONLY handler the host awaits
+  // on the model-call path — a fault (out-of-range latest_at in isoEnded, a
+  // frozen system array, a malformed payload) must fail open like every
+  // sibling: debug-only, never reject the model call, never mutate.
+  const sessionID = String(hookInput?.sessionID ?? "")
+  if (!sessionID) return
+  if (!Array.isArray(hookOutput?.system)) return
+  try {
+    if (injectedSessions.has(sessionID)) return
+    injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
+    const data = await fetchSessionTails(sessionID)
+    if (data === null) return
+    const built = buildRecallInjection(data.sessions)
+    if (built === null) {
+      // A reachable transform with nothing injectable gets one debug line —
+      // the attempt gate is already consumed, so no extra rate limiting.
+      debugLog("recall injection skipped: no injectable recall content", { sessionID })
+      return
+    }
+    hookOutput.system.push(built.block)
+    injectedRegistry.set(sessionID, built.registry)
+  } catch (err) {
+    console.debug("mnemoseed-local: chat.system.transform failed:", err)
+    debugLog("chat.system.transform failed", { sessionID, error: String(err) })
+  }
 }
 
 // ---- B2.2 crash durability (PRD-B2.2, single mechanism): the host persists
@@ -349,6 +586,9 @@ function postAssistantIngest(
       scheduleRecovery(sessionID)()
     },
   )
+  // B2.1 T3 consumption guard: the reply text just left the host — run the
+  // citation check on EVERY ingest of an assistant turn (live, sweep, replay).
+  noteConsumption(sessionID, text)
 }
 
 function postToolIngest(
@@ -373,6 +613,42 @@ function postToolIngest(
     () => noteWatermark(sessionID, ts),
     scheduleRecovery(sessionID),
   )
+}
+
+function noteConsumption(sessionID: string, text: string): void {
+  // B2.1 T3 (TA-6): only an assistant reply that actually CITES an injected
+  // slice counts as consumption. The matcher normalization is collapse +
+  // lowercase, no role-prefix strip (the reply text is raw). One reinforce
+  // per chunk per session; the POST carries NO ack (a usage event is not
+  // content — it never advances the replay watermark) and its failure is a
+  // debug log only (never scheduleRecovery).
+  const registry = injectedRegistry.get(sessionID)
+  if (registry === undefined || registry.size === 0) return
+  if (!text) return
+  const normalized = String(text).replace(/\s+/g, " ").toLowerCase()
+  let cited = citedChunks.get(sessionID)
+  if (cited === undefined) {
+    cited = new Set<string>()
+    citedChunks.set(sessionID, cited)
+  }
+  const hits: string[] = []
+  for (const [needle, chunkIds] of registry) {
+    if (!normalized.includes(needle)) continue
+    for (const chunkId of chunkIds) {
+      if (cited.has(chunkId)) continue
+      cited.add(chunkId)
+      hits.push(chunkId)
+    }
+  }
+  if (hits.length === 0) return
+  // NIT-1: batch to the daemon's 64-id cap (REINFORCE_BATCH_SIZE) — one post
+  // per batch, so an overflow can never 422 the whole cited set at once.
+  for (let i = 0; i < hits.length; i += REINFORCE_BATCH_SIZE) {
+    const batch = hits.slice(i, i + REINFORCE_BATCH_SIZE)
+    post("/memory/reinforce", { profile_id: PROFILE_ID, chunk_ids: batch }, undefined, () =>
+      debugLog("reinforce POST failed", { sessionID, hits: batch }),
+    )
+  }
 }
 
 // Deterministic retry for parked assistant fetches (senior QA findings 1+2):
@@ -584,6 +860,11 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
         }
         case "session.deleted": {
           const sessionID = sessionIdOfEvent(event)
+          // B2.1 T1/T3 lifecycle cleanup: a settled session's injection gate,
+          // consumption registry and cited set are dropped with it.
+          injectedSessions.delete(sessionID)
+          injectedRegistry.delete(sessionID)
+          citedChunks.delete(sessionID)
           enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
           await persistWatermarks()
           enqueueForSession(sessionID, () => settle(sessionID))
@@ -643,6 +924,8 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
   }
   return {
     "chat.message": async (hookInput: any, hookOutput: any) => onChatMessage(hookInput, hookOutput),
+    "chat.system.transform": async (hookInput: any, hookOutput: any) =>
+      onChatSystemTransform(hookInput, hookOutput),
     // The bus dispatcher voids this promise: awaiting the parts fetch here
     // never blocks the host.
     event: async ({ event }: { event: unknown }) => onBusEvent(event),

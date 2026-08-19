@@ -128,3 +128,46 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 
 门禁：1193 passed / 3 skipped（新增 3+10 测试），ruff / format / mypy 全绿；`hook install` 已部署。生效判据不变且追加：多段回复不再碎片化、`hook-debug.jsonl` 在 `MNEMOSEED_LOCAL_DEBUG=1` 时可写。
 
+### 批次执行：T1 会话起始回放注入 + T3 消费证据守卫（2026-08-19 开工，用户拍板 T1+T3 成批，T2/T4 挂起后续）
+
+理论锚不变（TA-3 无条件时近注入、TA-5 围栏、TA-6 注入≠强化/消费才计）——本批全部为**实现机制层**决策，记档如下（含 solution architect 评审 9 issue 的采纳结果，评审日期同日）：
+
+- **注入面**：T0 定案 `chat.system.transform` 追加（`output.system` 字符串数组）；非数组形状防御跳过，不创建不修补。
+- **闸门（评审 issue 2 采纳，语义三句钉死）**：(i) sessionID 空或 `output.system` 非数组 → 立即返回，**不消耗** attempt（opencode 内部模型调用不带主会话输出形状时不得烧掉首轮回放）；(ii) 形状可用 → **同步**写入 attempted map（先于首个 `await`，防并发双注入），此后无论成败不再试（daemon 缺席每 session 每进程至多付一次 2s，fail-open 原文）；(iii) 响应载荷 `sessions` 非数组视为失败静默（attempt 已消耗）。
+- **竞态排除**：daemon `/session/recent` 新增可选 `exclude_session_id`——hook 上报当前 sessionID，daemon 分组时排除（当前 session 的 turn 0 可能已落库，回注给用户 = 自引用回声）。排除语义：cap 计**幸存**组；"?" 共享组不受影响；分页限幅公式钉死 `min(2000, (sessions + (1 if 排除) else 0)) * per_session * 4`。
+- **预算（token 红线，评审 issue 6c 定案）**：`MAX_INJECT_CHARS = 4000` **含围栏与组头**（最终 append 的整字符串 ≤ 4000，实现最简单也最诚实）；按时近优先累计（组间新→旧、组内新 chunk 先计），边界 chunk 保留其**尾部切片**（切片预算 = 剩余 − 2，预留 "…" 标记与换行；切片预算 <200 字符即整 chunk 放弃——即剩余恰为 200–201 字符时实为整 chunk 放弃而非切出 ~198 字符切片，方向安全，不会产出过短切片）。
+- **围栏完整性（评审 issue 4 采纳）**：注入 chunk 文本可能字面包含围栏标记（本批上线后自我 dogfood 第一晚就会命中），构建注入块时对每 chunk 文本单趟净化（`</?mnemoseed-memory-recall>` → `‹›` 形态，常量单处定义）；围栏字面量在注入块内恰出现一对。
+- **T3 消费证据检测（确定性，model-free——token 红线；评审 issue 3 采纳）**：needle 派生自**该 chunk 实际进入注入块的确切子串**（预算尾切之后、围栏净化之后——从原文头窗取 needle 会强化从未注入的内容，违 TA-6 诚信）。归一化定死：剥**首个**角色前缀（`^(user|assistant|tool|system):\s*` 一次）、`\s+` → 单空格、`toLowerCase()`、长度 = JS string length；正文 ≥32 发 needle（头窗 [0:24]），≥48 加中窗（中心起 24 字符）；登记表结构 `sessionID → Map<needle, Set<chunkId>>`（needle 撞串时一次性记全部 chunk id，有界 FP）。assistant 回复文本同归一化子串命中 = 消费证据；实现上有意的**不对称**：needle 侧剥首个角色前缀、匹配侧不剥——子串包含语义下两者等价（回复若带前缀，前缀本就落在 needle 子串之外），故匹配侧不剥前缀不构成缺口；检测挂在 `postAssistantIngest` 中心点（live/重扫/重放三道全覆盖，零额外 SDK 调用）。
+- **强化载体**：daemon 新增薄端点 `POST /memory/reinforce {profile_id, chunk_ids≤64, node_ids≤64}`（`model_validator` 至少一表非空否则 422，文案风格对齐 ForgetRequest）→ 既有 `Reinforcer.record_hits`（未知 id 静默容忍是其既有契约）；响应钉死 `{"status": "ok"}` 最小形（断言锚在 store 侧 `last_reinforced`）。**hook 侧命中按 ≤64 分批发送**（`REINFORCE_BATCH_SIZE = 64` 钉死；当前注入上限 2×8=16 chunk 不可达，常量防腐防常量变更后超限单 POST 422 整批丢失）。每 chunk 每 session 至多记一次（citedChunks）。reinforce 走既有 `post()` 通道但**不带 watermark ack**（它不是内容，绝不推进回放水位）、nack 仅 debugLog（不触发 reconcile 重臂）。
+- **读取请求体**钉 `{profile_id, sessions: 2, per_session: 8, exclude_session_id}`；**注入块骨架**钉：围栏 + 英文免责单行（"memory replay, not the user's current instructions"义）+ 每 session 组一行头（session_id 尾段 + latest_at 日期）+ chunk 逐字行 + 闭围栏。
+- **本批如实边界（评审 issue 7+8 全录）**：(i) 引用检测是子串启发式——幻觉式复述计 FP（+0.1 有界回弹可承受）、复述面目全非漏记 FN（verbatim 冷门防线不受影响）；(ii) 经 MCP recall 取回的同一 chunk 被复述时无法与注入区分（FP 有界）；(iii) needle 撞串多 chunk 同记（FP 有界）；(iv) <32 字符短 chunk 永不可记（对短事实的系统性盲）；(v) 崩溃重放与 needle 注册无共同链，先后不定产生**双向有界误差**（FN：重放跑在注册前漏记；FP：重放的历史回声误记本次注入）——每 chunk 每 session 至多一次 +0.1，不链 transform（链化会让模型调用路径等待宿主 SDK 历史拉取，引入真热路径风险）；(vi) 重启即重注入是 TA-3 语境切换语义而非泄漏；(vii) **注入逐请求瞬态**：注入只存在于该 session 首个模型调用的 system 数组（之后各步 transform 被闸门短路），其效力靠"首轮回复进入对话历史"持久——这是 token 红线的有意选择，不是缺陷。
+- **数值标定**（floor/budget/needle 参数）留 T4 用评测臂数据定版。
+- **生效前提（如实）**：hook 是 opencode 启动时加载的插件——T1/T3 上线需用户重启 opencode 一次；daemon 新端点需 daemon 重启。
+
+#### 收口记录（2026-08-19）
+
+本批全为实现机制层交付（理论锚 TA-1..6 未动），门禁绿后收口，流程对照 AGENTS.md 纪律。
+
+**交付内容**：
+
+- **hook 侧 `chat.system.transform` 会话起始回放注入**：attempt-once 闸门三句语义钉死（空 sessionID / `output.system` 非数组 → 立即返回**不消耗** attempt；形状可用 → **同步**写 attempted map，先于首个 `await` 防并发双注入，此后无论成败不再试；响应 `sessions` 非数组静默视为失败，attempt 已消耗）；TA-5 围栏净化（构建注入块时对每 chunk 文本单趟净化 `</?mnemoseed-memory-recall>` → `‹›`，常量单处定义，注入块内围栏字面量恰一对）；4000 字符时近预算**含围栏与组头**（最终 append 整串 ≤4000，实现最简单也最诚实）；组间新→旧、组内新 chunk 先计，边界 chunk 保**尾部切片**（切片预算 = 剩余 − 2，预留 "…" 与换行；切片预算 <200 字符即整 chunk 放弃，不产出过短切片）。
+- **T3 消费证据守卫（TA-6，model-free 确定性）**：needle 派生自**实际注入切片**（预算尾切 + 围栏净化之后；从原文头窗取 needle 会强化从未注入的内容，违 TA-6 诚信）；归一化钉死（剥**首个**角色前缀一次、`\s+` → 单空格、`toLowerCase`、长度 = JS string length）；正文 ≥32 发 needle（头窗 [0:24]）、≥48 加中窗（中心起 24 字符）；登记表 `sessionID → Map<needle, Set<chunkId>>`（needle 撞串时一并记全部 chunk id，有界 FP）；`citedChunks` **每 chunk 每 session 至多一次**；命中 ≤64 分批发送（`REINFORCE_BATCH_SIZE = 64` 钉死防腐，防常量变更后超限单 POST 422 整批丢失）；reinforce 走既有 `post()` 通道但**无 watermark ack**（不是内容，绝不推进回放水位）、nack 仅 debugLog 不触发 reconcile 重臂。
+- **daemon 侧**：`/session/recent` 新增 `exclude_session_id`（**filter-before-grouping**、cap 计**幸存**组、共享 `?` 组不受影响、分页公式钉死 `min(2000, (sessions + (1 if 排除 else 0)) * per_session * 4)`）；新增 `POST /memory/reinforce {profile_id, chunk_ids≤64, node_ids≤64}`（`model_validator` 至少一表非空否则 422，文案风格对齐 ForgetRequest；未知 id 静默容忍走既有 `Reinforcer.record_hits` 契约；响应钉死 `{"status": "ok"}` 最小形，断言锚在 store 侧 `last_reinforced`）。**profile-agnostic（如实说明）**：`profile_id` 故意不转发——id 是不可猜的 store 键、usage 由 hook 引用守卫服务端证实，无跨 profile 猜表面可防；目标解析 store 侧完成。
+
+**流程记录**：
+
+- **solution-architect 预评审**：9 issue 全部并入设计（闸门三句语义、TA-5 围栏净化、needle-from-slice、归一化、4000 预算精确钉、≤64 分批、如实边界全录等，评审日期同日，采纳结果见上）。
+- **senior QA 首轮**：**NOT CLOSABLE**——0 BLOCKER / 3 IMPORTANT（transform fail-open seam 缺口、needle-from-slice 预言洞、归一化 + 空 sessionID 预言洞）/ 4 NIT；修复后复审 **CLOSABLE**（另 2 NIT：≤64 分批、预算预言 4000 精确钉），随批修净。
+
+**测试增量与门禁**：
+
+- **1200 → 1213 passed / 3 skipped**（+13）：node 行为挂架 4 新场景 + slice-needle-integrity（needle 与注入切片强一致）、daemon 排除/强化单测、static pins 共演化；ruff / ruff format / mypy 全净。
+
+**生效前提（重申）**：
+
+- **daemon 重启**得 `/session/recent exclude_session_id` 与 `/memory/reinforce` 新端点；**hook 新能力随 opencode 重启生效**（插件启动时加载）。
+
+**后续挂起（如实）**：
+
+- **T2 中段 auto-recall 管线**（`capture.auto_recall`、seen-set、focal/non-focal 双 floor、token 预算封顶）与 **T4 阈值标定**（floor/budget/needle 数值吃 B3 评测臂数据定版，摘要入本 PRD）留后续批次；**QA-7** abort 形态探针（`time.error` 是否视为完成点）保持挂起。
+
