@@ -88,14 +88,15 @@ async function fetchAssistantText(
   sessionID: string,
   messageID: string,
 ): Promise<{ ok: boolean; text: string }> {
-  // The opencode SDK (gen client) exposes ONLY the list endpoint
-  // session.messages({ path: { id } }) -> [{ info, parts }]; a singular
-  // session.message does not exist (dogfood finding 2026-08-19: every
-  // assistant turn silently short-circuited here before the fix).
-  const list = client?.session?.messages
-  if (typeof list !== "function") return { ok: false, text: "" }
+  // The opencode SDK (gen client, hey-api): session.messages({ path: { id } })
+  // lists [{ info, parts }]. Call it ON ITS RECEIVER — extracting the method
+  // unbinds `this` and the body `(options.client ?? this._client).get(...)`
+  // throws TypeError reading '_client' (dogfood 2026-08-19: BOTH the original
+  // singular-endpoint failure AND this unbound extraction died silently into
+  // console.debug before probe instrumentation exposed them).
+  if (typeof client?.session?.messages !== "function") return { ok: false, text: "" }
   try {
-    const response: any = await list({ path: { id: sessionID } })
+    const response: any = await client.session.messages({ path: { id: sessionID } })
     const entries = Array.isArray(response?.data) ? response.data : response
     if (!Array.isArray(entries)) return { ok: false, text: "" }
     const found = entries.find((entry: any) => entry?.info?.id === messageID)

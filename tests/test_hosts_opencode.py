@@ -255,19 +255,25 @@ def test_plugin_pins_settle_once_dedup_and_assistant_retry_rollback() -> None:
 
 
 def test_plugin_fetches_assistant_parts_via_session_messages_plural() -> None:
-    """Live dogfood finding (2026-08-19): the hook called a SINGULAR
-    ``session.message`` — a method this opencode SDK never exposed — so every
-    assistant-turn parts fetch short-circuited (``typeof query !==
-    "function"``) and assistant capture died SILENTLY into console.debug
-    (verbatim red line breached: user turns only in the store). The shipped
-    SDK (``@opencode-ai/sdk`` gen client) exposes only the LIST endpoint
-    ``session.messages({ path: { id } }) -> [{ info, parts }]``. Pin the
-    plural call, the absent singular name, and the info.id lookup, so
-    SDK-contract drift fails the Python gate instead of the memory store."""
+    """Live dogfood findings (2026-08-19): (1) the hook once called a SINGULAR
+    ``session.message`` with only one path param; (2) the follow-up 'fix'
+    extracted the method (``const list = client?.session?.messages``) and the
+    UNBOUND call threw ``TypeError: reading '_client'`` — the hey-api gen
+    client method body is ``(options.client ?? this._client).get(...)`` — and
+    the swallow-everything hook contract hid BOTH failures (probe-log
+    verified). Pin the plural call on its RECEIVER (bound `this`), the absent
+    bare extraction, and the info.id lookup, so SDK-contract AND
+    binding-form drift fail the Python gate instead of the memory store."""
     source = _plugin_source()
-    assert re.search(r"\.session\?\.messages\b", source), "must call client.session.messages (plural)"
+    assert re.search(r"\.session\?\.messages\b", source), "must guard client.session.messages (plural)"
     assert not re.search(r"\.session\?\.message\b(?!s)", source), (
         "singular session.message does not exist in the SDK"
+    )
+    assert re.search(r"client\.session\.messages\(\{", source), (
+        "the call must run on its receiver — extracting the method loses `this`"
+    )
+    assert not re.search(r"const \w+ = client\?\.session\?\.messages\b", source), (
+        "method extraction unbinds `this` (TypeError: reading '_client')"
     )
     assert re.search(r"info\??\.id === messageID", source), "must look the message up by info.id"
 

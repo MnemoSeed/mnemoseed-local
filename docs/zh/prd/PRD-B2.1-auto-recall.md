@@ -97,3 +97,11 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 - **已知良性竞态（如实记录）**：assistant `message.updated` 与同轮 `session.idle` 的 flush 两个 fire-and-forget POST 次序不保证；若 flush 先到，assistant 文本会落进紧随的独立 turn——内容不丢、检索无碍，chunk 边界略丑，v1 接受。
 - **待用户动作**：重启 opencode 使修正 ①+② 同时生效；生效判据 = 本 PRD 会话内 assistant 轮文本出现在 `recent_sessions` 尾部。
 
+### 基线修正 ③（SDK 调用绑定形，2026-08-19 live dogfood，先于 T1 必须修）
+
+- **重启后再实锤**：修正 ①+② 部署生效后，user turn 连续落库了，但 assistant 轮依然全灭——且非竞态所致（迟到消息连独立 turn 都没开）。
+- **取证手段**：T0 探针临时扩线——新增只观测的 `event` 钩子做总线普查 + 原样重放生产 fetch 路径逐关记录（`probe-t0.jsonl`）。结果显示：`message.updated` 正常触发、角色/completed 正常，而 `client.session.messages(...)` 调用本身抛 `TypeError: Cannot read properties of undefined (reading '_client')`。
+- **根因（JS 方法解绑）**：hey-api gen client 的 `messages` 方法体为 `(options.client ?? this._client).get(...)`；插件写成 `const list = client?.session?.messages` 后**脱离接收者调用，`this` 丢失**即抛。基线修正 ① 的"单数端点不存在"实为同一异常被静默吞掉后的误诊（1.18.18 SDK 单数端点存在，需双 path 参）——`console.debug` 静默契约两度把真异常藏死，直到探针介入。
+- **修复**：fetch 改为**在接收者上直接调用** `client.session.messages({...})`（绑定 `this`）；契约测试升级为钉死绑定调用形态（`client.session.messages({` 必在、`const x = client?.session?.messages` 摘取式必禁）。门禁：1183 passed / 3 skipped，ruff/format/mypy 全绿；`hook install` 已部署。
+- **待用户动作**：再重启一次 opencode；生效判据 = assistant 轮文本入库。本轮教训（记录备查）：fire-and-forget 部件的 silent-failure 面必须配探针级可观测性——静态"契约钉死"测试拦不住"行为对了、绑定形错了"这类运行时缺陷。
+
