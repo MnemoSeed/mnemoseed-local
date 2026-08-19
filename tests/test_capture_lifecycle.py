@@ -195,3 +195,67 @@ def test_segmenter_flush_all_closes_every_open_turn() -> None:
     assert segmenter.flush_all() == 0, "idempotent: nothing left open"
     assert len(pipeline.turns("s1")) == 1
     assert len(pipeline.turns("s2")) == 1
+
+
+# ---------------------------------------------------------------- B2.2 crash replay
+
+
+def _post(client, event: str, session: str, ts: float, text: str) -> None:
+    response = client.post(
+        "/ingest",
+        json={
+            "host": "opencode",
+            "event": event,
+            "session_id": session,
+            "profile_id": PROFILE,
+            "ts": ts,
+            "content": {"text": text},
+        },
+    )
+    assert response.status_code == 202, response.text
+
+
+def _flush(client, session: str) -> None:
+    flushed = client.post("/flush", json={"session_id": session, "profile_id": PROFILE})
+    assert flushed.status_code == 200, flushed.text
+
+
+def _tail_texts(client, session: str) -> list[str]:
+    body = client.post("/session/recent", json={"profile_id": PROFILE, "sessions": 5, "per_session": 50})
+    assert body.status_code == 200, body.text
+    for group in body.json()["sessions"]:
+        if group["session_id"] == session:
+            return [c["text"] for c in group["chunks"]]
+    return []
+
+
+def test_crash_replay_of_host_history_is_absorbed_and_never_duplicated(config_path: Path) -> None:
+    """PRD-B2.2 T3: the crash-resume replay re-posts tail turns the daemon may
+    already hold; idempotency comes from the store's near-duplicate absorb —
+    replaying the same tail twice (and across a daemon restart) must add ZERO
+    chunks, while genuinely new turns still land. This is the first pin on
+    the 'repeats must be absorbed' half of the 宁可重复不丢 contract."""
+    session = "sess-crash"
+    # ---- pre-crash: one drained turn
+    with TestClient(create_app()) as client:
+        _post(client, "user_prompt", session, 1.0, "崩溃前的用户消息")
+        _post(client, "assistant_message", session, 2.0, "崩溃前的助手回复")
+        _flush(client, session)
+        assert _tail_texts(client, session) == ["user: 崩溃前的用户消息\nassistant: 崩溃前的助手回复"]
+    # ---- daemon restarted over the same stores; the hook replays the tail
+    with TestClient(create_app()) as client:
+        _post(client, "user_prompt", session, 1.0, "崩溃前的用户消息")
+        _post(client, "assistant_message", session, 2.0, "崩溃前的助手回复")
+        _flush(client, session)
+        assert _tail_texts(client, session) == ["user: 崩溃前的用户消息\nassistant: 崩溃前的助手回复"], (
+            "replayed tail must be absorbed, not duplicated"
+        )
+        # live traffic continues after the reconcile — only it lands
+        _post(client, "user_prompt", session, 3.0, "重启后的新消息")
+        _post(client, "assistant_message", session, 4.0, "重启后的新回复")
+        _flush(client, session)
+        texts = _tail_texts(client, session)
+        assert texts == [
+            "user: 崩溃前的用户消息\nassistant: 崩溃前的助手回复",
+            "user: 重启后的新消息\nassistant: 重启后的新回复",
+        ], f"unexpected tail: {texts}"
