@@ -47,6 +47,7 @@ from mnemoseed_local.config import (
     DREAM_HARDWARE_TIERS,
     LAMBDA_TARGETS,
     LLM_ROLES,
+    CaptureConfig,
     Config,
     DecayConfig,
     DreamConfig,
@@ -132,6 +133,15 @@ def _validate_confidence_floor(value: Any) -> float:
     """dream.core_confidence_floor: a probability in [0, 1]."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
         raise ValueError("must be a number in [0, 1]")
+    return float(value)
+
+
+def _validate_focal_floor(value: Any) -> float:
+    """capture.auto_recall_focal_floor: a decay in (0, 1] — a zero floor
+    would make every decayed chunk focal, so it is rejected like an
+    out-of-range value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 or value > 1:
+        raise ValueError("must be a number in (0, 1]")
     return float(value)
 
 
@@ -361,6 +371,30 @@ def _decay_apply(config: Config, field: str, value: Any) -> None:
         raw_decay[field] = value
 
 
+def _capture_apply(config: Config, field: str, value: Any) -> None:
+    """Replace the frozen CaptureConfig and mirror the change into config.raw.
+
+    The daemon's MemoryService holds a live reference to this Config, so a
+    write hot-applies to the NEXT user-prompt scan without a restart (B2.1 T2
+    D5). The rebuild is kwargs-preserving: every capture field is carried
+    over, so a write to one key can never silently reset the others.
+    """
+    current = config.capture
+    fields: dict[str, Any] = {
+        "auto_recall": current.auto_recall,
+        "auto_recall_focal_floor": current.auto_recall_focal_floor,
+        "auto_recall_budget_chars": current.auto_recall_budget_chars,
+    }
+    if value is not None:
+        fields[field] = value
+    config.capture = CaptureConfig(**fields)
+    raw_capture = config.raw.setdefault("capture", {})
+    if value is None:
+        raw_capture.pop(field, None)
+    else:
+        raw_capture[field] = value
+
+
 def _role_apply(config: Config, role: str, field: str, value: Any) -> None:
     """Rebuild the role's RoleLLMConfig with the new field and mirror raw."""
     cfg = config.llm[role]
@@ -541,6 +575,34 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         validate=_validate_lambda_map,
         read=lambda config: config.decay.lambda_per_type,
         apply=lambda config, value: _decay_apply(config, "lambda_per_type", value),
+        live_apply=True,
+    ),
+    # B2.1 T2 (design/01 §4.6): the mid-session auto-recall pipeline. All
+    # three keys are live-applied — the daemon's MemoryService reads the
+    # shared Config reference, so a flip reaches the NEXT user-prompt scan
+    # without a restart (default OFF).
+    "capture.auto_recall": ConfigKey(
+        key_path="capture.auto_recall",
+        value_type="boolean",
+        validate=_validate_bool,
+        read=lambda config: config.capture.auto_recall,
+        apply=lambda config, value: _capture_apply(config, "auto_recall", value),
+        live_apply=True,
+    ),
+    "capture.auto_recall_focal_floor": ConfigKey(
+        key_path="capture.auto_recall_focal_floor",
+        value_type="number in (0, 1]",
+        validate=_validate_focal_floor,
+        read=lambda config: config.capture.auto_recall_focal_floor,
+        apply=lambda config, value: _capture_apply(config, "auto_recall_focal_floor", value),
+        live_apply=True,
+    ),
+    "capture.auto_recall_budget_chars": ConfigKey(
+        key_path="capture.auto_recall_budget_chars",
+        value_type="positive integer",
+        validate=_validate_positive_int,
+        read=lambda config: config.capture.auto_recall_budget_chars,
+        apply=lambda config, value: _capture_apply(config, "auto_recall_budget_chars", value),
         live_apply=True,
     ),
 }
@@ -805,6 +867,11 @@ class ConfigWriteService:
                     "sweep_interval_s": self._config.decay.sweep_interval_s,
                     "min_apply_delta": self._config.decay.min_apply_delta,
                     "lambda_per_type": dict(self._config.decay.lambda_per_type),
+                },
+                "capture": {
+                    "auto_recall": self._config.capture.auto_recall,
+                    "auto_recall_focal_floor": self._config.capture.auto_recall_focal_floor,
+                    "auto_recall_budget_chars": self._config.capture.auto_recall_budget_chars,
                 },
             },
             "restart_required": {},

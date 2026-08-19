@@ -36,6 +36,7 @@ EXPECTED_MAPPING = {
     "session_end": "/session/end",
     "flush": "/flush",
     "session_recall_read": "/session/recent",
+    "session_recall_pending": "/session/recall-pending",
     "memory_reinforce": "/memory/reinforce",
 }
 
@@ -210,7 +211,14 @@ def test_plugin_registers_the_required_hooks() -> None:
 
 def test_plugin_mentions_all_daemon_endpoints_and_host_id() -> None:
     source = _plugin_source()
-    for endpoint in ('"/ingest"', '"/session/end"', '"/flush"', '"/session/recent"', '"/memory/reinforce"'):
+    for endpoint in (
+        '"/ingest"',
+        '"/session/end"',
+        '"/flush"',
+        '"/session/recent"',
+        '"/session/recall-pending"',
+        '"/memory/reinforce"',
+    ):
         assert endpoint in source, endpoint
     # HostId pinned to the daemon-side enum value.
     assert '"opencode"' in source
@@ -372,6 +380,37 @@ def test_plugin_pins_the_t1_t3_recall_injection_and_consumption_guard() -> None:
     assert transform_block is not None, "onChatSystemTransform handler block not found"
     assert "try {" in transform_block.group(0), "the awaited transform handler must fail open"
     assert "catch" in transform_block.group(0), "the awaited transform handler must fail open"
+
+
+def test_plugin_pins_the_t2_mid_session_recall_pull() -> None:
+    """PRD-B2.1 T2 (D8) hook gates: the pending-recall pull is armed by an
+    ACKED user ingest (per-session armed/acked flags), runs as an awaited
+    fetch with a bounded timeout in the transform, injects only a non-empty
+    selection, and never leaks into the post() lanes — the wire table gains
+    the session_recall_pending row and the invariant comment documents the
+    bounded awaited pull next to the once-per-session tails read. T1 chunk
+    ids ride along as seen_chunk_ids so the daemon never re-serves them."""
+    source = _plugin_source()
+    for token in (
+        "pendingPull",
+        "t1InjectedChunkIds",
+        "RECALL_PULL_TIMEOUT_MS = 300",
+        "RECALL_PULL_MAX_CHARS = 1200",
+        "pullPendingRecall(",
+    ):
+        assert token in source, token
+    # the pull is an awaited FETCH, not a post() call site (arity invariant)
+    assert len(re.findall(r'post\(\s*"/session/recall-pending"', source)) == 0
+    # the transform runs the T2 branch AFTER the T1 injection site — the T1
+    # attempt gate must never early-return past the pull (T1 and T2 are
+    # independent injections)
+    t1_site = source.index("buildRecallInjection(")
+    t2_site = source.index("pullPendingRecall(")
+    assert t2_site > t1_site, "the T2 pull must live after the T1 injection site in the transform"
+    # the invariant comment documents the bounded pull as the second awaited
+    # network call (after the once-per-session tails read)
+    assert "bounded pending-recall pull" in source
+    assert "session_recall_pending" in source
 
 
 def test_plugin_stays_fire_and_forget_and_debug_only() -> None:

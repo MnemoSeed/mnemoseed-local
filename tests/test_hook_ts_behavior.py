@@ -231,3 +231,128 @@ def test_slice_needle_integrity_needles_derive_from_the_included_slice(tmp_path:
     body = reinforce[0]["body"]
     assert body["chunk_ids"] == ["c-het-bound"], f"only the injected slice is citable: {body}"
     assert body["profile_id"] == "default"
+
+
+# ---------------------------------------------------------------- B2.1 T2 (mid-session auto recall)
+
+
+def test_recall_pull_fires_only_after_an_acked_user_ingest(tmp_path: Path) -> None:
+    """PRD-B2.1 T2 (D8): the pending-recall pull is gated on an ACKED user
+    ingest — a transform before any user prompt, or one racing the post
+    before its ack microtask, must not pull; the armed+acked transform pulls
+    exactly once, injects the fenced selection, and clears the flags (the
+    next transform pulls nothing more)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-gating")
+    g1, g2, g3, g4 = transcript["systems"]
+    assert g1 == ["BASE"], "no user prompt yet: T2 must not pull"
+    assert g2 == ["BASE2"], "the pre-ack transform must not pull"
+    assert len(g3) == 2, f"the armed+acked transform must inject: {g3}"
+    assert g3[1].count("<mnemoseed-memory-recall>") == 1
+    assert "上次中段提到 LanceDb" in g3[1]
+    assert g4 == ["BASE4"], "the served pull clears the flags"
+    assert transcript["pullCount"] == 1, transcript["pullCount"]
+    assert transcript["pullBodies"][0]["seen_chunk_ids"] == [], (
+        "no T1 injection for this session: the seen list is empty"
+    )
+
+
+def test_recall_pull_empty_selection_keeps_the_arm_and_never_appends(tmp_path: Path) -> None:
+    """PRD-B2.1 T2: an empty selection serves nothing but keeps the arm — the
+    next acked user turn re-pulls (the daemon slot may have rotated); the
+    system array is never appended to."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-empty-rearm")
+    e1, e2 = transcript["systems"]
+    assert e1 == ["BASE"]
+    assert e2 == ["BASE2"]
+    assert transcript["pullCount"] == 2, f"the arm must survive an empty serve: {transcript}"
+
+
+def test_recall_pull_fail_open_keeps_output_untouched_and_rearms(tmp_path: Path) -> None:
+    """PRD-B2.1 T2 fail-open: a 503 or a thrown network error leaves the
+    system untouched AND keeps the arm — the next acked user turn retries the
+    pull; an enabled:false lane serves nothing either."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-fail-open")
+    f1, f2, f3 = transcript["systems"]
+    assert f1 == ["BASE"], "a 503 pull must leave the system untouched"
+    assert len(f2) == 2 and "上次中段提到 LanceDb" in f2[1], "the healthy retry must serve the selection"
+    assert f3 == ["BASE3"], "an enabled:false lane must never append"
+    assert transcript["pullCount"] == 3, transcript["pullCount"]
+
+
+def test_recall_pull_is_independent_of_t1_and_reinforces_only_consumed(tmp_path: Path) -> None:
+    """PRD-B2.1 T2 (D8 restructure): the T2 branch runs independently of the
+    T1 attempt gate — the session-tail block (T1, first transform) and the
+    mid-session pull block (T2, after an acked user ingest) COEXIST; the T1
+    chunk ids ride the pull as seen_chunk_ids so the daemon never re-serves
+    them; citing the T2-injected chunk reinforces it exactly once per session
+    (TA-6: a re-citation is suppressed)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-t1-independence")
+    i1, i2 = transcript["systems"]
+    assert len(i1) == 2, f"T1 must inject on the first transform: {i1}"
+    assert "发布窗口" in i1[1], "the T1 session-tail block must be present"
+    assert len(i2) == 3, f"T1 and T2 blocks must coexist: {i2}"
+    assert i2[1] == i1[1], "the T1 block must not be re-injected"
+    assert "上次中段提到 LanceDb" in i2[2], "the T2 pull block must be injected"
+    assert i2[2].count("<mnemoseed-memory-recall>") == 1
+    pull_body = transcript["pullBodies"][0]
+    assert pull_body["profile_id"] == "default"
+    assert pull_body["session_id"] == "sess-behavior"
+    assert set(pull_body["seen_chunk_ids"]) == {"c-oldstop", "c-fence", "c-tail", "c-eval", "c-eng"}, (
+        "the T1-injected chunk ids must ride the pull as seen"
+    )
+    reinforce = transcript["reinforcePosts"]
+    assert len(reinforce) == 1, f"exactly one reinforce post expected: {reinforce}"
+    assert reinforce[0]["body"]["chunk_ids"] == ["c-mid"], "only the T2-injected consumed chunk is citable"
+
+
+def test_recall_pull_budget_equality_appends_the_full_selection(tmp_path: Path) -> None:
+    """QA BLOCKER-1 + NIT-7: the hook's item budget is the daemon's WIRE
+    budget_chars, never a hardcoded cap. A selection whose item cost lands
+    inside (1200 - wrapper, 2000] must STILL be appended; the assembled block
+    length is pinned EXACTLY — 156 wrapper chars + 1902 item cost = 2058 —
+    mirroring the T1 inject-budget equality pin. A mutant that hardcodes the
+    old 1200 cap drops this selection and fails."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-budget-equality")
+    [b1] = transcript["systems"]
+    assert len(b1) == 2, f"the full selection must be appended: {b1}"
+    block = b1[1]
+    assert block.count("<mnemoseed-memory-recall>") == 1
+    assert block.endswith("</mnemoseed-memory-recall>")
+    assert len(block) == 2058, f"block length must be wrapper(156) + items(1902): {len(block)}"
+    assert transcript["blockLength"] == 2058, transcript["blockLength"]
+
+
+def test_recall_pull_budget_below_slice_floor_still_appends(tmp_path: Path) -> None:
+    """QA IMPORTANT-3: the daemon is the sole budget authority across the WHOLE
+    positive-int range — a budget_chars=150 selection (below the T1 slice
+    floor) is daemon-legal: a full item whose cost fits IS served, and the
+    hook must append it instead of re-imposing a slicing floor it does not
+    own. Block length pinned exactly: wrapper(156) + item(101) = 257."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-low-budget")
+    [b1] = transcript["systems"]
+    assert len(b1) == 2, f"the daemon-legal low-budget selection must be appended: {b1}"
+    block = b1[1]
+    assert len(block) == 257, f"block length must be wrapper(156) + item(101): {len(block)}"
+    assert transcript["blockLength"] == 257, transcript["blockLength"]
+
+
+def test_recall_pull_clears_the_arm_once_the_slot_was_consumed(tmp_path: Path) -> None:
+    """QA IMPORTANT-2: a serve whose response was lost in transit must not
+    produce endless empty pulls — the daemon answers slot_consumed:true with
+    items:[], the transform clears the arm, and a subsequent transform issues
+    ZERO additional pulls (fail-open preserved: the system stays untouched).
+    QA BLOCKER-2: this response is now PRODUCIBLE by the real daemon (the
+    consumed tombstone answers the retry), so the scenario is the live
+    contract, not a hand-fed fiction."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-slot-consumed")
+    s1, s2 = transcript["systems"]
+    assert s1 == ["BASE"], "a consumed slot serves nothing"
+    assert s2 == ["BASE2"], "the cleared arm must not pull again"
+    assert transcript["pullCount"] == 1, transcript["pullCount"]

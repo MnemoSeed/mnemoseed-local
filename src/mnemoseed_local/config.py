@@ -102,6 +102,11 @@ DEFAULT_DREAM_CORE_CONFIDENCE_FLOOR: float = 0.0
 DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS: int = 32000
 DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
 
+#: B2.1 T2 mid-session auto-recall (PRD-B2.1): the focal decay floor and the
+#: pending-recall selection budget (design/01 §4.6).
+DEFAULT_AUTO_RECALL_FOCAL_FLOOR: float = 0.4
+DEFAULT_AUTO_RECALL_BUDGET_CHARS: int = 1200
+
 #: The T3a enum sets, shared by the config loader and the configwrite registry
 #: (a drift between the two is a validation split — one source, both consumers).
 DREAM_HARDWARE_TIERS: frozenset[str] = frozenset({"standard", "lite", "advanced"})
@@ -198,6 +203,23 @@ class DecayConfig:
     lambda_per_type: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LAMBDA_PER_TYPE))
 
 
+@dataclass(frozen=True)
+class CaptureConfig:
+    """B2.1 T2 mid-session auto-recall flags (PRD-B2.1, design/01 §4.6).
+
+    ``auto_recall`` gates the whole pipeline (default OFF — the mid-session
+    focal scan is opt-in). ``auto_recall_focal_floor`` is the focal decay
+    floor of the embedding-free entity-anchored scan (positive, at most 1 — a
+    zero floor would make every decayed chunk focal).
+    ``auto_recall_budget_chars`` caps the pending-recall selection served to
+    the hook (T1 budget semantics: greedy admission, boundary tail-slice).
+    """
+
+    auto_recall: bool = False
+    auto_recall_focal_floor: float = DEFAULT_AUTO_RECALL_FOCAL_FLOOR
+    auto_recall_budget_chars: int = DEFAULT_AUTO_RECALL_BUDGET_CHARS
+
+
 # A2 MVP + B1: the dream LLM roles. The cloud deep_reflection / short_increment
 # split is trimmed for the local single-user daemon; roles remain a
 # pipeline-internal parameter so a future split can re-open them without a
@@ -292,6 +314,7 @@ class Config:
     storage: dict[str, LayerSpec] = field(default_factory=dict)
     dream: DreamConfig = field(default_factory=DreamConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
     llm: dict[str, RoleLLMConfig] = field(default_factory=lambda: dict(DEFAULT_LLM_ROUTES))
     source: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -603,12 +626,36 @@ def load_config(path: Path | None = None) -> Config:
             lambda_per_type=lambda_map,
         )
 
+    # [capture] table (B2.1 T2, design/01 §4.6): the mid-session auto-recall
+    # pipeline. Default OFF — the focal scan is opt-in; the focal floor is
+    # positive (a zero floor would make every decayed chunk focal) and at most
+    # 1; the selection budget is a positive int.
+    capture = CaptureConfig()
+    capture_raw = raw.get("capture")
+    if capture_raw is not None:
+        capture_table = _require_table(capture_raw, "capture")
+        auto_raw = capture_table.get("auto_recall", False)
+        if not isinstance(auto_raw, bool):
+            raise ConfigError("capture.auto_recall", "must be a boolean")
+        floor_raw = capture_table.get("auto_recall_focal_floor", DEFAULT_AUTO_RECALL_FOCAL_FLOOR)
+        if not _is_positive_number(floor_raw) or float(floor_raw) > 1.0:
+            raise ConfigError("capture.auto_recall_focal_floor", "must be a number in (0, 1]")
+        budget_raw = capture_table.get("auto_recall_budget_chars", DEFAULT_AUTO_RECALL_BUDGET_CHARS)
+        if not isinstance(budget_raw, int) or isinstance(budget_raw, bool) or budget_raw <= 0:
+            raise ConfigError("capture.auto_recall_budget_chars", "must be a positive integer")
+        capture = CaptureConfig(
+            auto_recall=auto_raw,
+            auto_recall_focal_floor=float(floor_raw),
+            auto_recall_budget_chars=int(budget_raw),
+        )
+
     return Config(
         preset=preset_raw,
         baseurl=baseurl_raw,
         storage=storage,
         dream=dream,
         decay=decay,
+        capture=capture,
         llm=llm_routes,
         source=path,
         raw=raw,
@@ -705,4 +752,18 @@ path = "~/.mnemoseed-local/isolated.db"
 # sweep_interval_s = 86400.0
 # min_apply_delta = 0.01
 # lambda_per_type = {"PREFERENCE": 0.005, "EPISODE": 0.03, "chunk": 0.03}
+
+# B2.1 T2 mid-session auto-recall (PRD-B2.1, design/01 §4.6): the focal scan
+# runs inside the ingest of every user prompt and parks a budgeted selection
+# that the hook pulls on the next transform (ack-implies-ready). Default OFF:
+#   auto_recall              — enable the whole pipeline
+#   auto_recall_focal_floor  — focal decay floor (0, 1]: below it a chunk is
+#                              never focal (a zero floor would make everything
+#                              focal, so it is rejected)
+#   auto_recall_budget_chars — the selection budget; the greedy admission and
+#                              boundary tail-slice follow the T1 semantics
+# [capture]
+# auto_recall = false
+# auto_recall_focal_floor = 0.4
+# auto_recall_budget_chars = 1200
 """
