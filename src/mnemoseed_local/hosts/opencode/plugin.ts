@@ -82,18 +82,27 @@ function textOf(parts: unknown): string {
 }
 
 async function fetchAssistantText(
-  client: { session?: { message?: (options: unknown) => Promise<unknown> } } | undefined,
+  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
   sessionID: string,
   messageID: string,
 ): Promise<{ ok: boolean; text: string }> {
-  const query = client?.session?.message
-  if (typeof query !== "function") return { ok: false, text: "" }
+  // The opencode SDK (gen client) exposes ONLY the list endpoint
+  // session.messages({ path: { id } }) -> [{ info, parts }]; a singular
+  // session.message does not exist (dogfood finding 2026-08-19: every
+  // assistant turn silently short-circuited here before the fix).
+  const list = client?.session?.messages
+  if (typeof list !== "function") return { ok: false, text: "" }
   try {
-    const response: any = await query({ path: { id: sessionID, messageID } })
-    const parts = response?.data?.parts ?? response?.parts
-    return { ok: true, text: textOf(parts) }
+    const response: any = await list({ path: { id: sessionID } })
+    const entries = Array.isArray(response?.data) ? response.data : response
+    if (!Array.isArray(entries)) return { ok: false, text: "" }
+    const found = entries.find((entry: any) => entry?.info?.id === messageID)
+    // Not yet retrievable: fail the fetch so the caller rolls the fingerprint
+    // back and a later message.updated retries (宁可重复不丢).
+    if (!found) return { ok: false, text: "" }
+    return { ok: true, text: textOf(found.parts) }
   } catch (error) {
-    console.debug("mnemoseed-local: fetch message parts failed:", error)
+    console.debug("mnemoseed-local: fetch message list failed:", error)
     return { ok: false, text: "" }
   }
 }

@@ -70,3 +70,22 @@
 ## 门禁（不变）
 
 TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` / ruff / format / mypy）→ 单 commit 收口 + 收口记录入本 PRD。
+
+## 批次执行记录（随批追加）
+
+### T0 探针观测结果（2026-08-19，临时插件 `mnemoseed-probe.ts`，只观测零注入）
+
+三候选注入面全部真实触发，形状实测（日志 `~/.mnemoseed-local/probe-t0.jsonl`）：
+
+- **`chat.system.transform` —— 首选面成立**：`input = { sessionID, model }`，`output.system` 为**字符串数组**（含系统提示词）。注入 = 追加一个字符串元素，最干净、与消息流无侵扰。
+- `chat.messages.transform` —— 备选：`output.messages` 为 `{info, parts}` 消息列表，可插合成消息但需构造合法 info，侵扰面更大。
+- `chat.message` —— 备选：`output = { message, parts }`（用户消息），可追加 text part，但只作用于当轮用户消息。
+
+注入策略按此定案：回放/回忆注入走 system.transform 追加；每 session/每轮闸控（session 首轮判定、seen-set）在 hook 侧以 sessionID 为键执行。
+
+### 基线修正（捕获面红线，先于 T1 必须修）
+
+- **Dogfood 实锤**：新 session 实测"刚刚做了什么"——记忆只有 user 轮，assistant 轮全灭，回忆无从衔接。
+- **根因（SDK 契约层）**：hook 调用了 `client.session.message`（单数）——@opencode-ai/sdk gen 客户端**只暴露列表端点** `session.messages({path:{id}}) -> [{ info, parts }]`；`typeof query !== "function"` 使每条 assistant 轮静默短路进 console.debug（宁吞不炸的 hook 契约放大了缺口）。
+- **修复**：`fetchAssistantText` 改走列表端点 + `info.id` 查目标消息 + 未冲刷时 ok:false 回滚指纹稍后重试（宁可重复不丢）；新增契约钉死测试（session.messages 复数调用 / 单数名缺席 / info.id 查找三点）；`hook install opencode` 已把修复部署到全局插件目录，**待宿主重启后 live 验证 assistant 轮入库**。
+
