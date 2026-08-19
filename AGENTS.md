@@ -28,6 +28,15 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
 - Commit discipline (user directive 2026-08-19): land work via
   **issue → branch → PR → merge** (PR body: `Closes #<issue>`), never a
   direct commit to `main`.
+- **Delegated execution (user directive 2026-08-19, designed in from the
+  start)**: the main session only orchestrates (decompose, brief, accept,
+  run gates). ALL execution goes to the named subagents (registered as
+  global opencode agents under `~/.config/opencode/agents/`, model pinned
+  there): development to **senior-software-engineer**, QA to
+  **senior-qa-reviewer** (adversarial), design/trade-off discussion to
+  **solution-architect** for comprehensive evaluation, general chores to the
+  built-in **general** agent. Do NOT substitute the built-in general agent
+  with a role prompt when a named agent exists.
 - Public code and comments are English-only; Chinese docs live in `docs/zh`.
 - Phase work is PRD-driven: brief in `docs/zh/prd/` → batched TDD execution →
   single-commit closeout → closeout record in the PRD.

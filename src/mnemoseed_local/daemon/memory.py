@@ -24,6 +24,9 @@ every request, never guessed, D5 isolation):
 - POST /memory/dream_once   - the /dream command HTTP surface (FR-2.8
                               manual-first): run exactly one manual dream cycle
                               and read the trigger's observability.
+- POST /memory/reinforce    - B2.1 T3 consumption evidence: the hook attests
+                              that an injected slice was cited by the assistant;
+                              the Reinforcer applies its FR-4.2 rebound.
 
 Determinism: no clocks except reading the live timestamp where the semantic
 contract is timestamp-based (forget/deletion time, remember ``asserted_at``,
@@ -149,6 +152,26 @@ class SessionRecentRequest(BaseModel):
     profile_id: ProfileRef
     sessions: int = Field(default=2, ge=1, le=5)
     per_session: int = Field(default=20, ge=1, le=100)
+    exclude_session_id: str | None = None
+
+
+class ReinforceRequest(BaseModel):
+    """Request body for POST /memory/reinforce (B2.1 T3 consumption evidence).
+
+    ``chunk_ids``/``node_ids`` are the exact store keys whose usage the hook's
+    consumption guard attested; unknown ids are tolerated silently by the
+    Reinforcer (concurrently purged targets never fail the caller).
+    """
+
+    profile_id: ProfileRef
+    chunk_ids: list[str] = Field(default_factory=list, max_length=64)
+    node_ids: list[str] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def _has_target(self) -> Self:
+        if not self.chunk_ids and not self.node_ids:
+            raise ValueError("reinforce requires at least one chunk_id or node_id target")
+        return self
 
 
 def _group_session_tails(
@@ -156,6 +179,7 @@ def _group_session_tails(
     *,
     per_session: int,
     sessions: int,
+    exclude_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Group ingested_at-DESC chunks into per-session tails (B2 semantics).
 
@@ -163,10 +187,16 @@ def _group_session_tails(
     exactly recency order); each group's tail is its LAST ``per_session``
     chunks, listed ascending — the reading order. The endpoint never guesses
     which session is "closed": at most ``sessions`` groups come back and the
-    caller recognizes its own current one as the still-growing newest group."""
+    caller recognizes its own current one as the still-growing newest group.
+    ``exclude_session_id`` is a filter applied BEFORE grouping (the caller's
+    own session must never be echoed back to it): the session cap counts
+    SURVIVOR groups, and the shared "?" group (chunks without a session label)
+    is never excluded."""
     groups: list[dict[str, Any]] = []
     by_session: dict[str, dict[str, Any]] = {}
     for chunk in chunks:
+        if exclude_session_id is not None and chunk.provenance.session_id == exclude_session_id:
+            continue
         # a chunk without a session label (e.g. a manual pin) still lands in a
         # visible shared group instead of breaking the grouping
         session_id = chunk.provenance.session_id or "?"
@@ -513,20 +543,53 @@ class MemoryService:
         profile_id: str,
         per_session: int = 20,
         sessions: int = 2,
+        exclude_session_id: str | None = None,
     ) -> dict[str, Any]:
         """B2 time-ordered resume: the newest sessions' verbatim chunk tails.
 
         Read-only over the store's ingested_at-desc listing (lancedb driver
         guarantee); the page window is a pragmatic guardrail against very long
-        sessions diluting the older group out of view."""
-        limit = min(2000, sessions * per_session * 4)
+        sessions diluting the older group out of view. ``exclude_session_id``
+        widens the page by one session's worth of chunks so the caller's own
+        session can be filtered out without starving the survivor groups."""
+        limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
         )
         return {
             "profile_id": profile_id,
-            "sessions": _group_session_tails(page.items, per_session=per_session, sessions=sessions),
+            "sessions": _group_session_tails(
+                page.items,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+            ),
         }
+
+    # ------------------------------------------------------------ reinforce (B2.1 T3)
+
+    def reinforce(
+        self,
+        *,
+        profile_id: str,
+        chunk_ids: list[str],
+        node_ids: list[str],
+    ) -> dict[str, Any]:
+        """T3 consumption-evidence reinforcement (B2.1): apply the Reinforcer's
+        FR-4.2 rebound to the attested chunk/node usage. Best-effort like the
+        recall accounting path — a store fault must never fail the hook's
+        fire-and-forget POST, and unknown ids are ignored silently.
+
+        ``profile_id`` is deliberately NOT forwarded: target resolution is
+        profile-agnostic by design (the ids are unguessable store keys and the
+        usage is attested server-side by the hook's citation guard, so there
+        is no cross-profile guessing surface to defend against)."""
+        del profile_id  # the Reinforcer resolves targets store-side
+        try:
+            self._reinforcer.record_hits(chunk_ids, node_ids)
+        except Exception:  # pragma: no cover - usage accounting must not fail the caller
+            logger.warning("reinforce event write failed; consumption guard proceeds", exc_info=True)
+        return {"status": "ok"}
 
     # ------------------------------------------------------------ export
 
@@ -663,12 +726,28 @@ def memory_export(req: ExportRequest, request: Request) -> dict[str, Any]:
 def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any]:
     """B2 (PRD-B2): time-ordered session tails for the resume seam — the
     "continue where the last conversation ended" surface, verbatim chunks,
-    newest session group first, tails ascending."""
+    newest session group first, tails ascending. ``exclude_session_id`` lets
+    the session-start injection read skip the caller's own session."""
     service: MemoryService = request.app.state.memory
     return service.session_recent(
         profile_id=req.profile_id,
         per_session=req.per_session,
         sessions=req.sessions,
+        exclude_session_id=req.exclude_session_id,
+    )
+
+
+@router.post("/memory/reinforce")
+def memory_reinforce(req: ReinforceRequest, request: Request) -> dict[str, Any]:
+    """B2.1 T3 (PRD-B2.1): consumption-evidence reinforcement — the hook's
+    consumption guard attests that an injected slice was actually cited by the
+    assistant, and this endpoint turns that attestation into a real usage
+    event (TA-6: being injected is not being used)."""
+    service: MemoryService = request.app.state.memory
+    return service.reinforce(
+        profile_id=req.profile_id,
+        chunk_ids=req.chunk_ids,
+        node_ids=req.node_ids,
     )
 
 

@@ -112,6 +112,33 @@ def test_group_session_tails_respects_the_session_cap_and_empty_input() -> None:
     assert _group_session_tails([], per_session=5, sessions=2) == []
 
 
+def test_group_session_tails_excludes_exactly_the_named_session() -> None:
+    """B2.1 T1 (exclusion is a filter before grouping): the caller's own
+    session must never be echoed back to it, and the shared '?' group (a chunk
+    without any session label) is never excluded by an exact-match exclusion."""
+    chunks = [
+        _stamp("c3", "sess-cur", 30.0, "current session turn 0"),
+        _stamp("c2", "sess-old", 20.0, "older session"),
+        _stamp("c1", None, 10.0, "manual pin"),
+    ]
+    groups = _group_session_tails(chunks, per_session=20, sessions=5, exclude_session_id="sess-cur")
+    assert [g["session_id"] for g in groups] == ["sess-old", "?"]
+    assert [c["text"] for c in groups[0]["chunks"]] == ["older session"]
+    assert [c["text"] for c in groups[1]["chunks"]] == ["manual pin"]
+
+
+def test_group_session_tails_cap_counts_survivor_groups_after_exclusion() -> None:
+    """The session cap counts SURVIVOR groups: the excluded session is gone
+    before grouping, so the remaining newest sessions fill the slots."""
+    chunks = [
+        _stamp("c3", "sess-cur", 30.0, "current"),
+        _stamp("c2", "sess-old2", 20.0, "older two"),
+        _stamp("c1", "sess-old1", 10.0, "older one"),
+    ]
+    groups = _group_session_tails(chunks, per_session=5, sessions=2, exclude_session_id="sess-cur")
+    assert [g["session_id"] for g in groups] == ["sess-old2", "sess-old1"]
+
+
 # ---------------------------------------------------------------- daemon integration
 
 
@@ -209,3 +236,32 @@ def test_session_recent_rejects_out_of_range_caps(config_path: Path) -> None:
         assert body.status_code == 422
         body = client.post("/session/recent", json={"profile_id": PROFILE, "sessions": 99})
         assert body.status_code == 422
+
+
+def test_session_recent_excludes_the_named_session(config_path: Path) -> None:
+    """B2.1 T1 integration: the injection read asks the daemon to exclude its
+    own session (a race can land the current session's turn 0 before the
+    transform fires) — only the older session's tail comes back. An unknown
+    exclusion id leaves the order and shape untouched."""
+    with TestClient(create_app()) as client:
+        _ingest(client, "sess-old", 1.0, "老session内容")
+        client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
+        _ingest(client, "sess-new", 2.0, "新session内容")
+        client.post("/session/end", json={"session_id": "sess-new", "profile_id": PROFILE})
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "exclude_session_id": "sess-new"},
+        )
+        assert body.status_code == 200, body.text
+        sessions = body.json()["sessions"]
+        assert [s["session_id"] for s in sessions] == ["sess-old"]
+        assert [c["text"] for c in sessions[0]["chunks"]] == ["user: 老session内容"]
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "exclude_session_id": "no-such-session"},
+        )
+        assert body.status_code == 200, body.text
+        sessions = body.json()["sessions"]
+        assert [s["session_id"] for s in sessions] == ["sess-new", "sess-old"]

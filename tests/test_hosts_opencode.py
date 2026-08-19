@@ -35,6 +35,8 @@ EXPECTED_MAPPING = {
     "tool_use": "/ingest",
     "session_end": "/session/end",
     "flush": "/flush",
+    "session_recall_read": "/session/recent",
+    "memory_reinforce": "/memory/reinforce",
 }
 
 
@@ -200,6 +202,7 @@ def test_plugin_ts_is_shipped_as_package_data() -> None:
 def test_plugin_registers_the_required_hooks() -> None:
     source = _plugin_source()
     assert '"chat.message": async' in source
+    assert '"chat.system.transform": async' in source
     assert '"tool.execute.after": async' in source
     assert '"experimental.session.compacting": async' in source
     assert re.search(r"(?m)^\s*event: async", source)
@@ -207,7 +210,7 @@ def test_plugin_registers_the_required_hooks() -> None:
 
 def test_plugin_mentions_all_daemon_endpoints_and_host_id() -> None:
     source = _plugin_source()
-    for endpoint in ('"/ingest"', '"/session/end"', '"/flush"'):
+    for endpoint in ('"/ingest"', '"/session/end"', '"/flush"', '"/session/recent"', '"/memory/reinforce"'):
         assert endpoint in source, endpoint
     # HostId pinned to the daemon-side enum value.
     assert '"opencode"' in source
@@ -324,12 +327,51 @@ def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     promises: /session/end single-site (session.deleted), /flush two
     (idle/error + pre-compact), /ingest three (user prompt, assistant message
     — shared by the completion path and the pending-sweep retry via
-    postAssistantIngest — and tool use). Multi-line formatting must not
-    matter: count by regex, not literal."""
+    postAssistantIngest — and tool use), /memory/reinforce one (the T3
+    consumption guard only). The recall READ path (/session/recent) is an
+    awaited fetch inside the transform handler, NOT a post() call site.
+    Multi-line formatting must not matter: count by regex, not literal."""
     source = _plugin_source()
     assert len(re.findall(r'post\(\s*"/session/end"', source)) == 1
     assert len(re.findall(r'post\(\s*"/flush"', source)) == 2
     assert len(re.findall(r'post\(\s*"/ingest"', source)) == 3
+    assert len(re.findall(r'post\(\s*"/memory/reinforce"', source)) == 1
+
+
+def test_plugin_pins_the_t1_t3_recall_injection_and_consumption_guard() -> None:
+    """PRD-B2.1 T1/T3 mechanics: the attempt-once session gate, the
+    consumption-fingerprint registry (needle -> chunk ids) and the per-session
+    cited set; the hard 4000-char injection budget; the needle builder; the
+    consumption hook; and both fence literals. The single /memory/reinforce
+    call site is a pure usage event: it must never touch the watermark (it is
+    not content) nor re-arm recovery."""
+    source = _plugin_source()
+    for token in (
+        "injectedSessions",
+        "injectedRegistry",
+        "citedChunks",
+        "MAX_INJECT_CHARS = 4000",
+    ):
+        assert token in source, token
+    assert "needlesOf(" in source
+    assert "noteConsumption(" in source
+    assert "<mnemoseed-memory-recall>" in source
+    assert "</mnemoseed-memory-recall>" in source
+    # QA re-review NIT-1: the daemon's ReinforceRequest caps chunk_ids at
+    # max_length=64; the hook must split hits into <=64-id batches so an
+    # overflow can never 422 the whole cited batch after marking it cited.
+    assert "REINFORCE_BATCH_SIZE = 64" in source, "reinforce hits must batch to the daemon's 64-id cap"
+    reinforce_site = source.index('post("/memory/reinforce"')
+    window = source[reinforce_site : reinforce_site + 300]
+    assert "noteWatermark" not in window, "reinforce is not content — no watermark ack"
+    assert "scheduleRecovery" not in window, "reinforce failure must not re-arm reconciliation"
+    # IMPORTANT-1 (QA): the transform is the only handler the host AWAITS on
+    # the model-call path — it must fail open via try/catch like its siblings
+    # (a fault must never reject the awaited call nor mutate the system array).
+    transform_block = re.search(r"async function onChatSystemTransform.*?\n}", source, re.S)
+    assert transform_block is not None, "onChatSystemTransform handler block not found"
+    assert "try {" in transform_block.group(0), "the awaited transform handler must fail open"
+    assert "catch" in transform_block.group(0), "the awaited transform handler must fail open"
 
 
 def test_plugin_stays_fire_and_forget_and_debug_only() -> None:
