@@ -48,3 +48,12 @@ TDD（先红后绿）→ 对抗 QA 复审（无 BLOCKER 方可收口）→ 全�
 - **随批修（IMPORTANT）**：POSIX 路径根 + `MNEMOSEED_LOCAL_DATA_DIR`、tmp+rename 原子写、无水位跳过进 debug lane、`textOf` 滤 `ignored`/`synthetic` 部件、replay tool_use 带原事件 ts、reconcile 失败不置位（下次事件重试）、replay assistant 指纹守卫 + 成功解 pending。
 - **复审 Round-2（2026-08-19）：0 BLOCKER、2 个同族新 IMPORTANT 已修**：NEW-1（道中宕机空洞：拒收后的下一个 ack 会把水位跃过空洞窗口，reconciled 一旦置位本进程永不再对账）→ POST 新增 `nack` 通道，ingest 被拒/失败即解除该 session 的 reconciled 标记，下一事件自动按最后 ack 水位重放（行为场景 `outage-hole` 钉死"重放先于恢复轮到达"）；NEW-2（replay assistant 指纹在 POST 发出时置位、TOP 前置 unpark——单发失败即真丢失）→ 指纹置位保留（抑在飞重复）但 nack 回滚指纹并重挂 pending。另有 NIT-6（persist tmp 唯一后缀）、NIT-7（session.deleted 的 info.id 幻影键——优先 info.sessionID）随批修；其余 NIT（派发序 vs socket 序、链长、秒级 tmp 冲突已修外余项）评价后记录在案不阻收口。
 - **T4 红绿灯形态（如实调整）**：原 T4(b)/(c) 承诺的"基准对比/删文件行为测试"超出静态 pin 能力——以"静态 pin + node 行为挂架"替代交付（挂架本身就是对"TS 裸奔"的结构性回应），如实在本节声明。
+
+## 收口记录（2026-08-19）
+
+- 收口 commit：`c9040ac`（PR #4 → Closes #3，squash 合入；7 文件，+822/-74）。收口时 1199 passed / 3 skipped，ruff/format/mypy 干净；合并后 main 全量复验 **1200 passed / 3 skipped**，三大静态门禁全净。
+- TDD 批次：T1（ack 水位）+ T2（per-session FIFO 重生回放）+ T3（双层幂等：daemon e2e 零新增 chunk + node 行为挂架）+ T4（工程红线：token 零 LLM / 热路径零新增 I/O / 删水位文件可回退，静态 pin）同包交付。
+- 对抗 QA 两轮：首轮 NOT CLOSABLE——2 BLOCKER 打中要害（发送钟水位、live/replay 到达序错绑），修复并以挂架场景 `ack-watermark` / `replay-before-live` / `assistant-dedup` 钉死；复审 0 BLOCKER，揪出 2 个同族新 IMPORTANT（NEW-1 宕机空洞被后续 ack 跳跃覆盖 → post 增 nack 通道解除 reconciled；NEW-2 replay 指纹发出即置位 → nack 回滚指纹重挂 pending）与 NIT-6/7（tmp 唯一后缀、幻影键优先序）随批修净，补行为场景 `outage-hole`（挂架 4 场景 36 断言全绿）。
+- 装机同步：`uv tool install --force .` 自合并后 main 重建，daemon 换新构建重启（/healthz gate ok）；`hook install` 后 `hook status` 报 match（deployed 与 shipped 逐字节一致）。opencode 插件仅启动时加载——2026-08-19 14:23 之后启动的宿主进程已在跑 B2.2 版本，老进程一次重启即激活。
+- 边界声明保持"边界（如实）"节原文不松弛：WAL / hook spool / debounce 的不做判定、残余 ≤ 一轮缺口、ack 钟 cadence 内 acked 轮次的多重放由近重复吸收。
+- 下一刀候选（路线图）：B2.1 挂起的 T1 起始回放、T2 中段 auto-recall（T0 探针已于前批观测完成：注入面定案 system.transform 追加）；B4 前置候选 qwen3.5:9b verify 席零产出排查。
