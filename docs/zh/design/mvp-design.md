@@ -76,7 +76,8 @@
 ## 5. 流程图
 
 ```
-hooks（OpenCode 首发，映射 /ingest + /session/end；
+hooks（OpenCode 首发，映射 /ingest + /flush（空闲/出错）
+       + /session/end（仅 deleted），§4.5；
       jsonl/sqlite 文件 watch 备选）                →
   /api/v1/ingest（verbatim chunk）                 →
   ScorePool（S 分累计；pool_forced_cap 防溢出）      →
@@ -114,7 +115,7 @@ hooks（OpenCode 首发，映射 /ingest + /session/end；
   7. ollama 驱动转发 params→options（num_ctx、生成上限）；
   8. isolated 实例必需化（init 模板写入 + 启动/doctor 硬检查 + 断言测试）；
   9. 默认路由对齐：`llm.dream` 默认 `ollama/qwen3.5:9b`。
-- **Phase A3**：零依赖安装脚本（编排壳：装 ollama/uv → uv tool install → init → doctor 硬件探测荐档 → 用户确认后拉模型）、**OpenCode 宿主 hook 适配（首发，含会话生命周期映射 /ingest + /session/end）**、MCP 网关骨架（stdio + recall/remember/dream_once）、`.github` 工作流对齐（ci 触发器改 main + PR，删 development；release 保留 tag → PyPI trusted publishing）。包主体走 PyPI（`uv tool install mnemoseed-local` 本身即一行安装）。模型缺失 UX：init/doctor 引导 + `up` 启动检查、缺失时报错附 `ollama pull` 提示，**绝不静默拉取**（复用 bge-m3 懒加载先例）。
+- **Phase A3**：零依赖安装脚本（编排壳：装 ollama/uv → uv tool install → init → doctor 硬件探测荐档 → 用户确认后拉模型）、**OpenCode 宿主 hook 适配（首发，含会话生命周期映射 /ingest + /flush + /session/end——空闲误判为曾结案的 dogfood 勘正见 §4.5）**、MCP 网关骨架（stdio + recall/remember/dream_once）、`.github` 工作流对齐（ci 触发器改 main + PR，删 development；release 保留 tag → PyPI trusted publishing）。包主体走 PyPI（`uv tool install mnemoseed-local` 本身即一行安装）。模型缺失 UX：init/doctor 引导 + `up` 启动检查、缺失时报错附 `ollama pull` 提示，**绝不静默拉取**（复用 bge-m3 懒加载先例）。
 - **Phase B（后续，不纳入本稿）**：评测矩阵（档位 × off/verify/vote）与 bar 立项；lite 档 4B 型号定版（候选锚点 `qwen3.5:4b`）；advanced 档 27B 实测（首选官方 `qwen3.8:27b`，备选官方 `qwen3.5:27b` 与第三方 `smtek/Qwen3.8-27B` IQ2 系，不达标即移除）；`core_confidence_floor` 数值标定；`dream.capture_only` 硬模式裁定；BYOK opt-in（可带用户自设用量上限）；`needs_reconcile` 与 vote 分歧两套冲突机制的协同；ensemble 高配仲裁位。其余子项立项时再定。
 
 ## 7. 已识风险（主动承认）

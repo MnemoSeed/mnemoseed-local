@@ -21,7 +21,13 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
 
 - Gates (all must stay clean): `uv run pytest -q`, `ruff check`,
   `ruff format --check`, `mypy src`.
-- TDD: failing tests first; adversarial self-verification before closeout.
+- TDD: failing tests first; adversarial self-verification before closeout;
+  and per user directive 2026-08-19, closeouts additionally require a senior
+  adversarial QA review (no BLOCKER left) — once gates AND the QA verdict
+  are green, committing is pre-authorized.
+- Commit discipline (user directive 2026-08-19): land work via
+  **issue → branch → PR → merge** (PR body: `Closes #<issue>`), never a
+  direct commit to `main`.
 - Public code and comments are English-only; Chinese docs live in `docs/zh`.
 - Phase work is PRD-driven: brief in `docs/zh/prd/` → batched TDD execution →
   single-commit closeout → closeout record in the PRD.

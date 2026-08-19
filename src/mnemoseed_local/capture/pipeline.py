@@ -68,6 +68,19 @@ class InMemoryCapturePipeline:
     def sessions(self) -> tuple[str, ...]:
         return tuple(self._turns)
 
+    def prune_settled(self, session_id: str) -> None:
+        """QA-5: return a settled session's buffers to the OS.
+
+        Called by the /session/end REST handler AFTER the drain persisted the
+        turns — the live post-drain read paths (recent replay, recall) hit the
+        STORE, not these builders' buffers, so a settled session must not hold
+        its RAM forever. No-op for an unsettled session.
+        """
+        if session_id not in self._settled:
+            return
+        self._turns.pop(session_id, None)
+        self._settled.pop(session_id, None)
+
 
 class StrippingPipeline:
     """F1 seam: O(1) submit on the HTTP path; the stripper drains on read.
@@ -130,6 +143,13 @@ class StrippingPipeline:
 
     def sessions(self) -> tuple[str, ...]:
         return self._delegate.sessions()
+
+    def prune_settled(self, session_id: str) -> None:
+        """QA-5: drop this layer's stripped cache, then the delegate's buffers."""
+        if self._delegate.settled(session_id) is None:
+            return
+        self._stripped.pop(session_id, None)
+        self._delegate.prune_settled(session_id)
 
     @property
     def stats(self) -> StripStats:
@@ -287,6 +307,18 @@ class ScoringPipeline:
     def sessions(self) -> tuple[str, ...]:
         return self._delegate.sessions()
 
+    def prune_settled(self, session_id: str) -> None:
+        """QA-5: drop this layer's stripped/scored caches, then the buffers.
+
+        The profile-scoped ``_recent`` novelty window is NOT per-session and
+        stays — it feeds the scorer across sessions.
+        """
+        if self._delegate.settled(session_id) is None:
+            return
+        self._stripped.pop(session_id, None)
+        self._scored.pop(session_id, None)
+        self._delegate.prune_settled(session_id)
+
     @property
     def pool(self) -> ScorePool:
         return self._pool
@@ -385,6 +417,10 @@ class WritingPipeline:
 
     def sessions(self) -> tuple[str, ...]:
         return self._inner.sessions()
+
+    def prune_settled(self, session_id: str) -> None:
+        """QA-5: pass-through — the scored/stripped/raw caches all live inside."""
+        self._inner.prune_settled(session_id)
 
     @property
     def stats(self) -> WritingStats:

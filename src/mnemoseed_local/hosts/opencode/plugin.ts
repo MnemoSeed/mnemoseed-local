@@ -16,22 +16,51 @@
 //
 // Invariants: HostId is always "opencode"; every daemon call is
 // fire-and-forget (the host session is never blocked); every failure is
-// swallowed into console.debug; requests time out after 2s via AbortSignal.
+// swallowed into console.debug UNLESS the opt-in observability lane is armed
+// (env MNEMOSEED_LOCAL_DEBUG: failures escalate to console.error + a JSONL
+// sink, and every daemon POST's status is inspected — a swallowed non-2xx is
+// how the settle-sealing bug hid); requests time out after 2s via
+// AbortSignal.
 //
 // Type reference only (NOT a runtime import — the plugin is dependency-free):
 //   import type { Plugin } from "@opencode-ai/plugin"
 // The module's default export is the plugin function; OpenCode's loader
 // treats every exported function-valued value as a plugin instance.
 
+import { appendFile, mkdir } from "node:fs/promises"
+import { dirname } from "node:path"
+
 const HOST_ID = "opencode"
 const BASE_URL: string = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
 const PROFILE_ID: string = process.env.MNEMOSEED_LOCAL_PROFILE_ID || "default"
 const TIMEOUT_MS = 2000
+const FETCH_TIMEOUT_MS = 1500
 const DEDUP_CAP = 1000
+const MAX_TOOL_OUTPUT_CHARS = 20000
+
+// ---- opt-in observability lane (senior QA finding 12b, 2026-08-19): three
+// silent-failure dogfoods in one day proved console.debug alone is
+// invisible. Arm with MNEMOSEED_LOCAL_DEBUG (any non-empty value): failures
+// escalate to console.error AND a JSONL sink next to the daemon data dir.
+const DEBUG: boolean = Boolean(process.env.MNEMOSEED_LOCAL_DEBUG)
+const DEBUG_LOG_PATH: string =
+  `${process.env.USERPROFILE || ""}\\.mnemoseed-local\\hook-debug.jsonl`
+
+function debugLog(tag: string, payload: unknown): void {
+  console.debug(`mnemoseed-local: ${tag}:`, payload)
+  if (!DEBUG) return
+  console.error(`mnemoseed-local: ${tag}:`, payload)
+  const line = JSON.stringify({ ts: new Date().toISOString(), tag, payload })
+  void mkdir(dirname(DEBUG_LOG_PATH), { recursive: true })
+    .then(() => appendFile(DEBUG_LOG_PATH, line + "\n", "utf8"))
+    .catch((error: unknown) => console.debug("mnemoseed-local: debug sink failed:", error))
+}
 
 type JsonRecord = { [key: string]: unknown }
 
-// Fire-and-forget POST of a single-line JSON body; never throws.
+// Fire-and-forget POST of a single-line JSON body; never throws. The daemon's
+// STATUS is inspected: a non-2xx lands in the debug lane (409 = rejected,
+// e.g. an already-settled session — losing it silently once cost a day).
 function post(endpoint: string, body: JsonRecord): void {
   try {
     void fetch(BASE_URL + endpoint, {
@@ -39,9 +68,16 @@ function post(endpoint: string, body: JsonRecord): void {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
-    }).catch((error: unknown) => {
-      console.debug("mnemoseed-local: POST", endpoint, "failed:", error)
     })
+      .then((response) => {
+        if (!response.ok) {
+          debugLog("daemon POST rejected", { endpoint, status: response.status })
+        }
+      })
+      .catch((error: unknown) => {
+        console.debug("mnemoseed-local: POST", endpoint, "failed:", error)
+        debugLog("daemon POST failed", { endpoint, error: String(error) })
+      })
   } catch (error) {
     console.debug("mnemoseed-local: POST", endpoint, "aborted:", error)
   }
@@ -60,19 +96,35 @@ function seen(mark: Map<string, true>, key: string): boolean {
   return false
 }
 
-function unseen(mark: Map<string, true>, key: string): void {
-  mark.delete(key)
-}
-
-// assistant_message fires ONCE per (sessionID, messageID): message.updated
-// re-fires per part flush, so the completed fingerprint suppresses repeats.
-// If the parts fetch fails the fingerprint is rolled back so a later
-// message.updated retries; a successful fetch with empty text is kept
-// (a tool-only reply has nothing to ingest but must not be refetched).
+// assistant_message marks its (sessionID, messageID) fingerprint up front
+// (message.updated re-fires per part flush; the mark suppresses duplicate
+// posts AND concurrent in-flight duplicates). A failed or textless fetch does
+// NOT roll the mark back — it PARKS the id in pendingAssistant instead, and
+// the next session sweep (idle/error/deleted) retries deterministically.
 const sentAssistant = new Map<string, true>()
 // session_end settles ONCE per session_id (session.deleted is the only
 // terminal signal — see onBusEvent).
 const settledSessions = new Map<string, true>()
+
+// Per-session set of assistant messageIDs whose parts fetch has not yet
+// succeeded with text (pending retry at the next sweep point).
+const pendingAssistant = new Map<string, Set<string>>()
+
+function parkAssistant(sessionID: string, messageID: string): void {
+  let set = pendingAssistant.get(sessionID)
+  if (set === undefined) {
+    set = new Set<string>()
+    pendingAssistant.set(sessionID, set)
+  }
+  if (set.size < DEDUP_CAP) set.add(messageID)
+}
+
+function unparkAssistant(sessionID: string, messageID: string): void {
+  const set = pendingAssistant.get(sessionID)
+  if (set === undefined) return
+  set.delete(messageID)
+  if (set.size === 0) pendingAssistant.delete(sessionID)
+}
 
 function textOf(parts: unknown): string {
   if (!Array.isArray(parts)) return ""
@@ -93,19 +145,27 @@ async function fetchAssistantText(
   // unbinds `this` and the body `(options.client ?? this._client).get(...)`
   // throws TypeError reading '_client' (dogfood 2026-08-19: BOTH the original
   // singular-endpoint failure AND this unbound extraction died silently into
-  // console.debug before probe instrumentation exposed them).
+  // console.debug before probe instrumentation exposed them). The call is
+  // timeout-raced so a hung SDK promise parks in the pending set instead of
+  // leaking forever (senior QA finding 1).
   if (typeof client?.session?.messages !== "function") return { ok: false, text: "" }
   try {
-    const response: any = await client.session.messages({ path: { id: sessionID } })
+    const response: any = await Promise.race([
+      client.session.messages({ path: { id: sessionID } }),
+      new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error("assistant parts fetch timeout")), FETCH_TIMEOUT_MS),
+      ),
+    ])
     const entries = Array.isArray(response?.data) ? response.data : response
     if (!Array.isArray(entries)) return { ok: false, text: "" }
     const found = entries.find((entry: any) => entry?.info?.id === messageID)
-    // Not yet retrievable: fail the fetch so the caller rolls the fingerprint
-    // back and a later message.updated retries (宁可重复不丢).
+    // Not yet retrievable (parts not flushed): fail the fetch so the caller
+    // parks the id for the next sweep (宁可重复不丢).
     if (!found) return { ok: false, text: "" }
     return { ok: true, text: textOf(found.parts) }
   } catch (error) {
     console.debug("mnemoseed-local: fetch message list failed:", error)
+    debugLog("assistant parts fetch failed", { sessionID, messageID, error: String(error) })
     return { ok: false, text: "" }
   }
 }
@@ -146,9 +206,48 @@ function settle(sessionID: string): void {
   })
 }
 
+function postAssistantIngest(sessionID: string, messageID: string, info: any, text: string): void {
+  const content: JsonRecord = { text }
+  const modelId = modelIdOf(info)
+  if (modelId) content.model_id = modelId
+  post("/ingest", {
+    host: HOST_ID,
+    event: "assistant_message",
+    session_id: sessionID,
+    profile_id: PROFILE_ID,
+    ts: Date.now() / 1000,
+    content,
+    raw: { messageID },
+  })
+}
+
+// Deterministic retry for parked assistant fetches (senior QA findings 1+2):
+// the host is NOT relied on to re-fire message.updated (the last reply of a
+// session never re-fires), and settle can never overtake an outstanding
+// fetch — the sweep is AWAITED before /flush and /session/end are posted.
+// A fetch that stays textless AT the sweep is final (tool-only reply).
+async function sweepPendingAssistant(
+  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
+  sessionID: string,
+): Promise<void> {
+  const parked = pendingAssistant.get(sessionID)
+  if (parked === undefined || parked.size === 0) return
+  for (const messageID of Array.from(parked)) {
+    try {
+      const fetched = await fetchAssistantText(client, sessionID, messageID)
+      if (!fetched.ok) continue // stays parked for the next sweep
+      unparkAssistant(sessionID, messageID)
+      if (!fetched.text) continue // final verdict: genuinely textless reply
+      postAssistantIngest(sessionID, messageID, undefined, fetched.text)
+    } catch (error) {
+      console.debug("mnemoseed-local: pending sweep failed:", error)
+    }
+  }
+}
+
 export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) {
   const client = input?.client as
-    | { session?: { message?: (options: unknown) => Promise<unknown> } }
+    | { session?: { messages?: (options: unknown) => Promise<unknown> } }
     | undefined
 
   async function onChatMessage(hookInput: any, hookOutput: any): Promise<void> {
@@ -184,23 +283,14 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
     const fingerprint = `${sessionID}:${messageID}`
     if (seen(sentAssistant, fingerprint)) return
     const fetched = await fetchAssistantText(client, sessionID, messageID)
-    if (!fetched.ok) {
-      unseen(sentAssistant, fingerprint)
+    if (!fetched.ok || !fetched.text) {
+      // Not retrievable yet (or still textless at completion): park it — the
+      // next session sweep retries (a genuinely tool-only reply is dropped
+      // for good at sweep time, after one retry).
+      parkAssistant(sessionID, messageID)
       return
     }
-    if (!fetched.text) return
-    const content: JsonRecord = { text: fetched.text }
-    const modelId = modelIdOf(info)
-    if (modelId) content.model_id = modelId
-    post("/ingest", {
-      host: HOST_ID,
-      event: "assistant_message",
-      session_id: sessionID,
-      profile_id: PROFILE_ID,
-      ts: Date.now() / 1000,
-      content,
-      raw: { messageID },
-    })
+    postAssistantIngest(sessionID, messageID, info, fetched.text)
   }
 
   async function onBusEvent(event: any): Promise<void> {
@@ -210,12 +300,18 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
           await onMessageCompleted(event?.properties?.info)
           break
         case "session.idle":
-        case "session.error":
-          flushSession(sessionIdOfEvent(event))
+        case "session.error": {
+          const sessionID = sessionIdOfEvent(event)
+          await sweepPendingAssistant(client, sessionID)
+          flushSession(sessionID)
           break
-        case "session.deleted":
-          settle(sessionIdOfEvent(event))
+        }
+        case "session.deleted": {
+          const sessionID = sessionIdOfEvent(event)
+          await sweepPendingAssistant(client, sessionID)
+          settle(sessionID)
           break
+        }
         default:
           break
       }
@@ -234,13 +330,20 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
   }
 
   function stringifyToolOutput(value: unknown): string {
-    if (typeof value === "string") return value
-    if (value === undefined || value === null) return ""
-    try {
-      return JSON.stringify(value)
-    } catch {
-      return String(value)
+    let text: string
+    if (typeof value === "string") text = value
+    else if (value === undefined || value === null) text = ""
+    else {
+      try {
+        text = JSON.stringify(value)
+      } catch {
+        text = String(value)
+      }
     }
+    if (text.length > MAX_TOOL_OUTPUT_CHARS) {
+      return `${text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[... truncated at ${MAX_TOOL_OUTPUT_CHARS} chars]`
+    }
+    return text
   }
 
   async function onToolExecuteAfter(hookInput: any, hookOutput: any): Promise<void> {

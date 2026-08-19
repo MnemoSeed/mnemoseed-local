@@ -56,6 +56,11 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
     if drain is not None:
         drain(req.session_id)
+    # QA-5: the turns are persisted by the drain, so the settled session can
+    # hand its buffers back (same guarded-seam pattern as drain).
+    prune = getattr(getattr(request.app.state, "capture", None), "prune_settled", None)
+    if prune is not None:
+        prune(req.session_id)
     # The dream chain then runs off the hot path, AFTER the drain persisted the
     # chunks: the ScorePool relay buffered any fired dream events during scoring
     # and flushing here hands them to the worker, so a launched dream's snapshot

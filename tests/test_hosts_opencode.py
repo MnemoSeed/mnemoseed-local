@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from importlib import resources
 from pathlib import Path
 
@@ -242,39 +244,68 @@ def test_plugin_maps_idle_to_flush_and_only_deleted_settles() -> None:
     assert "settle(" in deleted_block.group(0), "deleted is the terminal settle"
 
 
-def test_plugin_pins_settle_once_dedup_and_assistant_retry_rollback() -> None:
-    """Settle-once keeps a noisy host from spamming /session/end; the
-    rollback keeps a transient parts-fetch failure from dropping an assistant
-    turn forever (宁可重复不丢 is the cross-channel backstop, not the hook's
-    own retry). Pin both guards as code."""
+def test_plugin_pins_settle_once_dedup_and_assistant_pending_sweep() -> None:
+    """Settle-once keeps a noisy host from spamming /session/end. Assistant
+    capture reliability (senior QA review 2026-08-19, findings 1+2): the old
+    rollback-on-failure retried ONLY if the host happened to re-fire
+    message.updated for that message — the final reply of a session had no
+    retry point at all, and a settle racing an in-flight fetch silently
+    409-dropped the last assistant turn. The contract is now a PENDING SET
+    with a deterministic sweep: a failed or textless fetch parks the
+    messageID per session; `session.idle`/`session.error`/`session.deleted`
+    AWAIT the sweep BEFORE posting /flush resp. /session/end, so the last
+    reply always gets a final retry and settle can never overtake an
+    outstanding fetch. Pin the set, the sweep call sites, and the settle-once
+    dedup as code."""
     source = _plugin_source()
+    assert "pendingAssistant" in source, "failed/textless fetches must park, not vanish"
+    assert "sweepPendingAssistant(" in source, "the deterministic retry sweep must exist"
+    idle_block = re.search(r'case "session\.idle":.*?break', source, re.S)
+    assert idle_block is not None and "await sweepPendingAssistant(" in idle_block.group(0)
+    deleted_block = re.search(r'case "session\.deleted":.*?break', source, re.S)
+    assert deleted_block is not None and "await sweepPendingAssistant(" in deleted_block.group(0), (
+        "settle must wait for the sweep — ordering is the fix, not a sleep"
+    )
     assert "seen(settledSessions," in source
-    assert "seen(sentAssistant," in source
-    assert "unseen(sentAssistant," in source
     assert "DEDUP_CAP = 1000" in source
 
 
+def test_plugin_fetch_has_a_timeout_so_a_hung_sdk_call_cannot_park_forever() -> None:
+    """Senior QA review 2026-08-19, finding 1 variant 4: the SDK parts fetch
+    had NO timeout (only daemon POSTs got AbortSignal.timeout) — a
+    never-resolving client.session.messages() lost the assistant turn AND
+    leaked the promise. The fetch now races a bounded timeout; the loser
+    parks in the pending set (retried at the next sweep)."""
+    source = _plugin_source()
+    assert "FETCH_TIMEOUT_MS" in source
+    assert re.search(r"Promise\.race\(", source), "SDK fetch must be timeout-raced"
+
+
 def test_plugin_fetches_assistant_parts_via_session_messages_plural() -> None:
-    """Live dogfood findings (2026-08-19): (1) the hook once called a SINGULAR
-    ``session.message`` with only one path param; (2) the follow-up 'fix'
-    extracted the method (``const list = client?.session?.messages``) and the
-    UNBOUND call threw ``TypeError: reading '_client'`` — the hey-api gen
-    client method body is ``(options.client ?? this._client).get(...)`` — and
-    the swallow-everything hook contract hid BOTH failures (probe-log
-    verified). Pin the plural call on its RECEIVER (bound `this`), the absent
-    bare extraction, and the info.id lookup, so SDK-contract AND
-    binding-form drift fail the Python gate instead of the memory store."""
+    """Live dogfood findings (2026-08-19, PRD-B2.1 baseline fix 3): the
+    original failure AND its first 'fix' were the SAME JS method-unbinding
+    TypeError (``Cannot read properties of undefined (reading '_client')``)
+    — the hey-api gen client body is ``(options.client ?? this._client)``
+    and ``const list = client?.session?.messages`` strips the receiver. The
+    console.debug-only failure reporting misdiagnosed it as 'singular
+    endpoint missing' (the singular ``session.message`` endpoint DOES exist
+    in SDK 1.18.18 with dual path params; the hook just must not use it).
+    Pin: the plural call on its RECEIVER, NO singular form, NO extraction
+    alias of any shape, the request's path-param shape, and the info.id
+    lookup — so SDK-contract AND binding-form drift fail the Python gate
+    instead of the memory store."""
     source = _plugin_source()
     assert re.search(r"\.session\?\.messages\b", source), "must guard client.session.messages (plural)"
-    assert not re.search(r"\.session\?\.message\b(?!s)", source), (
-        "singular session.message does not exist in the SDK"
+    assert not re.search(r"\.session\??\.[\"']?message\b(?!s)", source), (
+        "no singular session.message access in any form (optional chain or bracket)"
     )
     assert re.search(r"client\.session\.messages\(\{", source), (
         "the call must run on its receiver — extracting the method loses `this`"
     )
-    assert not re.search(r"const \w+ = client\?\.session\?\.messages\b", source), (
+    assert not re.search(r"(?:const|let|var)\s+[\w{}\s,]*=\s*client\?\.session\?\.messages\b", source), (
         "method extraction unbinds `this` (TypeError: reading '_client')"
     )
+    assert "path: { id: sessionID }" in source, "pin the list call's path-param shape"
     assert re.search(r"info\??\.id === messageID", source), "must look the message up by info.id"
 
 
@@ -288,8 +319,9 @@ def test_plugin_pins_runtime_host_id_in_code() -> None:
 def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     """Each daemon endpoint has exactly the call sites the mapping table
     promises: /session/end single-site (session.deleted), /flush two
-    (idle/error + pre-compact), /ingest three (user prompt, assistant
-    message, tool use)."""
+    (idle/error + pre-compact), /ingest three (user prompt, assistant message
+    — shared by the completion path and the pending-sweep retry via
+    postAssistantIngest — and tool use)."""
     source = _plugin_source()
     assert source.count('post("/session/end"') == 1
     assert source.count('post("/flush"') == 2
@@ -304,3 +336,54 @@ def test_plugin_stays_fire_and_forget_and_debug_only() -> None:
     assert "MNEMOSEED_LOCAL_PROFILE_ID" in source
     assert "console.debug(" in source
     assert "console.log(" not in source
+
+
+def test_plugin_ts_parses_clean_under_esbuild(tmp_path: Path) -> None:
+    """Senior QA review 2026-08-19, finding 12a: every gate (pytest/ruff/mypy)
+    is Python-only — the shipped hook is pinned by REGEX, so a syntax-broken
+    plugin.ts (unbalanced brace, bad template quote) would sail green through
+    CI and then kill capture SILENTLY at host load (fire-and-forget: the host
+    session shows nothing). That is exactly the silent-failure class behind
+    all three 2026-08-19 dogfoods. esbuild gives a real parse gate with zero
+    repo dependencies (npx-cached); type-checking is deliberately out of
+    scope (the file is dependency-free TS by design)."""
+    if shutil.which("npx") is None:
+        pytest.skip("npx unavailable on this machine")
+    plugin = resources.files("mnemoseed_local.hosts.opencode").joinpath("plugin.ts")
+    out = tmp_path / "plugin.js"
+    result = subprocess.run(
+        f'npx --yes esbuild "{plugin}" --outfile="{out}" --log-level=error',
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, f"plugin.ts must parse clean: {result.stderr}"
+    assert out.is_file()
+
+
+def test_plugin_has_an_optin_observability_seam() -> None:
+    """Senior QA review 2026-08-19, finding 12b + finding 2: the
+    console.debug-only failure sink made three real defects invisible, and
+    fire-and-forget POSTs never even LOOKED at the daemon's status (a 409
+    'rejected' is indistinguishable from 'accepted' on the wire). The hook
+    now (a) inspects every POST's response status and reports non-2xx, and
+    (b) exposes an opt-in debug lane (env ``MNEMOSEED_LOCAL_DEBUG``) that
+    escalates failures to console.error + a JSONL debug sink, so the next
+    class of runtime failure is visible WITHOUT ad-hoc probe surgery."""
+    source = _plugin_source()
+    assert "MNEMOSEED_LOCAL_DEBUG" in source, "opt-in env flag must exist"
+    assert "debugLog(" in source, "the debug sink lane must exist"
+    assert re.search(r"!?\bresponse\.ok\b", source) or re.search(r"!?\br\.ok\b", source), (
+        "POST must inspect the daemon's status — a swallowed 409 is how the settle-sealing bug hid"
+    )
+
+
+def test_plugin_caps_tool_output_payloads() -> None:
+    """Senior QA review 2026-08-19, finding 5 (hook half): tool_use payloads
+    were POSTed untruncated into the verbatim provenance lane — one runaway
+    build log would bloat RAM buffers (in-memory until drain) and the lance
+    store. Cap with an explicit, greppable truncation marker."""
+    source = _plugin_source()
+    assert "MAX_TOOL_OUTPUT_CHARS" in source
+    assert "[... truncated" in source

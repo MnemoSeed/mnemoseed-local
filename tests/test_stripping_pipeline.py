@@ -157,6 +157,15 @@ def test_http_end_to_end_ingest_to_f1_buffer() -> None:
 
     app = create_app()
     app.router.lifespan_context = fake_lifespan
+    drained: list = []
+    original_drain = pipeline.drain
+
+    def recording_drain(session_id: str):
+        results = original_drain(session_id)
+        drained.extend(results)
+        return results
+
+    pipeline.drain = recording_drain
     with TestClient(app) as client:
         assert (
             client.post(
@@ -180,9 +189,14 @@ def test_http_end_to_end_ingest_to_f1_buffer() -> None:
             == 200
         )
 
-    assert pipeline.turns(SESSION)[0].steps[0].content == EXPECTED_NPM
+    # the HTTP-triggered drain stripped the turn exactly once (F1 verified)
+    assert drained[0].turn.steps[0].content == EXPECTED_NPM
     assert pipeline.stats.rules_hit["npm-warn"] >= 1
     assert isinstance(pipeline, StrippingPipeline)
+    # QA-5: post-settle the session's buffers were handed back (the STRIPPED
+    # view pruned too), while cumulative stats survive.
+    assert SESSION not in pipeline.sessions()
+    assert pipeline.turns(SESSION) == []
 
 
 def test_app_default_capture_is_stripping_pipeline() -> None:

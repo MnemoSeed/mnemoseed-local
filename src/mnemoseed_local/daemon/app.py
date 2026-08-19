@@ -607,6 +607,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for deg in stores.report.missing:
             logger.warning("degraded: %s - %s", deg.feature, deg.behavior)
     yield
+    # QA-4: drain the capture lane BEFORE anything closes — restart mid-reply
+    # must not lose the last exchange. Open turns close off the hot path, then
+    # every buffered session drains into the stores they belong to.
+    segmenter = getattr(app.state, "segmenter", None)
+    capture = getattr(app.state, "capture", None)
+    drain = getattr(capture, "drain", None)
+    if segmenter is not None and drain is not None and capture is not None:
+        segmenter.flush_all()
+        for session_id in capture.sessions():
+            drain(session_id)
     # Stop the background loops before the stores close (lifecycle order).
     for task_name in ("decay_task", "scheduler_task"):
         task = getattr(app.state, task_name, None)

@@ -4,7 +4,11 @@ One in-memory state machine per session_id. Turn boundaries are anchored by
 explicit user_prompt events (Claude Code / Codex / Gemini). Hosts without a
 user-prompt hook (Cursor: afterAgentResponse + postToolUse only) are
 segmented on response boundaries: a second assistant_message after an
-assistant step closes the preceding turn.
+assistant step closes the preceding turn. The boundary rule is ANCHOR-AWARE
+(senior QA review 2026-08-19, finding 3): a user-anchored turn absorbs every
+assistant message of a multi-block reply (opencode's tool-loop mode), so the
+verbatim chunk keeps the reply with its request; only anchor-less streams
+(orphan/tool-started turns) fall back to response-boundary segmentation.
 """
 
 from __future__ import annotations
@@ -72,7 +76,15 @@ class _SessionState:
             if not isinstance(content, MessageContent):
                 self._invalid(event)
             open_turn = self.open_turn
-            if open_turn is None or any(step.role is TurnRole.ASSISTANT for step in open_turn.steps):
+            # Anchor-aware boundary (QA-3): a user-anchored turn absorbs the
+            # whole multi-block reply; only anchor-less streams split on a
+            # second assistant message.
+            anchored = bool(
+                open_turn is not None and open_turn.steps and open_turn.steps[0].role is TurnRole.USER
+            )
+            if open_turn is None or (
+                any(step.role is TurnRole.ASSISTANT for step in open_turn.steps) and not anchored
+            ):
                 open_turn = self._start_turn(event, pipeline)
             open_turn.steps.append(TurnStep(role=TurnRole.ASSISTANT, content=content.text))
             if content.model_id:
@@ -183,3 +195,13 @@ class TurnSegmenter:
         if state is None:
             raise SessionUnknownError(f"session {session_id!r} not captured; nothing to flush")
         return state.flush(profile_id, self._pipeline)
+
+    def flush_all(self) -> int:
+        """Close EVERY session's in-flight turn (QA-4: daemon shutdown drains
+        the capture lane on teardown — dying mid-reply must not lose the last
+        exchange silently). Idempotent. Returns the total closed-turn count."""
+        closed = 0
+        for state in self._sessions.values():
+            if state.turn_range is None:
+                closed += state.flush(state.profile_id, self._pipeline)
+        return closed

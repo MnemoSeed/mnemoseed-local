@@ -105,3 +105,26 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 - **修复**：fetch 改为**在接收者上直接调用** `client.session.messages({...})`（绑定 `this`）；契约测试升级为钉死绑定调用形态（`client.session.messages({` 必在、`const x = client?.session?.messages` 摘取式必禁）。门禁：1183 passed / 3 skipped，ruff/format/mypy 全绿；`hook install` 已部署。
 - **待用户动作**：再重启一次 opencode；生效判据 = assistant 轮文本入库。本轮教训（记录备查）：fire-and-forget 部件的 silent-failure 面必须配探针级可观测性——静态"契约钉死"测试拦不住"行为对了、绑定形错了"这类运行时缺陷。
 
+### 基线修正 ④（senior QA 对抗复审收口，2026-08-19）
+
+修正 ①+②+③ live 验证通过（turn 连续、assistant 轮文本入库、双角色同 chunk）后，用户拍板：修复必须走完既定流程——**对抗式 senior QA 复审确认后才收口**。QA 复审结论：无 BLOCKER；三次修复方向全部正确，但静默丢失**这一类**问题在相邻路径上仍然敞开。按判定分批处置：
+
+**本批已修（确定性缺陷，TDD 先红后绿）**：
+
+- **QA-1+2 assistant 捕获可靠性重构**：旧"回滚指纹"重试依赖宿主再 fire——会话最后一条回复永远没有重试点；settle 与在途 fetch 竞跑会把末条 assistant 静默 409 丢掉。重构为 **pendingAssistant 集合 + idle/error/deleted 前 await 确定性重扫**（settle 再也无法超越在途 fetch）；SDK 拉取加超时竞速（挂起 promise 不再泄漏）；扫点时仍无文本才判 tool-only 终局（不再把"parts 未挂"误判成空）。
+- **QA-3 分片器 host 盲碎片化**：旧的 response-boundary 规则为无锚宿主（Cursor）设计，却对一切宿主生效——opencode 工具环模式下每条多段助手回复都碎成孤儿 turn，召回丢失上下文。改为**锚感知**：user 锚定的 turn 吸收整条多段回复；仅无锚流（孤儿/工具开头的 turn）保持按响应边界切分。
+- **QA-4 daemon 关停不 drain 捕获缓冲**：lifespan 收尾新增 `segmenter.flush_all()` + 全 session drain（重启丢最后一轮的静默缺口封死）。
+- **QA-5 内存常驻 + 工具输出无截断**：`/session/end` drain 后 `prune_settled` 释放 settled 会话缓冲（daemon 半程）；hook 半程 `MAX_TOOL_OUTPUT_CHARS=20000` 截断带显式标记。
+- **QA-10/11/13 pin 漏洞**：诈骗式 docstring 更正（单数端点其实存在，真凶是未绑 `this`）、解绑负 pin 泛化到 let/var/解构各种形态、钉死 `{ path: { id: sessionID } }` 调用形状。
+- **QA-12 系统性缺口（三次踩坑的共同根）**：(a) 门禁新增 **esbuild TS 语法校验测试**（此前全部门禁是 Python，plugin.ts 只靠正则 pin，语法坏文件能一路绿）；(b) hook 新增 **`MNEMOSEED_LOCAL_DEBUG` 可观测 seam**（失败升级 console.error + JSONL 沉槽；**每个 POST 现在检查 daemon 响应状态，非 2xx 必上报**——409 被静默吞没正是 settle 封口 bug 的隐身衣）。
+- **QA-14/15 文档残留**：mvp-design §5 流程图与 §6 A3 摘要同步 `/flush` 映射；测试与插件注释里的误诊表述全部更正。
+
+**记录挂起（不入本批，后续批次再议）**：
+
+- **QA-7**：用户中止（abort）的助手回复可能从不触发 completed 事件（`time.error` 形态）——待探针一轮验证，若属实则把 error 形态也视为完成点。
+- **QA-6**：重启不对称性已证无害（hook 抑重 + daemon 近重复吸收兜底），仅 provenance 外观问题，记录备查。
+- **QA-8**：idle-flush debounce 被 QA 否决（过度工程；竞态只是内容无损的重排，且已被 QA-3 的确定性修复吸收）；settle 序问题用 await 重扫解决，不用睡眠。
+- **QA-13 残余**：fixture 无 `model_id` 变体（NIT）；mvp-design.md:61 去重单元表述与实际近重复吸收实现不符（存量漂移，记录备查）。
+
+门禁：1193 passed / 3 skipped（新增 3+10 测试），ruff / format / mypy 全绿；`hook install` 已部署。生效判据不变且追加：多段回复不再碎片化、`hook-debug.jsonl` 在 `MNEMOSEED_LOCAL_DEBUG=1` 时可写。
+
