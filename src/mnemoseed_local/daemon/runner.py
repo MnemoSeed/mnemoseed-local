@@ -17,6 +17,8 @@ import time
 import httpx
 import uvicorn
 
+from mnemoseed_local.daemon.watchdog import Watchdog
+
 logger = logging.getLogger("mnemoseed_local.daemon")
 
 _ANNOUNCE_TIMEOUT = 120.0
@@ -88,5 +90,13 @@ def run_server(host: str, port: int) -> int:
         name="mnemoseed-announce",
     )
     announcer.start()
+    # PRD-B2.3 D2: arm the watchdog before the run loop. The probe host
+    # resolves the same way announce_ready does (a wildcard bind is probed via
+    # the loopback), and the thread force-exits the process if the listener is
+    # lost beyond a grace window — including a hung teardown, whose joins this
+    # exit skips. The watchdog thread is daemon=True, so a clean shutdown never
+    # waits on it.
+    watchdog = Watchdog("127.0.0.1" if host in _PROBE_HOSTS else host, port)
+    watchdog.start()
     server.run()
     return 0

@@ -80,6 +80,7 @@ def test_role_configured_audit_does_not_echo_a_literal_key(tmp_path, monkeypatch
         encoding="utf-8",
     )
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
 
     with TestClient(create_app()) as client:

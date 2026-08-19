@@ -85,6 +85,7 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg.write_text(_config_toml(tmp_path), encoding="utf-8")
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
     return cfg
 
@@ -95,6 +96,7 @@ def recall_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg.write_text(_config_toml(tmp_path, "[capture]\nauto_recall = true\n"), encoding="utf-8")
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
     return cfg
 
@@ -310,6 +312,7 @@ def _budget_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: int)
     )
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
     return cfg
 
