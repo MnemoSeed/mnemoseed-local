@@ -55,7 +55,7 @@
    - ScorePool 的防溢出强制触发上限曾硬编码 `forced_cap=50`：注册表化为 `dream.pool_forced_cap`（默认 `50.0`，须 ≥ floor，校验拦截）。
 4. **Verbatim 直达**（已写入 MVP spec）：每个 turn 原文逐字进 chunk（stripper 只剥 reasoning / tool use 等噪声单元；**F2 durability 判定只作元数据注解、绝不过滤落库**，scorer 的 S 仅供积分池积累——v1.4 起代码与契约对齐，此点前实现曾误把 DISPOSABLE turn 丢弃）；合并前即可检索（Freshness Guard 探测 `consolidated=false`），dream merge 后退出搜索面（`consolidated=true`，原文保留为证据链、可按 provenance 追溯取回但不进向量召回）。**主检索轨（hybrid vector track）同样过滤 `consolidated=false`**，杜绝 chunk+node 双表示重复命中。检索面 = 合并产物 graph nodes + 未合并 verbatim chunks——MVP 阶段记忆一定可找回。
 5. **摄取主通道**（优先级已拍板）：
-   - ① **宿主 hook**：**OpenCode 为开发/测试默认宿主、首发适配**；Claude Code 与 Codex 第二优先级；Cursor 类 IDE 第三优先级。**hook 适配必须映射宿主会话生命周期**：消息事件 → `/ingest`；会话结束/空闲 → `/session/end`（或 pre-compact → `/flush`），只推 `/ingest` 会永不 drain。
+   - ① **宿主 hook**：**OpenCode 为开发/测试默认宿主、首发适配**；Claude Code 与 Codex 第二优先级；Cursor 类 IDE 第三优先级。**hook 适配必须映射宿主会话生命周期**：消息事件 → `/ingest`；空闲/出错 → `/flush`（关闭在飞 turn 并 drain，会话保持可摄入）；仅真正的会话终止 → `/session/end`；pre-compact → `/flush`。只推 `/ingest` 会永不 drain；把"空闲"当"终止"会把会话在第一轮问答后就封口（2026-08-19 dogfood：opencode 的 `session.idle` 每答完一轮即 fire，旧映射令后续摄取全部 409 静默丢失，仅 `session.deleted` 才是终止信号）。
    - ② 宿主方言文件观察（jsonl/sqlite 文件 watch，闲时约 30s 级轮询校验）：备胎第一位；
    - ③ MCP 网关：备胎第二位，骨架随 A3 交付。骨架表面定义：stdio 传输 + `recall` / `remember` / `dream_once` 工具集；capture 自动通道仍归 hook 主线。
    - 去重单元：`host_id + session_id + turn_range` 精确匹配（A3 实现约束；跨通道 turn_range 不一致时的兜底：宁可重复摄入由近重复检测吸收，也不丢）。

@@ -37,6 +37,7 @@
      - `message.updated` 且 role=assistant 且 `time.completed` 已置（经 client 拉 parts 文本）→ `assistant_message`（client 端按 (sessionID, messageID) LRU 抑重）；
      - `tool.execute.after` → `tool_use`（tool_name / input=args / output=result 文本化）；
      - `session.idle` / `session.error` / `session.deleted` → POST `/session/end`（**会话生命周期映射必需，缺它永不 drain**）；
+       > **勘误（2026-08-19，B2.1 基线修正 ②）**：opencode 的 `session.idle` 每答完一轮即 fire（空闲 ≠ 会话终止），旧映射使会话首轮后封口、后续摄取 409 静默丢失。已更正为 `session.idle`/`session.error` → `/flush`，仅 `session.deleted` → `/session/end`；详见 `PRD-B2.1-auto-recall.md` 批次执行记录。
      - `experimental.session.compacting` → POST `/flush`（pre-compact 救援；宿主事件缺席时安全跳过）；
      - 底座：`IngestEvent.host = "opencode"`；baseurl = env `MNEMOSEED_LOCAL_BASEURL` 或 `http://localhost:7788`；profile = env `MNEMOSEED_LOCAL_PROFILE_ID` 或 `default`；请求超时 ≤2s。
   3. CLI 新 verb：`mnemoseed-local hook install|uninstall|status`（本地操作，不走 daemon REST 写路径）。

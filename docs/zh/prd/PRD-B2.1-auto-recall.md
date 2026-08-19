@@ -89,3 +89,11 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 - **根因（SDK 契约层）**：hook 调用了 `client.session.message`（单数）——@opencode-ai/sdk gen 客户端**只暴露列表端点** `session.messages({path:{id}}) -> [{ info, parts }]`；`typeof query !== "function"` 使每条 assistant 轮静默短路进 console.debug（宁吞不炸的 hook 契约放大了缺口）。
 - **修复**：`fetchAssistantText` 改走列表端点 + `info.id` 查目标消息 + 未冲刷时 ok:false 回滚指纹稍后重试（宁可重复不丢）；新增契约钉死测试（session.messages 复数调用 / 单数名缺席 / info.id 查找三点）；`hook install opencode` 已把修复部署到全局插件目录，**待宿主重启后 live 验证 assistant 轮入库**。
 
+### 基线修正 ②（生命周期映射勘误，2026-08-19 live dogfood，先于 T1 必须修）
+
+- **重启后实锤**：基线修正 ① 部署并完成宿主重启后，新 session 依旧只有 user turn 0——连后续 user 消息也消失；probe 日志证明 `chat.message` 钩子正常触发、daemon ingest 管道手动注入测试无恙（202 accepted + flush 落库）。
+- **根因（宿主生命周期语义错位）**：opencode 的 `session.idle` **每答完一轮即 fire**（空闲 = agent 安静，非会话终止）；A3 映射把 `idle|error|deleted` 全送 `/session/end`——会话在第一轮回答后结算封口（turn 0 顺带 drain 落库，掩盖了表象），之后一切 `/ingest` 由 daemon 正当地 409（SessionSettledError）拒绝，fire-and-forget 契约静默吞没。assistant 轮则自始至终被 409 挡在门外，修正 ① 的效果无法被观测。
+- **修复（hook 侧映射重排，daemon 零改动）**：`session.idle`/`session.error` → `/flush`（关闭在飞 turn 并 drain，会话保持可摄入）；仅 `session.deleted` → `/session/end`。新增端到端回归测试（idle→flush 后可续摄、双方角色 turn 全部 verbatim 落库、settled 后迟到消息 409），静态契约钉死 `flushSession(` 在 idle/error 分支、`settle(` 仅存于 deleted 分支；`mvp-design.md` §4.5 生命周期段与 `PRD-A3-delivery.md` 映射条目同步勘误。门禁：1183 passed / 3 skipped，ruff/format/mypy 全绿。
+- **已知良性竞态（如实记录）**：assistant `message.updated` 与同轮 `session.idle` 的 flush 两个 fire-and-forget POST 次序不保证；若 flush 先到，assistant 文本会落进紧随的独立 turn——内容不丢、检索无碍，chunk 边界略丑，v1 接受。
+- **待用户动作**：重启 opencode 使修正 ①+② 同时生效；生效判据 = 本 PRD 会话内 assistant 轮文本出现在 `recent_sessions` 尾部。
+

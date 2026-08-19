@@ -118,6 +118,72 @@ def test_flush_fixture_accepted_by_daemon(config_path: Path) -> None:
         assert flushed.json()["status"] == "flushed"
 
 
+def test_opencode_idle_flush_lifecycle_keeps_the_session_ingestable(config_path: Path) -> None:
+    """End-to-end regression for the 2026-08-19 dogfood finding: drive the
+    daemon exactly as the FIXED hook does — each completed reply fires
+    session.idle -> /flush, session.deleted -> /session/end. The old mapping
+    (idle -> /session/end) sealed the session after the first reply and every
+    later turn 409-dropped silently. Assert: ingest continues after flushes,
+    both roles of both turns land verbatim, and only the terminal settle seals
+    the session."""
+    sid = "oc-lifecycle"
+
+    def post_ingest(event: str, ts: float, text: str) -> None:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": event,
+                "session_id": sid,
+                "profile_id": "default",
+                "ts": ts,
+                "content": {"text": text},
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    with TestClient(create_app()) as client:
+        # turn 0 completes -> host fires session.idle -> flush (NOT settle)
+        post_ingest("user_prompt", 1.0, "第一条用户消息")
+        post_ingest("assistant_message", 2.0, "第一条助手回复")
+        flushed = client.post("/flush", json={"session_id": sid, "profile_id": "default"})
+        assert flushed.status_code == 200, flushed.text
+        assert flushed.json()["closed_turns"] == 1
+        # the flush drained the turn: still mid-session, already recallable
+        mid = client.post("/session/recent", json={"profile_id": "default", "sessions": 1})
+        mid_texts = [c["text"] for c in mid.json()["sessions"][0]["chunks"]]
+        assert any("第一条用户消息" in t and "第一条助手回复" in t for t in mid_texts)
+        # the session must STILL accept ingest (old mapping answered 409 here)
+        post_ingest("user_prompt", 3.0, "第二条用户消息")
+        post_ingest("assistant_message", 4.0, "第二条助手回复")
+        flushed2 = client.post("/flush", json={"session_id": sid, "profile_id": "default"})
+        assert flushed2.json()["closed_turns"] == 1
+        # session.deleted is the terminal settle
+        settled = client.post("/session/end", json={"session_id": sid, "profile_id": "default", "ts": 5.0})
+        assert settled.status_code == 200, settled.text
+        assert settled.json()["turns"] == 2
+        # the re-anchoring surface carries BOTH roles of BOTH turns
+        body = client.post(
+            "/session/recent", json={"profile_id": "default", "sessions": 1, "per_session": 10}
+        )
+        texts = [c["text"] for c in body.json()["sessions"][0]["chunks"]]
+        assert any("第一条用户消息" in t and "第一条助手回复" in t for t in texts)
+        assert any("第二条用户消息" in t and "第二条助手回复" in t for t in texts)
+        # settled really is terminal: late arrivals are rejected, not lost silently
+        late = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": sid,
+                "profile_id": "default",
+                "ts": 6.0,
+                "content": {"text": "迟到消息"},
+            },
+        )
+        assert late.status_code == 409
+
+
 # ---------------------------------------------------------------- packaging
 
 
@@ -154,13 +220,26 @@ def test_plugin_wires_the_pinned_hook_endpoint_mapping() -> None:
     assert found == EXPECTED_MAPPING
 
 
-def test_plugin_pins_the_settle_trigger_cases_in_code() -> None:
-    """The three session-lifecycle triggers are the primary session-drain path
-    (design §4.5: only pushing /ingest never drains). Pin them as CODE — the
-    header comment's `session.idle|error|deleted` shorthand must not count."""
+def test_plugin_maps_idle_to_flush_and_only_deleted_settles() -> None:
+    """Live dogfood finding (2026-08-19): opencode fires ``session.idle``
+    after EVERY completed assistant reply (idle = agent went quiet, NOT
+    conversation over). Mapping idle -> /session/end settled the session at
+    the first reply; every later /ingest answered HTTP 409
+    (SessionSettledError) and the fire-and-forget hook swallowed it into
+    console.debug — sessions silently truncated to turn 0 and assistant-turn
+    capture became unverifiable (verbatim red line breached). Corrected
+    lifecycle: idle/error -> /flush (close + drain the in-flight turn, the
+    session stays ingestable); only session.deleted -> /session/end. Pin the
+    mapping as CODE so a regression fails the Python gate."""
     source = _plugin_source()
-    for trigger in ('case "session.idle":', 'case "session.error":', 'case "session.deleted":'):
-        assert trigger in source, trigger
+    idle_block = re.search(r'case "session\.idle":.*?break', source, re.S)
+    assert idle_block is not None
+    assert 'case "session.error":' in idle_block.group(0)
+    assert "flushSession(" in idle_block.group(0), "idle/error must flush, not settle"
+    assert "settle(" not in idle_block.group(0), "idle is NOT session end"
+    deleted_block = re.search(r'case "session\.deleted":.*?break', source, re.S)
+    assert deleted_block is not None
+    assert "settle(" in deleted_block.group(0), "deleted is the terminal settle"
 
 
 def test_plugin_pins_settle_once_dedup_and_assistant_retry_rollback() -> None:
@@ -202,11 +281,12 @@ def test_plugin_pins_runtime_host_id_in_code() -> None:
 
 def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     """Each daemon endpoint has exactly the call sites the mapping table
-    promises: /session/end and /flush single-site, /ingest three (user prompt,
-    assistant message, tool use)."""
+    promises: /session/end single-site (session.deleted), /flush two
+    (idle/error + pre-compact), /ingest three (user prompt, assistant
+    message, tool use)."""
     source = _plugin_source()
     assert source.count('post("/session/end"') == 1
-    assert source.count('post("/flush"') == 1
+    assert source.count('post("/flush"') == 2
     assert source.count('post("/ingest"') == 3
 
 

@@ -10,7 +10,8 @@
 //   chat.message                        -> user_prompt       -> POST /ingest
 //   event message.updated (assistant)   -> assistant_message -> POST /ingest
 //   tool.execute.after                  -> tool_use          -> POST /ingest
-//   event session.idle|error|deleted    -> session_end       -> POST /session/end
+//   event session.idle|error            -> flush             -> POST /flush
+//   event session.deleted               -> session_end       -> POST /session/end
 //   experimental.session.compacting     -> flush             -> POST /flush
 //
 // Invariants: HostId is always "opencode"; every daemon call is
@@ -69,7 +70,8 @@ function unseen(mark: Map<string, true>, key: string): void {
 // message.updated retries; a successful fetch with empty text is kept
 // (a tool-only reply has nothing to ingest but must not be refetched).
 const sentAssistant = new Map<string, true>()
-// session_end settles ONCE per session_id.
+// session_end settles ONCE per session_id (session.deleted is the only
+// terminal signal — see onBusEvent).
 const settledSessions = new Map<string, true>()
 
 function textOf(parts: unknown): string {
@@ -121,6 +123,16 @@ function sessionIdOfEvent(event: any): string {
   // session.deleted carries the session record instead of a bare sessionID.
   if (typeof props.info?.id === "string") return props.info.id
   return ""
+}
+
+// opencode fires session.idle after EVERY completed reply — idle means the
+// agent went quiet, NOT that the conversation ended (dogfood 2026-08-19:
+// mapping idle -> /session/end settled the session at the first reply; all
+// later ingest then answered 409 and was swallowed silently). Flush closes
+// and drains the in-flight turn while keeping the session ingestable.
+function flushSession(sessionID: string): void {
+  if (!sessionID) return
+  post("/flush", { session_id: sessionID, profile_id: PROFILE_ID })
 }
 
 function settle(sessionID: string): void {
@@ -198,6 +210,8 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
           break
         case "session.idle":
         case "session.error":
+          flushSession(sessionIdOfEvent(event))
+          break
         case "session.deleted":
           settle(sessionIdOfEvent(event))
           break
