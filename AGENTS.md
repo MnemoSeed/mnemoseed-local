@@ -25,6 +25,14 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
 - Public code and comments are English-only; Chinese docs live in `docs/zh`.
 - Phase work is PRD-driven: brief in `docs/zh/prd/` → batched TDD execution →
   single-commit closeout → closeout record in the PRD.
+- **Theory-anchor discipline (user directive 2026-08-19, applies to the whole
+  mnemoseed family)**: every feature design must document its borrowed theory
+  in a 理论锚 section of its PRD/design doc — only empirically validated
+  neuroscience/psychology regularities (source + validated regularity +
+  design rule), strictly separated from implementation mechanisms; an
+  explicit "not borrowed" list keeps pop-neuro myths out. Design docs are
+  mandatory for the theories behind every feature; they are the cornerstone
+  of the system's core design.
 - Never commit secrets; `opencode.json` lives outside this repo (global user
   config) and must not leak into git.
 
