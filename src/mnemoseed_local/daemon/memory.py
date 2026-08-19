@@ -36,6 +36,7 @@ usage-event ``last_hit_at``); no randomness; no network.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import replace
@@ -76,6 +77,16 @@ logger = logging.getLogger("mnemoseed_local.daemon.memory")
 # Explicit-pin provenance source marker (FR-3.1). A /memory/remember write is
 # asserted by the user and never merges into the capture provenance channel.
 EXPLICIT_PIN_SOURCE = "memory.remember"
+
+# B2.1 T2 (design/01 §4.6, PRD-B2.1): the mid-session auto-recall focal scan.
+# NON_FOCAL_FLOOR mirrors the default focal floor: decay-healthy chunks the
+# focal scan did NOT select are reported as the T4 weak-association probe
+# (TA-4: weak associations are never injected — counted, never served).
+# _MIN_SLICE_CHARS mirrors the T1 budget semantics (a boundary slice below it
+# drops the whole item along with everything older).
+NON_FOCAL_FLOOR = 0.4
+_MIN_SLICE_CHARS = 200
+_SCAN_PAGE_LIMIT = 50
 
 
 class MemoryNotFoundError(Exception):
@@ -153,6 +164,20 @@ class SessionRecentRequest(BaseModel):
     sessions: int = Field(default=2, ge=1, le=5)
     per_session: int = Field(default=20, ge=1, le=100)
     exclude_session_id: str | None = None
+
+
+class RecallPendingRequest(BaseModel):
+    """Request body for POST /session/recall-pending (B2.1 T2 mid-session).
+
+    ``seen_chunk_ids`` are the chunk ids the caller already holds (the T1
+    session-start injection); the daemon merges them into its selection so a
+    chunk the caller saw is never re-served (D2). The cap mirrors the hook's
+    T1 tail size (16 ids).
+    """
+
+    profile_id: ProfileRef
+    session_id: str
+    seen_chunk_ids: list[str] = Field(default_factory=list, max_length=16)
 
 
 class ReinforceRequest(BaseModel):
@@ -250,6 +275,30 @@ class MemoryService:
         # FR-4.2 event side: retrieval usage becomes a reinforcement event
         # (baseline refresh + bounded rebound), the counterpart of the sweep.
         self._reinforcer = Reinforcer(stores)
+        # B2.1 T2 pending-recall state: per-session parked selection + seen
+        # set. The lock serializes the atomic serve=mark-seen against
+        # concurrent pulls — MemoryService is shared by the async ingest lane
+        # (focal scan in a worker thread) and the threadpool route handlers.
+        self._pending_slots: dict[tuple[str, str], list[dict[str, str]]] = {}
+        self._pending_non_focal: dict[tuple[str, str], int] = {}
+        self._seen_chunk_ids: dict[tuple[str, str], set[str]] = {}
+        # QA BLOCKER-2: per-key CONSUMED TOMBSTONE, distinct from the slot. A
+        # serve pops the slot and sets the tombstone; a later pull (the retry
+        # after a lost response) finds no slot but the tombstone and answers
+        # slot_consumed:true with an empty selection — the hook clears its arm
+        # on exactly that, so the retry loop cannot pull into the void forever.
+        # Cleared on /session/end with the rest of the lifecycle state; new
+        # scans may park fresh slots while it stands (slot and tombstone
+        # coexist, a fresh serve returns items + slot_consumed:true).
+        self._pending_consumed: dict[tuple[str, str], bool] = {}
+        # NIT-5: per-session monotonic scan sequence + settlement epoch. A scan
+        # captures both under the lock at start and only parks its selection on
+        # write-back if neither changed — a stale scan can never overwrite a
+        # newer scan's slot, and a scan started before /session/end can never
+        # re-park a selection afterwards (the settle is terminal).
+        self._scan_seq: dict[tuple[str, str], int] = {}
+        self._session_epoch: dict[tuple[str, str], int] = {}
+        self._pending_lock = threading.Lock()
 
     @property
     def retriever(self) -> HybridRetriever:
@@ -566,6 +615,215 @@ class MemoryService:
             ),
         }
 
+    # ------------------------------------------------------------ B2.1 T2 mid-session recall
+
+    def note_user_prompt(self, profile_id: str, session_id: str, text: str) -> None:
+        """Run the embedding-free focal scan for one user prompt and park the
+        budgeted selection as the session's pending slot (D1/D3/D4).
+
+        Called from the /ingest handler BEFORE it answers 202 (ack-implies-
+        ready): the pull that follows the ack finds the slot already filled.
+        The scan reads the stores outside the lock (only the seen-set is
+        snapshotted under it); the pull's serve=mark-seen is atomic under the
+        lock and filters against the merged seen-set, so a stale scan can
+        never resurrect a served item.
+        """
+        key = (profile_id, session_id)
+        with self._pending_lock:
+            seen = set(self._seen_chunk_ids.get(key, ()))
+            seq = self._scan_seq.get(key, 0) + 1
+            self._scan_seq[key] = seq
+            epoch = self._session_epoch.get(key, 0)
+        items, non_focal = self._focal_scan(profile_id, session_id, text, seen)
+        with self._pending_lock:
+            # NIT-5a: only the LAST scan to start may park — a scan that
+            # captured its sequence before a newer scan wrote must not
+            # overwrite the newer selection. NIT-5b: a settle bumps the epoch,
+            # so a scan started before /session/end cannot re-park afterwards.
+            if self._session_epoch.get(key, 0) != epoch:
+                return
+            if self._scan_seq.get(key, 0) != seq:
+                return
+            self._pending_slots[key] = items
+            self._pending_non_focal[key] = non_focal
+
+    def _focal_scan(
+        self,
+        profile_id: str,
+        session_id: str,
+        text: str,
+        seen: set[str],
+    ) -> tuple[list[dict[str, str]], int]:
+        """Embedding-free focal selection (D3): cue entities anchor a metadata
+        read over the vector and graph stores at the focal decay floor; the
+        requesting session and the daemon-seen ids are excluded; the budget
+        admits greedily by decay (tie newest-first) with the T1 slice
+        semantics (D4). Returns (items, non_focal_above_floor)."""
+        entities = tuple(self._cues.extract(text).cues.entities)
+        query_folded = {str.casefold(e) for e in entities}
+        if not entities:
+            # no entity anchor: nothing can be focal; the weak-association
+            # probe still reports the decay-healthy population
+            return [], self._non_focal_count(profile_id, session_id, query_folded, seen)
+        floor = self._config.capture.auto_recall_focal_floor
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id, entities=entities, min_decay=floor),
+            Page(0, _SCAN_PAGE_LIMIT),
+        )
+        # decay, recency-stamp, kind, id, text — sorted greedily by decay desc
+        # then newest-first (D4). The stamp is quantized to millisecond
+        # precision: the graph driver persists updated_at through an ISO8601
+        # ms round-trip (storage/drivers/_time.py), so a chunk ingested_at
+        # with sub-ms noise and a node updated_at from the same instant only
+        # tie when compared at the coarser (representable) precision — the
+        # cross-store tie then falls to page-order stability (chunks first).
+        candidates: list[tuple[float, float, str, str, str]] = []
+        for chunk in page.items:
+            if chunk.provenance.session_id == session_id:
+                continue  # the requesting session never sees its own chunks
+            if chunk.chunk_id in seen:
+                continue  # daemon-seen ids are excluded at scan time
+            stored = {str.casefold(e) for e in chunk.cues.entities}
+            if not stored & query_folded:
+                continue  # the casefold authority (mirror of the Freshness probe)
+            candidates.append(
+                (chunk.decay_weight, round(chunk.ingested_at, 3), "chunk", chunk.chunk_id, chunk.text)
+            )
+        node_page = self._stores.graph.list_nodes(
+            NodeFilter(profile_id=profile_id, entities=entities, min_decay=floor),
+            Page(0, _SCAN_PAGE_LIMIT),
+        )
+        for node in node_page.items:
+            statement = node.props.get("statement")
+            if not isinstance(statement, str) or not statement:
+                continue
+            stored = {str.casefold(e) for e in node.entities}
+            if not stored & query_folded:
+                continue
+            candidates.append((node.decay_weight, round(node.updated_at, 3), "node", node.node_id, statement))
+        budget = self._config.capture.auto_recall_budget_chars
+        items: list[dict[str, str]] = []
+        remaining = budget
+        for _decay, _stamp, kind, candidate_id, text in sorted(candidates, key=lambda c: (-c[0], -c[1])):
+            cost = len(text) + 1
+            if cost <= remaining:
+                items.append({"kind": kind, "id": candidate_id, "text": text})
+                remaining -= cost
+                continue
+            slice_budget = remaining - 2  # the "…" marker and the newline (T1)
+            if slice_budget < _MIN_SLICE_CHARS:
+                break  # the boundary item is dropped ALONG WITH everything older
+            items.append({"kind": kind, "id": candidate_id, "text": "…" + text[-slice_budget:]})
+            remaining = 0
+            break
+        return items, self._non_focal_count(profile_id, session_id, query_folded, seen)
+
+    def _non_focal_count(
+        self, profile_id: str, session_id: str, query_folded: set[str], seen: set[str]
+    ) -> int:
+        """The T4 weak-association probe: decay-healthy chunks (>= the
+        NON_FOCAL_FLOOR) outside the requesting session that the focal scan
+        did NOT select — the entity-blind / entity-miss population the
+        mid-session recall can never serve. Nodes are excluded (consolidated
+        graph entries are a different population); the probe is a bounded,
+        per-scan observation, never a selection."""
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id, min_decay=NON_FOCAL_FLOOR),
+            Page(0, _SCAN_PAGE_LIMIT),
+        )
+        floor = self._config.capture.auto_recall_focal_floor
+        count = 0
+        for chunk in page.items:
+            if chunk.provenance.session_id == session_id:
+                continue
+            if chunk.chunk_id in seen:
+                continue
+            stored = {str.casefold(e) for e in chunk.cues.entities}
+            if stored & query_folded and chunk.decay_weight >= floor:
+                continue  # a focal candidate (selected or budget-dropped) is not "non-focal"
+            count += 1
+        return count
+
+    def recall_pending(self, profile_id: str, session_id: str, seen_chunk_ids: list[str]) -> dict[str, Any]:
+        """Serve the pending slot (D6): the caller's seen ids (its T1-injected
+        flat list, <=16) join the daemon's SERVED-ids set as the pull-time
+        exclusion — the merged set selects the candidates; only a NON-EMPTY
+        serve consumes the slot and persists the served ids (serve =
+        mark-seen, the stale-scan safety net). An empty serve (everything
+        excluded) leaves the slot untouched so a fresh pull can still consume
+        it — D8's "empty pull keeps the flag armed" depends on exactly this.
+        The whole exchange is atomic under the lock.
+
+        ``budget_chars`` reports the daemon's effective item budget (the
+        selection cap the hook must respect when re-checking the block).
+        ``slot_consumed`` reports whether the slot is/was consumed: true for a
+        serve that consumed it, and — via the consumed tombstone (QA
+        BLOCKER-2) — true for a retry pull after an earlier serve, so the hook
+        clears its arm instead of pulling an empty slot forever. NIT-4: the
+        serve+mark is gated on ``enabled`` — a config-off pull consumes
+        nothing and marks nothing, so a later flip-on still serves the parked
+        selection. NIT-6: a pull for a session with no slot never materializes
+        any lifecycle state."""
+        key = (profile_id, session_id)
+        enabled = self._config.capture.auto_recall
+        budget = self._config.capture.auto_recall_budget_chars
+        if not enabled:
+            return {
+                "enabled": False,
+                "items": [],
+                "non_focal_above_floor": 0,
+                "budget_chars": budget,
+                "slot_consumed": False,
+            }
+        with self._pending_lock:
+            served = self._seen_chunk_ids.get(key)
+            excluded = (served if served is not None else frozenset()) | set(seen_chunk_ids)
+            slot = self._pending_slots.get(key)
+            items = [item for item in slot if item["id"] not in excluded] if slot is not None else []
+            if items:
+                if served is None:
+                    served = set()
+                    self._seen_chunk_ids[key] = served
+                served.update(item["id"] for item in items)
+                self._pending_slots.pop(key, None)
+                non_focal = self._pending_non_focal.pop(key, 0)
+                self._pending_consumed[key] = True  # the serve leaves its tombstone
+                slot_consumed = True
+            elif slot is not None:
+                # D6 empty serve: the slot survives so a fresh pull can still
+                # consume it; nothing is marked, the tombstone is untouched.
+                non_focal = self._pending_non_focal.get(key, 0)
+                slot_consumed = False
+            else:
+                # No slot: a consumed tombstone means an earlier serve already
+                # took it (the hook's clearing signal); otherwise this session
+                # never had anything to serve (or was settled) — false.
+                non_focal = 0
+                slot_consumed = self._pending_consumed.get(key, False)
+        return {
+            "enabled": True,
+            "items": items,
+            "non_focal_above_floor": non_focal,
+            "budget_chars": budget,
+            "slot_consumed": slot_consumed,
+        }
+
+    def end_session(self, profile_id: str, session_id: str) -> None:
+        """Drop a settled session's pending slot, probe count, seen-set and
+        consumed tombstone (D6 + QA BLOCKER-2): /session/end is the terminal
+        signal — a pull after the settle finds nothing to serve, the tombstone
+        is gone, and the seen-set stops accumulating. The settlement epoch is
+        bumped under the lock (NIT-5b): a scan started BEFORE the settle can
+        never re-park a slot afterwards."""
+        key = (profile_id, session_id)
+        with self._pending_lock:
+            self._pending_slots.pop(key, None)
+            self._pending_non_focal.pop(key, None)
+            self._seen_chunk_ids.pop(key, None)
+            self._pending_consumed.pop(key, None)
+            self._scan_seq.pop(key, None)
+            self._session_epoch[key] = self._session_epoch.get(key, 0) + 1
+
     # ------------------------------------------------------------ reinforce (B2.1 T3)
 
     def reinforce(
@@ -734,6 +992,20 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
         per_session=req.per_session,
         sessions=req.sessions,
         exclude_session_id=req.exclude_session_id,
+    )
+
+
+@router.post("/session/recall-pending")
+def session_recall_pending(req: RecallPendingRequest, request: Request) -> dict[str, Any]:
+    """B2.1 T2 (PRD-B2.1): the mid-session auto-recall pull — serve the focal
+    selection parked by the session's most recent user prompt (ack-implies-
+    ready), merging the caller's seen ids so chunks it already holds are
+    never re-served."""
+    service: MemoryService = request.app.state.memory
+    return service.recall_pending(
+        profile_id=req.profile_id,
+        session_id=req.session_id,
+        seen_chunk_ids=req.seen_chunk_ids,
     )
 
 

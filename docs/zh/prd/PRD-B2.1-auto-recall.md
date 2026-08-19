@@ -171,3 +171,48 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 
 - **T2 中段 auto-recall 管线**（`capture.auto_recall`、seen-set、focal/non-focal 双 floor、token 预算封顶）与 **T4 阈值标定**（floor/budget/needle 数值吃 B3 评测臂数据定版，摘要入本 PRD）留后续批次；**QA-7** abort 形态探针（`time.error` 是否视为完成点）保持挂起。
 
+### 批次执行：T2 中段自动回忆管线（2026-08-19 开工；solution-architect 评审 verdict SHIP-WITH-ADJUSTMENTS，7 IMPORTANT + 2 NIT 全部并入设计定案如下）
+
+理论锚不变（TA-1 原文直接作线索、TA-2 两级线索、focal/non-focal 分阈；TA-4 自发提取常开、non-focal 弱关联不自动注入）——本批全部为**实现机制层**决策：
+
+- **总线定案**：turn 捕获后 daemon 内同步跑 **focal-only** 回忆（embedding-free——hybrid 链路每轮无条件跑 embedder，捕获热路径不得出现模型推理），结果入 per-`(profile_id, session_id)` pending 槽（MemoryService 持有）；hook 在 `chat.system.transform` 中按 **armed∧acked** 门控做 awaited 拉取（`RECALL_PULL_TIMEOUT_MS = 300`，fail-open 原文）；serve = mark-seen **锁内原子**（并发双 transform 双 pull 不得重发，评审 issue 6 采纳）；注入块与 T1 同围栏/同净化/同 needle 通道。
+- **D1 时机与竞态（评审 issue 3 采纳）**：recall 计算放在 `POST /ingest` 处理器内（仅 user_prompt 事件）**同步**完成——**ack 即就绪**（hook 的 ack 回调是 happens-before 边）；I/O 离事件循环（sync-def 路由走 threadpool，同 `/memory/recall` 既有先例，或 `anyio.to_thread`）；扫描有上限故 ack 保持快，客户端本就 fire-and-forget 不等。pull 仅当"user ingest 已发出且其 ack 已回"；transform 早于 ack → 跳过本轮 pull（注入最晚迟一个模型调用，**绝不丢**——pending 槽 serve 前一直存活）。
+- **D2 seen-set 归属（评审 issue 1 定案）**：**daemon 侧**、`(profile_id, session_id)` 键、内存态、`/session/end` 时丢弃；hook 每次 pull 携带其 T1 已注入 id 平铺表（≤16），daemon 并入 seen-set 再选候选——否则首个 focal 命中会把 T1 起始回放 chunk 再服务一遍。daemon 重启丢 seen-set = TA-3 语境切换重注入，不持久化。本定案对 T2 管线凌驾 T0 时代第 84 行"seen-set 在 hook 侧"的表述（T1 的 attempt 闸门维持 hook 侧不动）。
+- **D3 双 floor 语义（评审 issue 2+7 定案）**：**focal floor = 注入闸门**；**non-focal floor 仅作标定/报告度量**（TA-4 明令 non-focal 弱关联不自动注入，MCP `recall` 显式查询是逃生通道），以 `non_focal_above_floor` 计数随响应上报，为 T4 备数据。focal 扫描 embedding-free：元数据实体过滤 + casefold 重叠后过滤（Freshness Guard 探针同款）+ 图节点 `NodeFilter.entities`，`decay_weight >= focal_floor`（默认 0.4，镜像 hybrid `min_decay`），扫描上限封顶、新→旧、当前 session 的 chunk 排除（provenance 已在模型自身上下文）。**禁复用 `MemoryService.recall`**。
+- **D4 预算**：独立于 T1 4000 的每轮小预算 `capture.auto_recall_budget_chars`（默认 1200，T4 标定对象）；**daemon 是唯一预算权威**（decay_weight 降序、同分新者先，贪心准入；边界项按 T1 切片语义切尾：切片 = 剩余−2、"…" 标记、<200 整项放弃）；hook 仅包裹 + 复核（超 1200 整块丢弃，fail-closed，防御纵深，设计上不可达）；空选择 → 零追加零 token。
+- **D5 config**：注册表新增三键 `capture.auto_recall`（bool，**默认 false**）、`capture.auto_recall_focal_floor`（float ≤1，默认 0.4）、`capture.auto_recall_budget_chars`（int，默认 1200）；热应用 `_capture_apply` 镜像 `_dream_apply`；`Config.capture`、`load_config [capture]`、configwrite get 块、`default_config_toml` 文档同步补齐。**as-is 边界如实记（评审 issue 5）**：`_SLOT_KEYS = sorted(REGISTRY)` 因 `capture.*` 字母序前移导致既有 version_id 槽位移——升级前记录的 version_id 回滚解码会指错键；DB 行以 key_path 为键不受影响，仅 wire-id 解码受影响，立边界"version_id 解码以注册表快照为域，升级前版本的 rollback 不支持"。
+- **D6 端点**：新增 `POST /session/recall-pending`——请求 `{profile_id, session_id, seen_chunk_ids?: string[]}`，响应 `{enabled: bool, items: [{kind, id, text}], non_focal_above_floor: int}`；`enabled:false`（config off 或空选择）时 hook 零追加。wire 模型风格对齐 `SessionRecentRequest`/`ReinforceRequest`。hook 走 awaited fetch（同 `fetchSessionTails` 先例），**不经 `post()`**——既有 arity pins 不触；wire 表与 `EXPECTED_MAPPING` 同步新增行。
+- **D7 与 T3 贯通**：T2 注入的 chunk 进同一 `injectedRegistry`（needle 派生自**实际注入切片**，复用 `sanitizeRecallText` 与围栏+免责包裹），`noteConsumption`/citedChunks/≤64 分批原样复用——TA-6 由构造保证；daemon 侧零新增（reinforce 端点已在）。
+- **D8 hook 门控（评审 issue 4 采纳，含改造陷阱钉死）**：transform 处理器拆 **T1/T2 两支独立判定**——现存 `injectedSessions.has(sessionID)` 提前 return 会把 T2 静默掐死，两支不得互门控。新增 per-session `pendingPull` 旗：user ingest 发出 = armed、其 ack 回 = acked；armed∧acked → pull；非空 pull → 清旗；空 pull 或失败 → 保留 armed 待下轮重试（timeout/503 不污染 system 数组）。既有"唯一 awaited 网络调用"不变量注释修订为：T1 session-tails 一次 + T2 有界 pending-recall pull（acked user ingest 门控、300ms 超时、fail-open）。
+- **NIT 处置**：issue 8（serve=mark-seen 后 warmup transform 吞 pending 批的有界 FN 窗）录入如实边界；issue 9（per-turn pull 复用 2s 过重）采纳为 300ms 专常量。
+- **KISS 界外（本批不做）**：T4 阈值标定（floor/budget/needle 数值吃 B3 评测臂）；`capture.auto_recall` 默认翻转（默认 off 给观望与安全验证留门）；跨 session / 持久 seen-set；non-focal 自动注入；hook 侧 config 管线（daemon 答 `enabled:false` 即开关）。
+- **本批如实边界**：(i) serve=mark-seen 后 warmup transform 可吞 pending 批——"服务过但未进模型调用"的有界 FN 窗（记录备查，短宽限重武装后续再议）；(ii) daemon 重启丢 seen-set → TA-3 语义重注入；(iii) focal 是元数据实体命中——实体标注缺失的 chunk 永不被中段回忆（系统性盲，留 T4 数据说话）；(iv) 注入至多迟一个模型调用；(v) version_id 槽位移边界（见 D5）。
+
+#### 收口记录（2026-08-19）
+
+本批全为实现机制层交付（理论锚 TA-1..6 未动），门禁绿后收口，流程对照 AGENTS.md 纪律。
+
+**交付内容**：
+
+- **daemon**：新增 `POST /session/recall-pending`（请求 `{profile_id, session_id, seen_chunk_ids?: string[]}`，风格对齐 `SessionRecentRequest`/`ReinforceRequest`）；响应线形钉死 `{enabled, items[{kind, id, text}], non_focal_above_floor, budget_chars, slot_consumed}`；focal-only 扫描 embedding-free（元数据实体过滤 + casefold 重叠后过滤 + 图节点 `NodeFilter.entities`，`decay_weight >= focal_floor` 默认 0.4，扫描上限封顶、新→旧、排除当前 session `provenance.session_id`）；non-focal 不计入注入、仅随响应上报 `non_focal_above_floor` 计数（TA-4，为 T4 备数据）；**daemon 是唯一预算权威**（贪心 `decay_weight` 降序、同分新者先，边界项 T1 同款尾切：切片 = 剩余−2、"…" 标记、<200 整弃）；serve = mark-seen 锁内原子。**slot_consumed 修正语义（QA 第二轮 BLOCKER-2 的定案）**：`slot_consumed` = "该 slot 已被/曾被服务"——服务 pull 与服务后的重试 pull 均回 true，依靠独立于 slot 的 per-`(profile_id, session_id)` `_pending_consumed` tombstone；tombstone 与之后新驻 slot 共存（活 slot 分支优先）；`/session/end` 随 seen-set/pending/scan-seq 一并清 tombstone + epoch 自增；空 serve（slot 在但全被排除）不置 tombstone；config off pull 零消费零标记（NIT-4）；未知 session 零物化（NIT-6，含 tombstone）；并发防御：per-session 单调 scan seq + settle epoch tombstone（stale scan 不得覆盖新 slot、end 前起跑的 scan 不得 re-park，NIT-5）；tie-break 量化到毫秒（图 store ISO8601 ms 精度是可表示精度）。
+- **config**：三注册键 `capture.auto_recall`（bool 默认 false）/ `capture.auto_recall_focal_floor`（正 float ≤1，默认 0.4）/ `capture.auto_recall_budget_chars`（正 int，默认 1200）；`_capture_apply` 镜像 `_dream_apply` 热应用；`Config.capture`、`load_config [capture]`、configwrite get 块、`default_config_toml` 表文档同步补齐；version_id 槽位移为 as-is 边界（D5）。**边界措辞修订（QA NIT-3 定案）**：升级前记录的 in-range old version_id 可能 silent 回滚到**错误的键**——比"升级前版本 rollback 不支持"更重，如实记此失败形态。
+- **ingest**：`/ingest` 对 user_prompt 在返回 202 前同步跑 focal scan（`anyio.to_thread`，ack 即就绪）；`/session/end` 对从未捕获的 session 应答 **200 no-op settle**（原 404——火忘 hook 不再静默吞 404）。
+- **hook**：`pendingPull` 旗（user ingest 发出 = armed、其 ack 回 = acked）；armed∧acked → awaited pull（`RECALL_PULL_TIMEOUT_MS = 300`，fail-open，不经 `post()`）；T1/T2 两支独立判定（T1 attempt 闸门不门控 T2）；T2 包裹复用 T1 围栏+免责+needle 通道（注入即登记 injectedRegistry，T3 消费证据原样复用）；itemBudget 取 wire `budget_chars`（字段缺席回退 `RECALL_PULL_MAX_CHARS = 1200`）；**T2 注入路径无切片下限守卫**（daemon 的 `_MIN_SLICE_CHARS` 只管边界项尾切；整正整数域内 daemon 是唯一预算权威——QA IMPORTANT-3 定案，原守卫是按 T1 抄来的 cargo cult，budget<200 时静默整丢 daemon 合法选择）；pendingPull 清零移到 build+append 成功之后；整块丢弃走 debugLog；`enabled∧items空∧slot_consumed` → 清臂（防丢失响应后的无限空 pull，QA IMPORTANT-2）；失败/超时保留 armed 下轮重试。
+- **诚实边界如实记（QA NIT-9 等）**：(i) 新 hook + 旧 daemon（无 budget_chars/slot_consumed 字段）会在丢失响应路径回退到修复前行为——混合版本为不受支持边界，字段缺席回退已记档；(ii) 余下的既有边界（D 系列既有：warmup 吞 pending 窗、daemon 重启 TA-3 重注入、实体缺失 chunk 系统性盲、注入至多迟一个模型调用、version_id 槽位移）继续有效。
+
+**流程记录**：
+
+- solution-architect 预评审 **SHIP-WITH-ADJUSTMENTS**（9 issue 采纳详情见上节设计定案）→ senior QA 首轮 **NOT CLOSABLE**（1 BLOCKER：hook 1044 有效预算 < daemon 1200 预算致 fail-closed 整块丢弃可达且丢在 mark-seen 之后；1 IMPORTANT：serve 后响应丢失 → 无限空 pull + 永久 FN；4 NIT）→ 修复 → 复审 **NOT CLOSABLE**（QA 深挖：BLOCKER-2 daemon 只在服务时置 slot_consumed，重试 Tombstone 缺失使 hook 清臂分支死码；IMPORTANT-3 hook 切片下限守卫在 budget<200 时仍整丢 daemon 合法选择；NIT-7 预算钉未钉死"wire 预算唯一权威"——硬编码 1200 变异体能过绿）→ 二修（tombstone + 守卫拆除 + 钉升级到 budget 2000/块长 2058 与 257 精确钉）→ 三审 **CLOSABLE**（0 BLOCKER / 0 IMPORTANT；NIT-8/9 两个记录项随本收口落档）。
+
+**测试增量与门禁**：
+
+- **1213 → 1253 passed / 3 skipped**（+40：daemon `test_recall_pending.py` 21 + `test_capture_config_keys.py` 16、node 挂架 4→15 场景含 budget-equality 2058/257 精确钉、slot-consumed、low-budget、fail-open、t1-independence；static pins 共演化 + `EXPECTED_MAPPING` 新行）；ruff / ruff format / mypy 全净。QA 变异攻击复核：新钉无实质幸存变异体（tombstone 两侧均钉死、hardcode-1200 变异体数值上证伪、257 钉防守卫回归）。
+
+**生效前提**：
+
+- `uv tool install --force .` + daemon 重启得新端点；hook 随 opencode 重启生效；**`capture.auto_recall` 默认 off——管线随构建发船但行为不变**，翻转待 T4 评测数据（默认 off 是给观望与安全验证留门）。
+
+**后续挂起**：
+
+- **T4 阈值标定**（floor/budget/needle 吃 B3 评测臂）；**QA-7** abort 形态探针；non-focal 注入通道维持"仅 MCP 显式 recall"（TA-4）；tombstone 仅内存态（daemon 重启即 TA-3 语境切换语义，无需持久化）。
+

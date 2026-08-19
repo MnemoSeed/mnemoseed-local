@@ -31,6 +31,9 @@ globalThis.fetch = async (url, init) => {
   if (url.endsWith("/session/recent")) {
     return { ok: true, status: 200, json: async () => recentPayload }
   }
+  if (url.endsWith("/session/recall-pending")) {
+    return { ok: true, status: 200, json: async () => recallPayload }
+  }
   return { ok: true, status: 200 }
 }
 
@@ -44,6 +47,29 @@ let outageTurnVisible = false
 // B2.1 T1/T3: the canned /session/recent payload the fake daemon serves. The
 // inject-once/citation-reinforce scenarios swap it in via `recentPayload`.
 let recentPayload = { profile_id: "default", sessions: [] }
+// B2.1 T2: the canned /session/recall-pending payload (mid-session focal
+// selection). Scenarios swap it in via `recallPayload`.
+let recallPayload = { enabled: false, items: [], non_focal_above_floor: 0, slot_consumed: false, budget_chars: 1200 }
+const RECALL_PAYLOAD = {
+  enabled: true,
+  items: [
+    {
+      kind: "chunk",
+      id: "c-mid",
+      // >= 32 normalized chars: the needle channel (NEEDLE_MIN_CONTENT) must
+      // be able to fingerprint it, like a real daemon turn chunk.
+      text: "user: 上次中段提到 LanceDb 的接入还在等存储层确认，存储层说这周会给结论",
+    },
+    {
+      kind: "chunk",
+      id: "c-mid2",
+      text: "assistant: 存储层确认后就可以继续推进",
+    },
+  ],
+  non_focal_above_floor: 1,
+  slot_consumed: false,
+  budget_chars: 1200,
+}
 const RECENT_PAYLOAD = {
   profile_id: "default",
   sessions: [
@@ -104,6 +130,9 @@ let citationTurnsVisible = false
 // the A-run citation (must NOT reinforce — the A run was never injected) and
 // an invented-content citation (must NOT reinforce).
 let sliceTurnsVisible = false
+// recall-pull-t1-independence: the fake host history gains assistant replies
+// that cite the T2-injected chunk c-mid (the second is a re-citation).
+let t2CiteTurnsVisible = false
 
 function historyEntries() {
   const entries = [
@@ -226,6 +255,36 @@ function historyEntries() {
         time: { completed: 53_000 },
       },
       parts: [{ type: "text", text: "丙".repeat(30) }],
+    })
+  }
+  if (t2CiteTurnsVisible) {
+    entries.push({
+      info: {
+        id: "m_cite_t2_1",
+        role: "assistant",
+        sessionID: SES,
+        time: { completed: 8_000 },
+      },
+      parts: [
+        {
+          type: "text",
+          text: "上次中段提到 LanceDb 的接入还在等存储层确认，我们继续推进。",
+        },
+      ],
+    })
+    entries.push({
+      info: {
+        id: "m_cite_t2_2",
+        role: "assistant",
+        sessionID: SES,
+        time: { completed: 9_000 },
+      },
+      parts: [
+        {
+          type: "text",
+          text: "再确认一次：上次中段提到 LanceDb 的接入还在等存储层确认。",
+        },
+      ],
     })
   }
   return entries
@@ -667,6 +726,247 @@ async function main() {
           block,
           blockLength: block.length,
           reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-gating": {
+      // T2 gating: the pull fires only after an ACKED user ingest. A
+      // transform before any user prompt, and a transform racing the post
+      // before its ack microtask, must NOT pull; the armed+acked transform
+      // pulls exactly once, injects the selection and clears the flags — a
+      // later transform pulls nothing more.
+      recallPayload = RECALL_PAYLOAD
+      const g1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, g1)
+      const posted = hooks["chat.message"](
+        { sessionID: SES, messageID: "m_pull_1" },
+        { parts: [{ type: "text", text: "LanceDb 现在什么状态" }] },
+      )
+      await posted // the handler resolves; the ack microtask may not have run
+      const g2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, g2)
+      await delay(50) // now the ack has landed
+      const g3 = { system: ["BASE3"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, g3)
+      const g4 = { system: ["BASE4"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, g4)
+      console.log(
+        JSON.stringify({
+          systems: [g1.system, g2.system, g3.system, g4.system],
+          pullBodies: posts
+            .filter((post) => post.url.endsWith("/session/recall-pending"))
+            .map((post) => post.body),
+          pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-empty-rearm": {
+      // an empty selection serves nothing but keeps the arm — the next acked
+      // user turn re-pulls (the daemon slot may have rotated); never append.
+      recallPayload = {
+        enabled: true,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      const e1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_e1" },
+        { parts: [{ type: "text", text: "第一轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, e1)
+      const e2 = { system: ["BASE2"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_e2" },
+        { parts: [{ type: "text", text: "第二轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, e2)
+      console.log(
+        JSON.stringify({
+          systems: [e1.system, e2.system],
+          pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-fail-open": {
+      // a failed pull (503 or thrown network) leaves the system untouched AND
+      // keeps the arm — the next acked user turn retries; an enabled:false
+      // lane serves nothing either.
+      recallPayload = RECALL_PAYLOAD
+      failing.add("http://localhost:7788/session/recall-pending")
+      const f1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_f1" },
+        { parts: [{ type: "text", text: "失败轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, f1)
+      failing.clear()
+      const f2 = { system: ["BASE2"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_f2" },
+        { parts: [{ type: "text", text: "恢复轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, f2)
+      recallPayload = {
+        enabled: false,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      const f3 = { system: ["BASE3"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_f3" },
+        { parts: [{ type: "text", text: "禁用轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, f3)
+      console.log(
+        JSON.stringify({
+          systems: [f1.system, f2.system, f3.system],
+          pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-t1-independence": {
+      // T1 and T2 are INDEPENDENT injections: the first transform injects the
+      // session-tail block (T1); after a user prompt is posted AND acked, the
+      // next transform ALSO pulls the pending-recall selection (T2) — both
+      // blocks coexist, and the T1 chunk ids ride the pull as seen_chunk_ids.
+      // Consumption: citing the T2-injected chunk reinforces it once per
+      // session (a re-citation is suppressed).
+      recentPayload = RECENT_PAYLOAD
+      recallPayload = RECALL_PAYLOAD
+      const i1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, i1)
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_pull_2" },
+        { parts: [{ type: "text", text: "继续 LanceDb 的话题" }] },
+      )
+      await delay(50)
+      // the host hands the transform the ACCUMULATED system array (i1's block
+      // is already in it): the T2 block must COEXIST with the T1 block, never
+      // replace or re-inject it. The copy keeps the transcript snapshot of
+      // i1.system honest (a fresh array per call, like the real host).
+      const i2 = { system: [...i1.system] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, i2)
+      t2CiteTurnsVisible = true
+      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_1", 8_000) })
+      await delay(100)
+      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_2", 9_000) })
+      await delay(100)
+      console.log(
+        JSON.stringify({
+          systems: [i1.system, i2.system],
+          pullBodies: posts
+            .filter((post) => post.url.endsWith("/session/recall-pending"))
+            .map((post) => post.body),
+          reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-budget-equality": {
+      // QA BLOCKER-1 + NIT-7: the hook's item budget is the DAEMON's WIRE
+      // budget_chars, never a hardcoded cap. A daemon-legal selection whose
+      // item cost lands inside (1200 - wrapper, 2000] must still be appended
+      // — a mutant hardcoding the old 1200 cap drops it whole. Items total
+      // exactly 1902 chars of item cost (950+1 + 950+1); the assembled block
+      // must be 2058 chars (156 wrapper + 1902) — pinned EXACTLY.
+      recallPayload = {
+        enabled: true,
+        items: [
+          { kind: "chunk", id: "c-big1", text: "x".repeat(950) },
+          { kind: "chunk", id: "c-big2", text: "y".repeat(950) },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 2000,
+      }
+      const b1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_budget" },
+        { parts: [{ type: "text", text: "预算轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, b1)
+      console.log(
+        JSON.stringify({
+          systems: [b1.system],
+          blockLength: b1.system.length > 1 ? b1.system[1].length : 0,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-low-budget": {
+      // QA IMPORTANT-3: the daemon owns the WHOLE positive-int budget range —
+      // a budget below the T1 slice floor (200) still serves full items whose
+      // cost fits; the hook must append them instead of re-imposing a slicing
+      // floor it does not own. One 100-char item (101 item cost) under
+      // budget_chars:150; block = 156 wrapper + 101 = 257 — pinned exactly.
+      recallPayload = {
+        enabled: true,
+        items: [{ kind: "chunk", id: "c-low", text: "x".repeat(100) }],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 150,
+      }
+      const b1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_lowbudget" },
+        { parts: [{ type: "text", text: "低预算轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, b1)
+      console.log(
+        JSON.stringify({
+          systems: [b1.system],
+          blockLength: b1.system.length > 1 ? b1.system[1].length : 0,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-slot-consumed": {
+      // QA IMPORTANT-2: the daemon answers that the slot was ALREADY consumed
+      // (an earlier serve whose response was lost in transit): the transform
+      // must clear the arm — a later transform must not keep pulling into the
+      // void (endless empty pulls), and the system stays untouched.
+      recallPayload = {
+        enabled: true,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: true,
+        budget_chars: 1200,
+      }
+      const s1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_consumed" },
+        { parts: [{ type: "text", text: "已消费轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, s1)
+      const s2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, s2)
+      console.log(
+        JSON.stringify({
+          systems: [s1.system, s2.system],
+          pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
         }),
       )
       break

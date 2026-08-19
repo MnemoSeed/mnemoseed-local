@@ -14,6 +14,7 @@
 //   event session.deleted               -> session_end       -> POST /session/end
 //   experimental.session.compacting     -> flush             -> POST /flush
 //   chat.system.transform (first call per session) -> session_recall_read -> POST /session/recent
+//   chat.system.transform (armed∧acked user ingest) -> session_recall_pending -> POST /session/recall-pending
 //   citation guard in postAssistantIngest -> memory_reinforce -> POST /memory/reinforce
 //
 // Invariants: HostId is always "opencode"; every daemon call is
@@ -22,9 +23,10 @@
 // (env MNEMOSEED_LOCAL_DEBUG: failures escalate to console.error + a JSONL
 // sink, and every daemon POST's status is inspected — a swallowed non-2xx is
 // how the settle-sealing bug hid); requests time out after 2s via
-// AbortSignal. The ONLY awaited network call is the session-tails read inside
-// the transform handler, bounded by AbortSignal and fail-open, at most once
-// per session (B2.1 T1).
+// AbortSignal. The ONLY awaited network calls in the transform handler are
+// the session-tails read (bounded by AbortSignal and fail-open, at most once
+// per session — B2.1 T1) and the bounded pending-recall pull (B2.1 T2, gated
+// on an ACKED user ingest, 300ms timeout, fail-open).
 //
 // Type reference only (NOT a runtime import — the plugin is dependency-free):
 //   import type { Plugin } from "@opencode-ai/plugin"
@@ -68,6 +70,18 @@ const RECALL_DISCLAIMER =
 // Unreachable today (2 x 8 injected chunks max), pinned so a constant change
 // cannot rot it silently.
 const REINFORCE_BATCH_SIZE = 64
+
+// B2.1 T2 mid-session auto-recall (PRD-B2.1): a bounded pending-recall pull
+// per ACKED user ingest. The daemon is the ONLY budget authority
+// (capture.auto_recall_budget_chars, default 1200, reported on the wire as
+// budget_chars); the hook uses that wire value as the ITEM budget and
+// re-verifies the assembled block fail-closed (defense in depth, unreachable
+// by design). RECALL_PULL_MAX_CHARS is the FALLBACK item budget when a daemon
+// omits the wire field (older daemon, or a malformed payload). The 300ms is a
+// DEDICATED constant: reusing the shared 2s transform timeout would be too
+// heavy for a per-turn pull (re-review issue 9 adopted).
+const RECALL_PULL_TIMEOUT_MS = 300
+const RECALL_PULL_MAX_CHARS = 1200
 
 // ---- opt-in observability lane (senior QA finding 12b, 2026-08-19): three
 // silent-failure dogfoods in one day proved console.debug alone is
@@ -184,6 +198,18 @@ const injectedRegistry = new Map<string, Map<string, Set<string>>>()
 // per chunk per session (bounded FP, PRD-B2.1).
 const citedChunks = new Map<string, Set<string>>()
 
+// B2.1 T2: per-session pending-recall gate. ARMED when a user prompt is
+// posted (postUserIngest), ACKED when the daemon answered 2xx — the ingest
+// handler parks the focal slot before answering, so the ack is a happens-
+// before edge (ack-implies-ready). The transform pulls only armed∧acked; a
+// non-empty serve clears the flag, an empty or failed pull keeps it armed for
+// the next transform (D8).
+const pendingPull = new Map<string, { armed: boolean; acked: boolean }>()
+// sessionID -> chunk ids the T1 session-start injection served: the T2 pull
+// rides them as seen_chunk_ids so a focal hit never re-serves a T1 replay
+// (D2 — the daemon merges them into its selection).
+const t1InjectedChunkIds = new Map<string, string[]>()
+
 function normalizeRecallText(text: string): string {
   // One role-prefix strip (the verbatim channel labels turns), then collapse
   // whitespace to single spaces and lowercase — needle building and the
@@ -249,17 +275,20 @@ function registerNeedles(
 
 function buildRecallInjection(
   groups: any[],
-): { block: string; registry: Map<string, Set<string>> } | null {
+): { block: string; registry: Map<string, Set<string>>; includedIds: string[] } | null {
   // Accrue newest-first (groups in payload order, chunks within a group
   // reversed) against a char budget whose final assembled block must stay
   // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line and the
   // group headers — the wrapper is accounted up front. A boundary chunk keeps
   // only its newest tail slice (prefixed with the "…" marker) when the
   // leftover can still hold MIN_SLICE_CHARS; otherwise it is dropped along
-  // with everything older. Dropped chunks register NO needles. Needles derive
-  // from the EXACT included (sanitized, possibly sliced) text per chunk.
+  // with everything older. Dropped chunks register NO needles AND no seen id.
+  // Needles derive from the EXACT included (sanitized, possibly sliced) text
+  // per chunk; includedIds lists every ADMITTED chunk id (needle or not) —
+  // the T2 pull's seen list must match what the session already holds.
   if (!Array.isArray(groups)) return null
   const registry = new Map<string, Set<string>>()
+  const includedIds: string[] = []
   const lines: string[] = []
   let remaining =
     MAX_INJECT_CHARS -
@@ -279,13 +308,11 @@ function buildRecallInjection(
     for (const chunk of chunks) {
       const text = sanitizeRecallText(typeof chunk?.text === "string" ? chunk.text : "")
       if (!text) continue
+      const chunkId = typeof chunk?.chunk_id === "string" ? chunk.chunk_id : ""
       const lineCost = text.length + 1
       if (lineCost <= remaining) {
-        registerNeedles(
-          registry,
-          text,
-          typeof chunk?.chunk_id === "string" ? chunk.chunk_id : "",
-        )
+        registerNeedles(registry, text, chunkId)
+        if (chunkId) includedIds.push(chunkId)
         groupChunks.push(text)
         remaining -= lineCost
         gotChunk = true
@@ -294,7 +321,8 @@ function buildRecallInjection(
       const sliceBudget = remaining - 2 // reserve the "…" marker and the newline
       if (sliceBudget < MIN_SLICE_CHARS) break
       const slicedText = text.slice(-sliceBudget)
-      registerNeedles(registry, slicedText, typeof chunk?.chunk_id === "string" ? chunk.chunk_id : "")
+      registerNeedles(registry, slicedText, chunkId)
+      if (chunkId) includedIds.push(chunkId)
       groupChunks.push("…" + slicedText)
       remaining = 0
       gotChunk = true
@@ -310,6 +338,63 @@ function buildRecallInjection(
   lines.push(RECALL_FENCE_CLOSE)
   const block = lines.join("\n")
   if (block.length > MAX_INJECT_CHARS) return null
+  return { block, registry, includedIds }
+}
+
+function mergeRegistry(
+  target: Map<string, Set<string>>,
+  addition: Map<string, Set<string>>,
+): void {
+  // D7: T2 injections share the SAME needle registry as T1 — later citations
+  // of a T2-served chunk reinforce it through the existing consumption guard
+  // (TA-6 by construction). Never replaces the T1 entries.
+  for (const [needle, ids] of addition) {
+    let existing = target.get(needle)
+    if (existing === undefined) {
+      existing = new Set<string>()
+      target.set(needle, existing)
+    }
+    for (const id of ids) existing.add(id)
+  }
+}
+
+function buildT2Injection(
+  items: any[],
+  itemBudget: number,
+): { block: string; registry: Map<string, Set<string>> } | null {
+  // B2.1 T2 (D7): same fence + disclaimer envelope and same needle channel as
+  // T1 — no group headers (the daemon already shaped the payload). The DAEMON
+  // is the only budget authority (capture.auto_recall_budget_chars, reported
+  // on the wire as budget_chars, default 1200); the hook re-checks the item
+  // cost fail-closed against that budget: an oversized line or block is
+  // dropped WHOLE (defense in depth, unreachable by design — QA BLOCKER-1: the
+  // old fixed cap under-accounted the fence+disclaimer wrapper, silently
+  // dropping daemon-legal selections whose item cost landed inside
+  // (cap - wrapper, cap]). QA IMPORTANT-3: there is NO slicing floor here —
+  // the daemon's _MIN_SLICE_CHARS governs only TAIL-SLICING of a boundary
+  // item; full items under ANY positive budget are served and must append.
+  if (!Array.isArray(items)) return null
+  const wrapper =
+    RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length
+  const registry = new Map<string, Set<string>>()
+  const lines: string[] = []
+  let remaining = itemBudget
+  lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
+  let committed = false
+  for (const item of items) {
+    const text = sanitizeRecallText(typeof item?.text === "string" ? item.text : "")
+    if (!text) continue
+    const lineCost = text.length + 1
+    if (lineCost > remaining) return null
+    registerNeedles(registry, text, typeof item?.id === "string" ? item.id : "")
+    lines.push(text)
+    remaining -= lineCost
+    committed = true
+  }
+  if (!committed) return null
+  lines.push(RECALL_FENCE_CLOSE)
+  const block = lines.join("\n")
+  if (block.length > itemBudget + wrapper) return null
   return { block, registry }
 }
 
@@ -345,6 +430,41 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
   }
 }
 
+async function pullPendingRecall(sessionID: string): Promise<any | null> {
+  // B2.1 T2 (D6/D8): the bounded mid-session pull — an awaited fetch with its
+  // own 300ms timeout, fail-open (null = nothing to inject, the flag stays
+  // armed). The seen list is the session's T1-injected chunk ids (flat,
+  // <=16); the daemon merges them into the selection so a focal hit never
+  // re-serves a T1 replay. NOT a post() call site — the arity invariants
+  // stay untouched.
+  try {
+    const response = await fetch(BASE_URL + "/session/recall-pending", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        profile_id: PROFILE_ID,
+        session_id: sessionID,
+        seen_chunk_ids: t1InjectedChunkIds.get(sessionID) ?? [],
+      }),
+      signal: AbortSignal.timeout(RECALL_PULL_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      debugLog("session/recall-pending rejected", { sessionID, status: response.status })
+      return null
+    }
+    const data = await response.json()
+    if (!Array.isArray(data?.items)) {
+      debugLog("session/recall-pending malformed", { sessionID })
+      return null
+    }
+    return data
+  } catch (error) {
+    console.debug("mnemoseed-local: session/recall-pending failed:", error)
+    debugLog("session/recall-pending failed", { sessionID, error: String(error) })
+    return null
+  }
+}
+
 async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<void> {
   // B2.1 T1 gate semantics (PRD): a falsy session or a non-array system burns
   // NOTHING (the host may invoke the transform with an empty shape on a
@@ -358,19 +478,79 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
   if (!sessionID) return
   if (!Array.isArray(hookOutput?.system)) return
   try {
-    if (injectedSessions.has(sessionID)) return
-    injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
-    const data = await fetchSessionTails(sessionID)
-    if (data === null) return
-    const built = buildRecallInjection(data.sessions)
-    if (built === null) {
-      // A reachable transform with nothing injectable gets one debug line —
-      // the attempt gate is already consumed, so no extra rate limiting.
-      debugLog("recall injection skipped: no injectable recall content", { sessionID })
-      return
+    // T1 (session-start replay) and T2 (mid-session recall) are INDEPENDENT
+    // branches: the T1 attempt gate must NEVER early-return past the T2 pull
+    // (D8 — the pre-T2 `injectedSessions.has` return silently strangled the
+    // whole mid-session lane).
+    if (!injectedSessions.has(sessionID)) {
+      injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
+      const data = await fetchSessionTails(sessionID)
+      if (data !== null) {
+        const built = buildRecallInjection(data.sessions)
+        if (built === null) {
+          // A reachable transform with nothing injectable gets one debug line —
+          // the attempt gate is already consumed, so no extra rate limiting.
+          debugLog("recall injection skipped: no injectable recall content", { sessionID })
+        } else {
+          hookOutput.system.push(built.block)
+          injectedRegistry.set(sessionID, built.registry)
+          // the T2 seen list = every chunk the T1 injection ADMITTED (needle
+          // or not): the daemon merges it so a focal hit never re-serves a T1
+          // replay. The daemon caps the list at 16 ids; the T1 budget
+          // (2 x 8 chunks) stays under it.
+          t1InjectedChunkIds.set(sessionID, built.includedIds)
+        }
+      }
     }
-    hookOutput.system.push(built.block)
-    injectedRegistry.set(sessionID, built.registry)
+    const pull = pendingPull.get(sessionID)
+    if (pull !== undefined && pull.armed && pull.acked) {
+      // T2: the awaited pull is bounded (300ms) and fail-open; a timeout, a
+      // 503 or an empty selection keeps the arm for the next transform —
+      // the daemon's slot survives an empty serve (D6).
+      const served = await pullPendingRecall(sessionID)
+      if (served === null) return
+      if (served.enabled === true && served.items.length > 0) {
+        // QA BLOCKER-1: the daemon's budget_chars IS the item budget — the
+        // old fixed cap (RECALL_PULL_MAX_CHARS minus the fence+disclaimer
+        // wrapper) silently dropped daemon-legal selections in (1044, 1200].
+        // The arm is cleared only AFTER a successful build+append: a dropped
+        // block must not burn the arm while the daemon already consumed the
+        // slot — the next acked turn re-pulls and slot_consumed on the retry
+        // clears it.
+        const itemBudget =
+          typeof served.budget_chars === "number" && served.budget_chars > 0
+            ? served.budget_chars
+            : RECALL_PULL_MAX_CHARS
+        const built = buildT2Injection(served.items, itemBudget)
+        if (built === null) {
+          debugLog("recall pull dropped: selection exceeds the item budget", {
+            sessionID,
+            items: served.items.length,
+            budget_chars: served.budget_chars,
+          })
+          return
+        }
+        hookOutput.system.push(built.block)
+        pendingPull.delete(sessionID) // a non-empty serve consumes the flags (D8)
+        let registry = injectedRegistry.get(sessionID)
+        if (registry === undefined) {
+          registry = new Map<string, Set<string>>()
+          injectedRegistry.set(sessionID, registry)
+        }
+        mergeRegistry(registry, built.registry)
+      } else if (served.enabled === true && served.slot_consumed === true) {
+        // IMPORTANT-2: a serve whose response was lost in transit must not
+        // leave the arm pulling into the void — the daemon already consumed
+        // the slot, so this empty answer is terminal; clear the flags.
+        pendingPull.delete(sessionID)
+      } else if (served.enabled !== true) {
+        // enabled:false — the daemon owns the switch; zero append, and the
+        // (consumed) slot clears the flag so the next prompt's arm is fresh.
+        pendingPull.delete(sessionID)
+      }
+      // items empty ∧ enabled ∧ not consumed: keep the arm — a fresh pull can
+      // still consume the surviving slot (D8).
+    }
   } catch (err) {
     console.debug("mnemoseed-local: chat.system.transform failed:", err)
     debugLog("chat.system.transform failed", { sessionID, error: String(err) })
@@ -534,6 +714,14 @@ function scheduleRecovery(sessionID: string): () => void {
 }
 
 function postUserIngest(sessionID: string, text: string, ts: number, raw: JsonRecord): void {
+  // B2.1 T2: posting a user prompt ARMS the mid-session pending-recall pull;
+  // the daemon's 2xx is the ACK (ack-implies-ready — the ingest handler parks
+  // the focal slot before answering). A rejected/nacked prompt stays armed but
+  // un-acked: the transform cannot pull a slot that never existed.
+  const pull = pendingPull.get(sessionID) ?? { armed: false, acked: false }
+  pull.armed = true
+  pull.acked = false
+  pendingPull.set(sessionID, pull)
   post(
     "/ingest",
     {
@@ -545,7 +733,11 @@ function postUserIngest(sessionID: string, text: string, ts: number, raw: JsonRe
       content: { text },
       raw,
     },
-    () => noteWatermark(sessionID, ts),
+    () => {
+      noteWatermark(sessionID, ts)
+      const armed = pendingPull.get(sessionID)
+      if (armed !== undefined) armed.acked = true
+    },
     scheduleRecovery(sessionID),
   )
 }
@@ -860,11 +1052,14 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
         }
         case "session.deleted": {
           const sessionID = sessionIdOfEvent(event)
-          // B2.1 T1/T3 lifecycle cleanup: a settled session's injection gate,
-          // consumption registry and cited set are dropped with it.
+          // B2.1 T1/T2/T3 lifecycle cleanup: a settled session's injection
+          // gate, consumption registry, cited set, pending-recall arm and T1
+          // seen list are dropped with it.
           injectedSessions.delete(sessionID)
           injectedRegistry.delete(sessionID)
           citedChunks.delete(sessionID)
+          pendingPull.delete(sessionID)
+          t1InjectedChunkIds.delete(sessionID)
           enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
           await persistWatermarks()
           enqueueForSession(sessionID, () => settle(sessionID))

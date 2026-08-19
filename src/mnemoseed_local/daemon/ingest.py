@@ -8,8 +8,10 @@ guesses identity. Token auth lands with PRD-06; only the shape is reserved.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request, status
 
 from mnemoseed_local.capture import (
@@ -18,9 +20,18 @@ from mnemoseed_local.capture import (
     SessionUnknownError,
     TurnSegmenter,
 )
-from mnemoseed_local.schema.turn import FlushRequest, IngestEvent, SessionEndRequest
+from mnemoseed_local.schema.turn import (
+    FlushRequest,
+    IngestEvent,
+    IngestEventType,
+    MessageContent,
+    SessionEndRequest,
+)
+from mnemoseed_local.storage.ports import TurnRange
 
 router = APIRouter()
+
+logger = logging.getLogger("mnemoseed_local.daemon.ingest")
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
@@ -32,6 +43,28 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except SessionSettledError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    # B2.1 T2 (PRD-B2.1): user prompts run the embedding-free focal scan and
+    # park the pending-recall selection BEFORE the 202 answers (ack-implies-
+    # ready). The scan is store I/O, so it runs in a worker thread; the
+    # TurnSegmenter itself stays on the event loop (it is not thread-safe —
+    # a sync-def handler would threadpool it into a real race).
+    if (
+        event.event is IngestEventType.USER_PROMPT
+        and isinstance(event.content, MessageContent)
+        and event.content.text
+    ):
+        config = getattr(request.app.state, "config", None)
+        memory = getattr(request.app.state, "memory", None)
+        if memory is not None and config is not None and config.capture.auto_recall:
+            try:
+                await anyio.to_thread.run_sync(
+                    memory.note_user_prompt,
+                    event.profile_id,
+                    event.session_id,
+                    event.content.text,
+                )
+            except Exception:  # pragma: no cover - the scan must never fail ingest
+                logger.warning("focal scan failed; ingest proceeds", exc_info=True)
     return {
         "status": "accepted",
         "session_id": event.session_id,
@@ -45,8 +78,13 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
         turn_range = segmenter.end_session(req.session_id, req.profile_id)
-    except SessionUnknownError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except SessionUnknownError:
+        # B2.1 T2 NIT-5b: a settle for a session the segmenter never captured
+        # (never ingested, or a fresh hook process) is still TERMINAL for the
+        # pending-recall lifecycle — the memory seams below must run and the
+        # fire-and-forget hook must not swallow a 404 silently. Answer a 200
+        # no-op settle (zero turns) instead of rejecting.
+        turn_range = TurnRange(start=0, end=-1)
     except ProfileMismatchError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     # v1 drain trigger: no scheduled drain exists yet, so settlement is the
@@ -69,6 +107,13 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     relay = getattr(request.app.state, "dream_relay", None)
     if relay is not None:
         await relay.flush()
+    # B2.1 T2: the terminal settle drops the session's pending-recall slot and
+    # seen-set — a pull after the settle finds nothing to serve. Runs for
+    # fresh and repeat settles alike (the guarded seam keeps injection-only
+    # test harnesses working).
+    memory = getattr(request.app.state, "memory", None)
+    if memory is not None:
+        memory.end_session(req.profile_id, req.session_id)
     return {
         "status": "settled",
         "session_id": req.session_id,
