@@ -253,18 +253,21 @@ def test_plugin_pins_settle_once_dedup_and_assistant_pending_sweep() -> None:
     409-dropped the last assistant turn. The contract is now a PENDING SET
     with a deterministic sweep: a failed or textless fetch parks the
     messageID per session; `session.idle`/`session.error`/`session.deleted`
-    AWAIT the sweep BEFORE posting /flush resp. /session/end, so the last
-    reply always gets a final retry and settle can never overtake an
-    outstanding fetch. Pin the set, the sweep call sites, and the settle-once
-    dedup as code."""
+    ENQUEUE the sweep and the drain through the per-session FIFO chain (the
+    same chain that keeps crash replay strictly before live posts — ordering
+    is a CHAIN property, as deterministic as the old inline await, and it
+    cannot interleave with content posts), so the last reply always gets a
+    final retry and settle can never overtake an outstanding fetch. Pin the
+    set, the enqueued sweep sites, and the settle-once dedup."""
     source = _plugin_source()
     assert "pendingAssistant" in source, "failed/textless fetches must park, not vanish"
     assert "sweepPendingAssistant(" in source, "the deterministic retry sweep must exist"
+    assert "enqueueForSession(" in source, "turn content is FIFO-chained per session"
     idle_block = re.search(r'case "session\.idle":.*?break', source, re.S)
-    assert idle_block is not None and "await sweepPendingAssistant(" in idle_block.group(0)
+    assert idle_block is not None and "sweepPendingAssistant(" in idle_block.group(0)
     deleted_block = re.search(r'case "session\.deleted":.*?break', source, re.S)
-    assert deleted_block is not None and "await sweepPendingAssistant(" in deleted_block.group(0), (
-        "settle must wait for the sweep — ordering is the fix, not a sleep"
+    assert deleted_block is not None and "sweepPendingAssistant(" in deleted_block.group(0), (
+        "settle must be ordered after the sweep — via the chain, not a sleep"
     )
     assert "seen(settledSessions," in source
     assert "DEDUP_CAP = 1000" in source
@@ -321,11 +324,12 @@ def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     promises: /session/end single-site (session.deleted), /flush two
     (idle/error + pre-compact), /ingest three (user prompt, assistant message
     — shared by the completion path and the pending-sweep retry via
-    postAssistantIngest — and tool use)."""
+    postAssistantIngest — and tool use). Multi-line formatting must not
+    matter: count by regex, not literal."""
     source = _plugin_source()
-    assert source.count('post("/session/end"') == 1
-    assert source.count('post("/flush"') == 2
-    assert source.count('post("/ingest"') == 3
+    assert len(re.findall(r'post\(\s*"/session/end"', source)) == 1
+    assert len(re.findall(r'post\(\s*"/flush"', source)) == 2
+    assert len(re.findall(r'post\(\s*"/ingest"', source)) == 3
 
 
 def test_plugin_stays_fire_and_forget_and_debug_only() -> None:
@@ -387,3 +391,49 @@ def test_plugin_caps_tool_output_payloads() -> None:
     source = _plugin_source()
     assert "MAX_TOOL_OUTPUT_CHARS" in source
     assert "[... truncated" in source
+
+
+# ---------------------------------------------------------------- B2.2 crash durability
+
+
+def test_plugin_pins_the_crash_replay_mechanism() -> None:
+    """PRD-B2.2 T1/T2 (KISS single mechanism): on host startup, each session
+    is reconciled LAZILY at its first event in this hook process — the host's
+    OWN persisted history (client.session.messages) is replayed for the tail
+    missing since the watermark, with a 30s overlap the daemon's near-dup
+    absorb eats. Pin the watermark file, the once-per-session lazy trigger,
+    the overlap constant, the receiver-bound list call, the per-idle persist
+    cadence, and the escalate-on-failure degradation (watermark trouble must
+    never touch the main lane)."""
+    source = _plugin_source()
+    assert "hook-watermarks.json" in source, "T1 watermark file"
+    assert "REPLAY_OVERLAP_MS = 30000" in source, "30s overlap margin (T2)"
+    assert "reconcileSession(" in source and "reconciledSessions" in source, (
+        "lazy, once-per-session-per-process reconciliation (T2)"
+    )
+    assert re.search(r"case \"session\.idle\":.*?reconcile", source) or re.search(
+        r"chat\.message.*?reconcile", source, re.S
+    ), "reconciliation hooks into the lazy first-event path"
+    assert re.search(r"client\.session\.messages\(\{", source), (
+        "host history is read via the bound list call (no new API surface)"
+    )
+
+
+def test_plugin_replay_keeps_the_engineering_red_lines() -> None:
+    """PRD-B2.2 T4: (a) TOKEN red-line — the replay path must never construct
+    or call any LLM client (the whole plugin talks to exactly two parties:
+    the daemon REST and the host's own SDK); (b) hot-path zero-cost — the
+    existing chat.message/ingest lane gains no awaited I/O (reconcile is
+    fire-and-forget like every other post); (c) reversibility — the only new
+    filesystem artifact is the single watermark file."""
+    source = _plugin_source()
+    assert ".chat(" not in source and "LLM" not in source, (
+        "no LLM client anywhere in the hook — replay is byte-reshuffling only"
+    )
+    chat_block = re.search(r"async function onChatMessage.*?\n  \}", source, re.S)
+    assert chat_block is not None and "await reconcileSession" not in chat_block.group(0), (
+        "reconcile must stay fire-and-forget — the hot path awaits nothing"
+    )
+    assert source.count("hook-watermarks.json") >= 1 and "journal" not in source.lower(), (
+        "single listed artifact; NO WAL/journal machinery (PRD boundary)"
+    )
