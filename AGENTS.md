@@ -37,6 +37,13 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
   **solution-architect** for comprehensive evaluation, general chores to the
   built-in **general** agent. Do NOT substitute the built-in general agent
   with a role prompt when a named agent exists.
+- **Parallelized execution (user directive 2026-08-19)**: decompose batches
+  into the smallest tasks that can run asynchronously in parallel; multiple
+  senior-software-engineer sessions may run concurrently on DISJOINT
+  file/test surfaces, while steps with true ordering dependencies are chained
+  inside one task. Every parallel task plan is checked by solution-architect
+  for conflicts (file-surface overlap, test-oracle collisions, ordering)
+  BEFORE execution starts.
 - Public code and comments are English-only; Chinese docs live in `docs/zh`.
 - Phase work is PRD-driven: brief in `docs/zh/prd/` → batched TDD execution →
   single-commit closeout → closeout record in the PRD.

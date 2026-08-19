@@ -1,0 +1,532 @@
+"""PRD-B2.3 S1: daemon watchdog + durable daemon.log pins.
+
+The S1 shipped surface (this batch):
+
+- daemon/watchdog.py — a daemon THREAD (never an asyncio task: a dead event
+  loop kills asyncio tasks with it, which is exactly the failure the watchdog
+  must observe) probing the served listener with raw TCP connects and
+  force-exiting the process after a grace window (PRE_BIND boot grace /
+  ARMED refused grace).
+- runner.py arms the watchdog inside run_server() only — create_app() and
+  TestClient boots NEVER arm it.
+- app.py attaches a durable FileHandler writing CONFIG_DIR/daemon.log at
+  lifespan startup, plus boot/teardown stage lines.
+
+The root-mechanism pin (worker stop hang) is the PRD-B2.3 D2 documented
+mechanism: the watchdog converts that zombie into a bounded crash; the join
+semantics are intentionally NOT changed this batch.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import socket
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.daemon.app import DreamWorker, create_app
+from mnemoseed_local.daemon.watchdog import _PROBE_TIMEOUT_S, Watchdog, default_probe
+from mnemoseed_local.dream import DreamTrigger, SnapshotResult
+from mnemoseed_local.storage.ports import TurnRange
+
+PROFILE = "default"
+WATCHDOG_THREAD_NAME = "mnemoseed-watchdog"
+DAEMON_LOG_NAME = "daemon.log"
+
+
+def _config_text(tmp_path: Path) -> str:
+    return (
+        'preset = "embedded"\n'
+        f'[storage.vector]\nuri = "{(tmp_path / "chunks.lance").as_posix()}"\ndimensions = 64\n'
+        f'[storage.graph]\npath = "{(tmp_path / "cortex.db").as_posix()}"\n'
+        f'[storage.graph.instances.isolated]\npath = "{(tmp_path / "isolated.db").as_posix()}"\n'
+        f'[storage.meta]\npath = "{(tmp_path / "meta.db").as_posix()}"\n'
+        f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
+        "[dream.llm.dream]\n"
+        'driver = "stub"\n'
+        'model = "stub"\n'
+    )
+
+
+def _detach_daemon_log_handler() -> None:
+    """Remove and close any attached daemon.log FileHandler so the suite stays
+    hermetic (a boot elsewhere in the process may have attached one)."""
+    target = logging.getLogger("mnemoseed_local")
+    for handler in list(target.handlers):
+        if getattr(handler, "name", None) == DAEMON_LOG_NAME:
+            target.removeHandler(handler)
+            handler.close()
+
+
+@pytest.fixture
+def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A bootable embedded config whose CONFIG_DIR lands in tmp_path, so the
+    app's daemon.log FileHandler never touches the real home; the handler is
+    detached again in the finalizer."""
+    _detach_daemon_log_handler()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(_config_text(tmp_path), encoding="utf-8")
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
+    yield cfg
+    _detach_daemon_log_handler()
+
+
+def _boot() -> TestClient:
+    return TestClient(create_app())
+
+
+# ---------------------------------------------------------------- never armed
+
+
+def test_create_app_and_testclient_never_arm_watchdog(config_path: Path) -> None:
+    """Only run_server() arms the watchdog: a TestClient boot of create_app()
+    must never leave a mnemoseed-watchdog thread behind (the module-level boot
+    discipline, app.py:714)."""
+    with _boot() as client:
+        assert client.get("/healthz").json()["status"] == "ok"
+        names = [t.name for t in threading.enumerate()]
+        assert WATCHDOG_THREAD_NAME not in names
+
+
+# ---------------------------------------------------------------- PRE_BIND
+
+
+def test_pre_bind_boot_grace_fires() -> None:
+    """PRE_BIND: a listener that never accepts connections (probe always
+    refused) past WATCHDOG_BOOT_GRACE_S fires with the boot-grace reason."""
+    fired: list[str] = []
+    fired_event = threading.Event()
+
+    def _record_fire(reason: str) -> None:
+        fired.append(reason)
+        fired_event.set()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.2,
+        interval=0.02,
+        probe=lambda: False,
+        fire=_record_fire,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "watchdog never fired in PRE_BIND"
+        assert fired and "boot" in fired[0]
+        assert len(fired) == 1  # exactly one fire, then the loop stops
+    finally:
+        watchdog.stop()
+
+
+# ---------------------------------------------------------------- ARMED
+
+
+def test_armed_refused_grace_fires_on_real_socket() -> None:
+    """ARMED: against a real listener the watchdog arms on the first real TCP
+    connect; once the listener disappears, the real production default probe
+    sees the dead listener (refused at ~2s latency on filtered Windows hosts)
+    and the refused grace fires with the refused-grace reason."""
+    # The accept loop drains the queue so every probe handshake completes while
+    # the listener is open, and closes the listener ITSELF when told to stop —
+    # on Windows a socket must be closed from the thread using it.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = listener.getsockname()[1]
+    stop_accept = threading.Event()
+
+    def _accept_loop() -> None:
+        listener.settimeout(0.05)
+        while not stop_accept.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue  # poll interval; re-check stop_accept
+            except OSError:
+                break
+            conn.close()
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+    accept_thread = threading.Thread(target=_accept_loop, daemon=True)
+    accept_thread.start()
+
+    # The production default probe must distinguish dead from alive on this
+    # host: a live listener answers fast, and the closed port is refused at
+    # ~2s latency on filtered Windows hosts (the probe budget must exceed that
+    # envelope or the refusal races the timeout and reads as alive).
+    live_started = time.perf_counter()
+    assert default_probe("127.0.0.1", port) is True, "live listener must probe as alive"
+    assert time.perf_counter() - live_started < 1.0, "live probe must answer fast"
+
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+
+    def _record_fire(reason: str) -> None:
+        fired.append(reason)
+        fired_event.set()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        port,
+        boot_grace=5.0,  # long: arming must happen before any grace matters
+        refused_grace=0.2,
+        interval=0.05,
+        fire=_record_fire,
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        assert armed.wait(3.0), "watchdog never armed against the live listener"
+        stop_accept.set()  # the accept loop closes the listener within 50ms
+        # sibling assertion: the real probe sees the closed listener as dead
+        # within the probe budget plus a margin (the refusal lands at ~2s)
+        deadline = time.monotonic() + _PROBE_TIMEOUT_S + 1.0
+        while time.monotonic() < deadline:
+            if not default_probe("127.0.0.1", port):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("default_probe never saw the closed listener as dead")
+        # refused_grace=0.2: the fire lands on the first refused probe (~2s)
+        assert fired_event.wait(10.0), "watchdog never fired after the listener closed"
+        assert fired and "refused" in fired[0]
+        assert len(fired) == 1
+    finally:
+        stop_accept.set()
+        listener.close()
+        watchdog.stop()
+        accept_thread.join(timeout=2.0)
+
+
+def test_armed_flapping_under_grace_does_not_fire() -> None:
+    """ARMED: short refused runs that recover before the refused grace must
+    never fire — every successful connect resets the refused accumulator."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()  # already armed: the PRE_BIND phase is skipped
+    script = (False, False, True)  # refused, refused, success — repeats
+    state = {"i": 0}
+
+    def _flapping_probe() -> bool:
+        value = script[state["i"] % len(script)]
+        state["i"] += 1
+        return value
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.05,
+        refused_grace=0.1,  # 2 refused probes at 0.02s stay well under this
+        interval=0.02,
+        probe=_flapping_probe,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.5)
+        assert fired == []
+    finally:
+        watchdog.stop()
+
+
+def test_pre_bind_alive_within_grace_does_not_fire() -> None:
+    """PRE_BIND: a listener that answers from the start arms quickly and never
+    fires — a successful connect is always alive."""
+    fired: list[str] = []
+    armed = threading.Event()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.1,
+        interval=0.02,
+        probe=lambda: True,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.3)  # several probe intervals
+        assert fired == []
+        assert armed.is_set()  # the first success armed it
+    finally:
+        watchdog.stop()
+
+
+# ---------------------------------------------------------------- fire path
+
+
+def test_fire_writes_last_words_and_flushes_before_exit() -> None:
+    """The default fire path: last-words line through the daemon logger, flush
+    of the handler chain, THEN the exit function — injecting exit_func while
+    keeping the real default fire path is the honest sequencing pin."""
+    _detach_daemon_log_handler()
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+    records: list[logging.LogRecord] = []
+    flush_calls: list[bool] = []
+
+    class _FlushRecorderHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+        def flush(self) -> None:
+            flush_calls.append(True)
+            super().flush()
+
+    handler = _FlushRecorderHandler()
+    daemon_logger.addHandler(handler)
+    captured: dict[str, object] = {}
+    exit_calls: list[int] = []
+
+    def _record_exit(code: int) -> None:
+        exit_calls.append(code)
+        captured["records_at_exit"] = list(records)
+        captured["flush_calls_at_exit"] = len(flush_calls)
+
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=_record_exit)
+    try:
+        watchdog._default_fire("boot-grace")  # the real fire path, exit injected
+    finally:
+        daemon_logger.removeHandler(handler)
+        handler.close()
+
+    assert exit_calls == [1]  # os._exit(1) in production
+    at_exit = captured["records_at_exit"]
+    assert at_exit, "the last-words record was not captured before the exit ran"
+    assert "boot-grace" in at_exit[-1].getMessage()
+    assert captured["flush_calls_at_exit"] >= 1, "the handler chain was not flushed"
+
+
+# ------------------------------------------------------- root mechanism (D2)
+
+
+class _BlockForeverSnapshotter:
+    """Snapshotter whose request blocks on a threading.Event inside the worker
+    thread, keeping a manual dream in flight forever (the PRD-B2.3 D2 repro
+    shape)."""
+
+    def __init__(self, block: threading.Event) -> None:
+        self._block = block
+        self.entered = threading.Event()
+
+    def request(self, profile_id: str, turn_range: TurnRange) -> SnapshotResult:
+        del profile_id, turn_range
+        self.entered.set()
+        self._block.wait()  # blocks the worker thread until the test releases it
+        return SnapshotResult(snapshot=None, ok=True)
+
+
+def _manual_event() -> PoolEvent:
+    return PoolEvent(
+        kind=PoolEventKind.DREAM_TRIGGER,
+        profile_id=PROFILE,
+        turn_range=TurnRange(start=0, end=0),
+        balance=10.0,
+        fired_at=1.0,
+    )
+
+
+def test_worker_stop_hangs_on_blocked_inflight_job() -> None:
+    """PRD-B2.3 D2 repro pin: DreamWorker.stop() does NOT return in bounded
+    time while an in-flight job is blocked forever inside the snapshotter.
+
+    The join hang is the DOCUMENTED mechanism — the watchdog converts this
+    zombie into a bounded crash (os._exit(1) after the refused grace window),
+    and the join semantics are intentionally NOT changed this batch.
+
+    stop() runs on a dedicated event loop so the hang is observable from the
+    main thread: the loop jams inside executor.shutdown(wait=True) and stays
+    jammed past a 1s real-time bound, then the block release lets it finish.
+    (The block must be released from outside the jammed loop — wait_for's
+    timeout cannot be delivered while the loop is blocked in the join.)
+    """
+    block = threading.Event()
+    snapshotter = _BlockForeverSnapshotter(block)
+    outcome: list[str] = []
+    scenario_done = threading.Event()
+
+    def _scenario() -> None:
+        async def _inner() -> None:
+            trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
+            trigger.handle_event(_manual_event())
+            worker = DreamWorker(trigger)
+            worker.start()
+            job = asyncio.create_task(worker.submit_dream_once(PROFILE))
+            await asyncio.to_thread(snapshotter.entered.wait, 2.0)
+            stop_task = asyncio.create_task(worker.stop())
+            await asyncio.wait_for(stop_task, timeout=2.5)
+            await asyncio.wait_for(job, timeout=1.0)
+            outcome.append("released")
+
+        asyncio.run(_inner())
+        scenario_done.set()
+
+    thread = threading.Thread(target=_scenario, daemon=True)
+    thread.start()
+    try:
+        assert snapshotter.entered.wait(3.0), "the manual job never reached the snapshotter"
+        time.sleep(1.2)  # the dedicated loop is jammed in shutdown(wait=True) now
+        assert not scenario_done.is_set(), "stop() returned while the job was blocked"
+    finally:
+        block.set()  # release the executor thread no matter what happened
+    assert scenario_done.wait(10.0), "the scenario never finished after release"
+    assert outcome == ["released"]
+
+
+# ------------------------------------------------------------- daemon.log pins
+
+
+@pytest.fixture
+def log_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A bootable home under tmp_path: MNEMOSEED_LOCAL_HOME honors CONFIG_DIR,
+    and the app's daemon.log FileHandler lands inside it (detached after)."""
+    _detach_daemon_log_handler()
+    (tmp_path / "config.toml").write_text(_config_text(tmp_path), encoding="utf-8")
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path))
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
+    yield tmp_path
+    _detach_daemon_log_handler()
+
+
+def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
+    """The durable daemon.log: exists under CONFIG_DIR, holds the boot line
+    (with pid) while the process is alive, gains the teardown stage lines after
+    shutdown, and is attached exactly once across repeated in-process boots."""
+    log_file = log_home / "daemon.log"
+    app = create_app()
+    with TestClient(app) as client:
+        assert client.get("/healthz").json()["status"] == "ok"
+        # readable while the daemon is alive: the FileHandler flushes per emit
+        assert log_file.exists()
+        live_text = log_file.read_text(encoding="utf-8")
+        assert "daemon boot:" in live_text
+        assert f"daemon boot: pid={os.getpid()}" in live_text
+
+    # after teardown the stage lines landed in the same file
+    final_text = log_file.read_text(encoding="utf-8")
+    assert "teardown: drain capture lane" in final_text
+    assert "teardown: complete" in final_text
+
+    # a second in-process boot must not double-attach the handler
+    with TestClient(app) as client:
+        assert client.get("/healthz").json()["status"] == "ok"
+    target = logging.getLogger("mnemoseed_local")
+    attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
+    assert len(attached) == 1
+    # the boot line carries the full identity payload, not just the pid
+    boot_line = next(line for line in live_text.splitlines() if "daemon boot:" in line)
+    assert f"pid={os.getpid()}" in boot_line
+    assert "version=" in boot_line
+    assert "preset=embedded" in boot_line
+    assert "port=7788" in boot_line
+
+
+# ------------------------------------------- QA I-1: no real-home pollution
+
+
+def test_daemon_log_handler_follows_patched_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA I-1: the daemon.log FileHandler must resolve CONFIG_DIR at attach
+    time — a monkeypatched mnemoseed_local.config.CONFIG_DIR must redirect the
+    log away from the real user home, or every TestClient boot in the suite
+    pollutes ~/.mnemoseed-local/daemon.log (empirically confirmed)."""
+    _detach_daemon_log_handler()
+    (tmp_path / "config.toml").write_text(_config_text(tmp_path), encoding="utf-8")
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
+    app = create_app()
+    try:
+        with TestClient(app) as client:
+            assert client.get("/healthz").json()["status"] == "ok"
+        with TestClient(app) as client:
+            assert client.get("/healthz").json()["status"] == "ok"
+        target = logging.getLogger("mnemoseed_local")
+        attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
+        assert len(attached) == 1
+        base = str(attached[0].baseFilename)
+        assert base.startswith(str(tmp_path)), f"handler writes to {base!r}, not the tmp home"
+    finally:
+        _detach_daemon_log_handler()
+
+
+# ------------------------------------------- QA I-2: B6 stall red line
+
+
+class _RecordHandler(logging.Handler):
+    """Handler that collects emitted records (for B6 log-line pins)."""
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        super().__init__()
+        self._records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append(record)
+
+
+def test_default_probe_stall_returns_alive_and_logs_b6(monkeypatch) -> None:
+    """QA I-2: the B6 red line — a stalled probe (timeout, not refused) must
+    read as ALIVE and emit the stall log line, never as dead. A mutant
+    default_probe returning False on any OSError must fail this pin."""
+    records: list[logging.LogRecord] = []
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+    handler = _RecordHandler(records)
+    daemon_logger.addHandler(handler)
+
+    def _stall(*args: object, **kwargs: object) -> socket.socket:
+        del args, kwargs
+        raise TimeoutError("simulated stalled bound loop (B6 domain)")
+
+    monkeypatch.setattr(socket, "create_connection", _stall)
+    try:
+        assert default_probe("127.0.0.1", 7788) is True
+    finally:
+        daemon_logger.removeHandler(handler)
+        handler.close()
+    assert any("B6" in r.getMessage() for r in records), "the stall must be logged"
+
+
+def test_armed_stalled_probe_never_fires() -> None:
+    """QA I-2: a probe that behaves like a stalled-but-bound loop (always reads
+    alive, as the default probe does for timeouts) must keep an ARMED watchdog
+    alive — several intervals without a single refused reading, no fire."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()  # already armed: the PRE_BIND phase is skipped
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.05,
+        refused_grace=0.1,
+        interval=0.02,
+        probe=lambda: True,  # stalled-bound behavior: timeouts map to alive
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.3)  # several probe intervals
+        assert fired == []
+    finally:
+        watchdog.stop()

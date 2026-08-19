@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -542,6 +543,32 @@ def _build_capture(
     )
 
 
+def _attach_daemon_log_handler() -> None:
+    """Attach the durable daemon.log FileHandler to the ``mnemoseed_local``
+    logger (PRD-B2.3 D4), idempotent across repeated lifespan entries in one
+    process. The handler flushes per emit, so the file is readable while the
+    daemon is alive; the boot/teardown stage lines and the watchdog last-words
+    all land here through the daemon logger's propagation. The logger's level
+    is lifted to INFO so the info-graded stage lines are not dropped before the
+    handler sees them."""
+    target = logging.getLogger("mnemoseed_local")
+    for handler in target.handlers:
+        if getattr(handler, "name", None) == "daemon.log":
+            return
+    # Resolve CONFIG_DIR at call time, not import time, so a test (or a
+    # process that relocated its home) monkeypatching config.CONFIG_DIR is
+    # honored — otherwise every TestClient boot in the suite writes the real
+    # user home's daemon.log (QA I-1).
+    from mnemoseed_local.config import CONFIG_DIR
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(CONFIG_DIR / "daemon.log", encoding="utf-8")
+    handler.name = "daemon.log"
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config = load_config()
@@ -551,6 +578,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             f"daemon refuses non-loopback baseurl {config.baseurl!r}: the local MVP "
             "is localhost-only (no identity/accounts/tokens)"
         )
+    _attach_daemon_log_handler()
+    logger.info(
+        "daemon boot: pid=%d version=%s preset=%s port=%s",
+        os.getpid(),
+        __version__,
+        config.preset,
+        urlparse(config.baseurl).port or 7788,
+    )
     stores = build_stores(config)
     app.state.config = config
     app.state.stores = stores
@@ -610,6 +645,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # QA-4: drain the capture lane BEFORE anything closes — restart mid-reply
     # must not lose the last exchange. Open turns close off the hot path, then
     # every buffered session drains into the stores they belong to.
+    logger.info("teardown: drain capture lane")
     segmenter = getattr(app.state, "segmenter", None)
     capture = getattr(app.state, "capture", None)
     drain = getattr(capture, "drain", None)
@@ -618,6 +654,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for session_id in capture.sessions():
             drain(session_id)
     # Stop the background loops before the stores close (lifecycle order).
+    logger.info("teardown: stop background loops")
     for task_name in ("decay_task", "scheduler_task"):
         task = getattr(app.state, task_name, None)
         if task is not None:
@@ -626,11 +663,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await task
             except asyncio.CancelledError:
                 pass
+    logger.info("teardown: close memory")
     app.state.memory.close()
     # Drain an in-flight dream before the stores close (the chain uses the
     # storage stack); new event submissions stop with the cancelled scheduler.
+    logger.info("teardown: stop dream worker")
     await app.state.dream_worker.stop()
+    logger.info("teardown: close stores")
     await stores.close()
+    logger.info("teardown: complete")
 
 
 def create_app() -> FastAPI:
