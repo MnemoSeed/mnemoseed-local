@@ -45,6 +45,14 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
   for conflicts (file-surface overlap, test-oracle collisions, ordering)
   BEFORE execution starts.
 - Public code and comments are English-only; Chinese docs live in `docs/zh`.
+- **Code style (user directive 2026-08-20)**: DRY — extract shared logic,
+  never copy-paste. Keep features modular and decoupled so problems are easy
+  to isolate and features easy to move later. Comments stay minimal: names
+  and structure should carry the meaning; a comment may state the code's
+  purpose and background only, and must never reference issues, PRs, QA
+  rounds, people, or incident history (history lives in PRDs and git, not
+  in code). Applies to new and touched code; do not mass-edit untouched
+  legacy comments.
 - Phase work is PRD-driven: brief in `docs/zh/prd/` → batched TDD execution →
   single-commit closeout → closeout record in the PRD.
 - **Theory-anchor discipline (user directive 2026-08-19, applies to the whole
