@@ -124,7 +124,7 @@ hooks（OpenCode 首发，映射 /ingest + /flush（空闲/出错）
 2. ScorePool 阈值必须完全 config-driven：daemon 构造 Pool 时直接绑定 `dream.floor_pool_points` / `dream.idle_min_sec`，与调度器同源（app.py 已钉住）；残余硬编码 `forced_cap` 已列 A2.5 注册表化。
 3. 本地模型上下文窗口有限：跨批 digest 连贯性依赖模型能力（如 ollama 的 `preserve_thinking` 支持度）；delta 动态预算控制单次调用体量；摘要质量对模型选型敏感。**已知部署坑：ollama 驱动目前不传 params（连 num_ctx 都进不了请求体）**——A2.5 补 options seam，doctor 按 `prefix + delta + 生成余量 ≤ num_ctx` 校验；生成侧补输出上限防 32k JSON 截断。
 4. `.github` 工作流仍是主仓 v0.1.1 形态（ci 触发 development/main 双分支、release 为 tag → PyPI trusted publishing）；与本仓单分支开发及 A3 安装形态的对齐重写放在 Phase A3。
-5. 公开发布面最小化：AGPL-3.0 + 英文 README；其余发布物料待 A3 再定。
+5. 公开发布面最小化：MIT + 英文 README；其余发布物料待 A3 再定。
 6. lite 档 4B 模型的事实准确率**未经实测**：`core_confidence_floor` 降级（预期值标低）+ isolated 结构 + ensemble 交叉验证是防线，Phase B 评测臂是最终把关；过不了 bar 就推荐 capture-only。
 7. ensemble 合并逻辑若写得不干净会引入新的不一致：约束为**纯确定性 combiner**（无 LLM 裁判），分歧进 isolated 而非投票消灭；vote 的 journal 扩展成本已如实计价（决策 1），双 run 双 merge 形状已否决。
 8. **dream 阻塞事件循环**（盲审发现）：现状整链同步跑在 daemon 事件循环上，lite 档单节 dream 可冻结 daemon 数分钟——A2.5 第 2 项修复，修法为 worker 线程化。
