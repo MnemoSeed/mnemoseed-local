@@ -21,6 +21,7 @@ from mnemoseed_local.dream.delta import estimate_tokens
 from mnemoseed_local.retrieve.assemble import (
     AssembleConfig,
     AssembledContext,
+    AssembledEntry,
     Assembler,
     CoverageReport,
     EntryFlag,
@@ -87,6 +88,7 @@ def _chunk(
     entities: tuple[str, ...] = (),
     profile: str = _PROFILE,
     consolidated: bool = False,
+    session_id: str | None = "s1",
 ) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
@@ -98,7 +100,7 @@ def _chunk(
         cues=Cues(entities=list(entities)),
         provenance=Provenance(
             asserted_by="test-model",
-            session_id="s1",
+            session_id=session_id,
             source="manual",
             confidence=0.8,
             asserted_at=100.0,
@@ -578,3 +580,30 @@ def test_identical_inputs_identical_package(stack) -> None:
     second = _assemble(stack, recall)
     assert first == second
     assert [entry.id for entry in first.entries] == [entry.id for entry in second.entries]
+
+
+# ------------------------------------------------------------ entry provenance
+
+
+def test_chunk_entries_carry_verbatim_session_and_ingested_at(stack) -> None:
+    _write(stack, _chunk("c_src", "session provenance fact", session_id="sess-9", ingested_at=42.0))
+    result = _assemble(stack, _recall(stack, "session provenance", _query_cues(("LanceDb",))))
+    entry = next(entry for entry in result.entries if entry.kind == "chunk")
+    assert entry.session_id == "sess-9"
+    assert entry.ingested_at == 42.0
+
+
+def test_graph_entries_carry_null_session_provenance(stack) -> None:
+    """Graph nodes aggregate many sessions; their source attribution stays the
+    honest null instead of borrowing the node's updated_at as an ingest time."""
+    stack.graph.upsert_node(_node("g_src", statement="graph conclusion", entities=("LanceDb",)))
+    result = _assemble(stack, _recall(stack, "graph conclusion", _query_cues(("LanceDb",))))
+    entry = next(entry for entry in result.entries if entry.kind == "graph")
+    assert entry.session_id is None
+    assert entry.ingested_at is None
+
+
+def test_assembled_entry_defaults_provenance_to_null() -> None:
+    entry = AssembledEntry(kind="chunk", id="c", source="s", text="t", score=1.0, tokens=1, flags=())
+    assert entry.session_id is None
+    assert entry.ingested_at is None

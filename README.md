@@ -57,7 +57,8 @@ daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
 {"mcp": {"mnemoseed": {"type": "local", "command": ["mnemoseed-local", "mcp"]}}}
 ```
 
-Tools: `recall(query, top_k?)`, `remember(text)`, `dream_once()`. The
+Tools: `recall(query, top_k?)`, `remember(text)`, `dream_once()`,
+`recent_sessions(n_sessions?, n_per_session?)`, `session_windows(n_sessions?)`. The
 handshake works even when the daemon is down; only tool calls report the
 connectivity error.
 

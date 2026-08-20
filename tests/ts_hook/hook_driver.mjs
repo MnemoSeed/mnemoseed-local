@@ -72,10 +72,18 @@ const RECALL_PAYLOAD = {
 }
 const RECENT_PAYLOAD = {
   profile_id: "default",
+  self_window: {
+    session_id: "sess-behavior",
+    window: { first: "2026-08-19T09:00:00.000Z", latest: "2026-08-19T10:30:00.000Z" },
+    chunk_count: 3,
+    active: true,
+  },
   sessions: [
     {
       session_id: "sess-prev-new",
       latest_at: 40.0,
+      window: { first: "2026-08-19T08:00:00.000Z", latest: "2026-08-19T09:00:00.000Z" },
+      window_truncated: false,
       chunks: [
         {
           chunk_id: "c-oldstop",
@@ -103,6 +111,8 @@ const RECENT_PAYLOAD = {
     {
       session_id: "sess-prev-old",
       latest_at: 20.0,
+      window: { first: "2026-08-18T07:00:00.000Z", latest: "2026-08-18T08:30:00.000Z" },
+      window_truncated: false,
       chunks: [
         {
           chunk_id: "c-eval",
@@ -457,6 +467,124 @@ async function main() {
           reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
         }),
       )
+      break
+    }
+
+    case "inject-time-windows": {
+      // B2.4 T3: the injected block carries the self-anchor line exactly once,
+      // inside the fence right after the disclaimer; group headers gain
+      // started= only when the group has a window that was not truncated.
+      recentPayload = {
+        profile_id: "default",
+        self_window: {
+          session_id: "sess-window",
+          window: { first: "2026-08-20T01:00:00.000Z", latest: "2026-08-20T02:00:00.000Z" },
+          chunk_count: 1,
+          active: true,
+        },
+        sessions: [
+          {
+            session_id: "sess-window-full",
+            latest_at: 40.0,
+            window: { first: "2026-08-19T01:00:00.000Z", latest: "2026-08-19T02:00:00.000Z" },
+            window_truncated: false,
+            chunks: [
+              {
+                chunk_id: "w-full",
+                text: "user: full window group content",
+                ingested_at: 40.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+            ],
+          },
+          {
+            session_id: "sess-window-trunc",
+            latest_at: 30.0,
+            window: { first: "2026-08-18T01:00:00.000Z", latest: "2026-08-18T02:00:00.000Z" },
+            window_truncated: true,
+            chunks: [
+              {
+                chunk_id: "w-trunc",
+                text: "user: truncated window group content",
+                ingested_at: 30.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+            ],
+          },
+          {
+            session_id: "sess-window-none",
+            latest_at: 20.0,
+            chunks: [
+              {
+                chunk_id: "w-none",
+                text: "user: no window group content",
+                ingested_at: 20.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+            ],
+          },
+        ],
+      }
+      const w = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: "sess-window" }, w)
+      console.log(
+        JSON.stringify({
+          block: w.system[1],
+          recentRequests: posts
+            .filter((post) => post.url.endsWith("/session/recent"))
+            .map((post) => post.body),
+        }),
+      )
+      break
+    }
+
+    case "inject-old-daemon": {
+      // B2.4 T3 fallback: a payload with no window/self_window fields renders
+      // byte-identical to the pre-feature block — no self line, no started=.
+      recentPayload = {
+        profile_id: "default",
+        sessions: [
+          {
+            session_id: "sess-old-new",
+            latest_at: 40.0,
+            chunks: [
+              {
+                chunk_id: "old-a",
+                text: "user: hello world alpha",
+                ingested_at: 30.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+              {
+                chunk_id: "old-b",
+                text: "assistant: hello world beta",
+                ingested_at: 40.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+            ],
+          },
+          {
+            session_id: "sess-old-old",
+            latest_at: 20.0,
+            chunks: [
+              {
+                chunk_id: "old-c",
+                text: "user: hello world gamma",
+                ingested_at: 20.0,
+                turn_start: 0,
+                turn_end: 0,
+              },
+            ],
+          },
+        ],
+      }
+      const d = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: "sess-old-daemon" }, d)
+      console.log(JSON.stringify({ block: d.system[1] }))
       break
     }
 

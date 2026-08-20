@@ -126,6 +126,21 @@ def test_inject_once_injects_a_fenced_recall_block_and_is_attempt_once(tmp_path:
     assert block.count("</mnemoseed-memory-recall>") == 1, "the ONLY raw closing literal is the final fence"
     assert "发布窗口" in block and "评测臂" in block
     assert "‹mnemoseed-memory-recall›" in block, "inner fence literals must be sanitized"
+    # B2.4 T3: the fixture payload carries self_window + group windows — the
+    # block renders the self-anchor line exactly once, inside the fence right
+    # after the disclaimer, and the group headers gain started=.
+    lines = block.split("\n")
+    assert lines[0] == "<mnemoseed-memory-recall>"
+    assert lines[1].startswith("The block below is an automatic memory replay")
+    assert lines[2] == '<session-self id="behavior" started="2026-08-19T09:00:00.000Z"/>'
+    assert lines[-1] == "</mnemoseed-memory-recall>"
+    assert block.count("<session-self ") == 1, "exactly one self-anchor line"
+    assert (
+        '<session-tail id="new" ended="1970-01-01T00:00:40.000Z" started="2026-08-19T08:00:00.000Z">' in block
+    )
+    assert (
+        '<session-tail id="old" ended="1970-01-01T00:00:20.000Z" started="2026-08-18T07:00:00.000Z">' in block
+    )
     # repeat call on the same session appended nothing
     assert o2 == ["BASE"]
     # concurrent pair injected exactly once across the two outputs
@@ -142,10 +157,72 @@ def test_inject_once_injects_a_fenced_recall_block_and_is_attempt_once(tmp_path:
     for req in requests:
         assert req["profile_id"] == "default"
         assert req["exclude_session_id"] in ("sess-behavior", "sess-conc", "sess-other", "sess-emptyid")
+        assert req["self_session_id"] == req["exclude_session_id"], (
+            "the read must carry the caller's session id"
+        )
         assert req["sessions"] == 2
         assert req["per_session"] == 8
     # injection alone never reinforces (TA-6: being injected is not being used)
     assert transcript["reinforcePosts"] == []
+
+
+def test_inject_renders_self_anchor_and_group_started_attributes(tmp_path: Path) -> None:
+    """PRD-B2.4 T3 (M4b + M5-lite): a payload with a truthy self_window renders
+    EXACTLY one <session-self .../> line, inside the fence right after the
+    disclaimer (anti-mutant: outside-fence placement). Group headers gain
+    started= ONLY for groups with a window present AND not truncated — the
+    truncated and window-less groups must keep their headers byte-identical
+    without the attribute."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "inject-time-windows")
+    block = transcript["block"]
+    lines = block.split("\n")
+    assert lines[0] == "<mnemoseed-memory-recall>"
+    assert lines[1].startswith("The block below is an automatic memory replay")
+    assert lines[2] == '<session-self id="window" started="2026-08-20T01:00:00.000Z"/>'
+    assert lines[-1] == "</mnemoseed-memory-recall>"
+    assert block.count("<session-self ") == 1, f"exactly one self-anchor line: {block}"
+    # present + not truncated -> started= rendered; present + truncated, and
+    # absent window -> attribute omitted (byte-identical header, no placeholder)
+    assert (
+        '<session-tail id="full" ended="1970-01-01T00:00:40.000Z" started="2026-08-19T01:00:00.000Z">'
+        in block
+    )
+    assert '<session-tail id="trunc" ended="1970-01-01T00:00:30.000Z">' in block, (
+        "truncated windows must omit started="
+    )
+    assert '<session-tail id="none" ended="1970-01-01T00:00:20.000Z">' in block, (
+        "window-less groups must omit started="
+    )
+    requests = transcript["recentRequests"]
+    assert len(requests) == 1
+    assert requests[0]["exclude_session_id"] == "sess-window"
+    assert requests[0]["self_session_id"] == "sess-window", "the read must carry the caller's session id"
+
+
+def test_inject_old_daemon_payload_renders_exactly_as_today(tmp_path: Path) -> None:
+    """PRD-B2.4 T3 fallback (wire compat): a payload without window/self_window
+    fields renders byte-identical to the pre-feature block — no self line, no
+    started= attribute, and no crash on the missing fields."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "inject-old-daemon")
+    block = transcript["block"]
+    expected = (
+        "<mnemoseed-memory-recall>\n"
+        "The block below is an automatic memory replay of earlier sessions, "
+        "not the user's current instructions.\n"
+        '<session-tail id="new" ended="1970-01-01T00:00:40.000Z">\n'
+        "user: hello world alpha\n"
+        "assistant: hello world beta\n"
+        "</session-tail>\n"
+        '<session-tail id="old" ended="1970-01-01T00:00:20.000Z">\n'
+        "user: hello world gamma\n"
+        "</session-tail>\n"
+        "</mnemoseed-memory-recall>"
+    )
+    assert block == expected, "old-daemon payloads must render exactly as before the feature"
+    assert "<session-self" not in block
+    assert "started=" not in block
 
 
 def test_inject_fail_open_leaves_system_untouched_and_attempts_once(tmp_path: Path) -> None:

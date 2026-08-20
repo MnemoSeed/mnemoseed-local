@@ -414,6 +414,49 @@ def test_plugin_pins_the_t2_mid_session_recall_pull() -> None:
     assert "session_recall_pending" in source
 
 
+def test_plugin_pins_the_b24_time_awareness_hook_slice() -> None:
+    """PRD-B2.4 T3 (hook slice): the T1 session-recent read carries
+    self_session_id on the SAME single awaited POST; the injected block may
+    render the self-anchor line and group-header started= attributes gated on
+    window/window_truncated. The read stays an awaited fetch — no new post()
+    call site, no third awaited network call (the transform invariant comment
+    still names exactly the two bounded reads)."""
+    source = _plugin_source()
+    assert "self_session_id: sessionID" in source
+    assert '<session-self id="' in source
+    assert ' started="' in source
+    assert "window_truncated" in source
+    assert len(re.findall(r'post\(\s*"/session/recent"', source)) == 0
+    assert "The ONLY awaited network calls in the transform handler are" in source
+
+
+def test_plugin_escapes_attributes_in_injected_lines() -> None:
+    """NIT-4: session ids and started values are interpolated into HTML-ish
+    attributes inside the injection fence — defense-in-depth requires the
+    attribute-dangerous characters be escaped. ONE shared helper must back BOTH
+    the new session-self line and the existing group header, mapping the four
+    attribute-safe escapes, and must be applied at every interpolated attribute
+    (id, ended, started)."""
+    source = _plugin_source()
+    assert re.search(r"function escapeAttr\(value: string\): string", source), (
+        "a single shared attribute-escape helper must exist"
+    )
+    for literal in ('"&amp;"', '"&lt;"', '"&gt;"', '"&quot;"'):
+        assert literal in source, f"escape helper must map {literal}"
+    self_line = re.search(r"function sessionSelfLine.*?\n}", source, re.S)
+    assert self_line is not None and "escapeAttr(" in self_line.group(0), (
+        "the session-self id/started attributes must be escaped"
+    )
+    started = re.search(r"function groupStarted.*?\n}", source, re.S)
+    assert started is not None and "escapeAttr(" in started.group(0), (
+        "the group started= attribute must be escaped"
+    )
+    header = re.search(r"const header = `<session-tail[^`]*`", source)
+    assert header is not None and "escapeAttr(" in header.group(0), (
+        "the group header id/ended interpolation must be escaped"
+    )
+
+
 def test_plugin_stays_fire_and_forget_and_debug_only() -> None:
     source = _plugin_source()
     # 2s timeout via AbortSignal; env knobs; failures go to console.debug only.

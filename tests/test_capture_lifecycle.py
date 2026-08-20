@@ -14,6 +14,7 @@ fixes:
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,9 @@ from mnemoseed_local.schema.turn import (
     IngestEventType,
     MessageContent,
     ToolContent,
+    Turn,
     TurnRole,
+    TurnStep,
 )
 
 PROFILE = "default"
@@ -53,6 +56,20 @@ def _tool(session: str, ts: float, name: str = "bash", output: str = "ok") -> In
         profile_id=PROFILE,
         ts=ts,
         content=ToolContent(tool_name=name, input={}, output=output),
+    )
+
+
+def _raw_turn(session: str, text: str, ts: float = 1.0) -> Turn:
+    """A fully-formed closed Turn, handed directly to the pipeline's submit."""
+    return Turn(
+        turn_index=0,
+        session_id=session,
+        profile_id=PROFILE,
+        host=HOST,
+        started_at=ts,
+        ended_at=ts,
+        closed=True,
+        steps=[TurnStep(role=TurnRole.USER, content=text)],
     )
 
 
@@ -196,6 +213,21 @@ def test_segmenter_flush_all_closes_every_open_turn() -> None:
     assert segmenter.flush_all() == 0, "idempotent: nothing left open"
     assert len(pipeline.turns("s1")) == 1
     assert len(pipeline.turns("s2")) == 1
+
+
+def test_sessions_snapshot_shares_the_mutation_lock() -> None:
+    """The sessions() read is a consistent snapshot over the same lock that
+    guards submit_turn's mutation — so the threadpool routes that iterate the
+    snapshot never race the event-loop ingest lane."""
+    pipeline = InMemoryCapturePipeline()
+    assert pipeline.sessions() == ()
+    # a mutation through submit_turn and a concurrent sessions() snapshot both
+    # serialize on the same lock; the snapshot always observes a complete key
+    # set, never a half-written dict
+    for index in range(8):
+        pipeline.submit_turn(_raw_turn(f"s-lock-{index}", f"turn {index}"))
+    assert pipeline.sessions() == tuple(f"s-lock-{index}" for index in range(8))
+    assert isinstance(pipeline._turns_lock, type(threading.Lock()))
 
 
 # ---------------------------------------------------------------- B2.2 crash replay

@@ -10,6 +10,7 @@ the still-growing newest group (preferred over an arbitrary cut).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from mnemoseed_local.storage.drivers import (
     sqlite_meta,
     synthetic_embedder,
 )
+from mnemoseed_local.storage.drivers._time import iso8601_utc
 from mnemoseed_local.storage.registry import (
     EMBED_DRIVERS,
     GRAPH_DRIVERS,
@@ -35,6 +37,8 @@ from mnemoseed_local.storage.registry import (
 )
 
 PROFILE = "default"
+
+_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
 
 # test_registry.py clears the driver registries wholesale; any daemon-booting
 # module ordered after it must defensively re-register (test_preset_embedded
@@ -228,7 +232,7 @@ def test_session_recent_empty_profile_returns_no_groups(config_path: Path) -> No
     with TestClient(create_app()) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
-        assert body.json() == {"profile_id": PROFILE, "sessions": []}
+        assert body.json() == {"profile_id": PROFILE, "sessions": [], "self_window": None}
 
 
 def test_session_recent_rejects_out_of_range_caps(config_path: Path) -> None:
@@ -266,3 +270,132 @@ def test_session_recent_excludes_the_named_session(config_path: Path) -> None:
         assert body.status_code == 200, body.text
         sessions = body.json()["sessions"]
         assert [s["session_id"] for s in sessions] == ["sess-new", "sess-old"]
+
+
+# ---------------------------------------------------------------- B2 windows / self_window
+
+
+def _write_chunk(
+    client: TestClient,
+    chunk_id: str,
+    session_id: str | None,
+    ingested_at: float,
+    text: str,
+) -> None:
+    stores = client.app.state.stores
+    stamp = ChunkStamp(
+        chunk_id=chunk_id,
+        profile_id=PROFILE,
+        text=text,
+        cognitive_tier=CognitiveTier.TIER_1,
+        model_id="test-model",
+        cues=Cues(entities=[]),
+        provenance=Provenance(asserted_by="user", session_id=session_id, source="manual"),
+        ingested_at=ingested_at,
+    )
+    result = stores.embed.embed(text)
+    stores.vector.upsert_chunk(stamp, result.dense, result.sparse)
+
+
+def test_session_recent_group_windows_are_exact_not_page_visible(config_path: Path) -> None:
+    """A long old session's true first chunk sits beyond the recent discovery
+    page; the group window must come from an exact per-session scan, never a
+    page-visible approximation."""
+    with TestClient(create_app()) as client:
+        _write_chunk(client, "new-1", "s-new", 1000.0, "newest turn")
+        _write_chunk(client, "new-2", "s-new", 1001.0, "newer turn")
+        for i in range(1, 251):
+            _write_chunk(client, f"old-{i:03d}", "s-old", float(i), f"old turn {i}")
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "sessions": 2, "per_session": 20},
+        )
+        assert body.status_code == 200, body.text
+        groups = body.json()["sessions"]
+        assert [g["session_id"] for g in groups] == ["s-new", "s-old"]
+        assert groups[0]["window"] == {"first": iso8601_utc(1000.0), "latest": iso8601_utc(1001.0)}
+        # the page-visible first for s-old would be turn 93; the exact scan sees turn 1
+        assert groups[1]["window"] == {"first": iso8601_utc(1.0), "latest": iso8601_utc(250.0)}
+        assert groups[1]["window_truncated"] is False
+        for group in groups:
+            assert _ISO.fullmatch(group["window"]["first"])
+            assert _ISO.fullmatch(group["window"]["latest"])
+
+
+def test_session_recent_self_window_exact_window_only_keys(config_path: Path) -> None:
+    """The top-level self_window carries the exact window and the active flag —
+    and nothing else: no chunk text may leak into the window surface."""
+    with TestClient(create_app()) as client:
+        _ingest(client, "sess-self", 1.0, "self session turn")
+        flushed = client.post("/flush", json={"session_id": "sess-self", "profile_id": PROFILE})
+        assert flushed.status_code == 200, flushed.text
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "self_session_id": "sess-self"},
+        )
+        assert body.status_code == 200, body.text
+        self_window = body.json()["self_window"]
+        assert set(self_window) == {"session_id", "window", "chunk_count", "active"}
+        assert self_window["session_id"] == "sess-self"
+        assert _ISO.fullmatch(self_window["window"]["first"])
+        assert _ISO.fullmatch(self_window["window"]["latest"])
+        assert self_window["chunk_count"] >= 1
+        assert self_window["active"] is True  # flushed, not settled: still buffered
+
+
+def test_session_recent_self_window_null_when_absent_or_unknown(config_path: Path) -> None:
+    with TestClient(create_app()) as client:
+        _ingest(client, "sess-x", 1.0, "some turn")
+        client.post("/session/end", json={"session_id": "sess-x", "profile_id": PROFILE})
+
+        absent = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert absent.status_code == 200, absent.text
+        assert absent.json()["self_window"] is None
+
+        unknown = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "self_session_id": "no-such-session"},
+        )
+        assert unknown.status_code == 200, unknown.text
+        assert unknown.json()["self_window"] is None
+
+
+def test_session_recent_window_truncated_only_for_exceeding_group(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.daemon.memory.SESSION_WINDOW_SCAN_LIMIT", 2)
+    with TestClient(create_app()) as client:
+        for i in range(1, 4):
+            _write_chunk(client, f"big-{i}", "s-big", float(i), f"big turn {i}")
+        _write_chunk(client, "small-1", "s-small", 4.0, "small turn")
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "sessions": 2, "per_session": 5},
+        )
+        assert body.status_code == 200, body.text
+        groups = {g["session_id"]: g for g in body.json()["sessions"]}
+        assert groups["s-big"]["window_truncated"] is True
+        assert groups["s-big"]["window"] == {"first": iso8601_utc(2.0), "latest": iso8601_utc(3.0)}
+        assert groups["s-small"]["window_truncated"] is False
+        assert groups["s-small"]["window"] == {"first": iso8601_utc(4.0), "latest": iso8601_utc(4.0)}
+
+
+def test_session_recent_question_group_window_is_null(config_path: Path) -> None:
+    """The shared '?' group has no session identity to scan; its window is the
+    honest null, never a guessed session window."""
+    with TestClient(create_app()) as client:
+        _write_chunk(client, "c1", "s-a", 2.0, "labeled turn")
+        _write_chunk(client, "c2", None, 1.0, "manual pin")
+
+        body = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "sessions": 5, "per_session": 5},
+        )
+        assert body.status_code == 200, body.text
+        groups = {g["session_id"]: g for g in body.json()["sessions"]}
+        assert "?" in groups
+        assert groups["?"]["window"] is None
+        assert groups["?"]["window_truncated"] is False

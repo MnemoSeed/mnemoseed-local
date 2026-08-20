@@ -9,6 +9,7 @@ and the daemon refuses a non-loopback baseurl at boot.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from pathlib import Path
@@ -314,6 +315,43 @@ def test_capture_stamps_epoch_domain_timestamps(config_path: Path) -> None:
         arrow = db.open_table("chunks").to_arrow()
         ingested_at = float(arrow.column("ingested_at").to_pylist()[-1])
         assert abs(ingested_at - time.time()) < 300
+
+
+def test_recall_entries_carry_session_provenance_and_iso_ingested_at(config_path: Path) -> None:
+    """Chunk recall entries report their verbatim session id and an ISO-8601
+    UTC ingest time (never a raw epoch float) — the comparative structure the
+    time-comparison surface needs."""
+    _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+
+    with _boot(config_path) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert response.status_code == 202, response.text
+        settled = client.post(
+            "/session/end",
+            json={"session_id": SESSION, "profile_id": PROFILE},
+        )
+        assert settled.status_code == 200, settled.text
+
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "pnpm", "top_k": 5},
+        ).json()
+        entries = recall["memory"]["entries"]
+        chunk_entries = [entry for entry in entries if entry["kind"] == "chunk"]
+        assert chunk_entries, entries
+        for entry in chunk_entries:
+            assert entry["session_id"] == SESSION
+            assert _ISO.fullmatch(entry["ingested_at"])
 
 
 # ---------------------------------------------------------------- T1a: dream off the event loop

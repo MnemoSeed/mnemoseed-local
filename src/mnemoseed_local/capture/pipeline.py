@@ -9,6 +9,7 @@ consumer side (``drain`` / ``turns``), never inside the HTTP handler.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -52,21 +53,28 @@ class InMemoryCapturePipeline:
     def __init__(self) -> None:
         self._turns: dict[str, list[Turn]] = {}
         self._settled: dict[str, TurnRange] = {}
+        # Serializes buffer mutations (the event-loop ingest lane) against the
+        # sessions() snapshot (threadpool routes), so a snapshot is a consistent
+        # key set and never observes a half-written dict.
+        self._turns_lock = threading.Lock()
 
     def submit_turn(self, turn: Turn) -> None:
-        self._turns.setdefault(turn.session_id, []).append(turn)
+        with self._turns_lock:
+            self._turns.setdefault(turn.session_id, []).append(turn)
 
     def end_session(self, session_id: str, turn_range: TurnRange) -> None:
         self._settled[session_id] = turn_range
 
     def turns(self, session_id: str) -> list[Turn]:
-        return list(self._turns.get(session_id, []))
+        with self._turns_lock:
+            return list(self._turns.get(session_id, []))
 
     def settled(self, session_id: str) -> TurnRange | None:
         return self._settled.get(session_id)
 
     def sessions(self) -> tuple[str, ...]:
-        return tuple(self._turns)
+        with self._turns_lock:
+            return tuple(self._turns)
 
     def prune_settled(self, session_id: str) -> None:
         """QA-5: return a settled session's buffers to the OS.
@@ -78,7 +86,8 @@ class InMemoryCapturePipeline:
         """
         if session_id not in self._settled:
             return
-        self._turns.pop(session_id, None)
+        with self._turns_lock:
+            self._turns.pop(session_id, None)
         self._settled.pop(session_id, None)
 
 
