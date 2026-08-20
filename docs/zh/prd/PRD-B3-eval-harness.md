@@ -252,3 +252,44 @@ T2 确定性 AC 存在但**只测了"fresh root"半边**：`test_repeat_runs_sem
 - 不动 v1.1 schema（triples 载荷已够离线重判用）。
 - 不引 lite 档（原 B4b 节提到的 lite 档定版——本批只做隔离修复 + 全量 rerun 钉 bar，lite 档留下一批）。
 
+### B4b 收口记录（2026-08-21 立项并收口，squash `f0883bc`，PR #36 → issue #35）
+
+- **根因**：`run_matrix` 把每 cell 的 rig 根钉在稳定 `root / "cells" / cell.cell_id`（`--workdir` 跨次复用）；`EvalRig.__init__` 在既存 store 文件上 `build_stores` 不清理→第二次 `run_matrix` 于共享 profile `"canary"` 之上继续进料→reflect 检索上下文逐轮膨胀→pollution/core 单调膨胀、recall 乱跳。seed=42 固定≠可复现，因累积态改变 reflect 输入。所有回归只用过 fresh `tmp_path`，从无"同 root 跑两遍"守门，故 B4a 收口的"数字可复现"论断实际从未被验证。
+- **修法（架构师择 (c)：run-id + 幂等 wipe 双管）**：`matrix.py run_matrix` 入口一次性 `run_id = uuid4().hex[:8]`，rig 根改 `root / "runs" / run_id / cell.cell_id`（per-call 全新命名空间，并发安全）；`harness.py EvalRig.__init__` 取 `stores_dir`/`journal_dir` `shutil.rmtree` + `config_path.unlink(missing_ok=True)` 后再 `mkdir`（构造幂等，覆盖 `canary` 子命令与直构 rig 的稳定根复用）。
+- **回归 oracle（TDD 红先行）**：`test_run_matrix_same_root_twice_is_idempotent` 于同一 `root` 连跑两次 `run_matrix`→`report_to_dict` 全等（_norm started_at + per-cell cost.duration_s_）+ triples 计数等 + audit 行数不翻倍。RED pre-fix 实测 `4 == 2`（真实翻倍 audit 计数）；GREEN post-fix。QA 对抗自验发现 oracle 自毁漏洞——helper 内新构 `EvalRig` 触发 wipe 把要数的证据先擦掉→post-fix 绿成自指 `2==2` tautology；经一轮治（改只读 `sqlite3 ...?mode=ro` 直读 `audit_log` 行数，无 rig 构造）后 green 变真测量，且 3 向 stash 实证（仅 Change1 / 仅 Change2 / 无修法）严格分辨"有隔离 vs 无"。
+- **门禁**：**1377 passed / 3 skipped**，ruff / ruff format / mypy（90 files）全净；PR #36 CI（test + install-smoke×2）全绿。
+- **QA 裁决**：CLOSABLE，无 BLOCKER（audit-oracle 自毁 tautology 经一轮治由 IMPORTANT 降为钉死；6 mutation 中只"有隔离 vs 无"被钉死——架构师已 bless (a)/(b)/(c) 任一皆可，故单机制 untested 是构造边界非漏洞；uuid 唯一性/并发 + Change2 稳定根 wipe 覆盖为 NOTE 留档）。
+
+### B4b live rerun 实测记录（2026-08-20T20:46Z，canary-00，12 cell × 1 material，零 skipped，约 16 分钟）
+
+报告：`C:\Users\Little Star\.mnemoseed-local\eval\2026-08-20T20-46-07Z-12cells-1materials.json`。**隔离修法 live 验证成立**：core/pollution 全程被框死（0–14 / 0–6），08-20 累积污染（core 103 / pollution 53）完全消失。
+
+| cell | recall | pollution | core | judged | tokens | t | collapse_attempts | recovered |
+|---|---|---|---|---|---|---|---|---|
+| qwen3_5_9b + off | 0.00 | 0 | 0 | - | 0 | 28s | **3** | False |
+| qwen3_5_9b + verify | 0.00 | 0 | 0 | - | 0 | 9s | **3** | False |
+| gemma4_e4b + off | 0.625 | 4 | 12 | - | 1900 | 50s | 0 | False |
+| gemma4_e4b + verify | 0.625 | 6 | 14 | 14 | 3674 | 30s | 0 | False |
+| qwen3_5_4b + off | 0.00 | 0 | 6 | - | 1154 | 21s | 0 | False |
+| qwen3_5_4b + verify | 0.625 | 0 | 8 | 8 | 2099 | 33s | 0 | False |
+| qwen3_8b + off | 0.00 | 0 | 0 | - | 0 | 123s | 0 | False |
+| qwen3_8b + verify | 0.125 | 3 | 11 | 11 | 2572 | 79s | 0 | False |
+| qwen3_4b ×2 | 0.00 | 0 | 0 | - | 0 | 190s | 0 | False |
+| gemma4_12b ×2 | 0.00 | 0 | 0 | - | 0 | 190s | 0 | False |
+
+**收口发现（如实）**：
+
+1. **隔离修法达目的**：非撞墙非坍缩 cell 的 core/pollution 于干净单跑内自洽，无跨跑累积。本报告即可信 bar 基线。
+2. **qwen3.5:9b seed=42 仍 3/3 坍缩（正面否定 B4a 收口论断）**：off+verify 两态 `reflect_collapse_attempts=3 / reflect_recovered=False`（坍缩分类器正确触发并报告，但穷尽 3 次重试仍字面 `[]` completion=2）→ reflect degraded、recall=0.00 tokens=0。B4a 收口称"seed=42 → 3/3 满抽取 780 tok"系 RCA 控制实验结论——live matrix 的 packed canary delta reflect 提示词下不复现。**核查**：ollama driver `seed` 正确 thread（`ollama.py:40` 在 option 白名单 + `_ollama_options` 转发 + `payload["options"]["seed"]` 入 /api/chat），driver 无 bug——问题在 prompt/model 层（提示词/num_ctx 交互/温度/或需退 verify 席）。**bar：qwen3.5:9b recall=0.00 不可信（collapse-driven zero，非模型质量基线）**。
+3. **gemma4:e4b = 干净基线**：recall 0.625 两态、core 12/14、pollution off 4 → verify 6（**升**，与 B3.1 "verify 减排 6→1" 相反——本批可复现 honest 发现：verify 不总减排，方差/canary seed 语境不同）。
+4. **qwen3.5:4b verify 真增益**：off recall 0.00（core 6 全 isolated/形状不对）→ verify recall 0.625 pollution 0，verify 在此方向正向。
+5. **qwen3:8b reflect 截断/畸形 JSON**：off 态 "Expecting ',' delimiter" + 重试 → degraded；verify 态 partial 0.125。reflect 截断仍是 8b 的真实风险。
+6. **60s 超时墙 ×4 钉死 qwen3:4b/gemma4:12b 两态**（190s≈60s×3 retry）——B3.1 墙发现再确认，B4 档位定版硬输入。
+7. 既有"单跑数值不当 bar"口径仍成立：仅一跑，方差类 cell（qwen3.5:9b/qwen3.5:4b/qwen3:8b）的数字是**单点观测**非统计共识，bar 仅钉确定性 cell（gemma4:e4b 两态、撞墙族指纹）。
+
+### 排队项（B4c 候选，交用户拍板）
+
+- **qwen3.5:9b 矩阵 reflect 席 seed=42 仍坍缩**：B4a 的 "固定 seed 即治" 论断被本批 live 否定。候选修法方向（B4c 批次定）：(a) reflect 提示词压缩/重排避免坍缩诱导；(b) reflect 席温度非零（破 greedy 坍缩，B4a RCA 已注 temp=0=必坍缩）；(c) qwen3.5:9b 退出 reflect 席（仅作 verify/云锚对照）；(d) 空值守卫把 `[]` 视坍缩信号而非合法空抽取并加有限重试外的不降级策略。本批不立项，待用户定。
+- **lite 档定版**：原 B4b 节划出，留下一批。
+
+
