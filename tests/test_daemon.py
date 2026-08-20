@@ -387,6 +387,70 @@ def test_recall_entries_carry_session_provenance_and_iso_ingested_at(config_path
             assert _ISO.fullmatch(entry["ingested_at"])
 
 
+# ---------------------------------------------------------------- B6 (W-C): drain off the event loop
+
+
+def test_settle_and_flush_drain_on_dedicated_daemon_thread(config_path: Path) -> None:
+    """B6 (W-C): the capture drain runs on a dedicated mnemoseed-drain daemon
+    thread, never on the event loop — a store write inside drain() must show up
+    as a mnemoseed-drain-* thread name (the pre-fix drain ran inline on the
+    loop, blocking every endpoint for its whole duration). Both drain sites
+    (/session/end and /flush) use the lane, and the lane worker is a daemon
+    thread never registered in the interpreter's atexit join set (F2 根治)."""
+    from concurrent.futures import thread as cf_thread
+
+    with _boot(config_path) as client:
+        app = client.app
+        names: list[str] = []
+        original_drain = app.state.capture.drain
+
+        def recording_drain(session_id: str) -> None:
+            names.append(threading.current_thread().name)
+            original_drain(session_id)
+
+        app.state.capture.drain = recording_drain
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        flushed = client.post("/flush", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert flushed.status_code == 200, flushed.text
+        assert names, "the drain never ran"
+        assert all(name.startswith("mnemoseed-drain-") for name in names), (
+            f"the drain ran on the event loop: {names}"
+        )
+        drain_threads = [t for t in threading.enumerate() if t.name.startswith("mnemoseed-drain-")]
+        assert drain_threads, "no mnemoseed-drain worker spawned"
+        assert all(t.daemon for t in drain_threads), "drain workers must be daemon threads"
+        assert all(t not in cf_thread._threads_queues for t in drain_threads), (
+            "the drain worker must never join the interpreter's atexit join set"
+        )
+
+
+def test_drain_exception_propagates_to_the_ack(config_path: Path) -> None:
+    """B6 (W-C): the ack is the drain's completion — a failing drain surfaces
+    its exception into the response path exactly like the pre-fix synchronous
+    raise (an honest error on both drain sites, never a swallowed success)."""
+    with _boot(config_path) as client:
+        calls = {"n": 0}
+
+        def broken_drain(session_id: str) -> None:
+            del session_id
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("drain exploded")
+
+        client.app.state.capture.drain = broken_drain
+        _ingest_turn(client, "sess-raise-settle", 1.0, DURABLE_TEXT)
+        with pytest.raises(RuntimeError, match="drain exploded"):
+            client.post("/session/end", json={"session_id": "sess-raise-settle", "profile_id": PROFILE})
+        _ingest_turn(client, "sess-raise-flush", 2.0, DURABLE_TEXT)
+        with pytest.raises(RuntimeError, match="drain exploded"):
+            client.post("/flush", json={"session_id": "sess-raise-flush", "profile_id": PROFILE})
+    # the aborted settle never pruned: teardown re-drains the buffered session
+    # and must not blow up teardown for a handler-side failure (calls 3+ stay
+    # healthy)
+
+
 # ---------------------------------------------------------------- T1a: dream off the event loop
 
 

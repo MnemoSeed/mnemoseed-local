@@ -8,10 +8,13 @@ import asyncio
 import math
 import threading
 import time
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
 
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.storage.drivers import lancedb_embedded as _lancedb_embedded
 from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 from mnemoseed_local.storage.ports import (
@@ -340,6 +343,66 @@ def _unit_vector(first: float, second: float = 0.0) -> list[float]:
     return [v / norm for v in axis]
 
 
+class _LimitSpy:
+    """Wraps a LanceDB query builder, recording every limit() argument of the
+    vector prefilter searches (get_chunk's plain one-row lookups are skipped)."""
+
+    def __init__(self, query: Any, limits: list[int], record: bool) -> None:
+        self._query = query
+        self._limits = limits
+        self._record = record
+
+    def where(self, *args: Any, **kwargs: Any) -> "_LimitSpy":
+        self._query = self._query.where(*args, **kwargs)
+        return self
+
+    def metric(self, *args: Any, **kwargs: Any) -> "_LimitSpy":
+        self._query = self._query.metric(*args, **kwargs)
+        return self
+
+    def limit(self, n: int) -> "_LimitSpy":
+        if self._record:
+            self._limits.append(n)
+        self._query = self._query.limit(n)
+        return self
+
+    def offset(self, n: int) -> "_LimitSpy":
+        self._query = self._query.offset(n)
+        return self
+
+    def to_list(self) -> list[dict[str, Any]]:
+        return self._query.to_list()
+
+
+def _spy_search(table: Any, limits: list[int]):
+    real = table.search
+
+    def spy(*args: Any, **kwargs: Any) -> _LimitSpy:
+        return _LimitSpy(real(*args, **kwargs), limits, record=bool(args))
+
+    return spy
+
+
+def _fail_if_called(*_args: Any, **_kwargs: Any) -> None:
+    raise AssertionError("near_duplicate must not paginate the full table")
+
+
+def _bulk_rows(
+    store: LanceDbEmbeddedStore,
+    count: int,
+    prefix: str,
+    dense: Sequence[float],
+    text: str,
+    batch: int = 500,
+) -> None:
+    for start in range(0, count, batch):
+        rows = [
+            store._to_row(_make(f"{prefix}{i:04d}", f"{text} {i}"), dense, SparseVector((), ()))
+            for i in range(start, min(start + batch, count))
+        ]
+        store._table.merge_insert("chunk_id").when_not_matched_insert_all().execute(rows)
+
+
 def test_near_duplicate_finds_self_at_high_threshold(store):
     vector = _unit_vector(1.0)
     store.upsert_chunk(_make("a1", "alpha beta gamma"), vector, SparseVector((), ()))
@@ -383,6 +446,143 @@ def test_near_duplicate_empty_when_none_similar(store, embedder):
 
 def test_near_duplicate_empty_table(store):
     assert store.near_duplicate([0.2] * _DIM, threshold=0.9) == []
+
+
+def test_near_duplicate_uses_ann_prefilter_not_full_scan(store, monkeypatch):
+    """The probe pre-filters via a capped top-K scan (limit <= widened K) and
+    never pages the full table, even past the old 500-row page boundary."""
+    probe = _unit_vector(1.0)
+    noise = _unit_vector(0.0, 1.0)
+    _bulk_rows(store, 1200, "n", noise, "noise row")
+    store.upsert_chunk(_make("dup", "the duplicate"), probe, SparseVector((), ()))
+
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+    monkeypatch.setattr(store, "_paginate", _fail_if_called, raising=False)
+
+    found = store.near_duplicate(probe, threshold=0.99, profile_id="alice")
+    assert [chunk.chunk_id for chunk in found] == ["dup"]
+    assert limits == [50]
+
+
+def test_near_duplicate_widens_prefilter_when_kth_near_threshold(store, monkeypatch):
+    """When the K-th top-K candidate's dense sim is within MARGIN of the
+    threshold, K widens (x4 + 50) and re-scans so a true duplicate ranked
+    beyond the initial K is still caught."""
+    probe = _unit_vector(1.0)
+    _bulk_rows(store, 60, "w", probe, "tied duplicate")
+
+    before = getattr(_lancedb_embedded, "near_duplicate_widenings", lambda: -1)()
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+
+    found = store.near_duplicate(probe, threshold=0.9, profile_id="alice")
+
+    assert limits == [50, 200]
+    assert _lancedb_embedded.near_duplicate_widenings() == before + 1
+    assert len(found) == 60
+
+
+def test_near_duplicate_no_widening_when_kth_below_margin(store, monkeypatch):
+    """A candidate set whose K-th dense sim sits below threshold - MARGIN
+    keeps the top-K scan at K — widening only engages near the threshold."""
+    probe = _unit_vector(1.0)
+    nearish = _unit_vector(0.5, math.sqrt(1.0 - 0.5**2))
+    _bulk_rows(store, 50, "c", nearish, "far candidate")
+    store.upsert_chunk(_make("dup", "the duplicate"), probe, SparseVector((), ()))
+
+    before = getattr(_lancedb_embedded, "near_duplicate_widenings", lambda: -1)()
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+
+    found = store.near_duplicate(probe, threshold=0.9, profile_id="alice")
+
+    assert limits == [50]
+    assert _lancedb_embedded.near_duplicate_widenings() == before
+    assert [chunk.chunk_id for chunk in found] == ["dup"]
+
+
+def test_near_duplicate_tie_break_pins_chunk_id_asc(store):
+    """Exact-duplicate ties order dense-desc then chunk_id asc so the caller's
+    band[0] cannot silently flip identity between identical chunks."""
+    vector = _unit_vector(1.0)
+    store.upsert_chunk(_make("b1", "duplicate b"), vector, SparseVector((), ()))
+    store.upsert_chunk(_make("a1", "duplicate a"), vector, SparseVector((), ()))
+
+    found = store.near_duplicate(vector, threshold=0.99, profile_id="alice")
+    assert [chunk.chunk_id for chunk in found] == ["a1", "b1"]
+
+
+def test_near_duplicate_prefilter_ranks_by_cosine_not_l2(store, monkeypatch):
+    """The top-K scan must rank by cosine, not L2: a scaled duplicate (same
+    direction, larger norm) ties cos=1.0 but is farthest in L2, so only the
+    cosine metric keeps it inside the K window."""
+    probe = _unit_vector(1.0)
+    scaled_dup = [2.0] + [0.0] * (_DIM - 1)
+    lure = _unit_vector(0.8, math.sqrt(1.0 - 0.8**2))
+    _bulk_rows(store, 60, "l", lure, "lure")
+    store.upsert_chunk(_make("dup", "scaled duplicate"), scaled_dup, SparseVector((), ()))
+
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+
+    found = store.near_duplicate(probe, threshold=0.99, profile_id="alice")
+
+    assert [chunk.chunk_id for chunk in found] == ["dup"]
+    assert limits == [50]
+
+
+def test_near_duplicate_sorts_dense_desc(store):
+    """Hits order dense-desc so the caller's band[0] is the strongest match —
+    a flip to ascending would absorb into the worst near-dup."""
+    probe = _unit_vector(1.0)
+    exact = [1.0] + [0.0] * (_DIM - 1)
+    mid = _unit_vector(0.95, math.sqrt(1.0 - 0.95**2))
+    near = _unit_vector(0.86, math.sqrt(1.0 - 0.86**2))
+    store.upsert_chunk(_make("near", "weakest echo"), near, SparseVector((), ()))
+    store.upsert_chunk(_make("mid", "middle echo"), mid, SparseVector((), ()))
+    store.upsert_chunk(_make("exact", "verbatim"), exact, SparseVector((), ()))
+
+    found = store.near_duplicate(probe, threshold=0.8, profile_id="alice")
+
+    assert [chunk.chunk_id for chunk in found] == ["exact", "mid", "near"]
+
+
+def test_near_duplicate_widens_when_kth_inside_margin_band(store, monkeypatch):
+    """A K-th candidate whose dense sim lands inside (threshold - MARGIN,
+    threshold) must widen — the boundary case between the pinned 1.0 and 0.5
+    sides of the window."""
+    probe = _unit_vector(1.0)
+    in_band = _unit_vector(0.87, math.sqrt(1.0 - 0.87**2))
+    _bulk_rows(store, 60, "ib", in_band, "in-band candidate")
+
+    before = getattr(_lancedb_embedded, "near_duplicate_widenings", lambda: -1)()
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+
+    found = store.near_duplicate(probe, threshold=0.9, profile_id="alice")
+
+    assert limits == [50, 200]
+    assert _lancedb_embedded.near_duplicate_widenings() == before + 1
+    assert found == []
+
+
+def test_near_duplicate_no_widening_when_kth_just_below_band(store, monkeypatch):
+    """A K-th candidate just below threshold - MARGIN must not widen — the
+    guard's lower edge, not just a far-below case."""
+    probe = _unit_vector(1.0)
+    below_band = _unit_vector(0.83, math.sqrt(1.0 - 0.83**2))
+    _bulk_rows(store, 60, "bb", below_band, "below-band candidate")
+
+    before = getattr(_lancedb_embedded, "near_duplicate_widenings", lambda: -1)()
+    limits: list[int] = []
+    monkeypatch.setattr(store._table, "search", _spy_search(store._table, limits))
+
+    found = store.near_duplicate(probe, threshold=0.9, profile_id="alice")
+
+    assert limits == [50]
+    assert _lancedb_embedded.near_duplicate_widenings() == before
+    assert found == []
 
 
 # ---------------------------------------------------------------- snapshot / lifecycle

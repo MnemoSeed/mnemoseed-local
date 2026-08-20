@@ -20,9 +20,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -95,11 +96,18 @@ _VERIFIER_ROLE = "dream_verifier"
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
-# F2 根治 (PRD-B2.3 append): the bounded stop wait for a wedged in-flight
-# dream chain. Worst-case teardown budget: retriever close (2s) + this wait
-# (5s) + capture drain and store close (~2s) ≈ 9s total, under the watchdog's
-# refused-grace kill margin (~10s grace + 1s probe interval).
+# F2 根治 (PRD-B2.3 append) + B6 (W-C): the bounded stop waits for a wedged
+# in-flight dream chain and for the capture drain lane. Worst-case teardown
+# budget: dream stop wait (5s) + retriever close (2s) + drain stop wait (2s)
+# + store close (~1s) ≈ 10s total — a ~1s margin under the watchdog's
+# refused-grace kill window (~10s grace + 1s probe interval).
 DREAM_STOP_TIMEOUT_S = 5.0
+# DRAIN_STOP_TIMEOUT_S is a WHOLE-QUEUE budget on the single drain worker:
+# every buffered session competes for the same 2s window, so a large backlog
+# can push tail sessions past the deadline and abandon them. Accepted boundary:
+# the host-side B2.2 replay re-posts an abandoned tail on the next session, so
+# a graceful restart never permanently loses data (no per-drain knob, KISS).
+DRAIN_STOP_TIMEOUT_S = 2.0
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -423,6 +431,103 @@ class DreamWorker:
             return False
 
 
+class DrainLane:
+    """Runs the capture drain off the event loop on one dedicated daemon thread.
+
+    ``WritingPipeline.drain`` is store I/O that used to run inline on the app
+    loop, blocking every endpoint for its whole duration. The lane executes each
+    drain on a ``DaemonExecutor`` with ``max_workers=1`` (per-session FIFO for
+    free; the store write lock serializes anyway). The handler awaits the drain
+    future, so the ack still means completed-applied; ``stop()`` completes every
+    queued drain with a bounded wait before the stores close and abandons a
+    wedged one on the deadline — the abandoned worker stays a daemon thread and
+    dies with the process (F2 根治 semantics: teardown never hangs).
+    """
+
+    def __init__(
+        self,
+        *,
+        stop_timeout: float = DRAIN_STOP_TIMEOUT_S,
+    ) -> None:
+        self._stop_timeout = stop_timeout
+        self._executor = DaemonExecutor(max_workers=1, thread_name_prefix="mnemoseed-drain")
+        self._pending: dict[str, ConcurrentFuture[Any]] = {}
+        self._lock = threading.Lock()
+
+    def submit(self, fn: Callable[[str], Any], session_id: str) -> None:
+        """Queue one drain without awaiting (teardown submits all, then stops)."""
+        future = self._executor.submit(fn, session_id)
+        with self._lock:
+            self._pending[session_id] = future
+
+    async def drain(self, fn: Callable[[str], Any], session_id: str) -> None:
+        """Queue one drain and await its completion (the ack = applied)."""
+        future = self._executor.submit(fn, session_id)
+        with self._lock:
+            self._pending[session_id] = future
+        try:
+            await asyncio.wrap_future(future)
+        finally:
+            with self._lock:
+                if self._pending.get(session_id) is future:
+                    self._pending.pop(session_id, None)
+
+    async def stop(self) -> tuple[int, int, int]:
+        """Complete every queued drain with a bounded wait, then close the lane.
+
+        Returns (completed, failed, abandoned): the drains that finished, the
+        ones that raised (a teardown-time data-loss event with no awaiting
+        handler — logged per session with the exception), and the ones wedged
+        past the deadline (never joined — the daemon worker dies with the
+        process; the host-side B2.2 replay absorbs their undrained turns).
+        Close is terminal: no drain can be submitted after stop.
+        """
+        deadline = time.monotonic() + self._stop_timeout
+        completed = 0
+        failed: list[str] = []
+        abandoned: list[str] = []
+        while True:
+            with self._lock:
+                pending = dict(self._pending)
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                abandoned.extend(pending)
+                break
+            wrapped = {session_id: asyncio.wrap_future(future) for session_id, future in pending.items()}
+            for afut in wrapped.values():
+                # retrieve a wrapper's exception on completion so a late-failing
+                # abandoned drain never leaves a 'never retrieved' loop warning
+                afut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+            await asyncio.wait(wrapped.values(), timeout=remaining)
+            for session_id, afut in wrapped.items():
+                if not afut.done():
+                    continue
+                with self._lock:
+                    if self._pending.get(session_id) is pending[session_id]:
+                        self._pending.pop(session_id, None)
+                exc = afut.exception()
+                if exc is not None:
+                    failed.append(session_id)
+                    logger.warning(
+                        "teardown: drain failed for session %s: %s",
+                        session_id,
+                        exc,
+                    )
+                else:
+                    completed += 1
+        if abandoned:
+            logger.warning(
+                "teardown: abandoned %d wedged drain(s): %s — the undrained "
+                "turns are absorbed by the B2.2 host-side replay",
+                len(abandoned),
+                ", ".join(abandoned),
+            )
+        self._executor.close(timeout=0)
+        return completed, len(failed), len(abandoned)
+
+
 class _DreamRelay:
     """Deferred dream-event delivery off the scoring hot path.
 
@@ -688,6 +793,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         deferred_resumes,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
+    # B6 (W-C): the drain lane runs WritingPipeline.drain off the event loop on
+    # one dedicated daemon thread. Per-lifespan (drains are recoverable-critical,
+    # unlike the never-closed scan singleton); teardown stops it before the
+    # stores close.
+    app.state.drain_lane = DrainLane()
     # Dream chain thread (T1a): the capture/memory surface never blocks on a
     # dream. Started here so the worker consumes events from boot onward.
     app.state.dream_worker.start()
@@ -738,17 +848,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for deg in stores.report.missing:
             logger.warning("degraded: %s - %s", deg.feature, deg.behavior)
     yield
-    # QA-4: drain the capture lane BEFORE anything closes — restart mid-reply
-    # must not lose the last exchange. Open turns close off the hot path, then
-    # every buffered session drains into the stores they belong to.
-    logger.info("teardown: drain capture lane")
-    segmenter = getattr(app.state, "segmenter", None)
-    capture = getattr(app.state, "capture", None)
-    drain = getattr(capture, "drain", None)
-    if segmenter is not None and drain is not None and capture is not None:
-        segmenter.flush_all()
-        for session_id in capture.sessions():
-            drain(session_id)
     # Stop the background loops before the stores close (lifecycle order).
     logger.info("teardown: stop background loops")
     for task_name in ("decay_task", "scheduler_task"):
@@ -761,10 +860,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pass
     logger.info("teardown: close memory")
     app.state.memory.close()
-    # Drain an in-flight dream before the stores close (the chain uses the
-    # storage stack); new event submissions stop with the cancelled scheduler.
+    # Stop the dream worker before the drain lane: its in-flight chain releases
+    # the shared storage stack earlier, shrinking the drain-abandon risk (B6 W-C).
+    # New event submissions stopped with the cancelled scheduler above.
     logger.info("teardown: stop dream worker")
     await app.state.dream_worker.stop()
+    # QA-4: drain the capture lane BEFORE anything closes — restart mid-reply
+    # must not lose the last exchange. Open turns close off the hot path, then
+    # every buffered session drains into the stores they belong to; the drains
+    # run on the drain lane thread and teardown waits for ALL of them (bounded)
+    # before the stores close (B6 W-C).
+    logger.info("teardown: drain capture lane")
+    segmenter = getattr(app.state, "segmenter", None)
+    capture = getattr(app.state, "capture", None)
+    drain = getattr(capture, "drain", None)
+    lane = getattr(app.state, "drain_lane", None)
+    if segmenter is not None and drain is not None and capture is not None:
+        segmenter.flush_all()
+        for session_id in capture.sessions():
+            if lane is not None:
+                lane.submit(drain, session_id)
+            else:
+                drain(session_id)
+        if lane is not None:
+            completed, failed, abandoned = await lane.stop()
+            logger.info(
+                "teardown: drain lane complete (%d drained, %d failed, %d abandoned)",
+                completed,
+                failed,
+                abandoned,
+            )
     logger.info("teardown: close stores")
     await stores.close()
     logger.info("teardown: complete")

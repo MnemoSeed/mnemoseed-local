@@ -31,6 +31,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
@@ -51,10 +52,11 @@ from mnemoseed_local.dream import (
     result_from_payload,
 )
 from mnemoseed_local.dream.merge import MergeOutcome, MergeSummary
-from mnemoseed_local.dream.reflect import ReflectionResult
+from mnemoseed_local.dream.reflect import ChatLLM, ReflectionResult
 from mnemoseed_local.dream.snapshot import Snapshot, load_snapshot_file
 from mnemoseed_local.eval.canary import CanarySession, CanaryTurn
 from mnemoseed_local.llm import RoleRouter
+from mnemoseed_local.llm.types import ChatResult
 from mnemoseed_local.schema.turn import HostId, IngestEvent, IngestEventType, MessageContent
 from mnemoseed_local.storage.factory import Stores, build_stores
 from mnemoseed_local.storage.ports import (
@@ -118,6 +120,80 @@ class EvalCell:
         return "+".join(parts)
 
 
+# ---------------------------------------------------------------- collapse guard (B4a)
+#
+# RCA (PRD-B3 "B4 前置排查"): the matrix reflect seat (think=False, no
+# seed/temperature) makes qwen3.5:9b emit a literal ``[]`` ~67% of the time
+# (ollama eval_count=2) — accepted as a "legit empty extraction" it hardens
+# into a deterministic-looking zero-recall cell. The classifier below pins the
+# exact fingerprint; the reflect retry loop turns it into a typed retry, and
+# the per-seat fixed seed (matrix.py) is the actual recovery.
+
+#: The verbatim collapse output (RCA fingerprint: content='[]').
+_COLLAPSE_TEXT = "[]"
+
+#: The completion-count boundary of the collapse fingerprint (ollama
+#: eval_count=2 for a bare ``[]``; any whitespace/formatting pushes it above).
+#: A well-formed empty extraction under normal token counts never matches.
+COLLAPSE_MAX_COMPLETION_TOKENS = 2
+
+
+class ReflectCollapseError(Exception):
+    """The reflect seat returned the sampling-collapse fingerprint: a verbatim
+    empty JSON array with a tiny completion count. The reflect retry loop
+    treats it as any other typed failure; the pinned seed is the recovery."""
+
+
+def is_reflect_collapse(
+    response: str | ChatResult, *, max_completion_tokens: int = COLLAPSE_MAX_COMPLETION_TOKENS
+) -> bool:
+    """True only for the collapse fingerprint: a verbatim ``[]`` text with a
+    tiny provider-reported completion count. Plain-text responses (no usage
+    fingerprint) and well-formed empty arrays under normal token counts are
+    never collapses."""
+    if not isinstance(response, ChatResult):
+        return False
+    usage = response.usage
+    if usage is None or usage.completion_tokens is None:
+        return False
+    return response.text.strip() == _COLLAPSE_TEXT and usage.completion_tokens <= max_completion_tokens
+
+
+class _CollapseGuard:
+    """Wraps a resolved reflect seat: raises ``ReflectCollapseError`` on the
+    collapse fingerprint (verbatim ``[]`` with completion <= 2) so the reflect
+    retry loop engages, and records per-run collapse attempts / recovery for
+    the report surface. The fingerprint is classified regardless of whether
+    the empty array was legitimate; only a well-formed empty extraction under
+    normal token counts passes through."""
+
+    def __init__(self, llm: ChatLLM, *, max_completion_tokens: int = COLLAPSE_MAX_COMPLETION_TOKENS) -> None:
+        self._llm = llm
+        self._max_completion_tokens = max_completion_tokens
+        self.run_collapse_attempts: int = 0
+        self.run_recovered: bool = False
+
+    def reset_run(self) -> None:
+        self.run_collapse_attempts = 0
+        self.run_recovered = False
+
+    def chat(self, *, system: str, user: str) -> str | ChatResult:
+        response = self._llm.chat(system=system, user=user)
+        if isinstance(response, ChatResult) and is_reflect_collapse(
+            response, max_completion_tokens=self._max_completion_tokens
+        ):
+            self.run_collapse_attempts += 1
+            usage = response.usage
+            assert usage is not None and usage.completion_tokens is not None
+            raise ReflectCollapseError(
+                f"reflect collapse fingerprint: literal {_COLLAPSE_TEXT!r} "
+                f"with completion_tokens={usage.completion_tokens}"
+            )
+        if self.run_collapse_attempts > 0:
+            self.run_recovered = True
+        return response
+
+
 # ---------------------------------------------------------------- run read-back
 
 
@@ -166,6 +242,13 @@ class CellRun:
     # turn index (material order) -> the mini-session id that carried it;
     # chunk.session_id reversed through this tuple gives exact attribution.
     turn_sessions: tuple[str, ...] = ()
+    # B4a collapse surface: how many reflect attempts hit the collapse
+    # fingerprint (max_retries=2 -> at most 3), and whether one recovered.
+    reflect_collapse_attempts: int = 0
+    reflect_recovered: bool = False
+    # the reflect seat's pinned sampling seed (None when the route carries no
+    # seed, e.g. stub seats or --no-seat-seed runs).
+    seat_seed: int | None = None
 
 
 # ---------------------------------------------------------------- rig paths
@@ -209,14 +292,23 @@ class _RecordingMerger(Merger):
 
 
 class _RecordingReflector(ReflectOrchestrator):
-    """Reflector that keeps its last typed outcome (cost telemetry)."""
+    """Reflector that keeps its last typed outcome (cost telemetry) plus the
+    collapse-guard counters for the current run (B4a report surface)."""
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, collapse_guard: _CollapseGuard | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.last_outcome: ReflectOutcome | None = None
+        self.last_collapse_attempts: int = 0
+        self.last_reflect_recovered: bool = False
+        self._collapse_guard = collapse_guard
 
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
+        if self._collapse_guard is not None:
+            self._collapse_guard.reset_run()
         self.last_outcome = super().reflect(snapshot)
+        if self._collapse_guard is not None:
+            self.last_collapse_attempts = self._collapse_guard.run_collapse_attempts
+            self.last_reflect_recovered = self._collapse_guard.run_recovered
         return self.last_outcome
 
 
@@ -250,7 +342,14 @@ class EvalRig:
     intended shape (matrix cells share their rig), so ``close()`` is explicit.
     """
 
-    def __init__(self, paths: RigPaths, cell: EvalCell, *, profile_id: str = "canary") -> None:
+    def __init__(
+        self,
+        paths: RigPaths,
+        cell: EvalCell,
+        *,
+        profile_id: str = "canary",
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.paths = paths
         self.cell = cell
         self.profile_id = profile_id
@@ -312,8 +411,14 @@ class EvalRig:
             meta=self._stores.meta,
             ledger=ledger,
         )
+        collapse_guard = _CollapseGuard(router.resolve("dream"))
         reflector = _RecordingReflector(
-            llm=router.resolve("dream"),
+            llm=collapse_guard,
+            collapse_guard=collapse_guard,
+            # B4a: cap the reflect retry lane at 3 total attempts (default 3
+            # retries = 4 attempts is wasteful against a deterministic collapse).
+            max_retries=2,
+            sleep=sleep,
             directory=snapshotter.directory,
             packer=DeltaPacker(budget_tokens=cell.delta_budget_tokens),
             on_done=trigger.on_reflect_complete,
@@ -321,6 +426,7 @@ class EvalRig:
             ledger=ledger,
             verifier=verifier,
         )
+        self._collapse_guard = collapse_guard
         merger = _RecordingMerger(
             graph_main=self._stores.graph,
             graph_isolated=cast(GraphStore, isolated),
@@ -493,6 +599,9 @@ class EvalRig:
             token_usage=usage_delta,
             duration_s=duration_s,
             turn_sessions=turn_sessions,
+            reflect_collapse_attempts=self._reflector.last_collapse_attempts,
+            reflect_recovered=self._reflector.last_reflect_recovered,
+            seat_seed=dict(self.cell.reflect.params).get("seed"),
         )
 
     def _read_nodes(self, graph: GraphStore, profile: str, name: str) -> tuple[RecordedNode, ...]:

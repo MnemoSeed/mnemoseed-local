@@ -23,6 +23,13 @@ from mnemoseed_local.eval.metrics import CanaryMetrics, CostMetrics, VerifyMetri
 
 REPORT_SCHEMA_VERSION = "v1.1"
 
+#: Seed-policy values (B4a): "per-seat-fixed" marks runs whose ollama seats
+#: carry the pinned sampling seed; "none" marks ``--no-seat-seed`` runs.
+#: Pre-B4a reports predate both and load as "none" — their seats were
+#: unseeded, so a fixed label would contradict the cells' ``seat_seed`` None.
+SEAT_SEED_POLICY_FIXED = "per-seat-fixed"
+SEAT_SEED_POLICY_NONE = "none"
+
 
 @dataclass(frozen=True)
 class SkippedCell:
@@ -51,7 +58,8 @@ class CellReport:
     """One (cell × material) scored block. ``canary`` is None for replay
     materials (no embedded ground truth — recall/pollution are canary-only).
     ``triples`` is the full merged graph payload (v1.1; empty for replay runs
-    that produced nothing, unknown on v1 reports)."""
+    that produced nothing, unknown on v1 reports). B4a fields are additive:
+    reflect collapse counts/recovery and the reflect seat's pinned seed."""
 
     cell_id: str
     material: str
@@ -59,6 +67,9 @@ class CellReport:
     verify: VerifyMetrics
     cost: CostMetrics
     triples: tuple[ReportedTriple, ...] = ()
+    reflect_collapse_attempts: int = 0
+    reflect_recovered: bool = False
+    seat_seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +80,7 @@ class EvalReport:
     started_at: str  # ISO-8601 UTC ("...Z")
     cells: tuple[CellReport, ...]
     skipped: tuple[SkippedCell, ...] = ()
+    seat_seed_policy: str = SEAT_SEED_POLICY_FIXED
 
 
 def default_out_dir() -> Path:
@@ -175,10 +187,14 @@ def report_to_dict(report: EvalReport) -> dict[str, Any]:
                     }
                     for t in cell.triples
                 ],
+                "reflect_collapse_attempts": cell.reflect_collapse_attempts,
+                "reflect_recovered": cell.reflect_recovered,
+                "seat_seed": cell.seat_seed,
             }
             for cell in report.cells
         ],
         "skipped": [{"cell_id": s.cell_id, "reason": s.reason} for s in report.skipped],
+        "seat_seed_policy": report.seat_seed_policy,
     }
 
 
@@ -206,6 +222,10 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
                     )
                     for t in cell.get("triples", [])
                 ),
+                # B4a fields: pre-B4a reports carry none — default, never crash
+                reflect_collapse_attempts=int(cell.get("reflect_collapse_attempts", 0)),
+                reflect_recovered=bool(cell.get("reflect_recovered", False)),
+                seat_seed=None if cell.get("seat_seed") is None else int(cell["seat_seed"]),
             )
             for cell in data["cells"]
         ),
@@ -213,6 +233,8 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
             SkippedCell(cell_id=str(item["cell_id"]), reason=str(item["reason"]))
             for item in data.get("skipped", [])
         ),
+        # legacy reports carry no policy field: their seats were unseeded
+        seat_seed_policy=str(data.get("seat_seed_policy", SEAT_SEED_POLICY_NONE)),
     )
 
 

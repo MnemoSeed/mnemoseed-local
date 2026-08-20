@@ -28,12 +28,16 @@ from mnemoseed_local.eval.materials import (
 )
 from mnemoseed_local.eval.matrix import (
     ROSTER_DEFAULT,
+    SEAT_SEED_DEFAULT,
     default_matrix,
     list_cells,
     matrix_exit_code,
+    ollama_route,
+    parse_extra_route,
     probe_ollama_models,
     run_matrix,
 )
+from mnemoseed_local.eval.report import SEAT_SEED_POLICY_FIXED, SEAT_SEED_POLICY_NONE
 
 STUB_A = EvalRoute(driver="stub", model="stub-a")
 STUB_B = EvalRoute(driver="stub_verifier", model="stub-b")
@@ -194,3 +198,60 @@ def test_listing_is_side_effect_free(tmp_path: Path) -> None:
     listing = list_cells(cells)
     assert listing == [c.cell_id for c in cells]
     assert not list(tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------- B4a per-seat fixed seed
+
+
+def test_ollama_route_carries_default_fixed_seed() -> None:
+    route = ollama_route("qwen3.5:9b")
+    params = dict(route.params)
+    assert params["seed"] == SEAT_SEED_DEFAULT
+    assert params["seed"] == 42  # RCA-validated full-extraction seed
+    assert params["think"] is False
+
+
+def test_no_seat_seed_removes_seed_from_ollama_routes() -> None:
+    route = ollama_route("qwen3.5:9b", seat_seed=None)
+    assert "seed" not in dict(route.params)
+    cells = default_matrix(roster=("qwen3.5:9b",), seat_seed=None)
+    assert all("seed" not in dict(c.reflect.params) for c in cells)
+    assert all("seed" not in dict(c.verifier.params) for c in cells if c.verifier is not None)
+
+
+def test_cloud_extra_route_never_carries_seed() -> None:
+    cloud = parse_extra_route("openai_compatible|kimi-k3|https://api.modal.test|KIMI_KEY")
+    assert "seed" not in dict(cloud.params)
+    local = parse_extra_route("ollama|qwen3:8b|http://localhost:11434")
+    assert dict(local.params)["seed"] == SEAT_SEED_DEFAULT
+    unseeded = parse_extra_route("ollama|qwen3:8b|http://localhost:11434", seat_seed=None)
+    assert "seed" not in dict(unseeded.params)
+
+
+def test_run_matrix_records_seat_seed_and_policy(tmp_path: Path) -> None:
+    seeded = EvalCell(
+        reflect=EvalRoute(driver="stub", model="stub-a", params=(("seed", SEAT_SEED_DEFAULT),)),
+        ensemble="off",
+        verifier=STUB_B,
+    )
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([seeded], materials, root=tmp_path / "seeded")
+    assert report.seat_seed_policy == SEAT_SEED_POLICY_FIXED
+    assert len(report.cells) == 1
+    assert report.cells[0].seat_seed == SEAT_SEED_DEFAULT
+    assert report.cells[0].reflect_collapse_attempts == 0
+    assert report.cells[0].reflect_recovered is False
+    plain = run_matrix(
+        [EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)],
+        material_catalog(None, canary_seed=1, canary_count=1),
+        root=tmp_path / "plain",
+    )
+    assert plain.seat_seed_policy == SEAT_SEED_POLICY_NONE
+    assert plain.cells[0].seat_seed is None
+
+
+def test_matrix_cli_no_seat_seed_flag_parses() -> None:
+    """--no-seat-seed exists on the matrix subcommand and parses cleanly."""
+    from mnemoseed_local.eval.__main__ import main
+
+    assert main(["matrix", "--list", "--no-seat-seed"]) == 0

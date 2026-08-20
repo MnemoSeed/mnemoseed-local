@@ -32,6 +32,8 @@ from mnemoseed_local.eval.materials import Material, MaterialError, fresh_replay
 from mnemoseed_local.eval.metrics import cost_metrics, score_canary, verify_metrics
 from mnemoseed_local.eval.report import (
     REPORT_SCHEMA_VERSION,
+    SEAT_SEED_POLICY_FIXED,
+    SEAT_SEED_POLICY_NONE,
     CellReport,
     EvalReport,
     ReportedTriple,
@@ -53,6 +55,13 @@ ROSTER_DEFAULT: tuple[str, ...] = (
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_NUM_CTX = 16384
 
+#: RCA-validated fixed sampling seed for ollama seats (B4a): seed=42
+#: reproducibly yields the full extraction on qwen3.5:9b (3/3 in the RCA
+#: rerun), where the unseeded seat collapses to a literal ``[]`` ~67% of the
+#: time. Cloud openai_compatible seats NEVER receive a seed — the knob does
+#: not exist on that driver, and the report policy marks the difference.
+SEAT_SEED_DEFAULT: int = 42
+
 #: Drivers that never need an availability probe (deterministic offline seats).
 NON_PROBED_DRIVERS: frozenset[str] = frozenset({"stub", "stub_verifier"})
 
@@ -60,14 +69,17 @@ FetchTags = Callable[[str, float], tuple[str, ...]]
 
 
 def ollama_route(
-    model: str, *, base_url: str = DEFAULT_BASE_URL, num_ctx: int = DEFAULT_NUM_CTX
+    model: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    num_ctx: int = DEFAULT_NUM_CTX,
+    seat_seed: int | None = SEAT_SEED_DEFAULT,
 ) -> EvalRoute:
     """An ollama seat route in the same shape as the config defaults."""
-    return EvalRoute(
-        driver="ollama",
-        model=model,
-        params=(("base_url", base_url), ("think", False), ("num_ctx", num_ctx)),
-    )
+    params: list[tuple[str, object]] = [("base_url", base_url), ("think", False), ("num_ctx", num_ctx)]
+    if seat_seed is not None:
+        params.append(("seed", seat_seed))
+    return EvalRoute(driver="ollama", model=model, params=tuple(params))
 
 
 def default_matrix(
@@ -79,16 +91,17 @@ def default_matrix(
     num_ctx: int = DEFAULT_NUM_CTX,
     delta_budget_tokens: int = 32000,
     extra_routes: Sequence[EvalRoute] = (),
+    seat_seed: int | None = SEAT_SEED_DEFAULT,
 ) -> list[EvalCell]:
     """Roster × ensembles expansion (deterministic, per-model pairing).
     ``extra_routes`` (cloud anchors) join the same off/verify pairing."""
     cells: list[EvalCell] = []
-    seats = [ollama_route(model, base_url=base_url, num_ctx=num_ctx) for model in roster]
+    seats = [ollama_route(model, base_url=base_url, num_ctx=num_ctx, seat_seed=seat_seed) for model in roster]
     seats.extend(extra_routes)
     for reflect in seats:
         for ensemble in ensembles:
             verifier = (
-                ollama_route(verifier_model, base_url=base_url, num_ctx=num_ctx)
+                ollama_route(verifier_model, base_url=base_url, num_ctx=num_ctx, seat_seed=seat_seed)
                 if ensemble != "off"
                 else None
             )
@@ -108,7 +121,7 @@ _EXTRA_ROUTE_MIN_PARTS = 3
 _EXTRA_ROUTE_MAX_PARTS = 6
 
 
-def parse_extra_route(spec: str) -> EvalRoute:
+def parse_extra_route(spec: str, *, seat_seed: int | None = SEAT_SEED_DEFAULT) -> EvalRoute:
     """Parse one ``--extra-route`` spec into an EvalRoute.
 
     Shape: ``driver|model|base_url[|key_env[|timeout_s[|max_tokens]]]`` (pipe
@@ -126,6 +139,8 @@ def parse_extra_route(spec: str) -> EvalRoute:
     if driver == "ollama":
         params.append(("think", False))
         params.append(("num_ctx", DEFAULT_NUM_CTX))
+        if seat_seed is not None:
+            params.append(("seed", seat_seed))
     if len(parts) > 3 and parts[3]:
         params.append(("api_key_env", parts[3]))
     params.append(("timeout", float(parts[4]) if len(parts) > 4 else 60.0))
@@ -258,6 +273,14 @@ def _run_material(rig: EvalRig, material: Material) -> CellRun:
     return rig.run_snapshot(fresh_replay(snapshot))
 
 
+def _seat_seed_policy(cells: Sequence[EvalCell]) -> str:
+    """The run's seed policy, derived from what the cells actually carry: any
+    reflect seat with a seed param means the run is per-seat-fixed."""
+    if any("seed" in dict(cell.reflect.params) for cell in cells):
+        return SEAT_SEED_POLICY_FIXED
+    return SEAT_SEED_POLICY_NONE
+
+
 def run_matrix(
     cells: Sequence[EvalCell],
     materials: Sequence[Material],
@@ -333,6 +356,9 @@ def run_matrix(
                             )
                             for node in (*run.core_nodes, *run.isolated_nodes)
                         ),
+                        reflect_collapse_attempts=run.reflect_collapse_attempts,
+                        reflect_recovered=run.reflect_recovered,
+                        seat_seed=run.seat_seed,
                     )
                 )
         finally:
@@ -342,6 +368,7 @@ def run_matrix(
         started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         cells=tuple(cell_reports),
         skipped=tuple(skipped),
+        seat_seed_policy=_seat_seed_policy(cells),
     )
 
 
@@ -352,7 +379,7 @@ def matrix_exit_code(report: EvalReport) -> int:
 
 def summary_lines(report: EvalReport) -> list[str]:
     """The per-cell surface + skip list, ready for PRD closeout excerpts."""
-    lines: list[str] = []
+    lines: list[str] = [f"seat_seed_policy: {report.seat_seed_policy}"]
     for cell in report.cells:
         canary = cell.canary
         recall = "-" if canary is None or canary.canary_recall is None else f"{canary.canary_recall:.2f}"
@@ -361,7 +388,8 @@ def summary_lines(report: EvalReport) -> list[str]:
         lines.append(
             f"{cell.cell_id} | {cell.material} | recall={recall} pollution={pollution} "
             f"core={canary.core_yield if canary is not None else '-'} judged={judged} "
-            f"fallbacks={cell.verify.fallbacks} tokens={cell.cost.token_usage} t={cell.cost.duration_s:.1f}s"
+            f"fallbacks={cell.verify.fallbacks} tokens={cell.cost.token_usage} "
+            f"t={cell.cost.duration_s:.1f}s seed={cell.seat_seed or 'none'}"
         )
     for skip in report.skipped:
         lines.append(f"{skip.cell_id} | SKIPPED | {skip.reason}")

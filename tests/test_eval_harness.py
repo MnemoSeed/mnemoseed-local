@@ -15,11 +15,14 @@ import pytest
 
 from mnemoseed_local.eval.canary import canary_session
 from mnemoseed_local.eval.harness import (
+    COLLAPSE_MAX_COMPLETION_TOKENS,
     EvalCell,
     EvalRig,
     EvalRoute,
     RigPaths,
+    is_reflect_collapse,
 )
+from mnemoseed_local.llm.types import ChatResult, Usage
 
 STUB_A = EvalRoute(driver="stub", model="stub-a")
 STUB_B = EvalRoute(driver="stub_verifier", model="stub-b")
@@ -141,3 +144,123 @@ def test_cell_id_deterministic_and_discriminating() -> None:
     assert a.cell_id != _stub_cell(verifier=EvalRoute(driver="stub_verifier", model="stub-c")).cell_id
     assert a.cell_id != _stub_cell(delta_budget_tokens=8192).cell_id
     assert a.cell_id != _stub_cell(core_confidence_floor=0.5).cell_id
+
+
+# ---------------------------------------------------------------- B4a collapse guard
+
+
+def _collapse_stub_chat(original, collapse: int = 1):
+    """StubLLM.chat stand-in: collapses (literal [] + completion=2) for the
+    first ``collapse`` calls, then delegates to the real deterministic stub.
+    Returns (fake, calls) — calls() reads the attempt counter."""
+    calls = 0
+
+    def fake(self, *, system: str, user: str) -> ChatResult:
+        nonlocal calls
+        calls += 1
+        if calls <= collapse:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=2), model=self.model, driver="stub")
+        return original(self, system=system, user=user)
+
+    return fake, lambda: calls
+
+
+def test_collapse_fingerprint_boundary() -> None:
+    """The classifier fires ONLY on the RCA fingerprint: verbatim [] with a
+    tiny completion count. Legit empty extractions never match."""
+    base = dict(model="m", driver="ollama")
+    collapse = ChatResult(text="[]", usage=Usage(completion_tokens=2), **base)
+    assert is_reflect_collapse(collapse)
+    # boundary pin: one token above the collapse fingerprint is already normal
+    assert not is_reflect_collapse(
+        ChatResult(text="[]", usage=Usage(completion_tokens=COLLAPSE_MAX_COMPLETION_TOKENS + 1), **base)
+    )
+    assert not is_reflect_collapse(ChatResult(text="[]", usage=Usage(completion_tokens=12), **base))
+    # formatting is not the verbatim fingerprint
+    assert not is_reflect_collapse(ChatResult(text="[ ]", usage=Usage(completion_tokens=2), **base))
+    # no provider usage (plain-text / stub seats) is never a collapse
+    assert not is_reflect_collapse("[]")
+    assert not is_reflect_collapse(ChatResult(text="[]", usage=None, **base))
+    # a real extraction is never a collapse
+    assert not is_reflect_collapse(
+        ChatResult(text='[{"predicate": "prefers"}]', usage=Usage(completion_tokens=60), **base)
+    )
+
+
+def test_collapse_retry_recovers_and_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse fingerprint -> typed exception -> retry loop engages -> second
+    call extracts fully -> cell completes with attempts + recovery recorded."""
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, calls = _collapse_stub_chat(StubLLM.chat, collapse=1)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), _stub_cell(), sleep=lambda _: None)
+    try:
+        run = rig.run_canary(canary_session(51, facts=4, noise=2))
+    finally:
+        rig.close()
+    assert calls() == 2  # one collapse, then one full-extraction retry
+    assert run.merge_committed
+    assert run.core_nodes, "the recovered attempt must extract the facts"
+    assert run.reflect_collapse_attempts == 1
+    assert run.reflect_recovered is True
+
+
+def test_collapse_every_retry_records_honestly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse on every retry: no crash, honest counts and a failed outcome."""
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, calls = _collapse_stub_chat(StubLLM.chat, collapse=99)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), _stub_cell(), sleep=lambda _: None)
+    try:
+        run = rig.run_canary(canary_session(52, facts=4, noise=2))
+    finally:
+        rig.close()
+    assert calls() == 3  # max_retries=2 -> exactly 3 attempts, no crash
+    assert run.reflect_collapse_attempts == 3
+    assert run.reflect_recovered is False
+    assert run.merge_committed is False
+    assert run.reflect_outcome is not None
+    assert run.reflect_outcome.ok is False
+    assert "collapse" in (run.reflect_outcome.error or "")
+
+
+def test_legit_empty_extraction_not_classified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A well-formed empty extraction under NORMAL token counts is not a
+    collapse: accepted without retry, no collapse fields set."""
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    calls = 0
+
+    def legit_empty(self, *, system: str, user: str) -> ChatResult:
+        nonlocal calls
+        calls += 1
+        return ChatResult(text="[]", usage=Usage(completion_tokens=12), model=self.model, driver="stub")
+
+    monkeypatch.setattr(StubLLM, "chat", legit_empty)
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), _stub_cell(), sleep=lambda _: None)
+    try:
+        run = rig.run_canary(canary_session(53, facts=4, noise=2))
+    finally:
+        rig.close()
+    assert calls == 1  # accepted as a legit empty extraction: no retry
+    assert run.reflect_collapse_attempts == 0
+    assert run.reflect_recovered is False
+    assert run.merge_committed  # a genuinely empty (no overflow) merge still commits
+
+
+def test_rig_records_seat_seed_from_reflect_route(tmp_path: Path) -> None:
+    cell = EvalCell(
+        reflect=EvalRoute(driver="stub", model="stub-a", params=(("seed", 42),)),
+        ensemble="off",
+        verifier=STUB_B,
+    )
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), cell)
+    try:
+        run = rig.run_canary(canary_session(54, facts=4, noise=2))
+    finally:
+        rig.close()
+    assert run.seat_seed == 42
+    assert run.reflect_collapse_attempts == 0
+    assert run.reflect_recovered is False

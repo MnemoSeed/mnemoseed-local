@@ -69,4 +69,5 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
 ## Useful entry points
 
 - `docs/zh/prd/PRD-B2-roadmap.md` — the Phase B master plan and batch log.
+- docs/zh/design/00…08 + REFERENCES.md — 架构设计文档系列（理论锚注册表在 REFERENCES.md）。
 - `README.md` — product surface (install, MCP registration, verbs).

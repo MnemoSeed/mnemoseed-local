@@ -18,6 +18,7 @@ from mnemoseed_local.eval.harness import EvalCell, EvalRoute
 from mnemoseed_local.eval.materials import material_catalog
 from mnemoseed_local.eval.matrix import run_matrix
 from mnemoseed_local.eval.report import (
+    SEAT_SEED_POLICY_NONE,
     EvalReport,
     ReportedTriple,
     load_report,
@@ -136,3 +137,21 @@ def test_rescore_entry_point(stub_report) -> None:
     produced = list(path.parent.glob(f"*-{path.stem}-rescored.json"))
     assert len(produced) == 1
     assert load_report(produced[0]).cells[0].canary.canary_recall == 1.0
+
+
+def test_rescore_preserves_no_seat_seed_policy(stub_report, tmp_path: Path) -> None:
+    """B4a: rescoring a --no-seat-seed report (policy none, unseeded cells)
+    must not relabel the policy to the per-seat-fixed default."""
+    report, _ = stub_report
+    unseeded = EvalReport(
+        eval_version=report.eval_version,
+        started_at=report.started_at,
+        cells=report.cells,
+        skipped=report.skipped,
+        seat_seed_policy=SEAT_SEED_POLICY_NONE,
+    )
+    unseeded_path = write_report(unseeded, tmp_path / "unseeded", matrix_slug="m")
+    rescored_path = rescore_report(unseeded_path, canary_seed=7)
+    rescored = load_report(rescored_path)
+    assert rescored.seat_seed_policy == SEAT_SEED_POLICY_NONE
+    assert rescored.cells[0].seat_seed is None

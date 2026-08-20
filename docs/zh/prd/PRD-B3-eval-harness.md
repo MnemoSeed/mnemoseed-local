@@ -174,3 +174,21 @@
 - **对照实验**：temp=0 → 3/3 `[]`（greedy 必坍缩）；seed=42 → 3/3 满抽取 780 tok（定 seed 即治）；num_predict=128 → 截断畸形（非本案）；think=True → 满抽取但烧 7-8k tok（不需）。
 - **B4 修法方向（择一或并用，B4 批次定）**：(a) verify 座固定 seed（repro 实证可复现满抽取）；(b) harness 空值守卫 + 有限重试（`[]` 视为坍缩信号而非合法空抽取）；(c) qwen3.5:9b 退出 verify 席。单跑数值不能当 bar 的既有结论不受影响。
 
+## 批次增量 B4a · reflect 席采样坍缩防护（2026-08-20）
+
+依据：B4 前置排查定案（上文"B4 前置排查"节）——qwen3.5:9b 在矩阵 reflect 席（think=False、无 seed/temp）下约 67% 概率吐字面 `[]`（completion=2 指纹），被 harness 当合法空抽取收下，固化成两跑同指纹的"确定性零产出"。修法方向 (a) 固定 seed + (b) harness 空值守卫/有限重试 双管齐下（B4b 已裁：seed 逐次变化出局）。
+
+1. **坍缩分类器**（`eval/harness.py`）：反射座输出命中 RCA 指纹（字面 `[]` + completion_tokens ≤ 2）即抛 `ReflectCollapseError`，复用 reflect.py 既有重试通道（1/2/4s 退避）；rig 侧 `ReflectOrchestrator(max_retries=2)`（共 3 次尝试）封顶。无 usage 指纹（stub/纯文本座）或正常 token 数的合法空抽取绝不误判。
+2. **逐座固定 seed**（`eval/matrix.py`）：ollama 座默认带 `seed=42`（RCA 实测 3/3 满抽取且可复现）；`openai_compatible` 云座绝不带 seed（该驱动无此采样旋钮）；`--no-seat-seed` 整体移除。
+3. **诚实记录**（v1.1 兼容追加字段）：`CellReport.reflect_collapse_attempts / reflect_recovered / seat_seed`，`EvalReport.seat_seed_policy`（`"per-seat-fixed"` / `"none"`）；旧报告缺字段照常加载并取默认值。
+
+### 可比性说明（重要）
+
+**B4a 之前的报告全部是无 seed 跑出来的**；对采样敏感 cell（qwen3.5:9b off、qwen3.5:4b 两态）而言，其数值与 seed 固定后的新跑**不可数值直接比较**。断点由报告字段显式标记：`seat_seed_policy`/`seat_seed`（旧报告加载后 policy 取默认 `"none"`，与 cell 级 `seat_seed=None` 一致——旧报告即无 seed 报告；`--no-seat-seed` 新跑同标 `"none"`）。`cell_id`/slug 不变——seed 不进 slug，同一 cell 前后可比性由字段标记，不由 id 伪造。
+
+### B4a 收口记录（2026-08-20）
+
+交付以 W-B harness 抗坍缩（B4a，即本批次增量节）为主；W-A near-dup 预筛、W-C drain 下 loop 为同一 Wave-2 三流并行的并行支流，与 eval 数值面无交集（W-A 的确定性 tie-break 与有界扫描守卫、W-C 的 teardown 预算重排均不影响本臂读数），详细记录见 roadmap 批次行与代码块注释。QA 修复轮两项标签修复：`rescore` 重判沿用被评报告既有的 `seat_seed_policy`（政策保真，不把旧报告翻转成 per-seat-fixed）；legacy 报告 `from_dict` 缺字段默认 `"none"`，与 cell 级 `seat_seed=None` 一致（QA IMPORTANT-2 翻转钉死）。`_CollapseGuard` docstring 纠偏：**指纹命中即分类，不问输出合法性**——verbatim `[]`+completion≤2 就判坍缩；正常 token 数的空抽取不算坍缩，合法空内容同样被指纹拦截。
+
+**B4b（live 矩阵定版 + bar 钉死 + lite 档定版）待排**——seed 已固定后 matrix 数字可复现，坍缩率可从 `collapse_attempts` 字段直接读。
+
