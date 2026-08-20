@@ -51,7 +51,8 @@
 - **daemon on/off 用户可控开关**：2026-08-20 用户立项，同日作为 **B2.5** 收口（见批次启动记录）。
 - **宿主 plugin 统一安装面（B2.6 候选，2026-08-20 用户立项，排在 B2.5 之后）**：每宿主定制 plugin 作 daemon 接口，MCP+hooks 打包成单 bundle、单开关整体启停（对标 Claude Code plugin 形态）。依据调研 `docs/zh/design/research-opencode-plugin-bundling.md`（2026-08-20 落盘）：opencode 无原生 bundle/无 per-plugin 开关（TUI 开关 PR #42410 未合并）；plugin `config` 钩注入 `cfg.mcp` 有真实先例但存在初始化竞态 → **前置 T0 式本地探针**；`["spec", {enabled:false}]` options 元组可作自实现整体开关；长期跟踪 agent-plugins 标准（opencode issue #39937/#40993/#41561）。
 - **多 session 互认知（2026-08-20 用户立项，排在 B2.6 之后立项研究）**：多 session 互相认知到同时在跑的 sessions 在做什么/做了什么的机制设计；与 B2.4 时间窗面同族（从"事后归因"到"并行互见"）。
-- **B2.3 挂起子项（2026-08-20 收口，squash `e95921b`，PR #23 → issue #22）**：boot 同步 dream 恢复挪出启动路径（RESUME 作业变体 + scheduler 首 tick 有界 drain 闸 `RESUME_DRAIN_TIMEOUT_S=600`；QA CLOSABLE，门禁 1338 passed / 3 skipped）。watchdog `daemon.log` 同日实弹首击（refused-grace fire，F2 僵尸按设计处死退场）。
+- **多 DB 可插拔后端（2026-08-20 用户探讨立项，暂不入排期）**：长期方向——驱动层多后端（qdrant 候选头牌、sqlite-vec 轻量选项、lance 保留），按喜好自由配置。qdrant 侧已探明：原生 sparse 倒排+HNSW、进程外故障隔离是真实收益（RAM 税 100-300MB 用户认可）；**snapshot 用自卷 MVCC（写带单调 store_version、点时读 filter `store_version<=X`）可精确复刻 lance `table.version` 语义**；Chroma 评估出局（in-proc、无版本读、更重）。最终闸门不变：下一次 watchdog fire 的堆栈取证先点名 wedge，再定是否值得迁。
+- **B2.3 挂起子项（2026-08-20 收口，squash `e95921b`，PR #23 → issue #22）**：boot 同步 dream 恢复挪出启动路径（RESUME 作业变体 + scheduler 首 tick 有界 drain 闸 `RESUME_DRAIN_TIMEOUT_S=600`；QA CLOSABLE，门禁 1338 passed / 3 skipped）。watchdog `daemon.log` 同日实弹首击（refused-grace fire，F2 僵尸按设计处死退场）。**取证修正（2026-08-20 架构师日志复核）**：当日实为 **5 次** refused-grace fire（02:29/10:47/12:02/13:07/13:34），且**均无 teardown 前行**——与 P1"关停卡 join"的根因形状不符：fire 是服务中途监听直接消失，wedge 机制未确证，"Lance 写死"假设单独解释不了 refused（堵死的 loop 仍有绑定 socket，probe 只会读 stalled）。决策闸门：dump 构建上线后的下一次 fire 的全线程堆栈。
 
 ## 门禁（每包不变）
 
