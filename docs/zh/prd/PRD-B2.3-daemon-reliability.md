@@ -119,3 +119,20 @@ while ($true) {
 - **QA**：首轮 **CLOSABLE**（0 BLOCKER / IMPORTANT-1 drain 无超时随批修净；NIT docstring pairs 随批修净；NIT-1 pin-3 的 `completed_later==1` 依赖 1s 墙钟窗、NIT-3 job 互斥不变量未强约束、NIT-4 enqueue_resume 无 pre-start 守卫——三条记录为本节如实边界）；崩溃窗口未加宽（journal 仍是唯一事实源，双恢复幂等）。
 - **门禁**：1327 → **1338 passed / 3 skipped**（本批 boot-recovery 5 钉 + 同波 B2.6 探针 6 钉）；ruff/format/mypy 全净。
 - **生效前提**：`uv tool install --force` + daemon 重启。
+
+### 批次执行：F2 根治（2026-08-20 用户指令立项并收口——Zombie 不可 killable，必须 impossible）
+
+- **动议**：B2.3 watchdog 把 F2 僵尸转为干净崩溃，但僵尸本体不该出现；上线首日 watchdog 实弹两击（daemon.log 12:02 / 13:07 CRITICAL），证实 zombie 仍在日常生成。本批目标：机制级根治。
+- **根因补充定案（solution-architect 复核，含 3.12.13 stdlib 源码+运行时实证）**：ThreadPoolExecutor worker 非 daemon 且被 `_threads_queues` 注册，`concurrent.futures._python_exit` / `threading._shutdown` 在解释器退出时 join **全部** executor 线程——teardown 的 `shutdown(wait=True)` 并不是唯一的绞索；**第二僵尸向量（架构师起获）**：anyio 4.14.2 `WorkerThread` 同样非 daemon，`ingest.py:60` 的 focal scan 走它，一样被 join。
+- **设计（架构师 SHIP-WITH-ADJUSTMENTS，2 BLOCKER 并入：anyio 向量必须修、停止预算不得竞速 watchdog 击杀线）**：
+  - **D1 共享模块 `util/daemon_executor.py`**：plain `threading.Thread(daemon=True)` workers on `queue.Queue`；TPE 兼容 `submit()`→Future / `close(timeout)`（sentinel-per-worker + 全局 deadline 等 running+已排队 future、未决者废弃不迟跑——QA NIT-2 定案）；RuntimeError after close；submit 与 close 竞态 lock-ordered；**永不注册 `_threads_queues`，卡死 worker 随进程亡**。
+  - **D2 DreamWorker**：`DaemonExecutor(1, mnemoseed-dream)`；`stop_timeout=DREAM_STOP_TIMEOUT_S=5.0`（注入式）；`stop()` 有界等待不堵 loop（`asyncio.wait_for(wrap_future(cf))`），超时**就地废弃**（journal 双恢复幂等兜底）；`close(timeout=0)`；`_inflight_launched()` 以 `cf.done()` 先验（原 `cf.result()` 无界调用在废弃路径上必冻——架构师 IMPORTANT 修入）。
+  - **D3 HybridRetriever**：`DaemonExecutor(2, mnemoseed-track)`；`close(timeout=close_timeout)`，`RETRIEVER_CLOSE_TIMEOUT_S=2.0` 注入式。
+  - **D4 ingest scan**：模块级 `scan_executor` 单例（2 workers，**刻意从不关闭**——线程随进程亡，watchdog/announcer 先例），`anyio.to_thread` 全删；原 fire-and-forget except 封套不动。
+  - **D5 watchdog 法医 dump**：fire 序列 = 末语 critical → flush 链 → dump 头（时间戳+reason+watchdog 线程名）→ `faulthandler.dump_traceback(all_threads=True)` 追加 `CONFIG_DIR/daemon.log`（**call-time 解析**，QA I-1 纪律）→ `os._exit(1)`；QA 修复轮再硬化：整个序列入 try、**`_exit(1)` 入 finally 无条件达成**（debug 日志自身抛错也不再跳过 exit）。
+- **teardown 预算表（QA 与架构师共同钉死）**：retriever close 2s + dream stop 5s + drain/stores ~2s ≈ **9s** < watchdog refused-grace 击杀线 ~11-14s——健康关停永不被 watchdog 误杀。
+- **判决否决记录**：TPE 子类 daemon 覆盖（注册表非 daemon 旗决定 join，实证无用）、submit-then-detach（WeakKeyDictionary 时序 hack）、multiprocessing（Windows spawn+store IPC 成本）、SIGBREAK 手动 dump（headless 无 console + fd 常驻）——全部记为 rejected 设计。
+- **QA**：首轮 **CLOSABLE**（0 BLOCKER / 1 IMPORTANT：fire 路径 dump 的 `open` 在停摆网络盘可**挂而不抛**，try/except 挡不住——in-band 部分以 finally 无条件 exit 修净，残余为一类边界）；修复轮（finally-exit + close 排干已排队项、debug-log 自抛吞没）→ **门禁 1338 → 1346 → 1349 passed / 3 skipped** 全绿，ruff/format/mypy 净。
+- **测试增量**：**13 钉**：翻转 pin（join-hang 文档 → bounded-abandon 实证）、daemon/unregistered 注册表 pin、subprocess 红绿对（DaemonExecutor wedged 子进程 rc=0 ∥ TPE wedged 子进程必挂——机制级直接证据）、retriever close 有界、recall-after-close RuntimeError、ingest scan 上 daemon 池且无 AnyIO worker、fire dump 全线程帧、dump 失败/ debug 失败皆不挡 exit、close 弃队不迟跑、提交竞态 lock-ordered。
+- **如实边界**：(i) dump 目标盘的 BLOCKING open（停摆网络 share）可推迟 exit——band 外边界；(ii) 卡死的调用本体保持卡死（abandoned 线程+被占的 `_write_lock` 至重启；D4-变体 = 有界 `_write_lock.acquire(timeout=...)` 挂起，等 D5 堆栈证据命名 wedge 层）；(iii) daemon.log 每次 fire 追加全线程 dump（百行级，fire 稀少可承受）；(iv) anyio scan 池永不关闭是刻意单例；(v) dump 判帧用函数名（Windows faulthandler 不打印线程名）——实现偏离如实记。
+- **生效前提**：`uv tool install --force` + daemon 重启；之后每次 watchdog fire 自带全线程堆栈取证。

@@ -323,6 +323,80 @@ def test_concurrent_tracks_overlap_in_wall_time(stack) -> None:
 # ------------------------------------------------------------ multi-thread storm
 
 
+class _BlockingSearchStore:
+    """Vector-store wrapper whose search blocks on an event, wedging one track
+    (the F2 根治 wedged-worker shape for the retriever)."""
+
+    def __init__(self, real, block: threading.Event) -> None:
+        self._real = real
+        self._block = block
+        self.entered = threading.Event()
+
+    def capabilities(self):
+        return self._real.capabilities()
+
+    def search(self, dense, sparse, filter, top_k):
+        self.entered.set()
+        self._block.wait()
+        return self._real.search(dense, sparse, filter, top_k)
+
+    def list_chunks(self, filter, page):
+        return self._real.list_chunks(filter, page)
+
+
+def test_retriever_close_bounded_when_track_wedged(stack) -> None:
+    """F2 根治 D3: close() must return in bounded time while one track is
+    wedged forever inside the vector store — the bounded wait abandons the
+    wedged worker instead of joining it (the pre-fix shutdown(wait=True)
+    jammed forever)."""
+    _seed(stack)
+    block = threading.Event()
+    blocking = _BlockingSearchStore(stack.vector, block)
+    retriever = HybridRetriever(close_timeout=0.2)
+    recall_thread = threading.Thread(
+        target=retriever.recall,
+        kwargs={
+            "query_text": "lancedb loader",
+            "cues": _query_cues(("LanceDb",)),
+            "profile_id": _PROFILE,
+            "vector_store": blocking,
+            "graph_store": stack.graph,
+            "embedder": stack.embed,
+        },
+        daemon=True,
+    )
+    recall_thread.start()
+    assert blocking.entered.wait(3.0), "the vector track never entered the blocked search"
+    started = time.monotonic()
+    close_thread = threading.Thread(target=retriever.close, daemon=True)
+    close_thread.start()
+    close_thread.join(timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert not close_thread.is_alive(), "close() hung past the bound (unbounded join?)"
+    assert elapsed < 1.0, f"close() was not bounded: {elapsed:.3f}s"
+    # the wedged worker is abandoned, never joined: the recall thread stays
+    # blocked on its result and the worker thread remains alive
+    assert recall_thread.is_alive(), "the wedged track was joined, not abandoned"
+
+
+def test_recall_after_close_raises_runtime_error(stack) -> None:
+    """Docstring-only contract pin (hybrid.py): ``recall`` after ``close``
+    raises the executor's RuntimeError instead of deadlocking — the retriever
+    never serves after teardown."""
+    _seed(stack)
+    retriever = HybridRetriever()
+    retriever.close()
+    with pytest.raises(RuntimeError):
+        retriever.recall(
+            "lancedb loader",
+            _query_cues(("LanceDb",)),
+            profile_id=_PROFILE,
+            vector_store=stack.vector,
+            graph_store=stack.graph,
+            embedder=stack.embed,
+        )
+
+
 def test_recalls_from_eight_threads_do_not_corrupt_state(stack) -> None:
     _seed(stack)
     text = "lancedb loader"
