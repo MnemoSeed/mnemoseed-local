@@ -68,6 +68,15 @@ class MnemoseedServer(uvicorn.Server):
             time.sleep(_POLL_INTERVAL)
 
 
+def intentional_shutdown(watchdog: Watchdog, server: MnemoseedServer) -> None:
+    """The POST /daemon/shutdown seam: disarm the watchdog BEFORE the listener
+    closes, then ask the server for a graceful teardown. Order pinned: uvicorn
+    closes the listener before lifespan teardown, so an armed watchdog would
+    misfire os._exit(1) on an intentional drain longer than the refused grace."""
+    watchdog.disarm()
+    server.request_shutdown()
+
+
 def run_server(host: str, port: int) -> int:
     """Boot the daemon app and block until shutdown; returns the exit code.
 
@@ -98,5 +107,13 @@ def run_server(host: str, port: int) -> int:
     # waits on it.
     watchdog = Watchdog("127.0.0.1" if host in _PROBE_HOSTS else host, port)
     watchdog.start()
+    # The shutdown seam behind POST /daemon/shutdown: the app module's `app`
+    # object is imported eagerly so the hook is bound before server.run() loads
+    # the same (cached) module via its import string.
+    from functools import partial
+
+    from mnemoseed_local.daemon import app as daemon_app
+
+    daemon_app.app.state.shutdown_hook = partial(intentional_shutdown, watchdog, server)
     server.run()
     return 0

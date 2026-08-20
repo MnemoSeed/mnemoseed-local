@@ -162,6 +162,13 @@ class Watchdog:
             thread.join(timeout=_STOP_JOIN_TIMEOUT_S)
             self._thread = None
 
+    def disarm(self) -> None:
+        """Disarm before an intentional shutdown: set the stop event only, no
+        join — the probe loop exits on its next interval and the daemon thread
+        dies with the process. Distinct from stop(): the shutting-down path
+        must never wait on the probe thread."""
+        self._stop.set()
+
     def _run(self) -> None:
         refused_since: float | None = None
         while not self._stop.wait(self._interval):

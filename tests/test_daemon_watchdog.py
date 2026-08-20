@@ -269,6 +269,103 @@ def test_pre_bind_alive_within_grace_does_not_fire() -> None:
         watchdog.stop()
 
 
+# ------------------------------------------------------- disarm (B2.5)
+
+
+def test_armed_disarm_never_fires_on_real_closed_listener() -> None:
+    """ARMED + disarm: an intentionally disarmed watchdog must NOT fire when
+    its real listener closes — disarm sets the stop event only, so the probe
+    loop exits on its next interval instead of accumulating refusals past the
+    refused grace (a not-disarmed watchdog fires on the closed listener)."""
+    # The accept loop drains the queue while the listener is open and closes
+    # the listener ITSELF when told to stop (Windows socket ownership).
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = listener.getsockname()[1]
+    stop_accept = threading.Event()
+
+    def _accept_loop() -> None:
+        listener.settimeout(0.05)
+        while not stop_accept.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue  # poll interval; re-check stop_accept
+            except OSError:
+                break
+            conn.close()
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+    accept_thread = threading.Thread(target=_accept_loop, daemon=True)
+    accept_thread.start()
+
+    assert default_probe("127.0.0.1", port) is True, "live listener must probe as alive"
+
+    fired: list[str] = []
+    armed = threading.Event()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        port,
+        boot_grace=5.0,  # long: arming must happen before any grace matters
+        refused_grace=0.2,
+        interval=0.05,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        assert armed.wait(3.0), "watchdog never armed against the live listener"
+        watchdog.disarm()
+        stop_accept.set()  # the accept loop closes the listener within 50ms
+        # Well beyond refused_grace (0.2s) plus the ~2s refused probe latency:
+        # a not-disarmed watchdog would have fired inside this window.
+        time.sleep(5.0)
+        assert fired == [], "a disarmed watchdog must never fire"
+        assert not watchdog.is_alive, "the probe loop must exit after disarm"
+    finally:
+        stop_accept.set()
+        listener.close()
+        watchdog.stop()
+        accept_thread.join(timeout=2.0)
+
+
+def test_disarm_stops_the_probe_loop_without_fire() -> None:
+    """disarm is distinct from stop(): it only sets the stop event, so the
+    loop ends on its next interval — no join, no probe, no fire (a probe that
+    would fire immediately if the loop kept running)."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()  # already armed: the PRE_BIND phase is skipped
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=0.1,
+        interval=0.02,
+        probe=lambda: False,  # a live loop would fire within the refused grace
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        assert armed.is_set()
+        watchdog.disarm()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and watchdog.is_alive:
+            time.sleep(0.05)
+        assert not watchdog.is_alive, "the probe loop must exit after disarm"
+        assert fired == []
+    finally:
+        watchdog.stop()
+
+
 # ---------------------------------------------------------------- fire path
 
 

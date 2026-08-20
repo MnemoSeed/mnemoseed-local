@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from mnemoseed_local.mcp_gateway import server
 from mnemoseed_local.mcp_gateway.reliable_client import GatewayClient
@@ -98,6 +99,40 @@ def test_refused_twice_reports_down_hint_and_retries_exactly_once() -> None:
     assert "cannot reach" in text
     assert "mnemoseed-local up" in text
     assert len(client.calls) == 2
+
+
+def test_disabled_marker_switches_refused_hint_to_disabled_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User-disabled (marker present): refused-after-retry points at
+    'mnemoseed-local on'; nagging 'up' would mislead, since up refuses while
+    the service is disabled."""
+    monkeypatch.setattr(server.daemon_state, "is_disabled", lambda: True)
+    client = ScriptedClient([("raise", _refused_error()), ("raise", _refused_error())])
+    _, responses = run_gateway([_call("recall", {"query": "x"})], client)
+    result = responses[0]["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    disabled_text = (
+        "cannot reach http://localhost:7788: memory service is disabled by the user "
+        "(run 'mnemoseed-local on' to re-enable)"
+    )
+    assert disabled_text in text
+    assert "mnemoseed-local up" not in text
+    assert len(client.calls) == 2
+
+
+def test_disabled_marker_does_not_leak_into_timeout_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server.daemon_state, "is_disabled", lambda: True)
+    client = ScriptedClient([("raise", _timeout_error())])
+    _, responses = run_gateway([_call("recall", {"query": "x"})], client)
+    result = responses[0]["result"]
+    text = result["content"][0]["text"]
+    assert "timed out" in text
+    assert "memory service is disabled" not in text
+    assert len(client.calls) == 1
 
 
 def test_timeout_never_retries_and_reports_timeout_hint() -> None:

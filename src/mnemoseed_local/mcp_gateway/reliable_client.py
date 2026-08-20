@@ -33,6 +33,12 @@ RETRY_TIMEOUT_SECONDS = 1.5
 #: Honest shape for a loopback refusal that survived the single retry.
 DAEMON_DOWN_HINT = "cannot reach {base_url}: daemon is not running (start it with 'mnemoseed-local up')"
 
+#: Honest shape for a refusal while the service is user-disabled (off marker).
+DAEMON_DISABLED_HINT = (
+    "cannot reach {base_url}: memory service is disabled by the user "
+    + "(run 'mnemoseed-local on' to re-enable)"
+)
+
 #: Honest shape for a timeout-caused unavailability.
 DAEMON_TIMEOUT_HINT = "cannot reach {base_url}: daemon timed out after 30s (busy or hung; try again shortly)"
 
@@ -40,18 +46,19 @@ DAEMON_TIMEOUT_HINT = "cannot reach {base_url}: daemon timed out after 30s (busy
 class GatewayClient:
     """Duck-typed wrapper that retries a ConnectError-caused refusal once."""
 
-    __slots__ = ("_client",)
+    __slots__ = ("_client", "_down_hint")
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, down_hint: str | None = None) -> None:
         self._client = client
+        self._down_hint = down_hint if down_hint is not None else DAEMON_DOWN_HINT
 
     @classmethod
-    def wrap(cls, client: Any) -> GatewayClient:
+    def wrap(cls, client: Any, down_hint: str | None = None) -> GatewayClient:
         """Idempotent: return a wrapped client, or the client itself if it is
         already a :class:`GatewayClient`."""
         if isinstance(client, cls):
             return client
-        return cls(client)
+        return cls(client, down_hint)
 
     @property
     def profile_id(self) -> str:
@@ -86,7 +93,7 @@ class GatewayClient:
                 try:
                     return cast(dict[str, Any], self._retry_client().post(path, body))
                 except DaemonUnavailableError:
-                    raise DaemonUnavailableError(DAEMON_DOWN_HINT.format(base_url=self.base_url)) from None
+                    raise DaemonUnavailableError(self._down_hint.format(base_url=self.base_url)) from None
             if isinstance(cause, httpx.TimeoutException):
                 raise DaemonUnavailableError(DAEMON_TIMEOUT_HINT.format(base_url=self.base_url)) from None
             raise
