@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
+from mnemoseed_local.retrieve.cues import ExtractedCues, Intent, extract_cues
 from mnemoseed_local.retrieve.hybrid import (
     Candidate,
     HybridConfig,
@@ -459,6 +459,28 @@ def test_tool_cue_overlap_activates_on_stored_tool_names(stack) -> None:
     )
     _write(stack, _chunk("c_plain", "the LanceDb loader", decay=0.9, entities=("LanceDb",)))
     result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",), tools=("bash",)))
+    tool_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_tool")
+    plain_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_plain")
+    # 0.25 * (1/1 tool overlap) vs 0.25 * 0 for the tool-less chunk
+    assert abs(tool_chunk.breakdown.cue_overlap - plain_chunk.breakdown.cue_overlap - 0.25) < 1e-9
+    assert result.candidates.index(tool_chunk) < result.candidates.index(plain_chunk)
+
+
+def test_tool_cue_overlap_fires_via_extract_cues_query_path(stack) -> None:
+    """IMPORTANT-1 e2e: capture now filters stored tool names through
+    _is_tool_name, so only query-matchable names persist. This walks the REAL
+    query path — the tool name is extracted by extract_cues (not hand-built
+    cues) — and proves the β_tool=0.25 overlap term fires on a matchable name
+    (snake_case, backticked like a real query)."""
+    _write(
+        stack,
+        _chunk("c_tool", "the LanceDb loader", decay=0.9, entities=("LanceDb",), tools=("run_tests",)),
+    )
+    _write(stack, _chunk("c_plain", "the LanceDb loader", decay=0.9, entities=("LanceDb",)))
+    query_text = "the `run_tests` loader for LanceDb"
+    query = extract_cues(query_text)
+    assert "run_tests" in query.cues.tools_used  # the real extractor sees the tool
+    result = _recall(stack, query_text, query)
     tool_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_tool")
     plain_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_plain")
     # 0.25 * (1/1 tool overlap) vs 0.25 * 0 for the tool-less chunk

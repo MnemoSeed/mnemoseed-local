@@ -290,9 +290,12 @@ def test_daemon_write_context_fills_entity_cues_from_turn_text() -> None:
 
 def test_daemon_write_context_fills_tool_cues_from_turn_steps() -> None:
     """Option C (encoding specificity R4): capture must store the tool cues the
-    retrieval side matches on. TOOL step names travel into
-    WriteContext.tools_used — casefold-deduped, first-occurrence order — so the
-    hybrid β_tool overlap term is no longer dead code."""
+    retrieval side matches on. Only query-matchable names (the _is_tool_name
+    shapes the query extractor recognises: camelCase/snake_case/kebab/MCP)
+    travel into WriteContext.tools_used — casefold-deduped, first-occurrence
+    order — so the hybrid β_tool overlap term is no longer dead code, and a
+    common lowercase host name (bash) is never stored verbatim where the query
+    side could not match it."""
     from mnemoseed_local.daemon.app import _daemon_write_context
     from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
 
@@ -304,9 +307,12 @@ def test_daemon_write_context_fills_tool_cues_from_turn_steps() -> None:
         started_at=1.0,
         steps=[
             TurnStep(role=TurnRole.USER, content="跑一遍测试"),
-            TurnStep(role=TurnRole.TOOL, tool_name="bash"),
-            TurnStep(role=TurnRole.TOOL, tool_name="Bash"),  # casefold duplicate
-            TurnStep(role=TurnRole.TOOL, tool_name="pytest"),
+            TurnStep(role=TurnRole.TOOL, tool_name="bash"),  # not matchable -> filtered
+            TurnStep(role=TurnRole.TOOL, tool_name="runTests"),  # camelCase
+            TurnStep(role=TurnRole.TOOL, tool_name="RunTests"),  # casefold duplicate
+            TurnStep(role=TurnRole.TOOL, tool_name="run_tests"),  # snake_case
+            TurnStep(role=TurnRole.TOOL, tool_name="run-tests"),  # kebab
+            TurnStep(role=TurnRole.TOOL, tool_name="github__create_issue__create"),  # MCP
             TurnStep(role=TurnRole.TOOL),  # nameless TOOL step -> skipped
             TurnStep(role=TurnRole.ASSISTANT, content="全绿"),
         ],
@@ -314,7 +320,12 @@ def test_daemon_write_context_fills_tool_cues_from_turn_steps() -> None:
 
     ctx = _daemon_write_context(turn)
 
-    assert ctx.tools_used == ("bash", "pytest")
+    assert ctx.tools_used == (
+        "runTests",
+        "run_tests",
+        "run-tests",
+        "github__create_issue__create",
+    )
 
 
 def test_daemon_write_context_caps_tool_cues_at_retrieval_budget() -> None:

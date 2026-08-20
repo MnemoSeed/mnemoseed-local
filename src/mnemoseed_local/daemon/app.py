@@ -73,7 +73,7 @@ from mnemoseed_local.llm.types import (
     LLMError,
     LLMUnavailable,
 )
-from mnemoseed_local.retrieve.cues import CueConfig, extract_cues
+from mnemoseed_local.retrieve.cues import CueConfig, _is_tool_name, extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.schema.turn import Turn, TurnRole
 from mnemoseed_local.storage.factory import Stores, build_stores
@@ -228,13 +228,16 @@ def _turn_tool_names(turn: Turn) -> tuple[str, ...]:
 
     First-occurrence order, casefold-deduped (matching the retrieval-side
     overlap semantics), capped at the retrieval cue budget so a tool-heavy turn
-    never stores more names than the query side can match.
+    never stores more names than the query side can match. Only names the
+    query-side classifier recognises (``_is_tool_name``: camelCase/snake_case/
+    kebab/MCP) are stored — a common lowercase host name like ``bash`` would
+    otherwise be stored verbatim but never matchable by the real extractor.
     """
     cap = CueConfig().tools_cap
     seen: set[str] = set()
     names: list[str] = []
     for step in turn.steps:
-        if step.role is TurnRole.TOOL and step.tool_name:
+        if step.role is TurnRole.TOOL and step.tool_name and _is_tool_name(step.tool_name):
             key = step.tool_name.casefold()
             if key in seen:
                 continue
