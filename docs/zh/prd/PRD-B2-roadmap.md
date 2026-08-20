@@ -51,7 +51,7 @@
 - **daemon on/off 用户可控开关**：2026-08-20 用户立项，同日作为 **B2.5** 收口（见批次启动记录）。
 - **宿主 plugin 统一安装面（B2.6 候选，2026-08-20 用户立项，排在 B2.5 之后）**：每宿主定制 plugin 作 daemon 接口，MCP+hooks 打包成单 bundle、单开关整体启停（对标 Claude Code plugin 形态）。依据调研 `docs/zh/design/research-opencode-plugin-bundling.md`（2026-08-20 落盘）：opencode 无原生 bundle/无 per-plugin 开关（TUI 开关 PR #42410 未合并）；plugin `config` 钩注入 `cfg.mcp` 有真实先例但存在初始化竞态 → **前置 T0 式本地探针**；`["spec", {enabled:false}]` options 元组可作自实现整体开关；长期跟踪 agent-plugins 标准（opencode issue #39937/#40993/#41561）。
 - **多 session 互认知（2026-08-20 用户立项，排在 B2.6 之后立项研究）**：多 session 互相认知到同时在跑的 sessions 在做什么/做了什么的机制设计；与 B2.4 时间窗面同族（从"事后归因"到"并行互见"）。
-- **B2.3 挂起子项**：boot 同步 dream 恢复挪出启动路径（watchdog PRE_BIND 宽限 300s 的根治项）。
+- **B2.3 挂起子项（2026-08-20 收口，squash `e95921b`，PR #23 → issue #22）**：boot 同步 dream 恢复挪出启动路径（RESUME 作业变体 + scheduler 首 tick 有界 drain 闸 `RESUME_DRAIN_TIMEOUT_S=600`；QA CLOSABLE，门禁 1338 passed / 3 skipped）。watchdog `daemon.log` 同日实弹首击（refused-grace fire，F2 僵尸按设计处死退场）。
 
 ## 门禁（每包不变）
 
