@@ -166,3 +166,11 @@
 5. **云锚链路打通**：Kimi-K3 以 `openai_compatible` extra-route 进矩阵（key 走环境变量名，报告/单元无任何密料），off 态 recall=0.50 pollution=0 提供高端参考点；verify 席 9.5s 零 token 快失败（Http 级，非撞墙），云座 × 本地校验配对待查。
 6. **离线重打分实测**：`python -m mnemoseed_local.eval rescore` 对 19:00Z 报告 70 cell 重判 **零偏差**（同尺确定性复核成立）；旧 v1 报告无载荷不可重判——v1.1 载荷的存在理由被同一事实反向证明。
 
+### B4 前置排查：qwen3.5:9b verify 席"确定性零产出"根因（2026-08-20 定案）
+
+报告：`C:\Users\LITTLE~1\AppData\Local\Temp\opencode\B4-qwen35-9b-verify-zero-output-report.md`（完整英文版，要点摘要如下）。
+
+- **根因定案**：非确定性零产出，是**采样坍缩**——verify 座参数（`think=False`、无 seed/temperature/num_predict）下 qwen3.5:9b 以 ~67% 概率（15 跑 10 次）吐字面 `[]`（合法 JSON 空数组），harness `_loads_json_array` + `reflect()` 无**空值守卫**无重试收下当"确定性零产出"。两次 live 矩阵同指纹 tok=522 / completion=2 即坍缩样本。
+- **对照实验**：temp=0 → 3/3 `[]`（greedy 必坍缩）；seed=42 → 3/3 满抽取 780 tok（定 seed 即治）；num_predict=128 → 截断畸形（非本案）；think=True → 满抽取但烧 7-8k tok（不需）。
+- **B4 修法方向（择一或并用，B4 批次定）**：(a) verify 座固定 seed（repro 实证可复现满抽取）；(b) harness 空值守卫 + 有限重试（`[]` 视为坍缩信号而非合法空抽取）；(c) qwen3.5:9b 退出 verify 席。单跑数值不能当 bar 的既有结论不受影响。
+

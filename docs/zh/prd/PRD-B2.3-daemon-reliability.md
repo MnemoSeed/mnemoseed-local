@@ -112,3 +112,10 @@ while ($true) {
 - **repro 钉（P1 §5 原文改写）**：`DreamWorker.stop()` 对"卡死 in-flight job"在有限时长内不返回（阻塞 snapshotter double + wait_for TimeoutError）——必须先红在现有代码上（现有 wait=True join 必卡）、watchdog 上线后行为不变但进程语义改变，钉住的是机制本身；teardown 期间 refused+宽限 → fire 决策的单测（watchdog 线程逻辑用假 socket 探针注入）；boot PRE_BIND 超宽限 fire 决策单测；**`create_app()`/TestClient 永不武装的 pin**；FileHandler 落 `CONFIG_DIR/daemon.log` 的行内容 pin（boot/teardown/watchdog 末语三类）。
 - **`tests/test_mcp_gateway_retry.py`（P2 §4 的 8 例原文）**：refused→success 恰好 2 次调用、refused 双败报 down hint、timeout/RestError/无 cause 零重试、成功路径恰好 1 次、重试两侧请求体逐项等值、ping/tools/list 不经 client。
 - **既有 pin 全保**：test_mcp_gateway.py `:148-258`、`test_cli.py:582-601`、`test_hosts_opencode.py:32-41`、`test_hosts_install.py:186`。
+
+### 挂起子项收口：boot 同步 dream 恢复挪出启动路径（2026-08-20 开工并收口）
+
+- **设计（solution-architect 波次计划评审并入的 2 条 IMPORTANT 调整）**：`_build_capture` 保持 `recover()/adopt()/resume_boundary()` 分类与 `trigger.resume()/resume_merge()` **O(1) 同步**（推迟它们会让 scheduler 首 tick 在 `dream_in_flight=False` 下并发发射新 snapshot）；只将 `pipeline.run(snapshot)` 延迟为 dream worker 的 **RESUME 作业变体**（`_DreamJob` 独立字段，不混入 event/manual union，FIFO 单 worker 保序，enqueue 在 `worker.start()` 之后、lifespan `yield` 之前，端口零 LLM 调用即绑定）；**scheduler 首 tick 等待全部 deferred resume 排空**（drain 计数 try/finally 递减、异常/取消亦释放、零 resume 预置）——防"恢复窗口内对刚合并范围重复做梦"；QA IMPORTANT-1 修复：drain 等待有界 `RESUME_DRAIN_TIMEOUT_S=600` + 超时 WARNING 后照常 tick（防 resume 卡死导致调度静默停摆——本项目第一类缺陷形态）。
+- **QA**：首轮 **CLOSABLE**（0 BLOCKER / IMPORTANT-1 drain 无超时随批修净；NIT docstring pairs 随批修净；NIT-1 pin-3 的 `completed_later==1` 依赖 1s 墙钟窗、NIT-3 job 互斥不变量未强约束、NIT-4 enqueue_resume 无 pre-start 守卫——三条记录为本节如实边界）；崩溃窗口未加宽（journal 仍是唯一事实源，双恢复幂等）。
+- **门禁**：1327 → **1338 passed / 3 skipped**（本批 boot-recovery 5 钉 + 同波 B2.6 探针 6 钉）；ruff/format/mypy 全净。
+- **生效前提**：`uv tool install --force` + daemon 重启。

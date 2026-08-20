@@ -415,6 +415,14 @@ DREAM_RETRY_CAP_S: float = 3600.0
 #: Consecutive failures after which the scheduler stops retrying and audits.
 DREAM_RETRY_MAX: int = 3
 
+#: Upper bound the scheduler waits for deferred boot-recovery resumes to drain
+#: before its first tick. The observed reflect/merge LLM legs run ~20-60s; 600s
+#: is 10x that envelope, so only a WEDGED resume executor thread (never a slow
+#: LLM) trips it — a hang must not silently stall every dream forever. On
+#: timeout the scheduler ticks anyway; the bounded duplicate risk is absorbed
+#: by in-flight queueing + fingerprint dedup.
+RESUME_DRAIN_TIMEOUT_S: float = 600.0
+
 
 @dataclass(frozen=True)
 class DreamEligibility:
@@ -465,12 +473,16 @@ class DreamScheduler:
         *,
         trigger: DreamTrigger | None = None,
         clock: Callable[[], float] = time.time,
+        resume_drain: asyncio.Event | None = None,
+        resume_drain_timeout_s: float = RESUME_DRAIN_TIMEOUT_S,
     ) -> None:
         self._vector: VectorStore = _vector_of(stores)
         self._meta: _MetaProbe = _meta_of(stores)
         self._config = config
         self._trigger = trigger
         self._clock = clock
+        self._resume_drain = resume_drain
+        self._resume_drain_timeout_s = resume_drain_timeout_s
         self._last: dict[str, tuple[str, int, int]] = {}
         self._retry: dict[str, _RetryState] = {}
         self._outcomes: queue.Queue[tuple[str, TurnRange, bool, str | None, float]] = queue.Queue()
@@ -698,8 +710,23 @@ class DreamScheduler:
 
         Ticks immediately once, then sleeps one cadence; the config keys are
         re-read every tick, so a configwrite change hot-applies to the next
-        tick. Never raises: a failed tick logs and retries.
+        tick. Never raises: a failed tick logs and retries. When a resume-drain
+        event is wired (boot recovery), the first tick waits for every deferred
+        journaled resume to complete — a tick during that window would emit a
+        dream for the still-unconsolidated profile and queue a duplicate behind
+        the resume. The daemon's lifespan never awaits this, so the port binds
+        immediately.
         """
+        drain = self._resume_drain
+        if drain is not None:
+            try:
+                await asyncio.wait_for(drain.wait(), timeout=self._resume_drain_timeout_s)
+            except TimeoutError:
+                logger.warning(
+                    "resume drain timed out after %gs; ticking anyway (bounded duplicate "
+                    "risk absorbed by in-flight queueing + fingerprint dedup)",
+                    self._resume_drain_timeout_s,
+                )
         while True:
             try:
                 self.tick()
