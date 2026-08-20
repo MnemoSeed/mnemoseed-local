@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -320,12 +321,15 @@ def run_matrix(
 
     cell_reports: list[CellReport] = []
     skipped: list[SkippedCell] = []
+    # one-shot run id: isolates every cell's rig under a per-call directory so
+    # a second matrix over the same root never re-ingests onto the first.
+    run_id = uuid.uuid4().hex[:8]
     for cell in cells:
         missing = _cell_missing_reason(cell, probe)
         if missing is not None:
             skipped.append(SkippedCell(cell_id=cell.cell_id, reason=missing))
             continue
-        rig = EvalRig(RigPaths(root=root / "cells" / cell.cell_id), cell)
+        rig = EvalRig(RigPaths(root=root / "runs" / run_id / cell.cell_id), cell)
         try:
             for material in materials:
                 try:

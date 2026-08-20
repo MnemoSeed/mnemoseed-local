@@ -37,7 +37,7 @@ from mnemoseed_local.eval.matrix import (
     probe_ollama_models,
     run_matrix,
 )
-from mnemoseed_local.eval.report import SEAT_SEED_POLICY_FIXED, SEAT_SEED_POLICY_NONE
+from mnemoseed_local.eval.report import SEAT_SEED_POLICY_FIXED, SEAT_SEED_POLICY_NONE, report_to_dict
 
 STUB_A = EvalRoute(driver="stub", model="stub-a")
 STUB_B = EvalRoute(driver="stub_verifier", model="stub-b")
@@ -255,3 +255,53 @@ def test_matrix_cli_no_seat_seed_flag_parses() -> None:
     from mnemoseed_local.eval.__main__ import main
 
     assert main(["matrix", "--list", "--no-seat-seed"]) == 0
+
+
+def _rig_audit_count(root: Path, cell: EvalCell) -> int:
+    """The largest audit row count of any rig store under ``root``.
+
+    Reads each ``meta.db`` read-only (no rig construction, so no store wipe):
+    the audit log is append-only, so a second run re-ingesting onto the same
+    store doubles its rows. Fresh-run stores each hold one run's worth, so the
+    max across stores is the contamination signal: no store may carry more
+    than one run's worth of audit rows.
+    """
+    import sqlite3
+
+    counts: list[int] = []
+    for meta in root.glob("**/stores/meta.db"):
+        conn = sqlite3.connect(f"file:{meta}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+            counts.append(int(row[0]) if row is not None else 0)
+        finally:
+            conn.close()
+    return max(counts) if counts else 0
+
+
+def test_run_matrix_same_root_twice_is_idempotent(tmp_path: Path) -> None:
+    """A second run_matrix over the SAME root must not accumulate store state
+    under the shared profile: reports must be byte-for-byte identical (modulo
+    wall-clock normalization) and no rig store may carry more than one run's
+    worth of data (the audit log is append-only, so accumulation doubles it)."""
+    cells = [EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    root = tmp_path / "root"
+
+    r1 = run_matrix(cells, materials, root=root)
+    baseline = _rig_audit_count(root, cells[0])
+
+    r2 = run_matrix(cells, materials, root=root)
+
+    d1 = report_to_dict(r1)
+    d2 = report_to_dict(r2)
+    d1["started_at"] = ""
+    d2["started_at"] = ""
+    for cell in d1["cells"]:
+        cell["cost"]["duration_s"] = None
+    for cell in d2["cells"]:
+        cell["cost"]["duration_s"] = None
+    assert d1 == d2
+    assert [len(c["triples"]) for c in d2["cells"]] == [len(c["triples"]) for c in d1["cells"]]
+    # cross-run isolation: run-2 must not re-ingest on top of run-1's store
+    assert _rig_audit_count(root, cells[0]) == baseline
