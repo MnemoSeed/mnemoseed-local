@@ -172,6 +172,7 @@ def test_ping_and_tools_list_never_touch_the_client() -> None:
         "remember",
         "dream_once",
         "recent_sessions",
+        "session_windows",
     }
     assert client.calls == []
 

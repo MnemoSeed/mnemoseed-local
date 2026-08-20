@@ -39,7 +39,8 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -62,6 +63,7 @@ from mnemoseed_local.retrieve.cues import CueExtractor
 from mnemoseed_local.retrieve.hybrid import HybridRetriever
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance, ProvenanceEvent
 from mnemoseed_local.schema.turn import ProfileRef
+from mnemoseed_local.storage.drivers._time import iso8601_utc
 from mnemoseed_local.storage.factory import Stores
 from mnemoseed_local.storage.ports import (
     AuditEntry,
@@ -69,6 +71,7 @@ from mnemoseed_local.storage.ports import (
     ChunkFilter,
     NodeFilter,
     Page,
+    VectorStore,
     WeightUpdate,
 )
 
@@ -87,6 +90,11 @@ EXPLICIT_PIN_SOURCE = "memory.remember"
 NON_FOCAL_FLOOR = 0.4
 _MIN_SLICE_CHARS = 200
 _SCAN_PAGE_LIMIT = 50
+
+# Bounded per-session window scan: the exact first/latest over a session's
+# rows. A scan that returns the limit may have missed older rows, so the
+# consumer reports window_truncated (never a page-visible approximation).
+SESSION_WINDOW_SCAN_LIMIT = 2000
 
 
 class MemoryNotFoundError(Exception):
@@ -164,6 +172,14 @@ class SessionRecentRequest(BaseModel):
     sessions: int = Field(default=2, ge=1, le=5)
     per_session: int = Field(default=20, ge=1, le=100)
     exclude_session_id: str | None = None
+    self_session_id: str | None = None
+
+
+class SessionWindowsRequest(BaseModel):
+    """Request body for POST /session/windows (B2 time-window surface)."""
+
+    profile_id: ProfileRef
+    sessions: int = Field(default=3, ge=1, le=10)
 
 
 class RecallPendingRequest(BaseModel):
@@ -199,6 +215,86 @@ class ReinforceRequest(BaseModel):
         return self
 
 
+def _discover_session_ids(
+    chunks: Sequence[ChunkStamp],
+    *,
+    sessions: int,
+    exclude_session_id: str | None = None,
+) -> list[str]:
+    """Newest-first distinct-session discovery over an ingested_at-desc page.
+
+    First-seen order over the newest-first walk is recency order; the shared
+    "?" group (chunks without a session label) is never excluded by an
+    exact-match exclusion."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        if exclude_session_id is not None and chunk.provenance.session_id == exclude_session_id:
+            continue
+        session_id = chunk.provenance.session_id or "?"
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        ids.append(session_id)
+        if len(ids) >= sessions:
+            break
+    return ids
+
+
+@dataclass(frozen=True)
+class SessionWindow:
+    """Exact per-session chunk window from a bounded full scan.
+
+    ``chunk_count`` is None for the shared "?" group, whose unlabeled rows are
+    not addressable by a session-scoped scan — the honest unknown, never a
+    fabricated zero."""
+
+    session_id: str
+    first: float | None
+    latest: float | None
+    chunk_count: int | None
+    window_truncated: bool
+
+
+def _scan_session_window(
+    vector: VectorStore,
+    *,
+    profile_id: str,
+    session_id: str,
+) -> SessionWindow:
+    """One bounded per-session scan: the true first/latest over the session's
+    rows, or an empty window when the session holds no chunks."""
+    if session_id == "?":
+        return SessionWindow(session_id, None, None, None, False)
+    page = vector.list_chunks(
+        ChunkFilter(profile_id=profile_id, session_id=session_id),
+        Page(offset=0, limit=SESSION_WINDOW_SCAN_LIMIT),
+    )
+    items = page.items
+    if not items:
+        return SessionWindow(session_id, None, None, 0, False)
+    ordered = sorted(items, key=lambda chunk: chunk.ingested_at)
+    return SessionWindow(
+        session_id=session_id,
+        first=ordered[0].ingested_at,
+        latest=ordered[-1].ingested_at,
+        chunk_count=len(items),
+        window_truncated=page.total > SESSION_WINDOW_SCAN_LIMIT,
+    )
+
+
+def _window_iso(window: SessionWindow) -> dict[str, str] | None:
+    """ISO-8601 UTC rendering of an exact window; null when it has no chunks
+    or a non-positive (epoch-leak) bound."""
+    first = window.first
+    if first is None or first <= 0:
+        return None
+    latest = window.latest
+    if latest is None or latest <= 0:
+        return None
+    return {"first": iso8601_utc(first), "latest": iso8601_utc(latest)}
+
+
 def _group_session_tails(
     chunks: list[ChunkStamp],
     *,
@@ -217,34 +313,24 @@ def _group_session_tails(
     own session must never be echoed back to it): the session cap counts
     SURVIVOR groups, and the shared "?" group (chunks without a session label)
     is never excluded."""
-    groups: list[dict[str, Any]] = []
-    by_session: dict[str, dict[str, Any]] = {}
+    session_ids = _discover_session_ids(chunks, sessions=sessions, exclude_session_id=exclude_session_id)
+    by_session: dict[str, list[ChunkStamp]] = {session_id: [] for session_id in session_ids}
     for chunk in chunks:
         if exclude_session_id is not None and chunk.provenance.session_id == exclude_session_id:
             continue
-        # a chunk without a session label (e.g. a manual pin) still lands in a
-        # visible shared group instead of breaking the grouping
         session_id = chunk.provenance.session_id or "?"
-        group = by_session.get(session_id)
-        if group is None:
-            if len(groups) >= sessions:
-                continue  # an older session than the capped set; the page is newest-first
-            group = {
-                "session_id": session_id,
-                "latest_at": chunk.ingested_at,
-                "chunks_desc": [],
-            }
-            by_session[session_id] = group
-            groups.append(group)
-        group["chunks_desc"].append(chunk)
+        if session_id not in by_session:
+            continue  # a session beyond the cap; the discovery walk ordered the rest
+        by_session[session_id].append(chunk)
     payload: list[dict[str, Any]] = []
-    for group in groups:
-        tail = group["chunks_desc"][:per_session]
+    for session_id in session_ids:
+        chunks_desc = by_session[session_id]
+        tail = chunks_desc[:per_session]
         tail.reverse()  # ascending: the tail in reading order
         payload.append(
             {
-                "session_id": group["session_id"],
-                "latest_at": group["latest_at"],
+                "session_id": session_id,
+                "latest_at": chunks_desc[0].ingested_at,
                 "chunks": [
                     {
                         "chunk_id": chunk.chunk_id,
@@ -404,6 +490,8 @@ class MemoryService:
             "flags": [flag.value for flag in entry.flags],
             "conflict_group": entry.conflict_group,
             "recent_evidence": list(entry.recent_evidence),
+            "session_id": entry.session_id,
+            "ingested_at": iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
         }
 
     # ------------------------------------------------------------ remember
@@ -593,6 +681,8 @@ class MemoryService:
         per_session: int = 20,
         sessions: int = 2,
         exclude_session_id: str | None = None,
+        self_session_id: str | None = None,
+        active_sessions: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """B2 time-ordered resume: the newest sessions' verbatim chunk tails.
 
@@ -600,20 +690,69 @@ class MemoryService:
         guarantee); the page window is a pragmatic guardrail against very long
         sessions diluting the older group out of view. ``exclude_session_id``
         widens the page by one session's worth of chunks so the caller's own
-        session can be filtered out without starving the survivor groups."""
+        session can be filtered out without starving the survivor groups.
+        Every group carries its exact per-session window; ``self_window`` is
+        the caller-named session's window when it has chunks, else null."""
         limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
         )
+        groups = _group_session_tails(
+            page.items,
+            per_session=per_session,
+            sessions=sessions,
+            exclude_session_id=exclude_session_id,
+        )
+        for group in groups:
+            window = _scan_session_window(
+                self._stores.vector, profile_id=profile_id, session_id=group["session_id"]
+            )
+            group["window"] = _window_iso(window)
+            group["window_truncated"] = window.window_truncated
+        self_window: dict[str, Any] | None = None
+        if self_session_id:
+            window = _scan_session_window(
+                self._stores.vector, profile_id=profile_id, session_id=self_session_id
+            )
+            if window.first is not None:
+                self_window = {
+                    "session_id": self_session_id,
+                    "window": _window_iso(window),
+                    "chunk_count": window.chunk_count,
+                    "active": self_session_id in active_sessions,
+                }
         return {
             "profile_id": profile_id,
-            "sessions": _group_session_tails(
-                page.items,
-                per_session=per_session,
-                sessions=sessions,
-                exclude_session_id=exclude_session_id,
-            ),
+            "sessions": groups,
+            "self_window": self_window,
         }
+
+    def session_windows(
+        self,
+        *,
+        profile_id: str,
+        sessions: int = 3,
+        active_sessions: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        """The exact per-session time-window surface: each discovered session's
+        true first/latest from a bounded full scan, its chunk count, the
+        live-capture active flag, and the scan-limit truncation marker."""
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=SESSION_WINDOW_SCAN_LIMIT)
+        )
+        result: list[dict[str, Any]] = []
+        for session_id in _discover_session_ids(page.items, sessions=sessions):
+            window = _scan_session_window(self._stores.vector, profile_id=profile_id, session_id=session_id)
+            result.append(
+                {
+                    "session_id": session_id,
+                    "window": _window_iso(window),
+                    "chunk_count": window.chunk_count,
+                    "active": session_id in active_sessions,
+                    "window_truncated": window.window_truncated,
+                }
+            )
+        return {"profile_id": profile_id, "sessions": result}
 
     # ------------------------------------------------------------ B2.1 T2 mid-session recall
 
@@ -987,12 +1126,27 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
     newest session group first, tails ascending. ``exclude_session_id`` lets
     the session-start injection read skip the caller's own session."""
     service: MemoryService = request.app.state.memory
+    sessions = getattr(getattr(request.app.state, "capture", None), "sessions", None)
+    active = frozenset(sessions()) if sessions is not None else frozenset()
     return service.session_recent(
         profile_id=req.profile_id,
         per_session=req.per_session,
         sessions=req.sessions,
         exclude_session_id=req.exclude_session_id,
+        self_session_id=req.self_session_id,
+        active_sessions=active,
     )
+
+
+@router.post("/session/windows")
+def session_windows(req: SessionWindowsRequest, request: Request) -> dict[str, Any]:
+    """Exact per-session chunk windows for the time-comparison surface: the
+    daemon supplies the structure, the consumer decides which window a mtime
+    belongs to."""
+    service: MemoryService = request.app.state.memory
+    sessions = getattr(getattr(request.app.state, "capture", None), "sessions", None)
+    active = frozenset(sessions()) if sessions is not None else frozenset()
+    return service.session_windows(profile_id=req.profile_id, sessions=req.sessions, active_sessions=active)
 
 
 @router.post("/session/recall-pending")

@@ -107,10 +107,16 @@ def test_ping_returns_empty_result() -> None:
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_four_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_five_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
-    assert {tool["name"] for tool in tools} == {"recall", "remember", "dream_once", "recent_sessions"}
+    assert {tool["name"] for tool in tools} == {
+        "recall",
+        "remember",
+        "dream_once",
+        "recent_sessions",
+        "session_windows",
+    }
     for tool in tools:
         assert tool["description"]
         schema = tool["inputSchema"]
@@ -128,6 +134,10 @@ def test_tools_list_has_exactly_the_four_tools_with_valid_schemas() -> None:
     assert "required" not in recent["inputSchema"]
     assert recent["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
     assert recent["inputSchema"]["properties"]["n_per_session"]["type"] == "integer"
+    # the session time-window surface takes no required arguments
+    windows = next(tool for tool in tools if tool["name"] == "session_windows")
+    assert "required" not in windows["inputSchema"]
+    assert windows["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
 
 
 # ---------------------------------------------------------------- tools/call
@@ -220,6 +230,66 @@ def test_call_recent_sessions_without_arguments_sends_profile_only() -> None:
     )
     assert responses[0]["result"]["isError"] is False
     assert client.calls == [("/session/recent", {"profile_id": "default"})]
+
+
+def test_call_session_windows_maps_arguments_to_the_daemon_endpoint() -> None:
+    """session_windows proxies to POST /session/windows with the wire key
+    name (n_sessions -> sessions) and passes the payload through untouched."""
+    payload = {
+        "profile_id": "default",
+        "sessions": [
+            {
+                "session_id": "s1",
+                "window": {"first": "2026-08-20T00:00:00Z", "latest": "2026-08-20T00:01:00Z"},
+                "chunk_count": 2,
+                "active": True,
+                "window_truncated": False,
+            }
+        ],
+    }
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [
+            _request(
+                8,
+                "tools/call",
+                {"name": "session_windows", "arguments": {"n_sessions": 7}},
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    text = responses[0]["result"]["content"][0]["text"]
+    assert text == json.dumps(payload, ensure_ascii=False, default=str)
+    assert json.loads(text) == payload
+    assert client.calls == [("/session/windows", {"profile_id": "default", "sessions": 7})]
+
+
+def test_call_session_windows_without_arguments_sends_profile_only() -> None:
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [_request(8, "tools/call", {"name": "session_windows"})],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert json.loads(responses[0]["result"]["content"][0]["text"]) == {
+        "profile_id": "default",
+        "sessions": [],
+    }
+    assert client.calls == [("/session/windows", {"profile_id": "default"})]
+
+
+def test_call_session_windows_daemon_unreachable_is_structured_error() -> None:
+    client = StubClient(error=DaemonUnavailableError("cannot reach http://localhost:7788"))
+    _, responses = run_gateway(
+        [_request(6, "tools/call", {"name": "session_windows", "arguments": {}}), _request(7, "ping")],
+        client,
+    )
+    assert len(responses) == 2
+    result = responses[0]["result"]
+    assert result["isError"] is True
+    assert "cannot reach" in result["content"][0]["text"]
+    assert responses[1]["id"] == 7
 
 
 def test_unknown_tool_is_structured_error_and_loop_survives() -> None:

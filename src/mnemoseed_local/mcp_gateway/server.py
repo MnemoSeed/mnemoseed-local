@@ -11,7 +11,8 @@ Protocol surface (MCP ``2024-11-05`` shape):
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
 - ``tools/list`` -> the daemon tools (recall / remember / dream_once /
-  recent_sessions — the last one is the B2 time-ordered resume surface);
+  recent_sessions / session_windows — recent_sessions is the B2 time-ordered
+  resume surface, session_windows the B2.4 per-session time-window surface);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -105,6 +106,22 @@ TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "session_windows",
+        "description": "Fetch per-session activity time windows (first/latest ISO-8601 UTC, chunk counts, "
+        "active flags) from mnemoseed-local — use it to attribute an unfamiliar workspace artifact "
+        "(file mtime) to the session that produced it by time comparison.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "n_sessions": {
+                    "type": "integer",
+                    "description": "how many recent session groups to return (default 3, max 10)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 #: Sentinel: no request id could be salvaged from a broken line.
@@ -150,6 +167,11 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             if arguments.get("n_per_session") is not None:
                 recent_body["per_session"] = arguments["n_per_session"]
             payload = client.post("/session/recent", recent_body)
+        elif name == "session_windows":
+            windows_body: dict[str, Any] = {"profile_id": client.profile_id}
+            if arguments.get("n_sessions") is not None:
+                windows_body["sessions"] = arguments["n_sessions"]
+            payload = client.post("/session/windows", windows_body)
         else:
             return _error_result(f"unknown tool: {name!r}")
     except (DaemonUnavailableError, DaemonRestError) as exc:

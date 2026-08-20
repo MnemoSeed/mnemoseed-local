@@ -257,6 +257,27 @@ function isoEnded(group: any): string {
   return Number.isFinite(latestAt) ? new Date(latestAt * 1000).toISOString() : ""
 }
 
+function escapeAttr(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+}
+
+function groupStarted(group: any): string {
+  const first = typeof group?.window?.first === "string" ? group.window.first : ""
+  if (!first || group?.window_truncated === true) return ""
+  return ` started="${escapeAttr(first)}"`
+}
+
+function sessionSelfLine(selfWindow: any): string {
+  const first = typeof selfWindow?.window?.first === "string" ? selfWindow.window.first : ""
+  const tail = sessionTailId(selfWindow)
+  if (!first || !tail) return ""
+  return `<session-self id="${escapeAttr(tail)}" started="${escapeAttr(first)}"/>`
+}
+
 function registerNeedles(
   registry: Map<string, Set<string>>,
   text: string,
@@ -275,31 +296,40 @@ function registerNeedles(
 
 function buildRecallInjection(
   groups: any[],
+  selfWindow: any,
 ): { block: string; registry: Map<string, Set<string>>; includedIds: string[] } | null {
   // Accrue newest-first (groups in payload order, chunks within a group
   // reversed) against a char budget whose final assembled block must stay
-  // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line and the
-  // group headers — the wrapper is accounted up front. A boundary chunk keeps
-  // only its newest tail slice (prefixed with the "…" marker) when the
-  // leftover can still hold MIN_SLICE_CHARS; otherwise it is dropped along
-  // with everything older. Dropped chunks register NO needles AND no seen id.
-  // Needles derive from the EXACT included (sanitized, possibly sliced) text
-  // per chunk; includedIds lists every ADMITTED chunk id (needle or not) —
-  // the T2 pull's seen list must match what the session already holds.
+  // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line, the
+  // self-anchor line (when present) and the group headers — the wrapper is
+  // accounted up front. A boundary chunk keeps only its newest tail slice
+  // (prefixed with the "…" marker) when the leftover can still hold
+  // MIN_SLICE_CHARS; otherwise it is dropped along with everything older.
+  // Dropped chunks register NO needles AND no seen id. Needles derive from
+  // the EXACT included (sanitized, possibly sliced) text per chunk;
+  // includedIds lists every ADMITTED chunk id (needle or not) — the T2 pull's
+  // seen list must match what the session already holds.
   if (!Array.isArray(groups)) return null
   const registry = new Map<string, Set<string>>()
   const includedIds: string[] = []
   const lines: string[] = []
+  const selfLine = sessionSelfLine(selfWindow)
   let remaining =
     MAX_INJECT_CHARS -
-    (RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length)
+    (RECALL_FENCE_OPEN.length +
+      1 +
+      RECALL_DISCLAIMER.length +
+      1 +
+      (selfLine ? selfLine.length + 1 : 0) +
+      RECALL_FENCE_CLOSE.length)
   if (remaining < MIN_SLICE_CHARS) return null
   lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
+  if (selfLine) lines.push(selfLine)
   let committedGroup = false
   for (const group of groups) {
     const chunks = Array.isArray(group?.chunks) ? [...group.chunks].reverse() : []
     if (chunks.length === 0) continue
-    const header = `<session-tail id="${sessionTailId(group)}" ended="${isoEnded(group)}">`
+    const header = `<session-tail id="${escapeAttr(sessionTailId(group))}" ended="${escapeAttr(isoEnded(group))}"${groupStarted(group)}>`
     const groupFixed = header.length + 1 + "</session-tail>".length + 1
     if (groupFixed > remaining) break
     remaining -= groupFixed
@@ -410,6 +440,7 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
         sessions: SESSION_TAIL_SESSIONS,
         per_session: SESSION_TAIL_PER_SESSION,
         exclude_session_id: sessionID,
+        self_session_id: sessionID,
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
@@ -486,7 +517,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
       const data = await fetchSessionTails(sessionID)
       if (data !== null) {
-        const built = buildRecallInjection(data.sessions)
+        const built = buildRecallInjection(data.sessions, data.self_window)
         if (built === null) {
           // A reachable transform with nothing injectable gets one debug line —
           // the attempt gate is already consumed, so no extra rate limiting.

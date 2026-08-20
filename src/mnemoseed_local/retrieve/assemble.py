@@ -48,6 +48,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Any
 
 from mnemoseed_local.dream.delta import estimate_tokens
 from mnemoseed_local.retrieve.hybrid import Candidate, HybridRecall
@@ -120,6 +121,8 @@ class AssembledEntry:
     flags: tuple[EntryFlag, ...]
     conflict_group: str | None = None
     recent_evidence: tuple[str, ...] = ()
+    session_id: str | None = None
+    ingested_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -413,6 +416,12 @@ class Assembler:
             if flag not in flags:
                 flags.append(flag)
         text = self._entry_text(candidate)
+        provenance: dict[str, Any] = {}
+        if candidate.kind == "chunk" and isinstance(candidate.item, ChunkStamp):
+            provenance = {
+                "session_id": candidate.item.provenance.session_id,
+                "ingested_at": candidate.item.ingested_at,
+            }
         return AssembledEntry(
             kind=candidate.kind,
             id=candidate.id,
@@ -423,6 +432,7 @@ class Assembler:
             flags=tuple(flags),
             conflict_group=admission.conflict_group,
             recent_evidence=evidence,
+            **provenance,
         )
 
     def _profile_chunk_count(self, vector_store: VectorStore, profile_id: str) -> int:
