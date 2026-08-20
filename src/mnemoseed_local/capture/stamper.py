@@ -66,6 +66,7 @@ class WriteContext:
     task: str | None = None
     time_bucket: str | None = None
     entities: tuple[str, ...] = ()
+    tools_used: tuple[str, ...] = ()
 
 
 class WriteOutcomeKind(StrEnum):
@@ -95,8 +96,9 @@ def _message_text(turn: Turn, role: TurnRole) -> str:
 
 def _assemble_text(turn: Turn) -> str:
     """Canonical chunk text: USER then ASSISTANT message text, one labelled
-    line per present role. Tool output is excluded (already stripped by F1);
-    the verbatim channel never summarizes these lines."""
+    line per present role. Tool steps never join the verbatim text — tool use
+    is not part of the AI response — and the verbatim channel never summarizes
+    these lines. Tool names travel separately as cues (Option C)."""
     parts: list[str] = []
     user = _message_text(turn, TurnRole.USER)
     assistant = _message_text(turn, TurnRole.ASSISTANT)
@@ -284,6 +286,7 @@ class StampWriter:
             task=ctx.task,
             time_bucket=ctx.time_bucket,
             entities=list(ctx.entities),
+            tools_used=list(ctx.tools_used),
             emotion=scored.emotion,
         )
         provenance = Provenance(

@@ -162,6 +162,7 @@ def test_writer_assembles_complete_stamp() -> None:
         task="fix-ci",
         time_bucket="weekday-morning",
         entities=("pipelines",),
+        tools_used=("bash", "pytest"),
     )
     scored = _scored("以后都用 pnpm", emotion=EmotionCue(valence=-0.2, arousal=0.5, peripheral_gaps=True))
     outcome = _writer(store, clock).write(scored, ctx)
@@ -179,6 +180,7 @@ def test_writer_assembles_complete_stamp() -> None:
     assert stamp.cues.task == "fix-ci"
     assert stamp.cues.time_bucket == "weekday-morning"
     assert stamp.cues.entities == ["pipelines"]
+    assert stamp.cues.tools_used == ["bash", "pytest"]
     assert stamp.cues.emotion == EmotionCue(valence=-0.2, arousal=0.5, peripheral_gaps=True)
     assert stamp.provenance.asserted_by == "claude-sonnet-5"
     assert stamp.provenance.session_id == SESSION
@@ -245,6 +247,41 @@ def test_stamp_text_joins_user_and_assistant_lines() -> None:
     )
     outcome = _writer(store, _Clock()).write(scored, WriteContext(profile_id=PROFILE))
     assert store.chunks[outcome.chunk_id].text == "user: 你喜欢什么风格\nassistant: 简洁直接"
+
+
+def test_stamp_text_excludes_tool_steps() -> None:
+    """Verbatim contract with TOOL steps present: tool output is excluded at
+    stamp assembly (never captured), only USER + ASSISTANT lines join the text.
+    The tool NAMES travel separately as cues — Option C fills them, the text
+    channel stays untouched."""
+    store = _FakeVectorStore()
+    turn = Turn(
+        turn_index=0,
+        session_id=SESSION,
+        profile_id=PROFILE,
+        host=HostId.GENERIC,
+        model_id="claude-sonnet-5",
+        started_at=0.0,
+        steps=[
+            TurnStep(role=TurnRole.USER, content="跑一遍测试"),
+            TurnStep(role=TurnRole.TOOL, content="tool stdout here", tool_name="bash"),
+            TurnStep(role=TurnRole.ASSISTANT, content="全绿"),
+        ],
+    )
+    scored = ScoredTurn(
+        turn=turn,
+        importance=4.0,
+        components=ScoreComponents(arousal=3.0, novelty=4.0, causal_chain=2.0),
+        durability=DurabilityResult(durability=Durability.DURABLE, confidence=0.8, reasons=["pref-marker"]),
+        emotion=None,
+        causal_reasons=[],
+        features={},
+    )
+    outcome = _writer(store, _Clock()).write(scored, WriteContext(profile_id=PROFILE, tools_used=("bash",)))
+    stamp = store.chunks[outcome.chunk_id]
+    assert stamp.text == "user: 跑一遍测试\nassistant: 全绿"
+    assert "tool stdout here" not in stamp.text
+    assert stamp.cues.tools_used == ["bash"]
 
 
 def test_no_model_falls_back_to_user_asserted() -> None:

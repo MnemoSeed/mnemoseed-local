@@ -449,6 +449,23 @@ def test_cue_overlap_blend_is_documented_shape(stack) -> None:
     assert abs(cand.breakdown.cue_overlap - 0.7) < 1e-9
 
 
+def test_tool_cue_overlap_activates_on_stored_tool_names(stack) -> None:
+    """Option C repair: capture now fills chunk.cues.tools_used, so the stored
+    side of the β_tool=0.25 overlap term is no longer always empty — a chunk
+    carrying the queried tool name outranks an otherwise identical one."""
+    _write(
+        stack,
+        _chunk("c_tool", "the LanceDb loader", decay=0.9, entities=("LanceDb",), tools=("bash",)),
+    )
+    _write(stack, _chunk("c_plain", "the LanceDb loader", decay=0.9, entities=("LanceDb",)))
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",), tools=("bash",)))
+    tool_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_tool")
+    plain_chunk = next(c for c in _chunk_candidates(result) if c.id == "c_plain")
+    # 0.25 * (1/1 tool overlap) vs 0.25 * 0 for the tool-less chunk
+    assert abs(tool_chunk.breakdown.cue_overlap - plain_chunk.breakdown.cue_overlap - 0.25) < 1e-9
+    assert result.candidates.index(tool_chunk) < result.candidates.index(plain_chunk)
+
+
 def test_entity_overlap_is_casefolded(stack) -> None:
     # "BgeM3" stored vs "bgeM3" queried: the store prefilter passes via the
     # exact-cased "LanceDb", the overlap score folds case on both entities.

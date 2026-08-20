@@ -73,7 +73,7 @@ from mnemoseed_local.llm.types import (
     LLMError,
     LLMUnavailable,
 )
-from mnemoseed_local.retrieve.cues import extract_cues
+from mnemoseed_local.retrieve.cues import CueConfig, extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.schema.turn import Turn, TurnRole
 from mnemoseed_local.storage.factory import Stores, build_stores
@@ -223,6 +223,28 @@ def _migrations_payload(stores: Stores) -> dict[str, int]:
     return versions
 
 
+def _turn_tool_names(turn: Turn) -> tuple[str, ...]:
+    """Tool-name cues from the turn's TOOL steps (encoding specificity R4).
+
+    First-occurrence order, casefold-deduped (matching the retrieval-side
+    overlap semantics), capped at the retrieval cue budget so a tool-heavy turn
+    never stores more names than the query side can match.
+    """
+    cap = CueConfig().tools_cap
+    seen: set[str] = set()
+    names: list[str] = []
+    for step in turn.steps:
+        if step.role is TurnRole.TOOL and step.tool_name:
+            key = step.tool_name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(step.tool_name)
+            if len(names) >= cap:
+                break
+    return tuple(names)
+
+
 def _daemon_write_context(turn: Turn) -> WriteContext:
     """Per-write encoding context on the serving path (FR-1.6).
 
@@ -231,6 +253,9 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
     extracts cues from the pinned text. Without this fill every capture chunk
     reads as no-entity-evidence to the recall-side entity gate, and every
     entity-bearing query silently excludes the whole capture surface (D2).
+    Tool-name cues come from the turn's TOOL steps (Option C): the retrieval
+    β_tool overlap term is dead code unless capture stores the names it
+    matches on.
     """
     text = " ".join(
         step.content
@@ -243,6 +268,7 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
         host=turn.host.value,
         cognitive_tier=CognitiveTier.TIER_1,
         entities=entities,
+        tools_used=_turn_tool_names(turn),
     )
 
 
