@@ -121,7 +121,7 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 
 **记录挂起（不入本批，后续批次再议）**：
 
-- **QA-7**：用户中止（abort）的助手回复可能从不触发 completed 事件（`time.error` 形态）——待探针一轮验证，若属实则把 error 形态也视为完成点。
+- **QA-7（2026-08-20 侦察定版，代码面结论 + live 探针待跑）**：abort 的 assistant 轮是否进捕获链**取决宿主在 abort 的 `message.updated` 上是否给 `time.completed`**——给则正常捕获（Trace A 无缺陷）；不给（`time.error` 形态）则**静默丢失且不可回放**（Trace B）：live 闸 `plugin.ts:1042` 早退在 park 之前，parked-sweep 与 crash-replay 三条恢复通道全部 gate 于 `time.completed`（`plugin.ts:1042/951/959`），用户步存活assistant步 100% 丢。**修法已定**：把 `metadata.error` 形态视同完成点、park 提前到 completed 闸之前（daemon 侧零改动，segmenter 本来就吸收；对应原定案"把 error 形态也视为完成点"）。**待跑**：live 探针——开 `MNEMOSEED_LOCAL_DEBUG=1` 后用户中止一次生成，查 `hook-debug.jsonl` 是否有该轮 `assistant_message` POST（或 `session/recent` 是否有半截文本）以定版 A/B；现装 opencode 版本行为未实证（anomalyco fork 源示 cleanup `Effect.ensuring` 会写 `time.completed`，但架构分叉不作准）。
 - **QA-6**：重启不对称性已证无害（hook 抑重 + daemon 近重复吸收兜底），仅 provenance 外观问题，记录备查。
 - **QA-8**：idle-flush debounce 被 QA 否决（过度工程；竞态只是内容无损的重排，且已被 QA-3 的确定性修复吸收）；settle 序问题用 await 重扫解决，不用睡眠。
 - **QA-13 残余**：fixture 无 `model_id` 变体（NIT）；mvp-design.md:61 去重单元表述与实际近重复吸收实现不符（存量漂移，记录备查）。

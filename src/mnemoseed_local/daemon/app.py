@@ -58,6 +58,7 @@ from mnemoseed_local.dream import (
     FileSnapshotter,
     Merger,
     ReflectOrchestrator,
+    Snapshot,
     TokenLedger,
     TripleVerifier,
     resume_boundary,
@@ -235,17 +236,23 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
 class _DreamJob:
     """One unit of dream work for the worker thread.
 
-    Exactly one of ``event`` (a fired pool event) and ``profile_id`` (a manual
-    ``dream_once`` run) is set. ``future`` resolves the manual launch decision
-    back to the awaiting /memory/dream_once caller.
+    Exactly one of ``event`` (a fired pool event), ``profile_id`` (a manual
+    ``dream_once`` run), or ``pipeline``+``snapshot`` (a boot-recovery resume)
+    is set. ``future`` resolves the manual launch decision back to the awaiting
+    /memory/dream_once caller.
     """
 
-    event: PoolEvent | None
-    profile_id: str | None
-    future: asyncio.Future[bool] | None
+    event: PoolEvent | None = None
+    profile_id: str | None = None
+    future: asyncio.Future[bool] | None = None
+    pipeline: DreamPipeline | None = None
+    snapshot: Snapshot | None = None
 
     def run(self, trigger: DreamTrigger) -> bool | None:
         """Execute on the worker thread; returns the manual launch decision."""
+        if self.pipeline is not None and self.snapshot is not None:
+            self.pipeline.run(self.snapshot)
+            return None
         if self.event is not None:
             trigger.handle_event(self.event)
             return None
@@ -273,6 +280,12 @@ class DreamWorker:
         self._task: asyncio.Task[None] | None = None
         self._inflight: _DreamJob | None = None  # the job whose chain is running
         self._inflight_cf: ConcurrentFuture[bool | None] | None = None
+        # Deferred boot-recovery resumes: the scheduler's first tick waits until
+        # every queued resume completed, so it never emits a duplicate dream
+        # over a range the resume is about to consolidate.
+        self._resume_pending = 0
+        self._resume_drained = asyncio.Event()
+        self._resume_drained.set()
 
     def start(self) -> None:
         """Create the consumer task (idempotent; called from lifespan)."""
@@ -286,6 +299,22 @@ class DreamWorker:
     def enqueue_event(self, event: PoolEvent) -> None:
         """Synchronous event submission (the scheduler tick path)."""
         self._queue.put_nowait(_DreamJob(event=event, profile_id=None, future=None))
+
+    def enqueue_resume(self, pipeline: DreamPipeline, snapshot: Snapshot) -> None:
+        """Queue one boot-recovery resume for the worker.
+
+        The scheduler gate tracks the count: each resume completion decrements
+        it and the drain event fires at zero, so the scheduler's first tick
+        waits for the whole journaled recovery window to drain."""
+        self._resume_pending += 1
+        self._resume_drained.clear()
+        self._queue.put_nowait(_DreamJob(pipeline=pipeline, snapshot=snapshot))
+
+    @property
+    def resume_drained(self) -> asyncio.Event:
+        """Set once every deferred boot-recovery resume completed; the
+        scheduler awaits it before its first tick."""
+        return self._resume_drained
 
     async def submit_dream_once(self, profile_id: str) -> bool:
         """Run exactly one manual cycle; awaits the worker's launch decision."""
@@ -305,6 +334,12 @@ class DreamWorker:
             except Exception:
                 logger.exception("dream worker job failed; the trigger state stays consistent")
                 result = None
+            finally:
+                if job.pipeline is not None and job.snapshot is not None:
+                    self._resume_pending -= 1
+                    if self._resume_pending <= 0:
+                        self._resume_pending = 0
+                        self._resume_drained.set()
             self._inflight = None
             self._inflight_cf = None
             if job.future is not None and not job.future.done():
@@ -398,10 +433,25 @@ class _WorkerTriggerForwarder:
 
 def _build_capture(
     stores: Stores, config: Config, configwrite: ConfigWriteService
-) -> tuple[WritingPipeline, DreamTrigger, DreamPipeline, DreamWorker, _DreamRelay, RoleRouter]:
+) -> tuple[
+    WritingPipeline,
+    DreamTrigger,
+    DreamPipeline,
+    DreamWorker,
+    _DreamRelay,
+    RoleRouter,
+    list[tuple[DreamPipeline, Snapshot]],
+]:
     """Serving capture funnel: strip -> score -> pool -> stamp/write over the
     resolved storage stack. /ingest stays submit-only; the funnel drains on
     /session/end (v1 drain trigger, off the /ingest hot path).
+
+    Journaled-snapshot recovery is split by cost: the O(1) classification and
+    trigger bookkeeping (recover / adopt / resume routing) run synchronously
+    here, but the expensive pipeline.run reflect/merge chain is deferred as
+    RESUME jobs for the dream worker, so the port binds fast and the watchdog
+    PRE_BIND window covers only true hangs. The deferred (pipeline, snapshot)
+    pairs are returned for the worker to enqueue in order after start.
     """
     snapshotter = FileSnapshotter(store=stores.vector, meta=stores.meta)
     trigger = DreamTrigger(
@@ -500,6 +550,7 @@ def _build_capture(
     worker = DreamWorker(trigger)
     relay = _DreamRelay(worker)
     snapshotter.on_ready = pipeline.on_snapshot_ready
+    deferred_resumes: list[tuple[DreamPipeline, Snapshot]] = []
     for snapshot in snapshotter.recover():
         snapshotter.adopt(snapshot)
         boundary = resume_boundary(snapshot)
@@ -507,7 +558,7 @@ def _build_capture(
             trigger.resume(snapshot.profile_id, snapshot.turn_range)
         elif boundary == "merge":
             trigger.resume_merge(snapshot.profile_id, snapshot.turn_range)
-        pipeline.run(snapshot)
+        deferred_resumes.append((pipeline, snapshot))
     # The capture pool self-fires at the SAME configured floor/idle keys the
     # scheduler reads (dream.floor_pool_points / dream.idle_min_sec): never a
     # fixed literal. The scheduler stays the authority — a pool fire drains the
@@ -541,6 +592,7 @@ def _build_capture(
         worker,
         relay,
         router,
+        deferred_resumes,
     )
 
 
@@ -602,11 +654,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.dream_worker,
         app.state.dream_relay,
         app.state.role_router,
+        deferred_resumes,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
     # Dream chain thread (T1a): the capture/memory surface never blocks on a
     # dream. Started here so the worker consumes events from boot onward.
     app.state.dream_worker.start()
+    # Deferred journaled recovery: the pipeline.run chain is enqueued as RESUME
+    # jobs in order AFTER the worker starts, so the expensive reflect/merge runs
+    # on the worker thread and the port binds fast. The scheduler waits for
+    # these to drain before its first tick.
+    for resume_pipeline, resume_snapshot in deferred_resumes:
+        app.state.dream_worker.enqueue_resume(resume_pipeline, resume_snapshot)
     # Memory surface (T4): one retrieval engine whose track executor is shut
     # down in teardown, before the stores close.
     app.state.memory = MemoryService(stores, config)
@@ -620,7 +679,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # through the worker forwarder so every trigger mutation stays on the
     # worker thread.
     scheduler_trigger = cast(DreamTrigger, _WorkerTriggerForwarder(app.state.dream_worker))
-    app.state.scheduler = DreamScheduler(stores, config, trigger=scheduler_trigger)
+    app.state.scheduler = DreamScheduler(
+        stores,
+        config,
+        trigger=scheduler_trigger,
+        resume_drain=app.state.dream_worker.resume_drained,
+    )
     # A2.5 T1 backoff wiring: the dream pipeline reports every attempt's outcome
     # (reflect/merge ok or error) back to the scheduler, so a failed dream
     # re-arms its fired fingerprint and re-fires on the exponential backoff. The
