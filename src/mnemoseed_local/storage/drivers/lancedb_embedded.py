@@ -62,6 +62,19 @@ _DEFAULT_TABLE = "chunks"
 _DEFAULT_URI = CONFIG_DIR / "chunks.lance"
 _DENSE_FUSION_WEIGHT = 0.5
 
+_NEAR_DUP_PREFILTER_K = 50
+_NEAR_DUP_WIDEN_MARGIN = 0.05
+_NEAR_DUP_WIDEN_FACTOR = 4
+_NEAR_DUP_WIDEN_STEP = 50
+
+_widening_count = 0
+
+
+def near_duplicate_widenings() -> int:
+    """Total near-duplicate prefilter widenings since import; approximate
+    under concurrent probes (unlocked counter, diagnostics only)."""
+    return _widening_count
+
 
 def _escape(value: object) -> str:
     """SQL string/number literal for the LanceDB WHERE clause."""
@@ -224,22 +237,44 @@ class LanceDbEmbeddedStore:
     def near_duplicate(
         self, vector: Sequence[float], threshold: float, profile_id: str | None = None
     ) -> list[ChunkStamp]:
-        """Full-scan cosine probe. profile_id scopes the probe to one profile
-        (D5 isolation); when omitted the whole table is scanned."""
-        where = self._filter_sql_all(ChunkFilter(profile_id=profile_id or "*"))
+        """Capped top-K scan + exact cosine re-score probe. profile_id scopes
+        the probe to one profile (D5 isolation); when omitted the whole table
+        is probed. The top-K cap widens while its K-th candidate's dense
+        similarity stays within MARGIN of the threshold, so a true duplicate
+        ranked just beyond the initial K is still caught. Residual envelope:
+        a duplicate whose top-K rank lands beyond the widened K, or whose
+        dense similarity sits below the threshold, is missed — the sparse
+        signature never rescues the probe. Ties order dense-desc then
+        chunk_id asc.
+        """
+        global _widening_count
         query = [float(value) for value in vector]
         query_norm = math.sqrt(sum(value * value for value in query)) or 1.0
+        where = self._filter_sql_all(ChunkFilter(profile_id=profile_id or "*"))
+        k = _NEAR_DUP_PREFILTER_K
+        while True:
+            rows = (
+                self._table.search(query, vector_column_name="vector_dense")
+                .where(where)
+                .metric("cosine")
+                .limit(k)
+                .to_list()
+            )
+            if len(rows) < k:
+                break
+            kth_sim = 1.0 - float(rows[-1]["_distance"])
+            if kth_sim < threshold - _NEAR_DUP_WIDEN_MARGIN:
+                break
+            _widening_count += 1
+            k = max(k * _NEAR_DUP_WIDEN_FACTOR, k + _NEAR_DUP_WIDEN_STEP)
         matches: list[tuple[float, str]] = []
-        for row in self._paginate(where):
-            row_vector = row["vector_dense"]
-            row_norm = math.sqrt(sum(v * v for v in row_vector)) or 1.0
-            dot = sum(q * v for q, v in zip(query, row_vector, strict=False))
-            similarity = dot / (query_norm * row_norm)
+        for row in rows:
+            similarity = self._dense_similarity(query, query_norm, row)
             if similarity >= threshold:
                 matches.append((similarity, str(row["chunk_id"])))
         if not matches:
             return []
-        matches.sort(key=lambda entry: entry[0], reverse=True)
+        matches.sort(key=lambda entry: (-entry[0], entry[1]))
         chunks: list[ChunkStamp] = []
         for _similarity, chunk_id in matches:
             stamp = self.get_chunk(chunk_id)
@@ -258,17 +293,6 @@ class LanceDbEmbeddedStore:
             batch = snapshot.search().where(where).limit(min(step, total - offset)).offset(offset).to_list()
             rows.extend(batch)
         return [self._to_stamp(row) for row in rows]
-
-    def _paginate(self, where: str) -> list[dict[str, Any]]:
-        """Bounded plain-scan pages over the current table data."""
-        total = self._table.count_rows(filter=where)
-        step = 500
-        rows: list[dict[str, Any]] = []
-        for offset in range(0, total, step):
-            rows.extend(
-                self._table.search().where(where).limit(min(step, total - offset)).offset(offset).to_list()
-            )
-        return rows
 
     def list_chunks(self, filter: ChunkFilter, page: Page) -> PageResult[ChunkStamp]:
         where = self._filter_sql(filter)
@@ -574,6 +598,12 @@ class LanceDbEmbeddedStore:
         if filter.needs_reconcile is not None:
             parts.append("needs_reconcile = " + ("true" if filter.needs_reconcile else "false"))
         return parts
+
+    def _dense_similarity(self, query: Sequence[float], query_norm: float, row: dict[str, Any]) -> float:
+        row_vector = row["vector_dense"]
+        row_norm = math.sqrt(sum(value * value for value in row_vector)) or 1.0
+        dot = sum(q * v for q, v in zip(query, row_vector, strict=False))
+        return float(dot / (query_norm * row_norm))
 
     def _sparse_similarity(self, query: SparseVector, row: dict[str, Any]) -> float:
         stored = row.get("vector_sparse") or {}

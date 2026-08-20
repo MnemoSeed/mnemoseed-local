@@ -15,6 +15,7 @@ fixes:
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,45 @@ def test_daemon_shutdown_flushes_open_turns_and_drains(config_path: Path) -> Non
         app.state.capture.drain = recording_drain
     # context exit == daemon shutdown: open turn closed, its buffer drained
     assert "sess-shutdown" in drain_calls
+
+
+def test_teardown_completes_queued_drains_before_stores_close(config_path: Path) -> None:
+    """B6 (W-C): teardown completes every queued drain BEFORE the stores close —
+    a slow drain still finishes first, so a restart mid-session cannot lose the
+    last exchange to a closing store (QA-4 order extended to the drain lane)."""
+    app = create_app()
+    with TestClient(app) as client:
+        opened = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": "sess-order",
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "关停前最后一句"},
+            },
+        )
+        assert opened.status_code == 202, opened.text
+        finished = threading.Event()
+        original_drain = app.state.capture.drain
+
+        def slow_drain(session_id: str) -> None:
+            time.sleep(0.5)
+            finished.set()
+            original_drain(session_id)
+
+        app.state.capture.drain = slow_drain
+        close_saw_finished: list[bool] = []
+        original_close = app.state.stores.close
+
+        async def recording_close() -> None:
+            close_saw_finished.append(finished.is_set())
+            await original_close()
+
+        app.state.stores.close = recording_close
+    assert close_saw_finished, "stores.close never ran during teardown"
+    assert close_saw_finished[0] is True, "stores closed before the queued drain finished"
 
 
 def test_segmenter_flush_all_closes_every_open_turn() -> None:

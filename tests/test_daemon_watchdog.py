@@ -595,6 +595,110 @@ async def test_daemon_worker_threads_are_daemon_and_unregistered() -> None:
         await worker.stop()
 
 
+# ------------------------------------------------ B6 W-C: drain lane teardown
+
+
+def test_teardown_drain_telemetry_precedes_stores_close(log_home: Path) -> None:
+    """B6 (W-C): teardown logs the drain-lane completion BEFORE the stores
+    close — the completed-before-close telemetry pin (a mutant that closes the
+    stores first, or omits the bounded drain wait, fails the order assert)."""
+    session = "sess-telemetry"
+    log_file = log_home / "daemon.log"
+    with _boot() as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": session,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "关停前最后一句"},
+            },
+        )
+        assert response.status_code == 202, response.text
+    final_text = log_file.read_text(encoding="utf-8")
+    assert "teardown: drain capture lane" in final_text
+    assert "teardown: drain lane complete (1 drained, 0 failed, 0 abandoned)" in final_text
+    assert final_text.index("teardown: drain lane complete") < final_text.index("teardown: close stores"), (
+        "the drain-lane completion must be logged before the stores close"
+    )
+
+
+def test_teardown_abandons_wedged_drain_in_bounded_time(config_path: Path) -> None:
+    """B6 (W-C): a drain wedged in store I/O hits the drain stop bound and
+    teardown completes anyway — the wedged worker is abandoned (daemon thread,
+    dies with the process), never joined, and the abandoned-drain warning names
+    the session (F2-rootfix semantics: teardown never hangs)."""
+    session = "sess-wedge"
+    block = threading.Event()
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": session,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "楔死前最后一句"},
+            },
+        )
+        assert response.status_code == 202, response.text
+
+        def wedged_drain(session_id: str) -> None:
+            del session_id
+            block.wait(5.0)  # outlives the 2s drain stop budget
+
+        app.state.capture.drain = wedged_drain
+        started = time.monotonic()
+    elapsed = time.monotonic() - started
+    assert elapsed < 4.0, f"teardown was not bounded: {elapsed:.3f}s"
+    log_text = (config_path.parent / "daemon.log").read_text(encoding="utf-8")
+    assert "teardown: drain lane complete (0 drained, 0 failed, 1 abandoned)" in log_text
+    assert f"abandoned 1 wedged drain(s): {session}" in log_text
+    assert "B2.2" in log_text, "the abandoned-drain warning must note the host-side replay absorb"
+    wedge_thread = next(
+        (t for t in threading.enumerate() if t.name.startswith("mnemoseed-drain-")),
+        None,
+    )
+    assert wedge_thread is not None, "no drain worker thread"
+    assert wedge_thread.is_alive(), "the wedged drain was joined, not abandoned"
+
+
+def test_teardown_reports_failed_drain_with_session_and_exception(config_path: Path) -> None:
+    """B6 (W-C) QA IMPORTANT-1: a teardown-submitted drain that raises is a
+    data-loss event with no awaiting handler — stop() must log a WARNING naming
+    the session and the exception, count it as failed (never as drained), and
+    still complete teardown."""
+    session = "sess-fail"
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": session,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "失败前最后一句"},
+            },
+        )
+        assert response.status_code == 202, response.text
+
+        def failing_drain(session_id: str) -> None:
+            del session_id
+            raise RuntimeError("teardown drain exploded")
+
+        app.state.capture.drain = failing_drain
+    log_text = (config_path.parent / "daemon.log").read_text(encoding="utf-8")
+    assert "teardown: drain lane complete (0 drained, 1 failed, 0 abandoned)" in log_text
+    assert f"drain failed for session {session}" in log_text
+    assert "teardown drain exploded" in log_text
+
+
 # ------------------------------------------------------------- daemon.log pins
 
 

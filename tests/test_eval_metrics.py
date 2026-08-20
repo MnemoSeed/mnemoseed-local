@@ -15,6 +15,8 @@ Metric definitions are pinned by hand-computed fixtures (never LLM judgments):
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mnemoseed_local.eval.canary import CanarySession, canary_session
@@ -36,6 +38,8 @@ from mnemoseed_local.eval.metrics import (
     verify_metrics,
 )
 from mnemoseed_local.eval.report import (
+    SEAT_SEED_POLICY_FIXED,
+    SEAT_SEED_POLICY_NONE,
     CellReport,
     EvalReport,
     SkippedCell,
@@ -307,3 +311,75 @@ def test_report_skipped_cells_round_trip(canary_run, tmp_path) -> None:
     )
     path = write_report(report, tmp_path / "eval-reports", matrix_slug="m")
     assert load_report(path).skipped == report.skipped
+
+
+def test_report_v11_round_trip_preserves_b4a_fields(canary_run, tmp_path) -> None:
+    session, run = canary_run
+    report = EvalReport(
+        eval_version="v1.1",
+        started_at="2026-08-20T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id=run.cell_id,
+                material=session.session_id,
+                canary=score_canary(session, run),
+                verify=verify_metrics(run),
+                cost=cost_metrics(run),
+                reflect_collapse_attempts=2,
+                reflect_recovered=True,
+                seat_seed=42,
+            ),
+        ),
+        skipped=(),
+        seat_seed_policy=SEAT_SEED_POLICY_FIXED,
+    )
+    path = write_report(report, tmp_path / "eval-reports", matrix_slug="b4a")
+    loaded = load_report(path)
+    assert loaded == report
+    cell = loaded.cells[0]
+    assert cell.reflect_collapse_attempts == 2
+    assert cell.reflect_recovered is True
+    assert cell.seat_seed == 42
+    assert loaded.seat_seed_policy == SEAT_SEED_POLICY_FIXED
+
+
+def test_pre_b4a_report_loads_with_default_fields(tmp_path) -> None:
+    """A pre-B4a v1.1 report (no collapse/seed fields) loads with defaults —
+    never a crash, never an invented seed. The top-level policy defaults to
+    NONE: pre-B4a seats were unseeded, so a "per-seat-fixed" label would
+    contradict the cells' seat_seed=None."""
+    old = {
+        "eval_version": "v1.1",
+        "started_at": "2026-08-18T19:00:00Z",
+        "cells": [
+            {
+                "cell_id": "qwen3_5_9b+off+d32000+f0",
+                "material": "canary-00",
+                "canary": None,
+                "verify": {
+                    "verifier_model": None,
+                    "judged": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "rejected_keys": [],
+                    "fallbacks": {},
+                },
+                "cost": {
+                    "duration_s": 4.3,
+                    "token_usage": 522,
+                    "reflect_prompt_tokens": 1370,
+                    "reflect_completion_tokens": 2,
+                    "verify_tokens": None,
+                },
+            }
+        ],
+        "skipped": [],
+    }
+    path = tmp_path / "pre-b4a.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = load_report(path)
+    assert loaded.seat_seed_policy == SEAT_SEED_POLICY_NONE
+    cell = loaded.cells[0]
+    assert cell.reflect_collapse_attempts == 0
+    assert cell.reflect_recovered is False
+    assert cell.seat_seed is None

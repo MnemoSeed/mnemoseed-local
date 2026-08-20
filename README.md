@@ -71,7 +71,7 @@ Gates: `uv run pytest -q`, `ruff check`, `ruff format --check`, `mypy src`.
 
 ## License
 
-AGPL-3.0.
+MIT.
 
 ## Daemon supervision (optional)
 

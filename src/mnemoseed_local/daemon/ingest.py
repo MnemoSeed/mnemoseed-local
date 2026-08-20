@@ -98,10 +98,17 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     # v1 drain trigger: no scheduled drain exists yet, so settlement is the
     # natural off-HTTP-path moment to move buffered turns through the F2-F4
     # funnel. /ingest stays submit-only (the client never waits on writes).
-    # Guarded so injection seams that bind a drain-less pipeline keep working.
+    # B6 (W-C): the drain runs on the daemon drain lane thread, so the settle
+    # never blocks the event loop for the whole store write; the response still
+    # waits for the drain future (ack = completed-applied). Guarded so injection
+    # seams that bind a drain-less pipeline keep working.
+    lane = getattr(request.app.state, "drain_lane", None)
     drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
     if drain is not None:
-        drain(req.session_id)
+        if lane is not None:
+            await lane.drain(drain, req.session_id)
+        else:
+            drain(req.session_id)
     # QA-5: the turns are persisted by the drain, so the settled session can
     # hand its buffers back (same guarded-seam pattern as drain).
     prune = getattr(getattr(request.app.state, "capture", None), "prune_settled", None)
@@ -139,7 +146,8 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
     Closure alone keeps the session ingestable; the subsequent /session/end
     still settles and drains any turns opened after the flush. The same
     guarded-drain spine as /session/end keeps injection seams that bind a
-    drain-less pipeline working.
+    drain-less pipeline working; the drain runs on the daemon drain lane thread
+    and the response waits for it (ack = completed-applied, B6 W-C).
     """
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
@@ -148,9 +156,13 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ProfileMismatchError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    lane = getattr(request.app.state, "drain_lane", None)
     drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
     if drain is not None:
-        drain(req.session_id)
+        if lane is not None:
+            await lane.drain(drain, req.session_id)
+        else:
+            drain(req.session_id)
     return {
         "status": "flushed",
         "session_id": req.session_id,

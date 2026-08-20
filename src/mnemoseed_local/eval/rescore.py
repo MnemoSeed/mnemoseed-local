@@ -82,6 +82,7 @@ def rescore_report(report_path: Path, *, canary_seed: int, out_dir: Path | None 
         started_at=report.started_at,
         cells=tuple(replace(cell, canary=_rescore_canary(cell, truth_by_name)) for cell in report.cells),
         skipped=report.skipped,
+        seat_seed_policy=report.seat_seed_policy,
     )
     return write_report(
         rescored,
