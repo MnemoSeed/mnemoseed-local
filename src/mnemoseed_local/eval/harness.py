@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -353,6 +354,12 @@ class EvalRig:
         self.paths = paths
         self.cell = cell
         self.profile_id = profile_id
+        # idempotent over the artifacts this rig owns: a reused root must not
+        # re-ingest onto a prior run's stores/journal under the shared profile.
+        for p in (paths.stores_dir, paths.journal_dir):
+            if p.exists():
+                shutil.rmtree(p)
+        paths.config_path.unlink(missing_ok=True)
         paths.root.mkdir(parents=True, exist_ok=True)
         paths.stores_dir.mkdir(parents=True, exist_ok=True)
         paths.journal_dir.mkdir(parents=True, exist_ok=True)

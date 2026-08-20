@@ -192,3 +192,63 @@
 
 **B4b（live 矩阵定版 + bar 钉死 + lite 档定版）待排**——seed 已固定后 matrix 数字可复现，坍缩率可从 `collapse_attempts` 字段直接读。
 
+## 批次 B4b · 跨跑隔离修复 + 全模型 rerun 钉 bar（2026-08-21 立项，用户拍板）
+
+> 理论锚：**不适用（not borrowed）**——本批是评测臂自身隔离契约的正确性修复 + 一次数值定版 rerun，不借任何神经/心理实证规律。立项仅为让 B3.1/B4a 已固化的送检结果在干净尺度上被跑出来；用既有的 dream/verify/blab 机制，不新增机制也不借理论。
+
+### 立项依据（证据，非感觉）
+
+B4a 收口后、seed 已固定的前提下，2026-08-20 19:00–19:30 用 `--workdir .eval-rigs` 连跑 6 次 canary-00（同 roster 同材料），数字非但不可复现反而**系统性发散**：
+
+| 跑次 | 起始报告 size | 终末 cell core | 终末 pollution | 用时 |
+|---|---|---|---|---|
+| 1 | 43 KB | 28 | 12 | 30s/seat |
+| 2-6 | 69→89→106→118→132 KB 单调膨胀 | 28→40→61→80→90→103 | 16→26→38→36→38→53 | 35→99→190s/seat |
+
+seed=42 固定≠数值可复现：pollution/core 随跑次单调膨胀、recall 在 0.25↔1.00 间无规跳变。验尸（v1.1 triple 载荷 + `.eval-rigs/cells/<cell_id>/` 目录直读）定位到单一根因，与采样/模型无关——
+
+### 根因定案（单一，包级）
+
+**跨跑 store 累积**：`matrix.py` `run_matrix` 把每个 cell 的 rig 根钉在 `root / "cells" / cell.cell_id`（`--workdir .eval-rigs` 是稳定路径，跨次调用复用同一目录）；`EvalRig.__init__` 在根下 `build_stores` 落 sqlite 三元图/meta + lance 向量 + config，**构造时不清理已有文件**。第二次 `run_matrix`（或任何复用 `--workdir` 的 runner）在上一轮的 chunks/graph/audit 上继续进料→reflect 的检索上下文逐轮变大→pollution 单调膨胀、recall 乱跳、tokens/duration 抬升。`run_turns` 的 ledger 月度计数虽按 run 取差值隔离了 token 面，graph/vector 累积无人防。
+
+### 测试盲区（让 bug 溜进 B4a 收口）
+
+T2 确定性 AC 存在但**只测了"fresh root"半边**：`test_repeat_runs_semantically_deterministic` 用 `tmp_path / f"rig-{index}"`——**两个孤立新 root**，从没把同一 root 喂两次。所有 `run_matrix` 的回归调用同样全是 fresh `tmp_path`。跨跑累积这一支无任何红测试守门，故 B4a"数字可复现"的论断实际从未被验证过。
+
+### 语义定版（本批拍板，写死进测试）
+
+1. **隔离契约（红线）**：一次 `run_matrix` 调用 = 一组独立、互不串料的 rig store；同一 `--workdir` 跨次 `run_matrix` 必须产出**逐字节可比的报告**（计时字段除外）。T2 既有 AC "同 cell 两次跑同材料：node/triple/审计形状一致" 由本批补齐"同一 root"半边。
+2. **修法方向（待 architect 评估择一/并用，后述）**：(a) `run_matrix` 每次 cell 根加一次性 run-id 子目录（`root / "cells" / cell.cell_id / run-<id>` 或 `root / "runs" / run_id / cell.cell_id`），落地即弃；(b) `EvalRig.__init__` 进入即 wipe 本 root 下的 stores（构造幂等）；(c) 两者并用——run-id 防累积、wipe 防遗留。`canary` 子命令与 `_run_material` 的 within-run rig 复用语义不动。
+3. **within-run 多材料仍复用同一 rig**（PRD T2 既有意图，本批不破）：一次 `run_matrix` 内 cell×material 循环里同一 `EvalRig` 跑多 material 是设计形态（profile 隔离子串料的 latent 风险由 architect 一并核查，不在本批修复范围，除非实测串料即升 P0）。
+4. **既有数据全废**：2026-08-20 19:00–19:30 六跑报告 + `.eval-rigs/` 残留目录全部作废，不进 bar、不入收口对照。
+
+### 任务 T1 · 回归测试（红先行）
+
+- 范围：
+  1. `run_matrix` 同一 `root` 连跑两次同 roster+materials → 两份 `EvalReport` 的 `cells` 序列**逐条等值**（cell_id/material/canary 全字段/verify 全字段/cost.token_usage/reflect_collapse_attempts/reflect_recovered/seat_seed；`cost.duration_s` 与 `started_at` 豁免）。
+  2. 跑两次后 `root` 下不残留跨跑可串料状态（按 stores 文件 mtime 不早于第二次构造、或按 graph 行数不翻倍断言）。
+  3. `__main__ matrix --workdir <稳定路径>` 端到端同断言（若 (1)(2) 已在 `run_matrix` 层覆盖，端到端可省，由 architect 裁）。
+- AC：测试当前（修法落地前）红；修法落地后绿。stub 通路秒级跑，不进 live 门禁。
+
+### 任务 T2 · 修法落地（T1 绿即收）
+
+- 范围：按 architect 批准的方案改 `matrix.py` 和/或 `harness.py`；现有 `tmp_path` 单跑测试全绿（不得为让跨跑测试绿而破坏 fresh-root 单跑语义）。
+- AC：T1 全绿 + 既有 eval/matrix 全套测试 (`test_eval_harness.py`/`test_eval_matrix.py`/`test_eval_metrics.py`/`test_eval_report.py`/`test_eval_rescore.py`/`test_eval_matcher_b31.py`/`test_eval_canary.py`/`test_eval_anchor.py`) 全绿；门禁净。
+
+### 任务 T3 · 全模型 rerun（用户已授权）
+
+- 范围：清理作废的 `.eval-rigs/` 与 `eval/` 旧报告后，跑默认 6 模型 roster × {off,verify}，B=gemma4:e4b，`--workdir` 取稳定一次性目录或 `--out` 显式区分。报告落 `<CONFIG_DIR>/eval/`。
+- AC：零 skipped 或 skipped 仅 `missing_model:`；首跑报告完整、收口对照表入 PRD。
+
+### 任务 T4 · bar 钉死 + 收口
+
+- 范围：据 T3 报告把每个确定性 cell 的 recall/pollution/judged/成本四面数值 + 撞墙指纹钉进本 PRD 的 bar 节；非确定性 cell（仍方差大者）按 B3.1 收口记录的"单跑不当 bar"既定口径标注、不强行钉数。
+- AC：bar 节落 PRD；收口记录入本节 + `PRD-B2-roadmap.md` 批次行。
+
+### 本批不做（划线）
+
+- 不改 dream/verify/capture/reflect 任何生产代码路径（纯 `eval/` 内修）。
+- 不修 within-run 多材料串料的 latent 风险：architect 核查确认默认 catalog（`canary_count=1`、各 replay `profile_id` 各异）下 profile_id 机制有效隔离——graph 写入按 profile_id 入 content-hash（`merge.py` `_content_id`）、graph/vector 读路径均强制 `profile_id` 过滤，同 run 内非共享 profile 的材料互不串料。**latent 边界**仅在 `canary_count>1`（多个 canary 共用 profile `"canary"`）或两份 replay 共享同一 `snapshot.profile_id` 时触发（共享 content-hash → merge reinforce 而非 create、chunks 于共享 profile 累积 → 同 run 内检索变大）。此边界由本节钉死，未来 catalog 变更任一条件时须重开隔离核查。
+- 不动 v1.1 schema（triples 载荷已够离线重判用）。
+- 不引 lite 档（原 B4b 节提到的 lite 档定版——本批只做隔离修复 + 全量 rerun 钉 bar，lite 档留下一批）。
+
