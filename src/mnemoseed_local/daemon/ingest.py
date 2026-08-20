@@ -8,10 +8,10 @@ guesses identity. Token auth lands with PRD-06; only the shape is reserved.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-import anyio
 from fastapi import APIRouter, HTTPException, Request, status
 
 from mnemoseed_local.capture import (
@@ -28,10 +28,16 @@ from mnemoseed_local.schema.turn import (
     SessionEndRequest,
 )
 from mnemoseed_local.storage.ports import TurnRange
+from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 router = APIRouter()
 
 logger = logging.getLogger("mnemoseed_local.daemon.ingest")
+
+# B2.1 T2 focal scan pool (F2 根治 D4): a module-level daemon-thread singleton,
+# NEVER closed — scan threads die with the process (watchdog/announcer
+# precedent), so a wedged scan can never block interpreter exit.
+scan_executor = DaemonExecutor(max_workers=2, thread_name_prefix="mnemoseed-scan")
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
@@ -57,11 +63,13 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         memory = getattr(request.app.state, "memory", None)
         if memory is not None and config is not None and config.capture.auto_recall:
             try:
-                await anyio.to_thread.run_sync(
-                    memory.note_user_prompt,
-                    event.profile_id,
-                    event.session_id,
-                    event.content.text,
+                await asyncio.wrap_future(
+                    scan_executor.submit(
+                        memory.note_user_prompt,
+                        event.profile_id,
+                        event.session_id,
+                        event.content.text,
+                    )
                 )
             except Exception:  # pragma: no cover - the scan must never fail ingest
                 logger.warning("focal scan failed; ingest proceeds", exc_info=True)

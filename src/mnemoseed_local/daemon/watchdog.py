@@ -20,11 +20,13 @@ Two-state machine:
 A successful connect — or any non-refused error such as a timeout — counts as
 alive: the bound-but-stalled loop is B6 domain, logged as a line, never a fire
 reason. Firing writes a last-words line through the daemon logger, flushes the
-handler chain, then calls ``os._exit(1)`` — skipping the very joins that hung.
+handler chain, dumps every thread's stack into daemon.log as a forensic
+artifact, then calls ``os._exit(1)`` — skipping the very joins that hung.
 """
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import socket
@@ -186,13 +188,41 @@ class Watchdog:
                 return
 
     def _default_fire(self, reason: str) -> NoReturn:
-        """Last words, flush, then force-exit — the production fire path."""
-        logger.critical(
-            "watchdog fire (%s): listener %s:%s unreachable beyond the grace "
-            "window; force-exiting the daemon with code 1 (last words)",
-            reason,
-            self._host,
-            self._port,
-        )
-        _flush_logger_chain(logger)
-        self._exit(1)
+        """Last words, forensic dump, then force-exit — the production fire path.
+
+        The dump is a forensic artifact (F2 根治 D5): every thread's stack
+        lands in ``CONFIG_DIR/daemon.log`` (append, no line cap) so the hung
+        teardown's players are on disk after the process is gone. CONFIG_DIR is
+        resolved at call time — a relocated home is honored. The exit runs in a
+        finally over the whole sequence, so ANY raise — including from the
+        failure-path debug log itself — still exits. Boundary: a BLOCKING (not
+        raising) CONFIG_DIR open/mkdir, e.g. a stalled network share, can still
+        defer the exit; that hang is out of band here.
+        """
+        try:
+            logger.critical(
+                "watchdog fire (%s): listener %s:%s unreachable beyond the grace "
+                "window; force-exiting the daemon with code 1 (last words)",
+                reason,
+                self._host,
+                self._port,
+            )
+            _flush_logger_chain(logger)
+            try:
+                from mnemoseed_local.config import CONFIG_DIR
+
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                with open(CONFIG_DIR / "daemon.log", "a", encoding="utf-8") as dump:
+                    dump.write(
+                        f"\n--- watchdog forensic dump ({reason}) at "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} on "
+                        f"thread {threading.current_thread().name} ---\n"
+                    )
+                    faulthandler.dump_traceback(file=dump, all_threads=True)
+            except Exception:  # noqa: BLE001
+                try:
+                    logger.debug("watchdog forensic dump failed; fire proceeds", exc_info=True)
+                except Exception:  # pragma: no cover - never block the fire path
+                    pass
+        finally:
+            self._exit(1)

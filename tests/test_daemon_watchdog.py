@@ -11,15 +11,16 @@ The S1 shipped surface (this batch):
   TestClient boots NEVER arm it.
 - app.py attaches a durable FileHandler writing CONFIG_DIR/daemon.log at
   lifespan startup, plus boot/teardown stage lines.
-
-The root-mechanism pin (worker stop hang) is the PRD-B2.3 D2 documented
-mechanism: the watchdog converts that zombie into a bounded crash; the join
-semantics are intentionally NOT changed this batch.
+- F2 根治 (PRD-B2.3 append): DreamWorker/HybridRetriever/ingest run on
+  DaemonExecutor daemon threads (never registered with the interpreter's
+  atexit join), stop() bounds its wait and abandons wedged chains, and the
+  fire path dumps all thread stacks into daemon.log before the forced exit.
 """
 
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import logging
 import os
 import socket
@@ -369,10 +370,12 @@ def test_disarm_stops_the_probe_loop_without_fire() -> None:
 # ---------------------------------------------------------------- fire path
 
 
-def test_fire_writes_last_words_and_flushes_before_exit() -> None:
+def test_fire_writes_last_words_and_flushes_before_exit(log_home: Path) -> None:
     """The default fire path: last-words line through the daemon logger, flush
     of the handler chain, THEN the exit function — injecting exit_func while
-    keeping the real default fire path is the honest sequencing pin."""
+    keeping the real default fire path is the honest sequencing pin. log_home
+    redirects CONFIG_DIR so the fire path's forensic dump lands in tmp_path
+    (QA I-1: never the real user home)."""
     _detach_daemon_log_handler()
     daemon_logger = logging.getLogger("mnemoseed_local.daemon")
     records: list[logging.LogRecord] = []
@@ -410,13 +413,99 @@ def test_fire_writes_last_words_and_flushes_before_exit() -> None:
     assert captured["flush_calls_at_exit"] >= 1, "the handler chain was not flushed"
 
 
-# ------------------------------------------------------- root mechanism (D2)
+def test_watchdog_fire_dumps_all_thread_stacks_to_daemon_log(log_home: Path) -> None:
+    """F2 根治 D5: the fire path's forensic dump — last-words line lands in
+    daemon.log BEFORE the dump header; the dump carries the watchdog's own
+    frame AND a live foreign thread's frame (all_threads=True proof; faulthandler
+    names threads by id on this platform, so the frame's function name is the
+    discriminator); the exit function ran exactly once. CONFIG_DIR is resolved
+    at call time, so the dump follows the relocated home. Mutants: dump
+    omitted, all_threads=False, a dump failure blocking the exit, or an
+    import-time-cached CONFIG_DIR all fail this pin."""
+    from mnemoseed_local.daemon.app import _attach_daemon_log_handler
+
+    _attach_daemon_log_handler()
+    exit_calls: list[int] = []
+    foreign_hold = threading.Event()
+    foreign = threading.Thread(
+        target=_foreign_pin_wedge, args=(foreign_hold,), name="mnemoseed-foreign-pin", daemon=True
+    )
+    foreign.start()
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+    try:
+        watchdog._default_fire("boot-grace")
+    finally:
+        foreign_hold.set()
+        foreign.join(timeout=2.0)
+
+    assert exit_calls == [1], "the exit function must run exactly once"
+    text = (log_home / DAEMON_LOG_NAME).read_text(encoding="utf-8")
+    assert "watchdog fire (boot-grace)" in text, "the last-words line never reached daemon.log"
+    dump_header = next(line for line in text.splitlines() if "forensic dump" in line)
+    assert text.index("watchdog fire (boot-grace)") < text.index(dump_header), (
+        "the last-words line must land before the dump header"
+    )
+    assert "boot-grace" in dump_header
+    assert threading.current_thread().name in dump_header, "the dump header must name its thread"
+    assert "_foreign_pin_wedge" in text, "the foreign thread's frame is missing (all_threads=False?)"
+    assert "_default_fire" in text, "the watchdog's own frame is missing from the dump"
+
+
+def test_watchdog_fire_dump_failure_never_blocks_exit(
+    log_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2 根治 D5: the fire path is NEVER blocked by a dump failure — a
+    raising faulthandler dump still ends in the exit function running exactly
+    once (the watchdog must always get its os._exit(1) out)."""
+    exit_calls: list[int] = []
+
+    def _explode(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("simulated dump failure")
+
+    monkeypatch.setattr(faulthandler, "dump_traceback", _explode)
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+    watchdog._default_fire("boot-grace")
+    assert exit_calls == [1], "a dump failure must never block the fire exit"
+
+
+def test_watchdog_fire_debug_log_failure_never_blocks_exit(
+    log_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NIT-1: the dump-failure debug line itself can raise (a broken handler,
+    a closed logger). The exit sits in a finally over the whole last-words/dump
+    sequence, so ANY raise path — including the failure-path debug log —
+    still runs the exit exactly once."""
+    exit_calls: list[int] = []
+
+    def _explode(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("simulated dump failure")
+
+    def _debug_explode(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated debug-log failure")
+
+    monkeypatch.setattr(faulthandler, "dump_traceback", _explode)
+    monkeypatch.setattr(logging.getLogger("mnemoseed_local.daemon"), "debug", _debug_explode)
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+    watchdog._default_fire("boot-grace")
+    assert exit_calls == [1], "the exit must run exactly once even when the debug log raises"
+
+
+# ------------------------------------------------------- root mechanism (F2 根治)
+
+
+def _foreign_pin_wedge(hold: threading.Event) -> None:
+    """Live foreign-thread target for the fire-path dump pin (its frame must
+    appear in the all_threads dump)."""
+    hold.wait()
 
 
 class _BlockForeverSnapshotter:
     """Snapshotter whose request blocks on a threading.Event inside the worker
     thread, keeping a manual dream in flight forever (the PRD-B2.3 D2 repro
-    shape)."""
+    shape, re-used by the F2 根治 flip pin)."""
 
     def __init__(self, block: threading.Event) -> None:
         self._block = block
@@ -439,51 +528,71 @@ def _manual_event() -> PoolEvent:
     )
 
 
-def test_worker_stop_hangs_on_blocked_inflight_job() -> None:
-    """PRD-B2.3 D2 repro pin: DreamWorker.stop() does NOT return in bounded
-    time while an in-flight job is blocked forever inside the snapshotter.
+async def test_worker_stop_bounded_abandons_wedged_inflight_job() -> None:
+    """F2 根治 flip pin: DreamWorker.stop() returns in bounded time while an
+    in-flight job is wedged forever inside the snapshotter.
 
-    The join hang is the DOCUMENTED mechanism — the watchdog converts this
-    zombie into a bounded crash (os._exit(1) after the refused grace window),
-    and the join semantics are intentionally NOT changed this batch.
-
-    stop() runs on a dedicated event loop so the hang is observable from the
-    main thread: the loop jams inside executor.shutdown(wait=True) and stays
-    jammed past a 1s real-time bound, then the block release lets it finish.
-    (The block must be released from outside the jammed loop — wait_for's
-    timeout cannot be delivered while the loop is blocked in the join.)
+    The pre-fix stop() jammed the event loop inside executor.shutdown(wait=True)
+    for the whole wedge; the fixed stop() waits at most ``stop_timeout`` WITHOUT
+    jamming the loop, then ABANDONS the wedged chain (journaled snapshots
+    guarantee re-recovery on the next boot; lancedb/sqlite writes are atomic).
+    The pending manual future resolves False and the wedged worker thread stays
+    alive as a daemon thread — abandoned, never joined. Mutants: unbounded join
+    hangs the wait_for; a True resolution on abandon fails the future assert.
     """
     block = threading.Event()
     snapshotter = _BlockForeverSnapshotter(block)
-    outcome: list[str] = []
-    scenario_done = threading.Event()
+    trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
+    trigger.handle_event(_manual_event())
+    worker = DreamWorker(trigger, stop_timeout=0.2)
+    worker.start()
+    job = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    entered = await asyncio.to_thread(snapshotter.entered.wait, 2.0)
+    assert entered, "the manual job never reached the snapshotter"
+    started = time.monotonic()
+    await asyncio.wait_for(worker.stop(), timeout=3.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"stop() was not bounded: {elapsed:.3f}s"
+    assert await asyncio.wait_for(job, timeout=1.0) is False
+    worker_thread = next(
+        (t for t in threading.enumerate() if t.name.startswith("mnemoseed-dream-")),
+        None,
+    )
+    assert worker_thread is not None, "no dream worker thread"
+    assert worker_thread.is_alive(), "the wedged worker was joined, not abandoned"
 
-    def _scenario() -> None:
-        async def _inner() -> None:
-            trigger = DreamTrigger(snapshotter=snapshotter, auto_trigger=False)
-            trigger.handle_event(_manual_event())
-            worker = DreamWorker(trigger)
-            worker.start()
-            job = asyncio.create_task(worker.submit_dream_once(PROFILE))
-            await asyncio.to_thread(snapshotter.entered.wait, 2.0)
-            stop_task = asyncio.create_task(worker.stop())
-            await asyncio.wait_for(stop_task, timeout=2.5)
-            await asyncio.wait_for(job, timeout=1.0)
-            outcome.append("released")
 
-        asyncio.run(_inner())
-        scenario_done.set()
+class _QuickSnapshotter:
+    """Snapshotter that returns immediately (a healthy in-flight dream)."""
 
-    thread = threading.Thread(target=_scenario, daemon=True)
-    thread.start()
+    def request(self, profile_id: str, turn_range: TurnRange) -> SnapshotResult:
+        del profile_id, turn_range
+        return SnapshotResult(snapshot=None, ok=True)
+
+
+async def test_daemon_worker_threads_are_daemon_and_unregistered() -> None:
+    """The dream worker thread is a daemon thread NEVER registered in
+    ``concurrent.futures.thread._threads_queues`` — the F2 root-cause shape:
+    TPE workers are non-daemon and joined by the interpreter's atexit hook, so
+    a wedged worker keeps the process alive forever. A TPE-backed worker fails
+    both asserts."""
+    from concurrent.futures import thread as cf_thread
+
+    trigger = DreamTrigger(snapshotter=_QuickSnapshotter(), auto_trigger=False)
+    trigger.handle_event(_manual_event())
+    worker = DreamWorker(trigger)
+    worker.start()
+    job = asyncio.create_task(worker.submit_dream_once(PROFILE))
+    assert await asyncio.wait_for(job, timeout=2.0) is True
     try:
-        assert snapshotter.entered.wait(3.0), "the manual job never reached the snapshotter"
-        time.sleep(1.2)  # the dedicated loop is jammed in shutdown(wait=True) now
-        assert not scenario_done.is_set(), "stop() returned while the job was blocked"
+        dream_threads = [t for t in threading.enumerate() if t.name.startswith("mnemoseed-dream-")]
+        assert dream_threads, "no dream worker thread"
+        assert all(t.daemon for t in dream_threads), "the dream worker must be a daemon thread"
+        assert all(t not in cf_thread._threads_queues for t in dream_threads), (
+            "the dream worker must never join the interpreter's atexit join set"
+        )
     finally:
-        block.set()  # release the executor thread no matter what happened
-    assert scenario_done.wait(10.0), "the scenario never finished after release"
-    assert outcome == ["released"]
+        await worker.stop()
 
 
 # ------------------------------------------------------------- daemon.log pins

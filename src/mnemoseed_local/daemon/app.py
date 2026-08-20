@@ -24,7 +24,6 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from concurrent.futures import Future as ConcurrentFuture
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
@@ -84,6 +83,7 @@ from mnemoseed_local.storage.ports import (
     GraphStore,
     Page,
 )
+from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 logger = logging.getLogger("mnemoseed_local.daemon")
 
@@ -94,6 +94,12 @@ _REFLECT_ROLE = "dream"
 _VERIFIER_ROLE = "dream_verifier"
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# F2 根治 (PRD-B2.3 append): the bounded stop wait for a wedged in-flight
+# dream chain. Worst-case teardown budget: retriever close (2s) + this wait
+# (5s) + capture drain and store close (~2s) ≈ 9s total, under the watchdog's
+# refused-grace kill margin (~10s grace + 1s probe interval).
+DREAM_STOP_TIMEOUT_S = 5.0
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -266,16 +272,25 @@ class DreamWorker:
 
     The snapshot -> reflect -> merge -> safe-clear chain is synchronous and used
     to run on the app event loop, freezing every other endpoint for its whole
-    duration. The worker hands each dream job to a ``ThreadPoolExecutor`` with
+    duration. The worker hands each dream job to a ``DaemonExecutor`` with
     ``max_workers=1``: at most one dream is ever in flight (by construction),
     the event loop only submits jobs and reads ``trigger.status()`` snapshots,
-    and all trigger mutations happen on the worker thread. ``stop()`` drains an
-    in-flight dream before the stores close during lifespan teardown.
+    and all trigger mutations happen on the worker thread. The worker thread is
+    a daemon thread never registered with the interpreter's atexit join set, so
+    a wedged chain cannot hold the process hostage (F2 根治). ``stop()`` drains
+    an in-flight dream with a bounded wait before the stores close during
+    lifespan teardown, abandoning a wedged chain instead of joining it.
     """
 
-    def __init__(self, trigger: DreamTrigger) -> None:
+    def __init__(
+        self,
+        trigger: DreamTrigger,
+        *,
+        stop_timeout: float = DREAM_STOP_TIMEOUT_S,
+    ) -> None:
         self._trigger = trigger
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mnemoseed-dream")
+        self._stop_timeout = stop_timeout
+        self._executor = DaemonExecutor(max_workers=1, thread_name_prefix="mnemoseed-dream")
         self._queue: asyncio.Queue[_DreamJob] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self._inflight: _DreamJob | None = None  # the job whose chain is running
@@ -346,13 +361,19 @@ class DreamWorker:
                 job.future.set_result(result is True)
 
     async def stop(self) -> None:
-        """Cancel the consumer, then drain pending manual jobs before shutdown.
+        """Cancel the consumer, drain pending manual jobs, then wait bounded
+        for the in-flight chain before shutdown.
 
         Queued jobs never launched: their pending futures resolve False here.
-        The in-flight job's chain runs to completion during executor shutdown;
-        its pending future then resolves with the real launch decision (or
-        False on failure), so a /memory/dream_once caller never hangs on a
-        dream that will never happen.
+        The in-flight chain is awaited for at most ``stop_timeout`` WITHOUT
+        jamming the event loop (the pre-fix shutdown(wait=True) blocked the
+        loop for the whole wedge); on timeout the chain is ABANDONED — the
+        journaled snapshot guarantees re-recovery on the next boot, and the
+        lancedb/sqlite writes are atomic, so abandoning never corrupts state.
+        The abandoned worker stays a daemon thread and dies with the process.
+        The pending future then resolves with the real launch decision (or
+        False on failure or abandon), so a /memory/dream_once caller never
+        hangs on a dream that will never happen.
         """
         task = self._task
         self._task = None
@@ -371,20 +392,30 @@ class DreamWorker:
             future = job.future
             if future is not None and not future.done():
                 future.set_result(False)
-        # let the in-flight chain finish, then resolve its pending future with
-        # the real outcome (the chain ran to completion on the worker thread)
-        self._executor.shutdown(wait=True)
+        # bounded wait on the in-flight chain without jamming the loop
+        inflight_cf = self._inflight_cf
+        if inflight_cf is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(inflight_cf),
+                    timeout=self._stop_timeout,
+                )
+            except TimeoutError:
+                pass  # abandoned: the chain is wedged in unbounded store I/O
+            except asyncio.CancelledError:
+                pass  # the chain never launched (cancelled while queued)
+        self._executor.close(timeout=0)
         inflight = self._inflight
-        self._inflight = None
         if inflight is not None and inflight.future is not None and not inflight.future.done():
             inflight.future.set_result(self._inflight_launched())
+        self._inflight = None
         self._inflight_cf = None
 
     def _inflight_launched(self) -> bool:
         """The real launch decision of the drained in-flight chain (False on
-        any failure — the job never actually launched)."""
+        any failure or abandon — the job never actually launched)."""
         cf = self._inflight_cf
-        if cf is None:
+        if cf is None or not cf.done():
             return False
         try:
             return cf.result() is True

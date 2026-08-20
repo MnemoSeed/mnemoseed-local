@@ -66,6 +66,39 @@ def test_healthz_after_real_boot(config_path: Path) -> None:
         assert health["drivers"]["embed"] == "synthetic"
 
 
+def test_ingest_scan_runs_on_daemon_pool(config_path: Path) -> None:
+    """B2.1 T2 focal scan runs on the daemon scan pool (F2 根治 D4): a
+    user_prompt ingest spawns a daemon mnemoseed-scan worker and never any
+    AnyIO worker thread — a non-daemon pool thread would outlive the process
+    (the F2 join-hang shape). A mutant reintroducing anyio.to_thread spawns an
+    AnyIO worker thread and fails the new-names assert."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "[capture]\nauto_recall = true\n",
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        before = {t.name for t in threading.enumerate()}
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert response.status_code == 202, response.text
+        new_names = {t.name for t in threading.enumerate()} - before
+    scan_workers = [t for t in threading.enumerate() if t.name.startswith("mnemoseed-scan-")]
+    assert scan_workers, "no mnemoseed-scan daemon worker spawned by the ingest"
+    assert all(t.daemon for t in scan_workers), "scan workers must be daemon threads"
+    assert not any(name.startswith("AnyIO worker thread") for name in new_names), (
+        f"the scan ran on a non-daemon AnyIO worker: {new_names}"
+    )
+
+
 def test_non_loopback_baseurl_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(

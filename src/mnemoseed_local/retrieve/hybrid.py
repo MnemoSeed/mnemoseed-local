@@ -25,9 +25,10 @@ issues them concurrently on a two-worker executor and the output is
 byte-identical to the sequential reference ``_recall_sequential``. The embedded
 sqlite drivers keep one connection per thread, so parallel track reads never
 share a handle. The executor is cached per retriever (threads spawn lazily on
-the first recall) and the interpreter joins its idle workers at exit, so no
-thread outlives the process. Deterministic: no clocks, no randomness, no
-network; ties break by (kind, id).
+the first recall) and runs on daemon threads never registered with the
+interpreter's atexit join set (F2 根治), so a wedged track cannot hold the
+process hostage and ``close`` abandons it after a bounded wait. Deterministic:
+no clocks, no randomness, no network; ties break by (kind, id).
 
 Situational weak cues (FR-3.14): extracted host/project/time_bucket never
 filter candidates; they feed the beta term as a low-weight blended component
@@ -42,7 +43,6 @@ case-differing may be cut before scoring.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from mnemoseed_local.retrieve.cues import ExtractedCues
@@ -57,6 +57,7 @@ from mnemoseed_local.storage.ports import (
     Page,
     VectorStore,
 )
+from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 # beta-internal component weights (FR-3.14: context stays a low-weight cue)
 _BETA_ENTITY_WEIGHT = 0.6
@@ -64,6 +65,11 @@ _BETA_TOOL_WEIGHT = 0.25
 _BETA_CONTEXT_WEIGHT = 0.15
 
 _SEED_PAGE_LIMIT = 10_000
+
+# F2 根治 (PRD-B2.3 append): the bounded close wait for a wedged track. Fits
+# the teardown budget: 2s here + 5s dream stop + ~2s drains ≈ 9s worst case,
+# under the watchdog's refused-grace kill margin.
+RETRIEVER_CLOSE_TIMEOUT_S = 2.0
 
 
 # ---------------------------------------------------------------- config
@@ -133,12 +139,18 @@ class HybridRecall:
 class HybridRetriever:
     """Deterministic dual-track retrieval with fusion rerank."""
 
-    def __init__(self, config: HybridConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: HybridConfig | None = None,
+        *,
+        close_timeout: float = RETRIEVER_CLOSE_TIMEOUT_S,
+    ) -> None:
         self._config = config if config is not None else HybridConfig()
+        self._close_timeout = close_timeout
         # Cached two-worker executor: threads spawn lazily on the first recall
-        # and stay for the retriever's lifetime (bounded sqlite handles), and
-        # the interpreter's atexit hook joins idle workers at exit.
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mnemoseed-track")
+        # and stay for the retriever's lifetime (bounded sqlite handles) as
+        # daemon threads — never registered with the interpreter's exit join.
+        self._executor = DaemonExecutor(max_workers=2, thread_name_prefix="mnemoseed-track")
 
     @property
     def config(self) -> HybridConfig:
@@ -150,9 +162,11 @@ class HybridRetriever:
         The daemon owns the retriever lifecycle (T4): shutdown the cached
         two-worker executor on teardown so worker threads and their sqlite
         handles never outlive the process. Idempotent; ``recall`` after close
-        raises the executor's RuntimeError instead of deadlocking.
+        raises the executor's RuntimeError instead of deadlocking. The wait is
+        bounded at ``close_timeout`` — a wedged track is abandoned, not joined
+        (F2 根治).
         """
-        self._executor.shutdown(wait=True)
+        self._executor.close(timeout=self._close_timeout)
 
     def recall(
         self,
