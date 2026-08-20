@@ -1,8 +1,8 @@
 """mnemoseed-local CLI entry point (A2 MVP).
 
-Verbs: init / up / status / doctor / recall / remember / dream (--once,
-status) / forget / config (get | set | rollback) / uninstall (--purge) /
-hook (install | uninstall | status) / mcp (MCP stdio gateway).
+Verbs: init / up / on / off / status / doctor / recall / remember / dream
+(--once, status) / forget / config (get | set | rollback) / uninstall (--purge)
+/ hook (install | uninstall | status) / mcp (MCP stdio gateway).
 Local loopback by default; every state-changing verb talks to the daemon REST
 (FR-7.12); no identity/accounts/tokens in the local MVP.
 """
@@ -13,6 +13,8 @@ import argparse
 import asyncio
 import json
 import sys
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from mnemoseed_local.config import (
     default_config_toml,
     load_config,
 )
+from mnemoseed_local.rest_client import DaemonClient
 
 #: Default profile at the application boundary (no identity in the local MVP).
 DEFAULT_PROFILE = "default"
@@ -55,9 +58,16 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_up(args: argparse.Namespace) -> int:
     from mnemoseed_local.daemon.runner import run_server
+    from mnemoseed_local.daemon_state import is_disabled
     from mnemoseed_local.storage.factory import build_stores
     from mnemoseed_local.storage.ports import StorageError
 
+    if is_disabled():
+        print(
+            "error: memory service is disabled (run 'mnemoseed-local on' to re-enable)",
+            file=sys.stderr,
+        )
+        return 1
     host, port = args.host, args.port
     try:
         config = load_config()
@@ -93,6 +103,131 @@ def cmd_up(args: argparse.Namespace) -> int:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"daemon on http://{host}:{port}")
     return run_server(host, port)
+
+
+#: The off poll waits this long for the listener to disappear; a longer drain
+#: is reported honestly instead of being blocked on.
+_OFF_POLL_TIMEOUT_S = 15.0
+_OFF_POLL_INTERVAL_S = 0.5
+#: Per-call cap for liveness probes: a half-dead daemon (accepts but never
+#: answers) must not park the poll for the client's 30s timeout.
+_OFF_PROBE_TIMEOUT_S = 1.0
+
+
+def _probe_client(client: DaemonClient) -> DaemonClient:
+    """A short-timeout copy of the client for liveness probes. Test fakes are
+    plain objects that control their own timing — only real clients carry a
+    settable timeout."""
+    if not isinstance(client, DaemonClient):
+        return client
+    return replace(client, timeout=_OFF_PROBE_TIMEOUT_S)
+
+
+def _daemon_reachable(client: DaemonClient) -> bool:
+    """True when the daemon answers /healthz — the running signal."""
+    try:
+        client.get("/healthz")
+        return True
+    except Exception:
+        return False
+
+
+def _wait_for_daemon_gone(client: DaemonClient, timeout_s: float) -> bool:
+    """Poll until the daemon stops answering /healthz; False on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _daemon_reachable(client):
+            return True
+        time.sleep(_OFF_POLL_INTERVAL_S)
+    return False
+
+
+def cmd_off(args: argparse.Namespace) -> int:
+    """Stop the daemon and persist the disabled state. The marker lands FIRST
+    — during the poll a watcher / up must not boot a fresh daemon, and the
+    marker must never land on a revived one."""
+    from mnemoseed_local.daemon_state import is_disabled, set_disabled
+    from mnemoseed_local.rest_client import DaemonRestError, DaemonUnavailableError, resolve_client
+
+    if is_disabled():
+        print("already off: memory service is disabled")
+        try:
+            client = resolve_client(args)
+        except Exception as exc:
+            return _client_error(exc)
+        if _daemon_reachable(_probe_client(client)):
+            print(
+                "note: a daemon is currently running but the memory service is disabled; "
+                "it will not be restarted by 'up' (stop it manually or run 'mnemoseed-local on')"
+            )
+        return 0
+    try:
+        client = resolve_client(args)
+    except Exception as exc:
+        return _client_error(exc)
+    probe = _probe_client(client)
+    try:
+        set_disabled()
+    except OSError as exc:
+        print(f"error: could not write the disabled marker: {exc}", file=sys.stderr)
+        return 1
+    try:
+        status: str
+        try:
+            client.post("/daemon/shutdown")
+            status = "requested"
+        except DaemonUnavailableError:
+            status = "gone"  # already stopped: the POST is best-effort
+        except DaemonRestError:
+            status = "refused"  # answered but did not accept the request (older build)
+        if status == "requested":
+            if _wait_for_daemon_gone(probe, _OFF_POLL_TIMEOUT_S):
+                print("daemon stopped; memory service disabled")
+            elif _daemon_reachable(probe):
+                print(
+                    "daemon is still running; memory service disabled "
+                    "(stop it manually, or run 'mnemoseed-local on' to re-enable)"
+                )
+            else:
+                print("daemon may still be shutting down; memory service disabled")
+        elif status == "gone":
+            print("daemon not running; memory service disabled")
+        elif _daemon_reachable(probe):
+            print(
+                "daemon is still running and did not accept the shutdown request; "
+                "stop it manually (Ctrl+C in its console, or Task Manager); "
+                "memory service disabled and stays off (run 'mnemoseed-local on' to re-enable)"
+            )
+        else:
+            print("daemon did not accept the shutdown request; memory service disabled")
+    except Exception as exc:
+        # The marker is already written (state converged); an unexpected
+        # shutdown-flow failure must still end with honest guidance, not a
+        # traceback.
+        print(
+            f"error: shutdown request failed: {exc}; memory service is disabled — "
+            "if the daemon is still running, stop it manually",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_on(args: argparse.Namespace) -> int:
+    """Re-enable the memory service and start the daemon unless it is already
+    running (a running daemon is reported, never restarted)."""
+    from mnemoseed_local.daemon_state import set_enabled
+    from mnemoseed_local.rest_client import resolve_client
+
+    set_enabled()
+    try:
+        client = resolve_client(args)
+    except Exception as exc:
+        return _client_error(exc)
+    if _daemon_reachable(client):
+        print("already on: memory service is running")
+        return 0
+    return cmd_up(args)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -746,6 +881,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_up.add_argument("--port", type=int, default=7788)
     p_up.add_argument("--baseurl", default=None, help="daemon base URL override")
 
+    p_on = sub.add_parser("on", help="re-enable the memory service and start the daemon")
+    p_on.add_argument("--host", default="127.0.0.1")
+    p_on.add_argument("--port", type=int, default=7788)
+    p_on.add_argument("--baseurl", default=None, help="daemon base URL override")
+
+    p_off = sub.add_parser("off", help="stop the daemon and disable the memory service")
+    p_off.add_argument("--baseurl", default=None, help="daemon base URL override")
+
     p_status = sub.add_parser("status", help="daemon health + resolved config")
     p_status.add_argument("--baseurl", default=None)
     p_status.add_argument("--json", action="store_true")
@@ -831,6 +974,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(args)
     if args.command == "up":
         return cmd_up(args)
+    if args.command == "on":
+        return cmd_on(args)
+    if args.command == "off":
+        return cmd_off(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "doctor":

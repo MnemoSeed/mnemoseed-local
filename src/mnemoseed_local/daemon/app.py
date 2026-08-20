@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, status
 
 from mnemoseed_local import __version__
 from mnemoseed_local.capture import (
@@ -45,6 +45,7 @@ from mnemoseed_local.capture.stamper import WriteContext
 from mnemoseed_local.config import Config, load_config
 from mnemoseed_local.configwrite.routes import router as configwrite_router
 from mnemoseed_local.configwrite.service import ConfigWriteService
+from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.ingest import router as ingest_router
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
@@ -748,6 +749,33 @@ def create_app() -> FastAPI:
             "offset": page.offset,
             "limit": page.limit,
         }
+
+    @app.post("/daemon/shutdown")
+    async def daemon_shutdown(request: Request) -> dict[str, Any]:
+        """Intentional shutdown (B2.5): answer 200 first, then run the
+        injected shutdown hook after the response is flushed. Only run_server
+        injects the hook (it alone arms the watchdog), so a TestClient boot
+        answers 503 with a clear message instead of a 500."""
+        hook = getattr(request.app.state, "shutdown_hook", None)
+        if hook is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="no shutdown hook: the daemon was not started via run_server",
+            )
+        actor = resolve_actor(request)
+        try:
+            request.app.state.stores.meta.audit_append(
+                AuditEntry(actor=actor, action="daemon_shutdown", detail={}, at=time.time())
+            )
+        except Exception:  # pragma: no cover - journaling is best-effort
+            logger.warning("daemon_shutdown audit failed; shutdown proceeds", exc_info=True)
+
+        async def _run_hook() -> None:
+            await asyncio.sleep(0)  # yield: the 200 response flushes first
+            hook()
+
+        asyncio.create_task(_run_hook())
+        return {"ok": True, "status": "shutting_down"}
 
     return app
 

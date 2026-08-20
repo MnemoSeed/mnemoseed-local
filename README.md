@@ -46,7 +46,9 @@ curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/inst
 ```
 
 Afterwards: `mnemoseed-local up` starts the daemon; `mnemoseed-local hook
-install` installs the OpenCode host adapter.
+install` installs the OpenCode host adapter; `mnemoseed-local off` stops the
+daemon and disables the memory service; `mnemoseed-local on` re-enables it and
+starts the daemon again.
 
 ## MCP gateway
 
@@ -119,3 +121,6 @@ The watchdog releases the port within its grace window, so the next loop
 naturally relaunches; a bind race with a still-releasing port is absorbed by
 the new `up` failing fast with a non-zero exit (the uncaught bind error
 propagates, not a custom code).
+
+With the service off (`mnemoseed-local off`), `up` exits 1 immediately (a
+harmless no-op) — remove the scheduled task / watcher, or accept the no-op.

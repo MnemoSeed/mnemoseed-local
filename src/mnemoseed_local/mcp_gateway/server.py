@@ -32,8 +32,8 @@ import sys
 from dataclasses import replace
 from typing import Any, TextIO
 
-from mnemoseed_local import __version__
-from mnemoseed_local.mcp_gateway.reliable_client import GatewayClient
+from mnemoseed_local import __version__, daemon_state
+from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_DISABLED_HINT, GatewayClient
 from mnemoseed_local.rest_client import (
     DaemonClient,
     DaemonRestError,
@@ -296,7 +296,11 @@ def serve(
     out_stream = stdout if stdout is not None else sys.stdout
     _force_utf8_lane(in_stream, newline=False)
     _force_utf8_lane(out_stream, newline=True)
-    daemon: Any = GatewayClient.wrap(client if client is not None else build_client())
+    down_hint = DAEMON_DISABLED_HINT if daemon_state.is_disabled() else None
+    daemon: Any = GatewayClient.wrap(
+        client if client is not None else build_client(),
+        down_hint=down_hint,
+    )
     try:
         for raw in in_stream:
             line = raw.strip()
