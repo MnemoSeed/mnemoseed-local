@@ -122,7 +122,7 @@ while ($true) {
 
 ### 批次执行：F2 根治（2026-08-20 用户指令立项并收口——Zombie 不可 killable，必须 impossible）
 
-- **动议**：B2.3 watchdog 把 F2 僵尸转为干净崩溃，但僵尸本体不该出现；上线首日 watchdog 实弹两击（daemon.log 12:02 / 13:07 CRITICAL），证实 zombie 仍在日常生成。本批目标：机制级根治。
+- **动议**：B2.3 watchdog 把 F2 僵尸转为干净崩溃，但僵尸本体不该出现；上线首日 watchdog 实弹 **5 击**（daemon.log 02:29 / 10:47 / 12:02 / 13:07 / 13:34 CRITICAL，均无 dump——早于本 build），证实 zombie 仍在日常生成；且 5 次 fire **均无 teardown 前行**，与 P1 根因形状不符（服务中途监听消失），wedge 机制未确证，本批根治的是 join 类通道、取证待 dump 时代。本批目标：机制级根治。
 - **根因补充定案（solution-architect 复核，含 3.12.13 stdlib 源码+运行时实证）**：ThreadPoolExecutor worker 非 daemon 且被 `_threads_queues` 注册，`concurrent.futures._python_exit` / `threading._shutdown` 在解释器退出时 join **全部** executor 线程——teardown 的 `shutdown(wait=True)` 并不是唯一的绞索；**第二僵尸向量（架构师起获）**：anyio 4.14.2 `WorkerThread` 同样非 daemon，`ingest.py:60` 的 focal scan 走它，一样被 join。
 - **设计（架构师 SHIP-WITH-ADJUSTMENTS，2 BLOCKER 并入：anyio 向量必须修、停止预算不得竞速 watchdog 击杀线）**：
   - **D1 共享模块 `util/daemon_executor.py`**：plain `threading.Thread(daemon=True)` workers on `queue.Queue`；TPE 兼容 `submit()`→Future / `close(timeout)`（sentinel-per-worker + 全局 deadline 等 running+已排队 future、未决者废弃不迟跑——QA NIT-2 定案）；RuntimeError after close；submit 与 close 竞态 lock-ordered；**永不注册 `_threads_queues`，卡死 worker 随进程亡**。
