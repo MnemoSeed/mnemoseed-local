@@ -20,9 +20,9 @@
 #      [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
 #      only after an explicit [y/N] confirmation; --yes skips the prompt;
 #      a model is NEVER pulled without that confirmation)
-#   7. final mnemoseed-local doctor re-check + next steps
-#      (mnemoseed-local up; mnemoseed-local hook install opencode for the
-#      OpenCode host adapter)
+#   7. OpenCode host adapter hook (mnemoseed-local hook install opencode)
+#   8. final mnemoseed-local doctor re-check + next steps
+#      (mnemoseed-local up; hook already installed)
 #
 # Idempotent: every step skips when already satisfied. Every failed external
 # install operation prints a one-line reason to stderr and exits non-zero.
@@ -72,7 +72,7 @@ options:
                    `config set dream.hardware_tier <tier>` (never changes config itself)
   -h, --help       show this help
 
-orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> doctor
+orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> hook -> doctor
 EOF
 }
 
@@ -250,9 +250,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' '[6] model pull (requires confirmation)'
     printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
     printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
-    printf '%s\n' '[7] final doctor + guidance'
+    printf '%s\n' '[7] OpenCode host adapter hook'
+    printf '%s\n' '    plan:  would run `mnemoseed-local hook install opencode`'
+    printf '%s\n' '[8] final doctor + guidance'
     printf '%s\n' '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
-    printf '%s\n' '           (`mnemoseed-local up`; `mnemoseed-local hook install opencode` for the OpenCode host adapter)'
+    printf '%s\n' '           (`mnemoseed-local up`; hook already installed)'
     printf '\n'
     printf '%s\n' 'dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed'
     exit 0
@@ -260,7 +262,7 @@ fi
 
 # --- step 1: ollama ---------------------------------------------------------
 
-printf '%s\n' '[1/7] ollama'
+printf '%s\n' '[1/8] ollama'
 if have ollama; then
     printf '%s\n' '      found - skipping install'
 else
@@ -284,7 +286,7 @@ fi
 
 # --- step 2: uv -------------------------------------------------------------
 
-printf '%s\n' '[2/7] uv'
+printf '%s\n' '[2/8] uv'
 if have uv; then
     printf '%s\n' '      found - skipping install'
 else
@@ -300,7 +302,7 @@ prepend_path "$UV_BIN_DIR"
 
 # --- step 3: the mnemoseed-local CLI ---------------------------------------
 
-printf '%s\n' '[3/7] mnemoseed-local CLI'
+printf '%s\n' '[3/8] mnemoseed-local CLI'
 if have mnemoseed-local; then
     printf '%s\n' '      found - upgrading via uv tool...'
     if ! uv tool upgrade mnemoseed-local; then
@@ -316,7 +318,7 @@ have mnemoseed-local || die "mnemoseed-local was installed but is not on PATH; a
 
 # --- step 4: init ------------------------------------------------------------
 
-printf '%s\n' '[4/7] init'
+printf '%s\n' '[4/8] init'
 if [ -f "$CONFIG_PATH" ]; then
     printf '%s\n' "      $CONFIG_PATH already exists - skipping"
 else
@@ -327,7 +329,7 @@ fi
 
 # --- step 5: doctor (first pass) + hardware-tier hint ------------------------
 
-printf '%s\n' '[5/7] doctor (first pass)'
+printf '%s\n' '[5/8] doctor (first pass)'
 run_doctor
 if [ "$DOCTOR_RC" -ne 0 ]; then
     printf '%s\n' 'install.sh: note: doctor reported failures (expected before the model pull) - continuing' >&2
@@ -336,7 +338,7 @@ show_tier_hints "$DOCTOR_OUT"
 
 # --- step 6: confirmation-gated model pull -----------------------------------
 
-printf '%s\n' '[6/7] dream model pull'
+printf '%s\n' '[6/8] dream model pull'
 MODEL="$(resolve_model "$CONFIG_PATH")"
 if [ "$MODEL" = "$DEFAULT_MODEL" ]; then
     printf '%s\n' "      model to pull: $MODEL (built-in default - the dream route's check target)"
@@ -368,9 +370,18 @@ else
     printf '%s\n' '      pulled'
 fi
 
-# --- step 7: final doctor + guidance -----------------------------------------
+# --- step 7: hook install ------------------------------------------------------
 
-printf '%s\n' '[7/7] doctor (final re-check)'
+printf '%s\n' '[7/8] OpenCode host adapter hook'
+if ! mnemoseed-local hook install opencode; then
+    printf '%s\n' "install.sh: note: 'mnemoseed-local hook install opencode' failed; you can run it manually later" >&2
+else
+    printf '%s\n' '      installed'
+fi
+
+# --- step 8: final doctor + guidance -----------------------------------------
+
+printf '%s\n' '[8/8] doctor (final re-check)'
 run_doctor
 if [ "$DOCTOR_RC" -ne 0 ]; then
     printf '%s\n' 'install.sh: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`' >&2
@@ -379,5 +390,5 @@ printf '\n'
 printf '%s\n' 'installation complete.'
 printf '%s\n' 'next steps:'
 printf '%s\n' '  mnemoseed-local up            # start the daemon'
-  printf '%s\n' '  mnemoseed-local hook install opencode  # install the OpenCode host adapter'
+printf '%s\n' '  (hook already installed; register MCP gateway in opencode.json if needed)'
 exit 0

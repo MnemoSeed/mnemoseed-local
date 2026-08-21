@@ -31,9 +31,9 @@
        [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
-    8. final mnemoseed-local doctor re-check + next steps
-       (mnemoseed-local up; mnemoseed-local hook install opencode for the
-       OpenCode host adapter)
+    8. OpenCode host adapter hook (mnemoseed-local hook install opencode)
+    9. final mnemoseed-local doctor re-check + next steps
+       (mnemoseed-local up; hook already installed)
 
   Idempotent: every step skips when already satisfied. Every failed external
   install operation prints a one-line reason to stderr and exits non-zero.
@@ -226,9 +226,11 @@ if ($DryRun) {
     Write-Host '[7] model pull (requires confirmation)'
     Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
     Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
-    Write-Host '[8] final doctor + guidance'
+    Write-Host '[8] OpenCode host adapter hook'
+    Write-Host '    plan:  would run `mnemoseed-local hook install opencode`'
+    Write-Host '[9] final doctor + guidance'
     Write-Host '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
-    Write-Host '           (`mnemoseed-local up`; `mnemoseed-local hook install opencode` for the OpenCode host adapter)'
+    Write-Host '           (`mnemoseed-local up`; hook already installed)'
     Write-Host ''
     Write-Host 'dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed'
     exit 0
@@ -236,7 +238,7 @@ if ($DryRun) {
 
 # --- step 1: ollama ---------------------------------------------------------
 
-Write-Host '[1/7] ollama'
+Write-Host '[1/9] ollama'
 if (Test-CommandExists 'ollama') {
     Write-Host '      found - skipping install'
 } else {
@@ -267,7 +269,7 @@ if (Test-CommandExists 'ollama') {
 # effort throughout: any scheduling failure prints one hint line and never
 # fails the install.
 
-Write-Host '[2/8] headless ollama server'
+Write-Host '[2/9] headless ollama server'
 
 function Install-HeadlessOllamaServe {
     param([string]$TaskName, [string]$TrayLnk)
@@ -317,7 +319,7 @@ Install-HeadlessOllamaServe -TaskName $OllamaServeTaskName -TrayLnk $OllamaTrayS
 
 # --- step 3: uv -------------------------------------------------------------
 
-Write-Host '[3/8] uv'
+Write-Host '[3/9] uv'
 if (Test-CommandExists 'uv') {
     Write-Host '      found - skipping install'
 } else {
@@ -352,7 +354,7 @@ Add-ToProcessPath $UvBinDir
 
 # --- step 3: the mnemoseed-local CLI ---------------------------------------
 
-Write-Host '[4/8] mnemoseed-local CLI'
+Write-Host '[4/9] mnemoseed-local CLI'
 if (Test-CommandExists 'mnemoseed-local') {
     Write-Host '      found - upgrading via uv tool...'
     & uv tool upgrade mnemoseed-local
@@ -368,7 +370,7 @@ if (-not (Test-CommandExists 'mnemoseed-local')) {
 
 # --- step 4: init ------------------------------------------------------------
 
-Write-Host '[5/8] init'
+Write-Host '[5/9] init'
 if (Test-Path -LiteralPath $ConfigPath) {
     Write-Host "      $ConfigPath already exists - skipping"
 } else {
@@ -378,7 +380,7 @@ if (Test-Path -LiteralPath $ConfigPath) {
 
 # --- step 5: doctor (first pass) + hardware-tier hint ------------------------
 
-Write-Host '[6/8] doctor (first pass)'
+Write-Host '[6/9] doctor (first pass)'
 $firstDoctor = Invoke-Doctor
 if ($firstDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor reported failures (expected before the model pull) - continuing')
@@ -387,7 +389,7 @@ Show-TierHints $firstDoctor.Text
 
 # --- step 6: confirmation-gated model pull -----------------------------------
 
-Write-Host '[7/8] dream model pull'
+Write-Host '[7/9] dream model pull'
 $model = Get-DreamModel $ConfigPath
 if ($model -eq $DefaultModel) {
     Write-Host "      model to pull: $model (built-in default - the dream route's check target)"
@@ -417,9 +419,19 @@ if (-not $confirmed) {
     Write-Host '      pulled'
 }
 
-# --- step 7: final doctor + guidance -----------------------------------------
+# --- step 7: hook install ------------------------------------------------------
 
-Write-Host '[8/8] doctor (final re-check)'
+Write-Host '[8/9] OpenCode host adapter hook'
+& mnemoseed-local hook install opencode
+if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("install.ps1: note: 'mnemoseed-local hook install opencode' failed (exit $LASTEXITCODE); you can run it manually later")
+} else {
+    Write-Host '      installed'
+}
+
+# --- step 8: final doctor + guidance -----------------------------------------
+
+Write-Host '[9/9] doctor (final re-check)'
 $finalDoctor = Invoke-Doctor
 if ($finalDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`')
@@ -428,5 +440,5 @@ Write-Host ''
 Write-Host 'installation complete.'
 Write-Host 'next steps:'
 Write-Host '  mnemoseed-local up            # start the daemon'
-  Write-Host '  mnemoseed-local hook install opencode  # install the OpenCode host adapter'
+Write-Host '  (hook already installed; register MCP gateway in opencode.json if needed)'
 exit 0
