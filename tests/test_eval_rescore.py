@@ -155,3 +155,26 @@ def test_rescore_preserves_no_seat_seed_policy(stub_report, tmp_path: Path) -> N
     rescored = load_report(rescored_path)
     assert rescored.seat_seed_policy == SEAT_SEED_POLICY_NONE
     assert rescored.cells[0].seat_seed is None
+
+
+def test_rescore_collapse_failed_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reflect-seat-failed cell (attempts>0, never recovered) is NOT re-judged
+    offline: rescore preserves the failure signature verbatim (no revived 0.00)."""
+    from test_eval_harness import _collapse_stub_chat
+
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, _ = _collapse_stub_chat(StubLLM.chat, collapse=99)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    report = run_matrix(
+        [EvalCell(reflect=STUB_A, ensemble="verify", verifier=STUB_B)],
+        material_catalog(None, canary_seed=7, canary_count=1),
+        root=tmp_path / "root",
+    )
+    cell = report.cells[0]
+    assert cell.reflect_collapse_attempts == 3
+    assert cell.reflect_recovered is False
+    path = write_report(report, tmp_path / "reports", matrix_slug="collapse")
+    rescored_cell = load_report(rescore_report(path, canary_seed=7)).cells[0]
+    assert rescored_cell.canary == cell.canary  # verbatim passthrough
+    assert rescored_cell.canary.canary_recall is None  # the failure signature survives

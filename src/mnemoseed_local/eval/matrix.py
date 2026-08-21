@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import httpx
 
+from mnemoseed_local.dream.snapshot import Snapshot
 from mnemoseed_local.eval.harness import CellRun, EvalCell, EvalRig, EvalRoute, RigPaths
 from mnemoseed_local.eval.materials import Material, MaterialError, fresh_replay, load_replay
 from mnemoseed_local.eval.metrics import cost_metrics, score_canary, verify_metrics
@@ -260,16 +262,32 @@ def probe_routes(
     return result
 
 
-def _run_material(rig: EvalRig, material: Material) -> CellRun:
-    if material.kind == "canary":
-        assert material.session is not None
-        return rig.run_canary(material.session)
+def _resolve_replay_snapshot(material: Material) -> Snapshot:
+    """The replay material's runnable snapshot: eager ride-through or the
+    lazy journal load the catalog defers to run time."""
     snapshot = material.snapshot
     if snapshot is None:
         if material.path is None:  # pragma: no cover - catalog always sets one side
             raise MaterialError(f"replay material {material.name!r} carries neither snapshot nor path")
         snapshot = load_replay(material.path).snapshot
         assert snapshot is not None
+    return snapshot
+
+
+def _run_material(
+    rig: EvalRig,
+    material: Material,
+    *,
+    split_canaries: bool = False,
+    replay_snapshot: Snapshot | None = None,
+) -> CellRun:
+    if material.kind == "canary":
+        assert material.session is not None
+        if split_canaries:
+            session = material.session
+            return rig.run_turns(session.turns, session_id=session.session_id, profile_id=session.session_id)
+        return rig.run_canary(material.session)
+    snapshot = replay_snapshot if replay_snapshot is not None else _resolve_replay_snapshot(material)
     return rig.run_snapshot(fresh_replay(snapshot))
 
 
@@ -298,7 +316,10 @@ def run_matrix(
     absent ollama tag (exit-neutral), ``route_unavailable:`` for a dead
     server/cloud anchor or an unset key env (a loud failure row). Material
     load failures (``material_error:``) and run failures (``run_error:``) are
-    failure rows. Skipped cells never build a rig.
+    failure rows. A replay whose ``snapshot.profile_id`` was already claimed by
+    an earlier material in this rig is a ``profile_collision:`` failure row
+    (profile identity is provenance evidence, never renamed). Skipped cells
+    never build a rig.
     """
     unique_routes = {
         (route.driver, route.model): route
@@ -320,16 +341,49 @@ def run_matrix(
 
     cell_reports: list[CellReport] = []
     skipped: list[SkippedCell] = []
+    # one-shot run id: isolates every cell's rig under a per-call directory so
+    # a second matrix over the same root never re-ingests onto the first.
+    run_id = uuid.uuid4().hex[:8]
+    # multiple canaries share the "canary" profile by default; >1 canary
+    # material in a run auto-splits each seat onto its own session-id profile
+    # so graph writes never share a content-hash namespace.
+    split_canaries = sum(1 for material in materials if material.kind == "canary") > 1
     for cell in cells:
         missing = _cell_missing_reason(cell, probe)
         if missing is not None:
             skipped.append(SkippedCell(cell_id=cell.cell_id, reason=missing))
             continue
-        rig = EvalRig(RigPaths(root=root / "cells" / cell.cell_id), cell)
+        rig = EvalRig(RigPaths(root=root / "runs" / run_id / cell.cell_id), cell)
         try:
+            seen_profiles: set[str] = set()
+            # canaries claim their profiles up front so a replay cannot merge
+            # into a canary's graph namespace (profile identity is provenance).
+            if split_canaries:
+                seen_profiles.update(
+                    m.session.session_id for m in materials if m.kind == "canary" and m.session is not None
+                )
+            elif any(m.kind == "canary" for m in materials):
+                seen_profiles.add("canary")
             for material in materials:
                 try:
-                    run = _run_material(rig, material)
+                    replay_snapshot: Snapshot | None = None
+                    if material.kind == "replay":
+                        replay_snapshot = _resolve_replay_snapshot(material)
+                        if replay_snapshot.profile_id in seen_profiles:
+                            skipped.append(
+                                SkippedCell(
+                                    cell_id=cell.cell_id,
+                                    reason=f"profile_collision: {replay_snapshot.profile_id}",
+                                )
+                            )
+                            continue
+                        seen_profiles.add(replay_snapshot.profile_id)
+                    run = _run_material(
+                        rig,
+                        material,
+                        split_canaries=split_canaries,
+                        replay_snapshot=replay_snapshot,
+                    )
                 except MaterialError as exc:
                     skipped.append(SkippedCell(cell_id=cell.cell_id, reason=f"material_error: {exc}"))
                     continue

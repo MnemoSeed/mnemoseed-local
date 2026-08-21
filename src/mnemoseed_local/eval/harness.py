@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -127,7 +129,9 @@ class EvalCell:
 # (ollama eval_count=2) — accepted as a "legit empty extraction" it hardens
 # into a deterministic-looking zero-recall cell. The classifier below pins the
 # exact fingerprint; the reflect retry loop turns it into a typed retry, and
-# the per-seat fixed seed (matrix.py) is the actual recovery.
+# the recovery ladder rebuilds the seat with seed = base + attempt per retry
+# (a pinned seed alone re-rolls the identical trajectory on a seed-fixed
+# collapse).
 
 #: The verbatim collapse output (RCA fingerprint: content='[]').
 _COLLAPSE_TEXT = "[]"
@@ -141,7 +145,8 @@ COLLAPSE_MAX_COMPLETION_TOKENS = 2
 class ReflectCollapseError(Exception):
     """The reflect seat returned the sampling-collapse fingerprint: a verbatim
     empty JSON array with a tiny completion count. The reflect retry loop
-    treats it as any other typed failure; the pinned seed is the recovery."""
+    treats it as any other typed failure; the recovery ladder rebuilds the
+    seat with a mutated seed per retry."""
 
 
 def is_reflect_collapse(
@@ -159,30 +164,70 @@ def is_reflect_collapse(
     return response.text.strip() == _COLLAPSE_TEXT and usage.completion_tokens <= max_completion_tokens
 
 
+def _reflect_recovery_factory(route: EvalRoute) -> Callable[[int], ChatLLM]:
+    """A fresh reflect seat per collapse retry: the retry ring re-rolls the
+    identical seeded trajectory unless the seat is rebuilt with a mutated seed."""
+    base_params = route_params(route)
+    key_env = base_params.get("api_key_env")
+    api_key = os.environ.get(str(key_env)) if key_env else ""
+
+    def build(attempt: int) -> ChatLLM:
+        params = {k: v for k, v in base_params.items() if k != "api_key_env"}
+        seed = params.get("seed")
+        if isinstance(seed, int):
+            params["seed"] = seed + attempt
+        params["model"] = route.model
+        params["api_key"] = api_key
+        from mnemoseed_local.llm import LLM_DRIVERS  # local import: registered drivers
+
+        return cast(ChatLLM, LLM_DRIVERS.build(route.driver, params))
+
+    return build
+
+
 class _CollapseGuard:
     """Wraps a resolved reflect seat: raises ``ReflectCollapseError`` on the
     collapse fingerprint (verbatim ``[]`` with completion <= 2) so the reflect
     retry loop engages, and records per-run collapse attempts / recovery for
-    the report surface. The fingerprint is classified regardless of whether
-    the empty array was legitimate; only a well-formed empty extraction under
-    normal token counts passes through."""
+    the report surface. An optional recovery factory rebuilds the seat with
+    seed = base + attempt after each collapse, so the retry ring explores a
+    different sampling trajectory instead of re-rolling the identical one.
+    The fingerprint is classified regardless of whether the empty array was
+    legitimate; only a well-formed empty extraction under normal token counts
+    passes through."""
 
-    def __init__(self, llm: ChatLLM, *, max_completion_tokens: int = COLLAPSE_MAX_COMPLETION_TOKENS) -> None:
+    def __init__(
+        self,
+        llm: ChatLLM,
+        *,
+        recovery_factory: Callable[[int], ChatLLM] | None = None,
+        max_completion_tokens: int = COLLAPSE_MAX_COMPLETION_TOKENS,
+    ) -> None:
+        self._base_llm = llm
         self._llm = llm
+        self._recovery_factory = recovery_factory
+        self._needs_rebuild = False
         self._max_completion_tokens = max_completion_tokens
         self.run_collapse_attempts: int = 0
         self.run_recovered: bool = False
 
     def reset_run(self) -> None:
+        self._llm = self._base_llm  # every run starts at seed = base + 0
+        self._needs_rebuild = False
         self.run_collapse_attempts = 0
         self.run_recovered = False
 
     def chat(self, *, system: str, user: str) -> str | ChatResult:
+        if self._needs_rebuild and self._recovery_factory is not None:
+            self._llm = self._recovery_factory(self.run_collapse_attempts)
+            self._needs_rebuild = False
         response = self._llm.chat(system=system, user=user)
         if isinstance(response, ChatResult) and is_reflect_collapse(
             response, max_completion_tokens=self._max_completion_tokens
         ):
             self.run_collapse_attempts += 1
+            if self._recovery_factory is not None:
+                self._needs_rebuild = True
             usage = response.usage
             assert usage is not None and usage.completion_tokens is not None
             raise ReflectCollapseError(
@@ -353,6 +398,12 @@ class EvalRig:
         self.paths = paths
         self.cell = cell
         self.profile_id = profile_id
+        # idempotent over the artifacts this rig owns: a reused root must not
+        # re-ingest onto a prior run's stores/journal under the shared profile.
+        for p in (paths.stores_dir, paths.journal_dir):
+            if p.exists():
+                shutil.rmtree(p)
+        paths.config_path.unlink(missing_ok=True)
         paths.root.mkdir(parents=True, exist_ok=True)
         paths.stores_dir.mkdir(parents=True, exist_ok=True)
         paths.journal_dir.mkdir(parents=True, exist_ok=True)
@@ -411,7 +462,9 @@ class EvalRig:
             meta=self._stores.meta,
             ledger=ledger,
         )
-        collapse_guard = _CollapseGuard(router.resolve("dream"))
+        collapse_guard = _CollapseGuard(
+            router.resolve("dream"), recovery_factory=_reflect_recovery_factory(cell.reflect)
+        )
         reflector = _RecordingReflector(
             llm=collapse_guard,
             collapse_guard=collapse_guard,

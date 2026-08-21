@@ -12,11 +12,13 @@ report rows; exit codes distinguish failed from skipped.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
+from mnemoseed_local.config import load_config
 from mnemoseed_local.dream.snapshot import SnapshotPhase
 from mnemoseed_local.eval.canary import canary_session
 from mnemoseed_local.eval.harness import EvalCell, EvalRig, EvalRoute, RigPaths
@@ -37,7 +39,9 @@ from mnemoseed_local.eval.matrix import (
     probe_ollama_models,
     run_matrix,
 )
-from mnemoseed_local.eval.report import SEAT_SEED_POLICY_FIXED, SEAT_SEED_POLICY_NONE
+from mnemoseed_local.eval.report import SEAT_SEED_POLICY_FIXED, SEAT_SEED_POLICY_NONE, report_to_dict
+from mnemoseed_local.storage.factory import Stores, build_stores
+from mnemoseed_local.storage.ports import ChunkFilter, NodeFilter, Page
 
 STUB_A = EvalRoute(driver="stub", model="stub-a")
 STUB_B = EvalRoute(driver="stub_verifier", model="stub-b")
@@ -255,3 +259,217 @@ def test_matrix_cli_no_seat_seed_flag_parses() -> None:
     from mnemoseed_local.eval.__main__ import main
 
     assert main(["matrix", "--list", "--no-seat-seed"]) == 0
+
+
+def _rig_audit_count(root: Path, cell: EvalCell) -> int:
+    """The largest audit row count of any rig store under ``root``.
+
+    Reads each ``meta.db`` read-only (no rig construction, so no store wipe):
+    the audit log is append-only, so a second run re-ingesting onto the same
+    store doubles its rows. Fresh-run stores each hold one run's worth, so the
+    max across stores is the contamination signal: no store may carry more
+    than one run's worth of audit rows.
+    """
+    import sqlite3
+
+    counts: list[int] = []
+    for meta in root.glob("**/stores/meta.db"):
+        conn = sqlite3.connect(f"file:{meta}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+            counts.append(int(row[0]) if row is not None else 0)
+        finally:
+            conn.close()
+    return max(counts) if counts else 0
+
+
+def test_run_matrix_same_root_twice_is_idempotent(tmp_path: Path) -> None:
+    """A second run_matrix over the SAME root must not accumulate store state
+    under the shared profile: reports must be byte-for-byte identical (modulo
+    wall-clock normalization) and no rig store may carry more than one run's
+    worth of data (the audit log is append-only, so accumulation doubles it)."""
+    cells = [EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    root = tmp_path / "root"
+
+    r1 = run_matrix(cells, materials, root=root)
+    baseline = _rig_audit_count(root, cells[0])
+
+    r2 = run_matrix(cells, materials, root=root)
+
+    d1 = report_to_dict(r1)
+    d2 = report_to_dict(r2)
+    d1["started_at"] = ""
+    d2["started_at"] = ""
+    for cell in d1["cells"]:
+        cell["cost"]["duration_s"] = None
+    for cell in d2["cells"]:
+        cell["cost"]["duration_s"] = None
+    assert d1 == d2
+    assert [len(c["triples"]) for c in d2["cells"]] == [len(c["triples"]) for c in d1["cells"]]
+    # cross-run isolation: run-2 must not re-ingest on top of run-1's store
+    assert _rig_audit_count(root, cells[0]) == baseline
+
+
+# ---------------------------------------------------------------- B4c T3 profile isolation guards
+
+
+def _rig_stores(root: Path, cell: EvalCell) -> Stores:
+    """The cell's rig stores (closed by run_matrix), reopened for read-back."""
+    config_path = next(root.glob(f"runs/*/{cell.cell_id}/config.toml"))
+    return build_stores(load_config(config_path))
+
+
+def _profile_chunk_ids(stores: Stores, profile_id: str) -> set[str]:
+    return {
+        chunk.chunk_id
+        for chunk in stores.vector.list_chunks(ChunkFilter(profile_id=profile_id), Page(limit=1000)).items
+    }
+
+
+def _profile_node_ids(stores: Stores, profile_id: str) -> set[str]:
+    return {
+        node.node_id
+        for node in stores.graph.list_nodes(NodeFilter(profile_id=profile_id), Page(limit=1000)).items
+    }
+
+
+def test_canary_count_one_keeps_canary_profile(tmp_path: Path) -> None:
+    """Regression guard: canary_count=1 keeps the shared 'canary' profile."""
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    report = run_matrix([cell], material_catalog(None, canary_seed=1, canary_count=1), root=tmp_path)
+    assert len(report.cells) == 1
+    assert report.skipped == ()
+    stores = _rig_stores(tmp_path, cell)
+    try:
+        assert _profile_chunk_ids(stores, "canary"), "the single canary must run under the canary profile"
+        assert _profile_node_ids(stores, "canary"), "the single canary must merge under the canary profile"
+        assert _profile_chunk_ids(stores, "canary-00") == set()
+    finally:
+        asyncio.run(stores.close())
+
+
+def test_canary_count_two_splits_profiles(tmp_path: Path) -> None:
+    """canary_count>1 auto-splits: each canary owns its session-id profile,
+    with disjoint chunk/node namespaces and nothing left on the shared one."""
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    report = run_matrix([cell], material_catalog(None, canary_seed=1, canary_count=2), root=tmp_path)
+    assert len(report.cells) == 2
+    assert report.skipped == ()
+    assert [c.material for c in report.cells] == ["canary-00", "canary-01"]
+    assert all(c.canary.canary_recall == 1.0 for c in report.cells)
+    stores = _rig_stores(tmp_path, cell)
+    try:
+        assert _profile_chunk_ids(stores, "canary") == set(), "nothing may accumulate on the shared profile"
+        chunks_00 = _profile_chunk_ids(stores, "canary-00")
+        chunks_01 = _profile_chunk_ids(stores, "canary-01")
+        assert chunks_00 and chunks_01, "each split canary must write its own chunks"
+        assert chunks_00.isdisjoint(chunks_01)
+        nodes_00 = _profile_node_ids(stores, "canary-00")
+        nodes_01 = _profile_node_ids(stores, "canary-01")
+        assert nodes_00 and nodes_01, "each split canary must merge its own graph namespace"
+        assert nodes_00.isdisjoint(nodes_01)
+    finally:
+        asyncio.run(stores.close())
+
+
+def test_replay_profile_collision_typed_skip(frozen_snapshot: Path, tmp_path: Path) -> None:
+    """Two replays sharing one snapshot.profile_id: exactly one runs, the
+    other lands a typed profile_collision: skip row (never a silent merge)."""
+    materials_dir = tmp_path / "materials"
+    materials_dir.mkdir()
+    journal = frozen_snapshot.read_text(encoding="utf-8")
+    (materials_dir / "a.json").write_text(journal, encoding="utf-8")
+    (materials_dir / "b.json").write_text(journal, encoding="utf-8")
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    report = run_matrix(
+        [cell],
+        material_catalog(materials_dir, canary_seed=1, canary_count=0),
+        root=tmp_path / "root",
+    )
+    assert len(report.cells) == 1
+    assert report.cells[0].material == "a"
+    assert len(report.skipped) == 1
+    assert report.skipped[0].reason.startswith("profile_collision:")
+    assert matrix_exit_code(report) == 1
+
+
+def test_replay_profile_collision_with_split_canary(frozen_snapshot: Path, tmp_path: Path) -> None:
+    """canary_count>1 auto-split claims canary-00..01 profiles; a replay whose
+    snapshot.profile_id matches one must be a typed profile_collision: skip,
+    never a silent merge into that canary's graph namespace."""
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    baseline = run_matrix(
+        [cell],
+        material_catalog(None, canary_seed=1, canary_count=2),
+        root=tmp_path / "base",
+    )
+    assert [c.material for c in baseline.cells] == ["canary-00", "canary-01"]
+    base_stores = _rig_stores(tmp_path / "base", cell)
+    try:
+        base_nodes_00 = _profile_node_ids(base_stores, "canary-00")
+    finally:
+        asyncio.run(base_stores.close())
+
+    other_root = tmp_path / "other"
+    rig = EvalRig(RigPaths(root=other_root), cell, profile_id="canary-00")
+    try:
+        session = canary_session(43, facts=4, noise=2)
+        run = rig.run_canary(session)
+        assert run.merge_committed
+        assert run.merge_summary is not None
+        canary00_journal = other_root / "dreams" / f"{run.merge_summary.snapshot_id}.json"
+        assert canary00_journal.exists()
+    finally:
+        rig.close()
+
+    materials_dir = tmp_path / "materials"
+    materials_dir.mkdir()
+    (materials_dir / "c00.json").write_text(canary00_journal.read_text(encoding="utf-8"), encoding="utf-8")
+    report = run_matrix(
+        [cell],
+        material_catalog(materials_dir, canary_seed=1, canary_count=2),
+        root=tmp_path / "root",
+    )
+    assert [c.material for c in report.cells] == ["canary-00", "canary-01"], "the replay must not run"
+    assert len(report.skipped) == 1
+    assert report.skipped[0].reason == "profile_collision: canary-00"
+    assert matrix_exit_code(report) == 1
+    stores = _rig_stores(tmp_path / "root", cell)
+    try:
+        assert _profile_node_ids(stores, "canary-00") == base_nodes_00, "replay must not merge into canary-00"
+    finally:
+        asyncio.run(stores.close())
+
+
+def test_replay_distinct_profiles_both_run(frozen_snapshot: Path, tmp_path: Path) -> None:
+    """Negative guard: two replays with distinct snapshot.profile_id both run,
+    and no profile_collision: row is emitted."""
+    other_root = tmp_path / "other"
+    rig = EvalRig(
+        RigPaths(root=other_root),
+        EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B),
+        profile_id="alice",
+    )
+    try:
+        session = canary_session(43, facts=4, noise=2)
+        run = rig.run_canary(session)
+        assert run.merge_committed
+        assert run.merge_summary is not None
+        other_journal = other_root / "dreams" / f"{run.merge_summary.snapshot_id}.json"
+        assert other_journal.exists()
+    finally:
+        rig.close()
+    materials_dir = tmp_path / "materials"
+    materials_dir.mkdir()
+    (materials_dir / "a.json").write_text(frozen_snapshot.read_text(encoding="utf-8"), encoding="utf-8")
+    (materials_dir / "b.json").write_text(other_journal.read_text(encoding="utf-8"), encoding="utf-8")
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    report = run_matrix(
+        [cell],
+        material_catalog(materials_dir, canary_seed=1, canary_count=0),
+        root=tmp_path / "root",
+    )
+    assert len(report.cells) == 2
+    assert report.skipped == ()
+    assert matrix_exit_code(report) == 0
