@@ -356,6 +356,14 @@ def run_matrix(
         rig = EvalRig(RigPaths(root=root / "runs" / run_id / cell.cell_id), cell)
         try:
             seen_profiles: set[str] = set()
+            # canaries claim their profiles up front so a replay cannot merge
+            # into a canary's graph namespace (profile identity is provenance).
+            if split_canaries:
+                seen_profiles.update(
+                    m.session.session_id for m in materials if m.kind == "canary" and m.session is not None
+                )
+            elif any(m.kind == "canary" for m in materials):
+                seen_profiles.add("canary")
             for material in materials:
                 try:
                     replay_snapshot: Snapshot | None = None

@@ -394,6 +394,54 @@ def test_replay_profile_collision_typed_skip(frozen_snapshot: Path, tmp_path: Pa
     assert matrix_exit_code(report) == 1
 
 
+def test_replay_profile_collision_with_split_canary(frozen_snapshot: Path, tmp_path: Path) -> None:
+    """canary_count>1 auto-split claims canary-00..01 profiles; a replay whose
+    snapshot.profile_id matches one must be a typed profile_collision: skip,
+    never a silent merge into that canary's graph namespace."""
+    cell = EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B)
+    baseline = run_matrix(
+        [cell],
+        material_catalog(None, canary_seed=1, canary_count=2),
+        root=tmp_path / "base",
+    )
+    assert [c.material for c in baseline.cells] == ["canary-00", "canary-01"]
+    base_stores = _rig_stores(tmp_path / "base", cell)
+    try:
+        base_nodes_00 = _profile_node_ids(base_stores, "canary-00")
+    finally:
+        asyncio.run(base_stores.close())
+
+    other_root = tmp_path / "other"
+    rig = EvalRig(RigPaths(root=other_root), cell, profile_id="canary-00")
+    try:
+        session = canary_session(43, facts=4, noise=2)
+        run = rig.run_canary(session)
+        assert run.merge_committed
+        assert run.merge_summary is not None
+        canary00_journal = other_root / "dreams" / f"{run.merge_summary.snapshot_id}.json"
+        assert canary00_journal.exists()
+    finally:
+        rig.close()
+
+    materials_dir = tmp_path / "materials"
+    materials_dir.mkdir()
+    (materials_dir / "c00.json").write_text(canary00_journal.read_text(encoding="utf-8"), encoding="utf-8")
+    report = run_matrix(
+        [cell],
+        material_catalog(materials_dir, canary_seed=1, canary_count=2),
+        root=tmp_path / "root",
+    )
+    assert [c.material for c in report.cells] == ["canary-00", "canary-01"], "the replay must not run"
+    assert len(report.skipped) == 1
+    assert report.skipped[0].reason == "profile_collision: canary-00"
+    assert matrix_exit_code(report) == 1
+    stores = _rig_stores(tmp_path / "root", cell)
+    try:
+        assert _profile_node_ids(stores, "canary-00") == base_nodes_00, "replay must not merge into canary-00"
+    finally:
+        asyncio.run(stores.close())
+
+
 def test_replay_distinct_profiles_both_run(frozen_snapshot: Path, tmp_path: Path) -> None:
     """Negative guard: two replays with distinct snapshot.profile_id both run,
     and no profile_collision: row is emitted."""
