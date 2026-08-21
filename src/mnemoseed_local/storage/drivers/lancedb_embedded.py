@@ -18,6 +18,7 @@ for one session in one delete.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
@@ -49,6 +50,8 @@ from mnemoseed_local.storage.ports import (
     WeightUpdate,
 )
 from mnemoseed_local.storage.registry import VECTOR_DRIVERS, register
+
+logger = logging.getLogger(__name__)
 
 _CAPABILITIES = frozenset(
     {
@@ -192,12 +195,25 @@ class LanceDbEmbeddedStore:
 
         The capture drain collects a whole session's new chunks and flushes them
         together — a single lock acquisition and LanceDB commit instead of one
-        per turn. Empty entry list is a no-op.
+        per turn. Empty entry list is a no-op. Each row reuses the per-chunk
+        merge logic so counters and rules survive a bulk collision.
         """
-        rows = [self._to_row(chunk, dense, sparse) for chunk, dense, sparse in entries]
-        if not rows:
+        if not entries:
             return
         with self._write_lock:
+            rows: list[dict[str, Any]] = []
+            for chunk, dense, sparse in entries:
+                row = self._to_row(chunk, dense, sparse)
+                # intra-batch duplicate takes precedence over table lookup
+                prior = next((p for p in rows if p["chunk_id"] == chunk.chunk_id), None)
+                if prior is not None:
+                    row = self._merge_upsert_row(prior, row)
+                    rows.remove(prior)
+                else:
+                    existing = self._find_row(chunk.chunk_id)
+                    if existing is not None:
+                        row = self._merge_upsert_row(existing, row)
+                rows.append(row)
             self._table.merge_insert(
                 "chunk_id"
             ).when_matched_update_all().when_not_matched_insert_all().execute(rows)
@@ -484,6 +500,13 @@ class LanceDbEmbeddedStore:
     def _ensure_table(self) -> None:
         if self.table_name in self._existing_tables():
             self._table = self._db.open_table(self.table_name)
+            if "rules_json" not in self._table.schema.names:
+                try:
+                    self._table.add_columns({"rules_json": pa.string()})
+                except TypeError:
+                    # lancedb >= 0.20 expects a field/schema for NULL columns
+                    self._table.add_columns([pa.field("rules_json", pa.string())])
+                self._table = self._db.open_table(self.table_name)
         else:
             self._table = self._db.create_table(self.table_name, schema=self._schema())
 
@@ -687,7 +710,10 @@ class LanceDbEmbeddedStore:
         if filter.needs_reconcile is not None:
             parts.append("needs_reconcile = " + ("true" if filter.needs_reconcile else "false"))
         if filter.rules_not_null:
-            parts.append("rules_json IS NOT NULL AND rules_json <> ''")
+            if "rules_json" not in self._table.schema.names:
+                logger.warning("rules_json column missing; degrading rules_not_null filter to no-op")
+            else:
+                parts.append("rules_json IS NOT NULL AND rules_json <> ''")
         return parts
 
     def _dense_similarity(self, query: Sequence[float], query_norm: float, row: dict[str, Any]) -> float:

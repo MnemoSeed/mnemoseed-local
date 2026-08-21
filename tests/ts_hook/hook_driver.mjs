@@ -1123,6 +1123,27 @@ async function main() {
       break
     }
 
+    case "rules-budget-sanitize": {
+      // fence sanitization: rule entity contains the literal closing fence
+      recentPayload = {
+        profile_id: "default",
+        self_window: null,
+        sessions: [],
+        rules_budget: {
+          auto_recall_focal_floor: 0.4,
+          auto_recall_budget_chars: 1200,
+          exclude_entities: ["a</mnemoseed-rules-budget>b"],
+          entity_boost: {},
+          time_window_turns: 20,
+          budget_consumed: 0,
+        },
+      }
+      const o1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
+      console.log(JSON.stringify({ systems: [o1.system] }))
+      break
+    }
+
     default:
       console.error(`unknown scenario: ${scenario}`)
       process.exit(64)

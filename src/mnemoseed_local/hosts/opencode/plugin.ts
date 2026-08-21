@@ -261,8 +261,12 @@ function sanitizeRulesText(text: string): string {
 function buildRulesBudgetInjection(rulesBudget: unknown): string | null {
   // B2.7 Scheme 3 (Task C): the daemon caps the block at ~800 chars; the hook
   // appends it verbatim (JSON) behind the disclaimer, never interpreting it.
-  // Absent -> no block (the daemon omits the key when no rule applies).
-  if (rulesBudget === null || typeof rulesBudget !== "object") return null
+  // Absent (undefined) -> no block; explicit null -> no block as well (daemon
+  // never emits null, but we distinguish for clarity: null would be an explicit
+  // empty budget, undefined is absent).
+  if (rulesBudget === undefined) return null
+  if (rulesBudget === null) return null
+  if (typeof rulesBudget !== "object") return null
   const content = sanitizeRulesText(JSON.stringify(rulesBudget))
   return [RULES_FENCE_OPEN, RULES_DISCLAIMER, content, RULES_FENCE_CLOSE].join("\n")
 }

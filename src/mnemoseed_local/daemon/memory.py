@@ -44,7 +44,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from mnemoseed_local.capture.stamper import ConsistencyVerdict, NearDuplicateChecker, WriteConfig
 from mnemoseed_local.config import Config
@@ -774,17 +774,26 @@ class MemoryService:
         global participate; another session's session-scoped rules never leak.
         Returns None when no applicable rule exists (absent semantics — the
         caller omits the ``rules_budget`` key)."""
-        page = self._stores.vector.list_chunks(
-            ChunkFilter(profile_id=profile_id, rules_not_null=True),
-            Page(offset=0, limit=1000),
-        )
+        try:
+            page = self._stores.vector.list_chunks(
+                ChunkFilter(profile_id=profile_id, rules_not_null=True),
+                Page(offset=0, limit=1000),
+            )
+        except Exception as exc:
+            logger.warning("rules_budget list failed; degrading to absent", exc_info=True)
+            logger.debug("rules_budget list failure", extra={"error": str(exc)})
+            return None
         exclude: list[str] = []
         boost: dict[str, float] = {}
         seen_exclude: set[str] = set()
         found = False
         for chunk in page.items:
             for rule_dict in chunk.rules:
-                rule = RecallRule(**rule_dict)
+                try:
+                    rule = RecallRule(**rule_dict)
+                except (ValidationError, TypeError, ValueError):
+                    logger.warning("skipping malformed rules_json entry", exc_info=True)
+                    continue
                 if not self._rule_in_scope(rule, session_id):
                     continue
                 found = True
@@ -799,13 +808,14 @@ class MemoryService:
                         boost[entity] = max(boost.get(entity, 0.0), coefficient)
         if not found:
             return None
+        budget_key = (profile_id, session_id if session_id is not None else "")
         return RulesBudgetBlock(
             auto_recall_focal_floor=self._config.capture.auto_recall_focal_floor,
             auto_recall_budget_chars=self._config.capture.auto_recall_budget_chars,
             exclude_entities=exclude,
             entity_boost=boost,
             time_window_turns=per_session,
-            budget_consumed=self._budget_consumed.get((profile_id, session_id or ""), 0),
+            budget_consumed=self._budget_consumed.get(budget_key, 0),
         )
 
     @staticmethod

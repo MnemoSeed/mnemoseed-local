@@ -10,8 +10,12 @@ clobber them).
 
 from __future__ import annotations
 
-from _support import PROFILE, make_stamp, raw_chunk
+from pathlib import Path
 
+from _support import DIMENSION, PROFILE, make_stamp, raw_chunk
+from lancedb import connect
+
+from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
 from mnemoseed_local.storage.ports import ChunkFilter, Page
 
 _RULE_A = {"kind": "exclude_entities", "value": ["a"], "ttl_turns": 1, "scope": "session", "session_id": "s1"}
@@ -81,3 +85,73 @@ def test_list_chunks_rules_not_null_filter(stack) -> None:
     assert {chunk.chunk_id for chunk in result.items} == {"wf"}
     all_rows = stack.vector.list_chunks(ChunkFilter(profile_id=PROFILE), Page(limit=10))
     assert {chunk.chunk_id for chunk in all_rows.items} == {"wf", "wo"}
+
+
+def test_upsert_chunk_merges_rules_keeps_larger_ttl_when_old_larger(stack) -> None:
+    """Old ttl larger than new ttl must survive (max semantics, not new-wins)."""
+    emb = stack.embed.embed("alpha rules")
+    stack.vector.upsert_chunk(_with_rules(stack, "x_ttl", "alpha rules", [_RULE_A9]), emb.dense, emb.sparse)
+    stack.vector.upsert_chunk(_with_rules(stack, "x_ttl", "alpha rules", [_RULE_A]), emb.dense, emb.sparse)
+    got = stack.vector.get_chunk("x_ttl")
+    assert got is not None
+    assert got.rules == [{**_RULE_A, "ttl_turns": 9}]
+
+
+def test_upsert_chunks_bulk_preserves_counters_and_merges_rules(stack) -> None:
+    """Bulk upsert must reuse the per-row merge logic: counters survive and rules merge."""
+    emb = stack.embed.embed("bulk rules")
+    # seed one row with counters and a rule
+    stack.vector.upsert_chunk(_with_rules(stack, "bulk-1", "bulk rules", [_RULE_A]), emb.dense, emb.sparse)
+    stack.vector.update_chunk_state(["bulk-1"], hit_increment=2, needs_reconcile=True)
+    # also set reinforce_count / last_hit_at via direct table update
+    from mnemoseed_local.storage.drivers.lancedb_embedded import _escape as _esc
+
+    # bump reinforce_count manually via raw update to simulate prior reinforce
+    stack.vector._table.update(where=f"chunk_id = {_esc('bulk-1')}", values={"reinforce_count": 5})
+    import time as _time
+
+    before = _time.time()
+    stack.vector._table.update(where=f"chunk_id = {_esc('bulk-1')}", values_sql={"last_hit_at": repr(before)})
+    # bulk upsert with colliding id carries a different rule and should merge
+    stamp_new = make_stamp("bulk-1", "bulk rules")
+    stamp_new.rules = [_RULE_B]
+    stamp_other = make_stamp("bulk-2", "bulk other")
+    stamp_other.rules = [_RULE_PROF]
+    emb2 = stack.embed.embed("bulk other")
+    stack.vector.upsert_chunks(
+        [
+            (stamp_new, emb.dense, emb.sparse),
+            (stamp_other, emb2.dense, emb2.sparse),
+        ]
+    )
+    row = raw_chunk(stack, "bulk-1")
+    assert int(row["hit_count"]) == 2
+    assert int(row["reinforce_count"]) == 5
+    assert row["needs_reconcile"] is True
+    assert float(row["last_hit_at"]) >= before
+    got = stack.vector.get_chunk("bulk-1")
+    assert got is not None
+    # union of old and new rules, max ttl for overlapping identity (none overlap here)
+    import json as _json
+
+    got_set = {_json.dumps(r, sort_keys=True) for r in got.rules}
+    expected = {_json.dumps(_RULE_A, sort_keys=True), _json.dumps(_RULE_B, sort_keys=True)}
+    assert got_set == expected
+    # the other chunk was inserted
+    assert stack.vector.get_chunk("bulk-2") is not None
+
+
+def test_list_chunks_rules_not_null_on_pre_b27_table(tmp_path: Path) -> None:
+    """Pre-B2.7 table without rules_json must degrade gracefully (empty, not crash)."""
+    uri = tmp_path / "old.lance"
+    db = connect(str(uri))
+    probe = LanceDbEmbeddedStore(uri=tmp_path / "probe.lance", dimensions=DIMENSION)
+    old_schema = probe._schema().remove(probe._schema().get_field_index("rules_json"))
+    db.create_table("chunks", schema=old_schema)
+    # reopen via the driver -> should migrate
+    store = LanceDbEmbeddedStore(uri=uri, dimensions=DIMENSION)
+    assert "rules_json" in store._table.schema.names
+    # no rows, filter must not crash and return empty
+    result = store.list_chunks(ChunkFilter(profile_id=PROFILE, rules_not_null=True), Page(limit=10))
+    assert result.items == []
+    assert result.total == 0

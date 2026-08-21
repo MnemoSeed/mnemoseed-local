@@ -339,7 +339,8 @@ def test_mcp_remember_schema_has_rules_and_relaxes_additional_properties() -> No
     schema = remember["inputSchema"]
     assert schema["required"] == ["text"]
     assert "rules" in schema["properties"]
-    assert schema["additionalProperties"] is True
+    assert schema["additionalProperties"] is False
+    assert "properties" in schema["properties"]["rules"]["items"]
 
 
 # ---------------------------------------------------------------- Task C: hook rules fence
@@ -357,3 +358,187 @@ def test_rules_budget_fence_appended_when_daemon_supplies_block(tmp_path: Path) 
     assert block.count("</mnemoseed-rules-budget>") == 1
     assert "daemon-supplied standing constraints" in block
     assert "secret1" in block
+
+
+def test_upsert_chunk_merges_rules_keeps_larger_ttl_when_old_larger_via_remember(
+    config_path: Path,
+) -> None:
+    """Daemon merge path: old ttl=9, new ttl=1 -> stored ttl stays 9 (max)."""
+    app = create_app()
+    with TestClient(app) as client:
+        rule_old = {
+            "kind": "exclude_entities",
+            "value": ["a"],
+            "ttl_turns": 9,
+            "scope": "session",
+            "session_id": "s_keep",
+        }
+        rule_new = {
+            "kind": "exclude_entities",
+            "value": ["a"],
+            "ttl_turns": 1,
+            "scope": "session",
+            "session_id": "s_keep",
+        }
+        r1 = client.post(
+            "/memory/remember", json={"profile_id": PROFILE, "text": "ttl keep old", "rules": [rule_old]}
+        ).json()
+        cid = r1["chunk_id"]
+        r2 = client.post(
+            "/memory/remember", json={"profile_id": PROFILE, "text": "ttl keep old", "rules": [rule_new]}
+        ).json()
+        assert r2["chunk_id"] == cid
+        got = app.state.stores.vector.get_chunk(cid)
+        assert got is not None
+        assert got.rules == [{**rule_old, "ttl_turns": 9}]
+
+
+def test_session_recent_malformed_rules_does_not_crash(config_path: Path) -> None:
+    """A chunk with an invalid rule kind must not crash /session/recent."""
+    app = create_app()
+    with TestClient(app) as client:
+        stores = client.app.state.stores
+        from mnemoseed_local.schema.stamp import ChunkStamp
+
+        emb = stores.embed.embed("malformed rules")
+        stores.vector.upsert_chunk(
+            ChunkStamp(
+                chunk_id="mal-1",
+                profile_id=PROFILE,
+                text="malformed rules",
+                cognitive_tier=CognitiveTier.TIER_1,
+                model_id="user",
+                cues=Cues(entities=[]),
+                provenance=Provenance(asserted_by="user", source="manual"),
+                rules=[{"kind": "invalid", "value": "x"}],
+            ),
+            emb.dense,
+            emb.sparse,
+        )
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        data = body.json()
+        # malformed rule is skipped, so no budget appears (absent semantics)
+        assert "rules_budget" not in data
+
+
+def test_session_recent_includes_global_scope(config_path: Path) -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        client.post(
+            "/memory/remember",
+            json={
+                "profile_id": PROFILE,
+                "text": "global rule fact",
+                "rules": [
+                    {
+                        "kind": "exclude_entities",
+                        "value": ["global-secret"],
+                        "ttl_turns": 0,
+                        "scope": "global",
+                        "session_id": None,
+                    }
+                ],
+            },
+        )
+        body = client.post("/session/recent", json={"profile_id": PROFILE, "self_session_id": "any"})
+        assert body.status_code == 200, body.text
+        rb = body.json().get("rules_budget")
+        assert rb is not None
+        assert "global-secret" in rb["exclude_entities"]
+
+
+def test_mcp_remember_omits_rules_when_absent() -> None:
+    from test_mcp_gateway import StubClient, _request, run_gateway
+
+    payload = {"outcome": "stored", "chunk_id": "c-1"}
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [_request(5, "tools/call", {"name": "remember", "arguments": {"text": "x"}})],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert client.calls == [("/memory/remember", {"profile_id": "default", "text": "x"})]
+
+
+def test_session_recent_never_emits_rules_budget_null(config_path: Path) -> None:
+
+    with TestClient(create_app()) as client:
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        raw = body.text
+        assert '"rules_budget": null' not in raw
+        assert '"rules_budget":null' not in raw
+        assert "rules_budget" not in body.json()
+        # with a rule, the key is present and not null
+        client.post(
+            "/memory/remember",
+            json={
+                "profile_id": PROFILE,
+                "text": "has rule",
+                "rules": [
+                    {
+                        "kind": "exclude_entities",
+                        "value": ["y"],
+                        "ttl_turns": 0,
+                        "scope": "profile",
+                        "session_id": None,
+                    }
+                ],
+            },
+        )
+        body2 = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body2.status_code == 200
+        assert "rules_budget" in body2.json()
+        assert body2.json()["rules_budget"] is not None
+
+
+def test_rules_budget_fence_sanitizes_inner_fence(tmp_path: Path) -> None:
+    from test_hook_ts_behavior import _bundle, _run
+
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "rules-budget-sanitize")
+    [system] = transcript["systems"]
+    assert len(system) == 2, f"BASE + rules fence expected: {system}"
+    block = system[1]
+    # inner literal must be sanitized to ‹› form
+    assert "‹mnemoseed-rules-budget›" in block
+    assert block.count("<mnemoseed-rules-budget>") == 1
+    assert block.count("</mnemoseed-rules-budget>") == 1
+
+
+def test_session_recent_on_pre_b27_table_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pre-B2.7 DB without rules_json must still serve /session/recent (empty, no crash)."""
+    from lancedb import connect
+
+    from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+
+    uri = tmp_path / "old.lance"
+    db = connect(str(uri))
+    probe = LanceDbEmbeddedStore(uri=tmp_path / "probe2.lance", dimensions=64)
+    old_schema = probe._schema().remove(probe._schema().get_field_index("rules_json"))
+    db.create_table("chunks", schema=old_schema)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'preset = "embedded"\n'
+        f'[storage.vector]\nuri = "{(tmp_path / "old.lance").as_posix()}"\ndimensions = 64\n'
+        f'[storage.graph]\npath = "{(tmp_path / "cortex.db").as_posix()}"\n'
+        f'[storage.graph.instances.isolated]\npath = "{(tmp_path / "isolated.db").as_posix()}"\n'
+        f'[storage.meta]\npath = "{(tmp_path / "meta.db").as_posix()}"\n'
+        f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
+        "[dream.llm.dream]\n"
+        'driver = "stub"\n'
+        'model = "stub"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
+    monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
+    app = create_app()
+    with TestClient(app) as client:
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        assert body.json()["sessions"] == []
+        # rules_not_null filter path inside _build_rules_budget must not crash
+        assert "rules_budget" not in body.json()

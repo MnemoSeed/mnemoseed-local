@@ -79,11 +79,22 @@ TOOLS: list[dict[str, Any]] = [
                 "rules": {
                     "type": "array",
                     "description": "optional standing constraints carried with the pin",
-                    "items": {"type": "object"},
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "value": {},
+                            "ttl_turns": {"type": "integer"},
+                            "scope": {"type": "string"},
+                            "session_id": {"type": ["string", "null"]},
+                        },
+                        "required": ["kind", "value"],
+                        "additionalProperties": False,
+                    },
                 },
             },
             "required": ["text"],
-            "additionalProperties": True,
+            "additionalProperties": False,
         },
     },
     {
