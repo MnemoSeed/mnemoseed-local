@@ -292,4 +292,54 @@ T2 确定性 AC 存在但**只测了"fresh root"半边**：`test_repeat_runs_sem
 - **qwen3.5:9b 矩阵 reflect 席 seed=42 仍坍缩**：B4a 的 "固定 seed 即治" 论断被本批 live 否定。候选修法方向（B4c 批次定）：(a) reflect 提示词压缩/重排避免坍缩诱导；(b) reflect 席温度非零（破 greedy 坍缩，B4a RCA 已注 temp=0=必坍缩）；(c) qwen3.5:9b 退出 reflect 席（仅作 verify/云锚对照）；(d) 空值守卫把 `[]` 视坍缩信号而非合法空抽取并加有限重试外的不降级策略。本批不立项，待用户定。
 - **lite 档定版**：原 B4b 节划出，留下一批。
 
+## 批次 B4c · reflect 席坍缩根治 + verify 污染回升排查 + within-run 串料硬化（2026-08-21 立项，用户拍板）
+
+> 理论锚：**部分借用——确定性解码下的退化（neural text degeneration under deterministic decoding）**。Holtzman et al. 2019（《The Curious Case of Neural Text Degeneration》）实证：max-likelihood / 贪心确定性解码（temperature=0、top-k=1）在高熵续写位会陷入重复与退化，概率最大化≠人类最优续写；正则规则——引入采样噪声（temperature>0 或 nucleus/top-p）可打破贪心退化。本批 T1 借此：reflect 席可对坍缩模型放开 temperature>0 破贪婪坍缩。**不借用**：任何"大模型有 understanding"泛谈、任何 pop-neuro 的"左脑/右脑分工""系统 1/2"隐喻——本批是评测臂工程正确性 + 一个已验证的解码正则，不引其他神经/心理理论。T2/T3 为工程排查与硬化，理论锚"不适用（工程控制面）"。
+
+### 立项依据（证据，非感觉）
+
+B4b 收口的 live rerun（`2026-08-20T20-46-07Z` 报告，隔离修法 live 验证成立后）暴露三项"非隔离"类残留缺陷，本批立项根治：
+
+1. **T1（P0，正面否定 B4a 收口论断）**：`qwen3.5:9b` 在 `seat_seed=42` 下，矩阵 reflect 席 off+verify 两态均 `reflect_collapse_attempts=3 / reflect_recovered=False`——坍缩分类器正确触发并报告，但穷尽 3 次重试（仍 seed=42）全部字面 `[]`+completion≤2。recall=0.00 / tokens=0 为 collapse-driven zero，**非模型质量基线**。B4a 收口"固定 seed=42 → 3/3 满抽取 780 tok"系 RCA 控制实验结论，live matrix 的 packed canary delta reflect 提示词下不复现。driver 端 `seed` 正确 thread（`ollama.py:40` option 白名单 + `payload["options"]["seed"]` 入 /api/chat），无 driver bug——问题在 prompt/model 层交互。
+2. **T2（P1，verify 减排论断出现反例）**：`gemma4:e4b` 本跑 off pollution=4 → verify pollution=6（**升**），与 B3.1 收口"e4b verify 减排 6→1"反向。可能方向：(a) verify 提示词/采样与 B3.1 实验态不同；(b) ensemble 逻辑变更后 verify 席输入差异；(c) canary seed 语境不同致单点方差。须定位根因，否则 verify"减排"不可作 bar。
+3. **T3（P2，latent 边界硬化）**：B4b closeout 划线明确记录——当前隔离在 default catalog（`canary_count=1`、各 replay `profile_id` 各异）下有效；latent 边界在 `canary_count>1`（多 canary 共享 profile `"canary"`）或两 replay 共享 `snapshot.profile_id` 时触发（共享 content-hash → merge reinforce 而非 create、chunks 累积 → 同 run 内检索膨胀）。architect Q2 已确认此 latent 存在但本批前未修。本批加 guard 防护。
+
+### 任务 T1 · qwen3.5:9b reflect 席坍缩根治（P0）
+
+- 范围：让 `qwen3.5:9b` 在 matrix reflect 席从 collapse-driven 0 抽取出 ≥0.6 recall，不破坏既有 B4a 抗坍缩（坍缩分类器、重试环、报告字段、`--no-seat-seed` 逃生门）与 rescore 政策保真。候选方向（architect 择一/并用，TDD 先行）：
+  - (a) **reflect 提示词压缩/重排**避免坍缩诱导位（packed canary delta 过密致 9b greedy 走死路）；
+  - (b) **reflect 席 temperature>0**（借理论锚正则，破贪婪坍缩；B4a RCA 已注 temp=0=必坍缩；须与 seed 兼容——seed 让采样可复现、temperature 让分布非退化）；
+  - (c) **qwen3.5:9b 退出 reflect 席**（模型-任务匹配性差，仅留 verify/云锚对照）；
+  - (d) **空值守卫不降级策略**：把 `[]` completion≤2 视坍缩信号而非合法空抽取，穷尽重试后不降级为 degraded 而是标记 reflect-seat-failed 并据全零上下文拒绝给污染分（防 collapse-driven zero 污染后续检索）。
+- 红测试：stub reflect 席返回 verbatim `[]`+completion=2 三次→断言 `qwen3.5:9b` cell 不产出 collapse-driven zero recall（即：要么真抽取到 ≥0.6 recall，要么标 reflect-seat-failed 不计 recall）。修法前红。
+- AC：`qwen3.5:9b` 在 stub 通路下 recall ≥0.6 或明确 reflect-seat-failed；既有抗坍缩全套测试（`test_eval_*collapse*`/rescore）全绿；门禁净。
+
+### 任务 T2 · gemma4:e4b verify 污染回升排查（P1）
+
+- 范围：定位 `gemma4:e4b` off pollution 4 → verify pollution 6 的根因，使 verify pollution ≤ off 或明确记录方差来源（不可复现则据实记录、不强修）。方向：
+  - (a) 比对 B3.1 实验态 vs 当前 verify 提示词/采样参数 diff；
+  - (b) 排查 ensemble 逻辑（verify 席是否在 reflect 污染上叠加自身抽取污染）；
+  - (c) canary seed 复现实验：固定 seed 跑多轮确认是否方差驱动；
+  - (d) verify 席是否因 reflect degraded 而退到 fallback 路径（fallback 污染控制更弱）。
+- 红测试：若定位为 bug → 写回归红测试钉死；若定位为方差 → 写方差记录测试（pollution 在 [off-2, off+2] 内不被断言为减排，避免 oracle 假阳性）。
+- AC：verify 污染 ≤ off 或方差来源明确记录入 PRD；既有 e4b 测试全绿；门禁净。
+
+### 任务 T3 · within-run 多材料串料硬化（P2）
+
+- 范围：为 B4b closeout 划线记录的 latent 边界加 guard，防 future catalog 变更触发：
+  - (a) `canary_count>1` 触发自动按材料拆 profile（如 `canary-01`/`canary-02`），或显式报错指引用户设 `profile_id` 各异；
+  - (b) 两 replay 共享 `snapshot.profile_id` 时报错或自动 rename（panic 优于静默串料）；
+  - (c) within-run 统计每 profile row count，跨材料 row 不翻倍断言（graph 写入后 audit 计数 = 预期，超预期即 raise）。
+- 红测试：构造 `canary_count=2` 两次同 material 进料 → 断言两 profile graph 行独立（content-hash 不撞、chunks 不共享）；共享 `profile_id` 两 replay → 断言 raise 或独立 profile。修法前红。
+- AC：latent 边界被 guard 守住；default catalog（count=1、各异 profile）行为不变；既有隔离测试全绿；门禁净。
+
+### 本批不做（划线）
+
+- 不动 driver 端 `seed` thread（B4b 已验无 bug）。
+- 不改跨跑 run-id 隔离（B4b 已修并收口）。
+- 不引 lite 档（原划线继续，留下一批）。
+- 不做全模型 rerun（T1/T2 修法落地后由收口节决定是否补 rerun，非本批硬性 AC）。
+- T1 不改 cloud 席 seed 政策（云席豁免既有，保留）。
+- T3 不改 default catalog 本身（只加 guard 防 future catalog 变更触界）。
+
 

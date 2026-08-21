@@ -3,7 +3,9 @@
 Definitions are deliberately dumb and honest:
 
 - ``canary_recall``: matched facts / total facts; ``None`` for a session with
-  no facts (0/0 is unknown, never silently 1.0 or 0.0);
+  no facts (0/0 is unknown, never silently 1.0 or 0.0) or for a
+  reflect-seat-failed run (collapse attempts > 0, never recovered — the seat
+  produced no extraction, so a numeric 0.00 would mislead);
 - ``noise_pollution``: core nodes citing at least one NOISE chunk. The
   evidence channel is provenance (node chunk_ids ∩ noise-attributed chunk
   ids) — never text similarity, so an "almost-noise" match is not pollution;
@@ -103,10 +105,15 @@ def score_canary(session: CanarySession, run: CellRun) -> CanaryMetrics:
             extra.append(node.node_id)
 
     total = len(session.facts)
+    recall: float | None = (len(matched) / total) if total else None
+    if run.reflect_collapse_attempts > 0 and not run.reflect_recovered:
+        # reflect-seat-failed: the seat produced no extraction, so recall is
+        # unknowable (a numeric 0.00 would mislead the report).
+        recall = None
     return CanaryMetrics(
         facts_total=total,
         facts_matched=len(matched),
-        canary_recall=(len(matched) / total) if total else None,
+        canary_recall=recall,
         matched_fact_ids=tuple(sorted(matched)),
         missed_fact_ids=tuple(sorted(missed)),
         noise_pollution=len(polluting),
