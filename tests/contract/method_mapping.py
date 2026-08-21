@@ -19,6 +19,8 @@ COVERAGE: dict[str, dict[str, str]] = {
         "delete_chunk": "test_contract_vector.py::test_delete_chunk",
         "search": "test_contract_vector.py::test_search_profile_isolation_and_metadata_filters",
         "near_duplicate": "test_contract_vector.py::test_near_duplicate_thresholds",
+        "near_duplicate_ranked": "test_contract_vector.py::test_near_duplicate_ranked_thresholds",
+        "upsert_chunks": "test_contract_vector.py::test_upsert_chunks_bulk",
         "snapshot_read": "test_contract_vector.py::test_snapshot_read_consistent_set",
         "mark_consolidated": "test_contract_vector.py::test_mark_consolidated",
         "purge_range": "test_contract_vector.py::test_purge_range_disjoint_safe",
@@ -102,7 +104,7 @@ COVERAGE: dict[str, dict[str, str]] = {
 # GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
 # 2026-08-13, the console Graph View bulk edge listing).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
-    "VectorStore": 12,
+    "VectorStore": 14,
     "GraphStore": 20,
     "MetaStore": 33,
     "Embedder": 3,

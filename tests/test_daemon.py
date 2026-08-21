@@ -288,6 +288,69 @@ def test_daemon_write_context_fills_entity_cues_from_turn_text() -> None:
     assert "MnemoSeed" in ctx.entities
 
 
+def test_daemon_write_context_fills_tool_cues_from_turn_steps() -> None:
+    """Option C (encoding specificity R4): capture must store the tool cues the
+    retrieval side matches on. Only query-matchable names (the _is_tool_name
+    shapes the query extractor recognises: camelCase/snake_case/kebab/MCP)
+    travel into WriteContext.tools_used — casefold-deduped, first-occurrence
+    order — so the hybrid β_tool overlap term is no longer dead code, and a
+    common lowercase host name (bash) is never stored verbatim where the query
+    side could not match it."""
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id=PROFILE,
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        steps=[
+            TurnStep(role=TurnRole.USER, content="跑一遍测试"),
+            TurnStep(role=TurnRole.TOOL, tool_name="bash"),  # not matchable -> filtered
+            TurnStep(role=TurnRole.TOOL, tool_name="runTests"),  # camelCase
+            TurnStep(role=TurnRole.TOOL, tool_name="RunTests"),  # casefold duplicate
+            TurnStep(role=TurnRole.TOOL, tool_name="run_tests"),  # snake_case
+            TurnStep(role=TurnRole.TOOL, tool_name="run-tests"),  # kebab
+            TurnStep(role=TurnRole.TOOL, tool_name="github__create_issue__create"),  # MCP
+            TurnStep(role=TurnRole.TOOL),  # nameless TOOL step -> skipped
+            TurnStep(role=TurnRole.ASSISTANT, content="全绿"),
+        ],
+    )
+
+    ctx = _daemon_write_context(turn)
+
+    assert ctx.tools_used == (
+        "runTests",
+        "run_tests",
+        "run-tests",
+        "github__create_issue__create",
+    )
+
+
+def test_daemon_write_context_caps_tool_cues_at_retrieval_budget() -> None:
+    """The capture-side fill shares the retrieval cue budget (tools_cap), so a
+    tool-heavy turn never stores more names than the query side can match."""
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.retrieve.cues import CueConfig
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    cap = CueConfig().tools_cap
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id=PROFILE,
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        steps=[TurnStep(role=TurnRole.TOOL, tool_name=f"tool-{i:02d}") for i in range(cap + 3)],
+    )
+
+    ctx = _daemon_write_context(turn)
+
+    assert len(ctx.tools_used) == cap
+    assert ctx.tools_used == tuple(f"tool-{i:02d}" for i in range(cap))
+
+
 def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
     """D2 end-to-end on the serving surface: a durable turn drained into the
     store must be reachable by a query whose cues extract entities (the

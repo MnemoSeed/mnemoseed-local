@@ -8,7 +8,7 @@ Driver family covered by the `stack` fixture:
 
 - embedded: lancedb_embedded + sqlite_graph + sqlite_meta + synthetic embedder
 
-## VectorStore (12 methods)
+## VectorStore (14 methods)
 
 | Method | Contract test |
 |---|---|
@@ -18,12 +18,14 @@ Driver family covered by the `stack` fixture:
 | list_chunks | `test_contract_vector.py::test_list_chunks_filter_pagination` |
 | mark_consolidated | `test_contract_vector.py::test_mark_consolidated` |
 | near_duplicate | `test_contract_vector.py::test_near_duplicate_thresholds` |
+| near_duplicate_ranked | `test_contract_vector.py::test_near_duplicate_ranked_thresholds` |
 | purge_range | `test_contract_vector.py::test_purge_range_disjoint_safe` |
 | search | `test_contract_vector.py::test_search_profile_isolation_and_metadata_filters` |
 | snapshot_read | `test_contract_vector.py::test_snapshot_read_consistent_set` |
 | update_chunk_state | `test_contract_vector.py::test_update_chunk_state_usage_counts` |
 | update_weights | `test_contract_vector.py::test_update_weights` |
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
+| upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
 ## GraphStore (20 methods)
 

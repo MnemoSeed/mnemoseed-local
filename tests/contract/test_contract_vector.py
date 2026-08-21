@@ -228,6 +228,36 @@ def test_near_duplicate_profile_scoping(stack) -> None:
     assert [chunk.chunk_id for chunk in only_bob] == ["x-bob"]
 
 
+def test_near_duplicate_ranked_thresholds(stack) -> None:
+    """B6 single-probe surface: near_duplicate_ranked returns (chunk, sim) pairs
+    sorted by similarity desc — one probe at the conflict threshold exposes both
+    the strong (>= reinforce) and band (>= conflict) near-duplicate sets."""
+    exact = _axis(1.0)
+    near = _axis(0.95, math.sqrt(1.0 - 0.95**2))
+    stack.vector.upsert_chunk(make_stamp("exact", "verbatim duplicate"), exact, SparseVector((), ()))
+    stack.vector.upsert_chunk(make_stamp("near", "echoing duplicate"), near, SparseVector((), ()))
+
+    ranked = stack.vector.near_duplicate_ranked(exact, threshold=0.85, profile_id=PROFILE)
+    assert [chunk.chunk_id for chunk, _ in ranked] == ["exact", "near"]
+    assert ranked[0][1] == pytest.approx(1.0, abs=1e-6)
+    assert ranked[1][1] == pytest.approx(0.95, abs=1e-6)
+
+
+def test_upsert_chunks_bulk(stack) -> None:
+    """B6 batch write: upsert_chunks persists every entry in one commit; each
+    chunk is independently readable afterward."""
+    a = stack.embed.embed("bulk one")
+    b = stack.embed.embed("bulk two")
+    stack.vector.upsert_chunks(
+        [
+            (make_stamp("b1", "bulk one"), a.dense, a.sparse),
+            (make_stamp("b2", "bulk two"), b.dense, b.sparse),
+        ]
+    )
+    assert stack.vector.get_chunk("b1").text == "bulk one"
+    assert stack.vector.get_chunk("b2").text == "bulk two"
+
+
 # ---------------------------------------------------------------- snapshot / lifecycle
 
 

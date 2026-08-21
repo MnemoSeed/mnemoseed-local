@@ -403,10 +403,8 @@ class WritingPipeline:
     def drain(self, session_id: str) -> list[WriteOutcome]:
         """Score pending turns, then write the durable ones to the store."""
         scored = self._inner.drain(session_id)
-        outcomes: list[WriteOutcome] = []
-        for item in scored:
-            outcome = self._writer.write(item, self._context(item.turn))
-            outcomes.append(outcome)
+        outcomes = self._writer.write_many([(item, self._context(item.turn)) for item in scored])
+        for outcome in outcomes:
             self._stats.turns_written += 1
             if outcome.kind is WriteOutcomeKind.NEW_CHUNK:
                 self._stats.new_chunks += 1

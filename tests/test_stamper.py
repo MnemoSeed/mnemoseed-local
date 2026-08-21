@@ -49,16 +49,15 @@ class _Clock:
 
 
 class _FakeVectorStore:
-    """Scripted VectorStore: near_duplicate returns whatever the test plans.
-
-    ``near_duplicate`` mirrors the D5-contract: the probe is profile-scoped, so
-    scripted matches are returned only for the probing profile (cross-profile
-    contamination would surface as a missing NEW_CHUNK / wrong outcome).
-    """
+    """Scripted VectorStore: near_duplicate_ranked returns whatever the test
+    plans, with similarities derived from the strong (0.9) vs band (0.85)
+    scripting — mirroring the D5 contract (probes are profile-scoped, so
+    scripted matches are returned only for the probing profile)."""
 
     def __init__(self) -> None:
         self.chunks: dict[str, ChunkStamp] = {}
         self.upserts: list[ChunkStamp] = []
+        self.upsert_chunks_calls: int = 0
         self.script: dict[float, list[ChunkStamp]] = {}
         self.probe_thresholds: list[float] = []
         self.probe_profiles: list[str] = []
@@ -66,9 +65,16 @@ class _FakeVectorStore:
         self.reconcile_flags: set[str] = set()
 
     def near_duplicate(self, vector: Sequence[float], threshold: float, profile_id: str) -> list[ChunkStamp]:
+        return [chunk for chunk, _ in self.near_duplicate_ranked(vector, threshold, profile_id)]
+
+    def near_duplicate_ranked(
+        self, vector: Sequence[float], threshold: float, profile_id: str
+    ) -> list[tuple[ChunkStamp, float]]:
         self.probe_thresholds.append(threshold)
         self.probe_profiles.append(profile_id)
-        return [chunk for chunk in self.script.get(threshold, []) if chunk.profile_id == profile_id]
+        strong_ids = {chunk.chunk_id for chunk in self.script.get(0.9, []) if chunk.profile_id == profile_id}
+        band = [chunk for chunk in self.script.get(threshold, []) if chunk.profile_id == profile_id]
+        return [(chunk, 0.95 if chunk.chunk_id in strong_ids else 0.85) for chunk in band]
 
     def upsert_chunk(
         self,
@@ -78,6 +84,13 @@ class _FakeVectorStore:
     ) -> None:
         self.chunks[chunk.chunk_id] = chunk
         self.upserts.append(chunk)
+
+    def upsert_chunks(
+        self, entries: Sequence[tuple[ChunkStamp, Sequence[float], SparseVector | None]]
+    ) -> None:
+        self.upsert_chunks_calls += 1
+        for chunk, dense, sparse in entries:
+            self.upsert_chunk(chunk, dense, sparse)
 
     def update_weights(self, updates: Sequence[WeightUpdate]) -> None:
         for update in updates:
@@ -162,6 +175,7 @@ def test_writer_assembles_complete_stamp() -> None:
         task="fix-ci",
         time_bucket="weekday-morning",
         entities=("pipelines",),
+        tools_used=("bash", "pytest"),
     )
     scored = _scored("以后都用 pnpm", emotion=EmotionCue(valence=-0.2, arousal=0.5, peripheral_gaps=True))
     outcome = _writer(store, clock).write(scored, ctx)
@@ -179,6 +193,7 @@ def test_writer_assembles_complete_stamp() -> None:
     assert stamp.cues.task == "fix-ci"
     assert stamp.cues.time_bucket == "weekday-morning"
     assert stamp.cues.entities == ["pipelines"]
+    assert stamp.cues.tools_used == ["bash", "pytest"]
     assert stamp.cues.emotion == EmotionCue(valence=-0.2, arousal=0.5, peripheral_gaps=True)
     assert stamp.provenance.asserted_by == "claude-sonnet-5"
     assert stamp.provenance.session_id == SESSION
@@ -245,6 +260,41 @@ def test_stamp_text_joins_user_and_assistant_lines() -> None:
     )
     outcome = _writer(store, _Clock()).write(scored, WriteContext(profile_id=PROFILE))
     assert store.chunks[outcome.chunk_id].text == "user: 你喜欢什么风格\nassistant: 简洁直接"
+
+
+def test_stamp_text_excludes_tool_steps() -> None:
+    """Verbatim contract with TOOL steps present: tool output is excluded at
+    stamp assembly (never captured), only USER + ASSISTANT lines join the text.
+    The tool NAMES travel separately as cues — Option C fills them, the text
+    channel stays untouched."""
+    store = _FakeVectorStore()
+    turn = Turn(
+        turn_index=0,
+        session_id=SESSION,
+        profile_id=PROFILE,
+        host=HostId.GENERIC,
+        model_id="claude-sonnet-5",
+        started_at=0.0,
+        steps=[
+            TurnStep(role=TurnRole.USER, content="跑一遍测试"),
+            TurnStep(role=TurnRole.TOOL, content="tool stdout here", tool_name="bash"),
+            TurnStep(role=TurnRole.ASSISTANT, content="全绿"),
+        ],
+    )
+    scored = ScoredTurn(
+        turn=turn,
+        importance=4.0,
+        components=ScoreComponents(arousal=3.0, novelty=4.0, causal_chain=2.0),
+        durability=DurabilityResult(durability=Durability.DURABLE, confidence=0.8, reasons=["pref-marker"]),
+        emotion=None,
+        causal_reasons=[],
+        features={},
+    )
+    outcome = _writer(store, _Clock()).write(scored, WriteContext(profile_id=PROFILE, tools_used=("bash",)))
+    stamp = store.chunks[outcome.chunk_id]
+    assert stamp.text == "user: 跑一遍测试\nassistant: 全绿"
+    assert "tool stdout here" not in stamp.text
+    assert stamp.cues.tools_used == ["bash"]
 
 
 def test_no_model_falls_back_to_user_asserted() -> None:
@@ -358,7 +408,40 @@ def test_no_near_duplicate_writes_new_chunk() -> None:
     outcome = _writer(store, _Clock()).write(_scored("我用 tabs 写代码"), WriteContext(profile_id=PROFILE))
     assert outcome.kind is WriteOutcomeKind.NEW_CHUNK
     assert len(store.upserts) == 1
-    assert store.probe_thresholds == [0.9, 0.85]
+    assert store.probe_thresholds == [0.85]  # B6 single probe at the conflict threshold
+
+
+def test_write_many_batches_new_chunk_upserts_into_one_call() -> None:
+    """B6 batch write: write_many collects every new-chunk and flushes them in a
+    single upsert_chunks call — one store commit instead of N per-turn ones."""
+    store = _FakeVectorStore()
+    items = [(_scored(f"以后都用 pnpm{i}"), WriteContext(profile_id=PROFILE)) for i in range(3)]
+
+    outcomes = _writer(store, _Clock()).write_many(items)
+
+    assert [o.kind for o in outcomes] == [WriteOutcomeKind.NEW_CHUNK] * 3
+    assert store.upsert_chunks_calls == 1
+    assert len(store.upserts) == 3
+    # one probe per turn (single ranked probe), all at the conflict threshold
+    assert store.probe_thresholds == [0.85, 0.85, 0.85]
+
+
+def test_write_many_stamps_batch_chunks_with_monotonic_ingested_at() -> None:
+    """B6 batch write: one drain reads the clock once, but each new chunk's
+    ingested_at is constructively monotonic (now + i * 1ms, items order) so the
+    ms-quantized focal scan and the recent tail keep their ordering — the
+    pre-B6 per-write clock semantics are reproduced as-is."""
+    store = _FakeVectorStore()
+    items = [(_scored(f"以后都用 pnpm{i}"), WriteContext(profile_id=PROFILE)) for i in range(3)]
+
+    _writer(store, _Clock()).write_many(items)
+
+    stamps = [store.upserts[i].ingested_at for i in range(3)]
+    assert stamps == [1000.0, 1000.001, 1000.002]
+    quantized = {round(stamp, 3) for stamp in stamps}
+    assert quantized == {1000.0, 1000.001, 1000.002}, (
+        "ms-quantized stamps must stay distinct: a smaller epsilon would collapse back to a tie"
+    )
 
 
 # ------------------------------------------------------------- consistency v1
@@ -433,7 +516,7 @@ def test_cross_profile_identical_text_never_reinforces_other_profile() -> None:
     assert outcome.kind is WriteOutcomeKind.NEW_CHUNK
     assert outcome.chunk_id != "chunk-alice"
     assert store.chunks[outcome.chunk_id].profile_id == BOB
-    assert store.probe_profiles == [BOB, BOB]
+    assert store.probe_profiles == [BOB]
     assert "chunk-alice" not in store.weight_updates
 
 

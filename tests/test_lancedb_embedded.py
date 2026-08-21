@@ -585,6 +585,64 @@ def test_near_duplicate_no_widening_when_kth_just_below_band(store, monkeypatch)
     assert found == []
 
 
+def test_near_duplicate_builds_stamps_without_get_chunk_roundtrip(store, monkeypatch):
+    """B6 round-trip elimination: the probe already returns full rows, so a
+    match must be reconstructed from those rows — never re-read through
+    ``get_chunk`` per match (the pre-fix N-round-trip cost per drain)."""
+    vector = _unit_vector(1.0)
+    store.upsert_chunk(_make("a1", "alpha beta gamma"), vector, SparseVector((), ()))
+    store.upsert_chunk(_make("a2", "alpha beta delta"), vector, SparseVector((), ()))
+
+    def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("near_duplicate must not re-read matches via get_chunk")
+
+    monkeypatch.setattr(store, "get_chunk", _explode)
+
+    found = store.near_duplicate(vector, threshold=0.9, profile_id="alice")
+    assert [chunk.chunk_id for chunk in found] == ["a1", "a2"]
+    assert found[0].text == "alpha beta gamma"  # full stamp reconstructed from probe rows
+
+
+def test_near_duplicate_ranked_returns_similarity_pairs(store):
+    """B6 single-probe: near_duplicate_ranked returns (chunk, similarity) pairs
+    sorted by similarity desc then chunk_id asc — one probe at the conflict
+    threshold serves both the strong and the band near-duplicate sets."""
+    exact = _unit_vector(1.0)
+    near = _unit_vector(0.95, math.sqrt(1.0 - 0.95**2))
+    store.upsert_chunk(_make("near", "echoing duplicate"), near, SparseVector((), ()))
+    store.upsert_chunk(_make("exact", "verbatim duplicate"), exact, SparseVector((), ()))
+
+    ranked = store.near_duplicate_ranked(exact, threshold=0.85, profile_id="alice")
+
+    assert [chunk.chunk_id for chunk, _ in ranked] == ["exact", "near"]
+    exact_sim = ranked[0][1]
+    near_sim = ranked[1][1]
+    assert exact_sim == pytest.approx(1.0, abs=1e-6)
+    assert near_sim == pytest.approx(0.95, abs=1e-6)
+    assert exact_sim >= near_sim
+
+
+def test_near_duplicate_ranked_filters_below_threshold(store):
+    store.upsert_chunk(_make("exact", "verbatim duplicate"), _unit_vector(1.0), SparseVector((), ()))
+    unrelated = _unit_vector(0.0, 1.0)
+    assert store.near_duplicate_ranked(unrelated, threshold=0.9, profile_id="alice") == []
+
+
+def test_upsert_chunks_bulk_commits_all_rows(store, embedder):
+    """B6 batch write: one upsert_chunks call persists every entry in a single
+    merge commit (no per-turn lock/commit round-trips)."""
+    a = embedder.embed("alpha beta gamma")
+    b = embedder.embed("alpha beta delta")
+    store.upsert_chunks(
+        [
+            (_make("b1", "alpha beta gamma"), a.dense, a.sparse),
+            (_make("b2", "alpha beta delta"), b.dense, b.sparse),
+        ]
+    )
+    assert store.get_chunk("b1").text == "alpha beta gamma"
+    assert store.get_chunk("b2").text == "alpha beta delta"
+
+
 # ---------------------------------------------------------------- snapshot / lifecycle
 
 
