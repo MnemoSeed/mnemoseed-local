@@ -207,11 +207,13 @@ def test_collapse_retry_recovers_and_records(tmp_path: Path, monkeypatch: pytest
 
 
 def test_collapse_every_retry_records_honestly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Collapse on every retry: no crash, honest counts and a failed outcome."""
+    """Collapse on every retry: no crash, honest counts and a failed outcome.
+    A seat without a seed must never grow one on the recovery ladder."""
     from mnemoseed_local.llm.drivers.stub import StubLLM
 
     fake, calls = _collapse_stub_chat(StubLLM.chat, collapse=99)
     monkeypatch.setattr(StubLLM, "chat", fake)
+    seeds = _record_driver_builds(monkeypatch)
     rig = EvalRig(RigPaths(root=tmp_path / "rig"), _stub_cell(), sleep=lambda _: None)
     try:
         run = rig.run_canary(canary_session(52, facts=4, noise=2))
@@ -224,6 +226,7 @@ def test_collapse_every_retry_records_honestly(tmp_path: Path, monkeypatch: pyte
     assert run.reflect_outcome is not None
     assert run.reflect_outcome.ok is False
     assert "collapse" in (run.reflect_outcome.error or "")
+    assert [s for s in seeds if s is not None] == []  # no-seat-seed: the ladder never injects a seed
 
 
 def test_legit_empty_extraction_not_classified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
