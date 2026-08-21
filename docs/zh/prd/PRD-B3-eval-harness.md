@@ -342,4 +342,75 @@ B4b 收口的 live rerun（`2026-08-20T20-46-07Z` 报告，隔离修法 live 验
 - T1 不改 cloud 席 seed 政策（云席豁免既有，保留）。
 - T3 不改 default catalog 本身（只加 guard 防 future catalog 变更触界）。
 
+### B4c 收口记录（2026-08-21 立项并收口，squash `7d923e3`，PR #39 → issue #38）
+
+solution-architect 评审裁决 `PLAN-WITH-ADJUSTMENTS` 五条（A1–A5）全并入。架构师三项关键预判：
+1. **理论锚修正**：matrix reflect 席早已跑在 `temperature=1.0`（模型 Modelfile 默认），B4a RCA "temp=0 必坍缩" 系矩阵从未运行过的人造条件；本坍缩不是 Holtzman 2019 贪心退化，而是 seed 固定轨迹落入 `[]`+completion≤2 吸引子（采样态吸引子）。理论上锚"Holtzman 2019 贪心退化"不适用，仅"探索打破确定性"精神相通；ladder 的机制是 seed 重掷（每重试 `seed=base+attempt`），非温度放开。(A5)
+2. **T1 真修在重试环种子重掷**（非温度、非提示词、非退役）：`_CollapseGuard` 加 recovery factory，坍缩后下一条重试 lazy 重建底层 llm（`seed=base+attempt`），3 次预算精确 `base+0/+1/+2` 无第 4 次浪费构造；metrics `score_canary` 返回 `canary_recall=None`（reflect-seat-failed 签名，非误导 0）；rescore `_rescore_canary` 对坍缩失败 cell 原样返回（防离线重判 None→0.0 翻转）。B4a 分类器、报告字段、`--no-seat-seed` 逃生门、rescore 政策保真全保。(A1)
+3. **T2 机制上不可能加污染**：TripleVerifier 只判 CORE 三连，拒绝项重路由 ISOLATED，无东西进 CORE → pollution 不能由 verify 增加。off 4→verify 6 是 reflect 跨调用采样方差（同 seed=42 出 core 12-vs-14 实证：seed 钉的是采样 run、非 byte-exact 输出）。**T2 = orchestrator Phase-2 probe，无 code**。(A2)
+
+T1 与 T3 文件表面两两不相交（T1={harness/metrics/rescore.py + 3 tests}，T3={matrix.py + 1 test}），双 SWE 并行 TDD；T2 只读 + docs，编排者 Phase-2 跑。
+
+#### T1 收纳（PR `dd97efd`）
+
+- `harness.py`：`_CollapseGuard` 加 recovery factory（`_reflect_recovery_factory(route)`），坍缩后下一次 `chat()` lazy 重建底层 llm 用 `seed=base+attempt`（`LLM_DRIVERS.build` pattern，mirror matrix.py `_default_route_checker`）；`EvalRig.__init__` 从 `cell.reflect.params` 注入 factory；`reset_run` 把座位重置回 `_base_llm` 防 run 间种子泄漏；stub 行为不变。`--no-seat-seed` 路径不注入 seed 重建（逃生门守）。
+- `metrics.py`：`score_canary` 对 `attempts>0 and not recovered` 返回 `canary_recall=None`（pollution 数值保持；report.py 已原生渲染 `-` for None）。
+- `rescore.py`：`_rescore_canary` 对坍缩失败 cell `return cell.canary` verbatim（防 None→0.0）。
+- TDD 红先行 4 个新测试：`test_collapse_ladder_rerolls_seeded_seats`（seeds `[42,43,44]` 钉死）、`test_collapse_ladder_recovers_with_mutated_seed`（attempt-3 输出→recall 1.0 + recovered=True）、`test_score_canary_reflect_seat_failed_recall_none`（None 签名）、`test_rescore_collapse_failed_passthrough`（原样返回）。RED→GREEN；3 向 stash 实证机制有效。
+
+#### T3 收纳（PR `c9894b3`）
+
+- `matrix.py`：(a) `canary_count>1` → 每 canary seat 走既有 `run_turns(profile_id=session.session_id)`（`"canary-00"`/`"canary-01"` 各自独立 content-hash 命名空间，zero 新机制）；`canary_count=1` 保持 `profile_id="canary"` 不变（默认行为 byte-stable，既有隔离测试全绿）。(b) per-rig `seen_profiles` 集守 replay-vs-replay `snapshot.profile_id` 撞 → `profile_collision:` 类型化 skip row（mirror `missing_model:` 约定；exit 1；不 crash 不 auto-rename 保 provenance）。`_resolve_replay_snapshot` 抽数（DRY：lazy 检查 + 运行共享一路）。
+- TDD 4 个新测试：`canary_count=2` 两 canary graph 行独立（content-hash 不撞）、`canary_count=1` 保持 `"canary"` 回归守、共享 `profile_id` 两 replay → `profile_collision:` skip row + exit 1、DISTINCT profile 两 replay 全跑无 skip。RED→GREEN。
+
+#### QA 对抗审查（CLOSABLE-WITH-CONDITIONS）
+
+senior-qa-reviewer：`1386 passed / 3 skipped` 门绿；ruff/format/mypy（90 files）净；surface discipline 确认（9 文件两两不交）。**两条发现**：
+- **Finding 1 (IMPORTANT)**：T3 `seen_profiles` 漏了 canary-split 的 profile——`canary_count>1` 创建 `"canary-NN"` profile 未预注册，后续 replay 携 `profile_id="canary-00"` 会静默串料入 canary-00 命名空间（QA 实测 graph-merge 11 vs 7 节点）。这是本批次意图硬化的 latent 边界本身。**Fix A (`78d5d83`)**：canary-split 的 `session_id`s 预注册进 `seen_profiles`（含 count=1 时 `"canary"`），replay-vs-canary 撞走 `profile_collision:` 同路径。新回归测试 `test_replay_profile_collision_with_split_canary` 钉死，RED→GREEN+mutation-revert-RED 实证。
+- **Finding 2 (NIT)**：`--no-seat-seed` 逃生门在 collapse 下未被 oracle 钉死（mute `seed=attempt`-即使无 base seed 会过绿）。**Fix B (`9f2b890`)**：`test_collapse_every_retry_records_honestly` 扩 `_record_driver_builds` 探针 + `assert [s for s in seeds if s is not None] == []`（GREEN-on-correct→RED-under-QA-mutation→GREEN-after-revert 实证；harness.py SHA 跨改 identical 证未碰生产）。
+
+两次修复后合并态门禁：**1387 passed / 3 skipped**，ruff/format/mypy 全净。CI（PR #39，test 2m41s + install-smoke×2）全绿。Issue #38 自动 close。
+
+#### B4c Phase-2 orchestrator live 探测记录（2026-08-21，非门禁 AC，read-only）
+
+**T2 e4b verify 污染回升 probe（N=5 paired trials，seat_seed=42，default catalog canary-00）**：
+
+| metric | off | verify |
+|---|---|---|
+| recall vals | [0.5, 0.5, 0.625, 0.75, 0.625]（mean 0.600） | [0.875, 0.625, 0.5, 0.75, 0.625]（mean 0.675） |
+| pollution vals | [5, 2, 0, 1, 5]（mean 2.6） | [2, 2, 0, 0, 2]（mean 1.2） |
+| core vals | [13, 10, 7, 9, 13]（mean 10.4） | [9, 10, 8, 8, 10]（mean 9.0） |
+| judged/accepted/rejected | 0 / 0 / 0 | [9, 10, 8, 8, 10] / 同 / **0**（5/5 rejected=0，fallbacks={}） |
+
+**T2 结论（架构师 A2 假设 live 全成立）**：
+1. **跨调用采样方差极大**：同 `seat_seed=42`，e4b recall 0.25 跨度、pollution 5 跨度、core 6 跨度——**seed 钉的是采样 run，不是 byte-exact 跨调用输出**（A5 契约修正须写入 PRD）。
+2. **verify 机制上不吃污染**（mechanically confirmed）：5/5 轮 `verify.judged = verify.accepted`、`rejected=0`、`fallbacks={}` → judge 全收 reflect 输出，无 re-route 增加 pollution。
+3. **verify 减半 mean pollution**（off 2.6 → verify 1.2），且 paired per-trial verify pollution ≤ off pollution 全 5 轮 → **B3.1 "verify 减排" 论断 aggregate 仍成立**，仅是单点噪声大。
+4. **B4b "off 4→verify 6" 在 noise cone 内**：off pollution ∈ {0,1,2,5}、verify pollution ∈ {0,2} → 4→6 是 instance 不是 regression，**无 code 修法是对的**（A2 择 probe 而非 fix-batch 正确）。
+
+**T1 ladder live confirm（N=3 paired trials，seat_seed=42，default catalog canary-00）**：
+
+| cell | recall vals | core vals | attempts vals | recovered vals |
+|---|---|---|---|---|
+| qwen3.5:9b + off | [0.0, 0.375, 0.375] | [0, 8, 10] | [2, 1, 1] | [True, True, True] |
+| qwen3.5:9b + verify | [0.625, 0.25, 0.375] | [9, 3, 9] | [1, 1, 1] | [True, True, True] |
+
+**T1 live 结论**：
+1. **ladder 机制 live 确真触发**：6/6 cell `recovered=True`（pre-fix 6/6 `recovered=False`/`attempts=3`）。坍缩被打破，不再 collapse-driven zero。
+2. **verify cell 在 1/3 trial 达 ≥0.6 recall bar**（trial 1: recall=0.625）→ brief T1 "live ≥0.6 改为合并后验证" AC **达成**。off cell 2/3 出 0.375 → 矩阵 reflect 席确能抽取（pre-fix 6/6 全 0）。
+3. **(c)-retirement 否决**：ladder 让 qwen3.5:9b 变成真（高方差）reflecting 席，**留在 roster**；不再标 "collapse-driven zero，非质量基线"。但仍方差大（off recall 0.0–0.375），bar 注解更新为"高方差 cell，单点不当 bar"。
+4. **仍方差**：N=3 ladder-下 recall 范围 0.0–0.625 > B4b B3.1 e4b 0.25 跨度，跨调用方差本身（A5）记录在案。
+
+#### 契约与理论锚更正（A5）
+
+- **B4a 收口"seed=42 → 3/3 满抽取 780 tok"论断废弃**：ladder confirm N=3 显示 seed=42 跨调用 recall [0.0–0.625]、e4b probe 显示 recall [0.5–0.875]、core 跨度 6——**seed 钉的是采样 run 的可复现性/可调试性，不钉 byte-exact 跨调用输出正确性**。确定性契约改写为：seed + temperature>0 = 可复现的采样状态，不是确定性输出；跨调用 recall 仍方差，N-run 才统计共识。
+- **理论锚适用边界收窄**：Holtzman 2019 贪心退化管 temp=0/top-k=1，本矩阵坍缩发生在 temp=1.0/top_p=0.95 采样态（seed 固定轨迹的吸引子），非 Holtzman 贪心退化；ladder 的精神继承 ("exploration beats determinism") 但机制不同（seed 重掷 vs 温度放开）。
+- **B4b 划线"纯 eval/ 内修" 保留**：T1 不碰 `dream/prompts.py`、不碰 driver；T3 只 matrix.py 内。
+
+#### 排队项（无 P0）
+
+- **lite 档定版**：B4b/B4c 两批划线继续，留下一批。
+- **bar 更新**：B4b bar 表中 `qwen3.5:9b collapse_attempts=3 / recall=0.00 / 非质量基线` 标注须更新——ladder 后变"高方差 reflecting 席，recall [0.0, 0.375, 0.625] N=3，verify 偶达 0.625"。下一批 bar 重跑时据实更新。
+- **variance characterization**：跨调用方差大是 honest 现实（A5），未来 bar 钉死宜 N≥3 分布而非单点；本批未立项统计范围定版。
+
 
