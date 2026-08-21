@@ -15,12 +15,48 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Literal, Protocol
+
+from pydantic import BaseModel, Field
 
 from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType
 from mnemoseed_local.schema.stamp import ChunkStamp
 
 # ---------------------------------------------------------------- data types
+
+
+class RecallRule(BaseModel):
+    """One standing constraint attached to a chunk (B2.7 Scheme 2-lite).
+
+    ``value``'s shape is decided by ``kind``: ``exclude_entities`` is a list of
+    entity names, ``entity_boost`` is ``[entity, coefficient]`` (the single
+    ``value`` slot carries both as strings), ``focal_floor``/``budget_chars``/
+    ``time_window`` are numeric. ``ttl_turns`` decays daemon-side per turn
+    (>0); 0 means permanent. ``scope`` selects the aggregation surface.
+    """
+
+    kind: Literal["focal_floor", "budget_chars", "exclude_entities", "entity_boost", "time_window"]
+    value: float | str | list[str]
+    ttl_turns: int = 0
+    scope: Literal["profile", "session", "global"] = "session"
+    session_id: str | None = None
+
+
+class RulesBudgetBlock(BaseModel):
+    """The standing-constraint budget the daemon serves on /session/recent.
+
+    The daemon is the only budget authority: the hook passes the block through
+    verbatim (never interprets it). ``exclude_entities`` is the union of the
+    matching rules; ``entity_boost`` takes the max coefficient per entity;
+    ``budget_consumed`` is the daemon-side T2 char count at call time.
+    """
+
+    auto_recall_focal_floor: float
+    auto_recall_budget_chars: int
+    exclude_entities: list[str] = Field(default_factory=list)
+    entity_boost: dict[str, float] = Field(default_factory=dict)
+    time_window_turns: int | None = None
+    budget_consumed: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +123,7 @@ class ChunkFilter:
     consolidated: bool | None = None
     needs_reconcile: bool | None = None  # console reconcile-queue filter (PRD-07)
     entities_allow_missing: bool = False
+    rules_not_null: bool = False  # B2.7: only chunks carrying rules (rules_json IS NOT NULL)
 
 
 @dataclass(frozen=True)

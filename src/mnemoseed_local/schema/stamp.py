@@ -91,6 +91,11 @@ class ChunkStamp(BaseModel):
     ingested_at: float = Field(default_factory=time.time)
     turn_start: int | None = None  # capturing turn window (safe purge scoping)
     turn_end: int | None = None  # inclusive; both ends must be set together
+    # B2.7 Scheme 2-lite: standing constraints carried with the chunk metadata
+    # (stored verbatim in the vector driver's ``rules_json`` column). The values
+    # are RecallRule dictionaries (ports.RecallRule) so the stamp stays a plain
+    # JSON carrier and the driver never depends on the port model.
+    rules: list[dict[str, Any]] = Field(default_factory=list)
 
     def metadata_filter_view(self) -> dict[str, Any]:
         """Flat view stored in vector-DB metadata (driver-agnostic).
