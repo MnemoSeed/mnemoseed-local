@@ -38,6 +38,17 @@ from mnemoseed_local.eval.matrix import (
     run_matrix,
     summary_lines,
 )
+from mnemoseed_local.eval.recall_harness import RecallRig
+from mnemoseed_local.eval.recall_materials import recall_materials
+from mnemoseed_local.eval.recall_matrix import (
+    PARAM_BUDGETS,
+    PARAM_FLOORS,
+    START_BUDGET,
+    START_FLOOR,
+    CoordinateDescentOutcome,
+    coordinate_descent,
+)
+from mnemoseed_local.eval.recall_metrics import RecallMetrics, score_recall
 from mnemoseed_local.eval.report import default_out_dir, write_report
 
 
@@ -117,6 +128,81 @@ def _rescore_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _recall_command(args: argparse.Namespace) -> int:
+    """T4b live calibration: run coordinate descent over the T2 pipeline rig
+    and emit recommended (focal_floor, budget_chars). Optionally writes to
+    config.py default values."""
+
+    # Build a metric_fn that runs the rig for each (floor, budget) and returns
+    # the 24 RecallMetrics for the coordinate descent.
+    materials = recall_materials()
+
+    def metric_fn(floor: float, budget: int) -> list[RecallMetrics]:
+        root = Path(args.workdir) / f"rig-f{floor}-b{budget}"
+        with RecallRig(root, focal_floor=floor, budget_chars=budget) as rig:
+            results: list[RecallMetrics] = []
+            for mat in materials:
+                run_result = rig.run_material(mat)
+                results.append(score_recall(run_result))
+            return results
+
+    outcome: CoordinateDescentOutcome = coordinate_descent(
+        metric_fn,
+        floors=PARAM_FLOORS,
+        budgets=PARAM_BUDGETS,
+        start_floor=START_FLOOR,
+        start_budget=START_BUDGET,
+    )
+
+    print(f"Coordinate descent completed: {len(outcome.groups)} groups")
+    if outcome.recommended is None:
+        print("No runnable groups — demotion path empty")
+        return 1
+
+    floor, budget = outcome.recommended
+    status = "DEMOTED" if outcome.demoted else "ACCEPTED"
+    print(f"Recommended: focal_floor={floor}, budget_chars={budget} ({status})")
+    if outcome.demoted:
+        print(f"Missed bars: {', '.join(outcome.demotion_path)}")
+
+    # Print the final frontier summary
+    print("\nFrontier summary (median over 24 points):")
+    for res in outcome.results:
+        if res.aggregate is None:
+            print(f"  floor={res.group.focal_floor:.2f} budget={res.group.budget_chars}: NO DATA")
+            continue
+        agg = res.aggregate
+        print(
+            f"  floor={res.group.focal_floor:.2f} budget={res.group.budget_chars}: "
+            f"R@5={agg.recall_at_5:.3f} P@5={agg.precision_at_5:.3f} "
+            f"floor_fp={agg.floor_fp:.3f} detector_fp={agg.detector_fp:.3f} "
+            f"fn_rate={agg.fn_rate:.3f} overhead={agg.token_overhead:.3f} "
+            f"points={agg.points}"
+        )
+
+    # Write to config.py if requested
+    if args.write_config:
+        config_path = Path("src/mnemoseed_local/config.py")
+        import re
+
+        content = config_path.read_text(encoding="utf-8")
+        # Update the two default constants
+        content = re.sub(
+            r"(auto_recall_focal_floor\s*=\s*)[\d.]+",
+            rf"\g<1>{floor}",
+            content,
+        )
+        content = re.sub(
+            r"(auto_recall_budget_chars\s*=\s*)\d+",
+            rf"\g<1>{budget}",
+            content,
+        )
+        config_path.write_text(content, encoding="utf-8")
+        print(f"Updated {config_path} with focal_floor={floor}, budget_chars={budget}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mnemoseed_local.eval", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -155,11 +241,18 @@ def main(argv: list[str] | None = None) -> int:
     rescore.add_argument("--seed", type=int, default=DEFAULT_CANARY_SEED, help="canary factory seed")
     rescore.add_argument("--out", default=None, help="output dir (default: beside the source report)")
 
+    recall = sub.add_parser("recall", help="T4b live calibration: coordinate descent over T2 pipeline rig")
+    recall.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
+    recall.add_argument("--write-config", action="store_true", help="write recommended values to config.py")
+    recall.add_argument("--seed", type=int, default=20260821, help="material catalog seed")
+
     args = parser.parse_args(argv)
     if args.command == "matrix":
         return _matrix_command(args)
     if args.command == "rescore":
         return _rescore_command(args)
+    if args.command == "recall":
+        return _recall_command(args)
     return _canary_command(args)
 
 
