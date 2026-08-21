@@ -383,3 +383,52 @@ def test_pre_b4a_report_loads_with_default_fields(tmp_path) -> None:
     assert cell.reflect_collapse_attempts == 0
     assert cell.reflect_recovered is False
     assert cell.seat_seed is None
+
+
+# ---------------------------------------------------------------- B4c reflect-seat-failed signature
+
+
+def _collapse_rig(tmp_path, monkeypatch: pytest.MonkeyPatch, *, collapse: int) -> EvalRig:
+    """A rig whose reflect seat collapses the first ``collapse`` attempts."""
+    from test_eval_harness import _collapse_stub_chat
+
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, _ = _collapse_stub_chat(StubLLM.chat, collapse=collapse)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    return EvalRig(
+        RigPaths(root=tmp_path / "rig"),
+        EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_B),
+        sleep=lambda _: None,
+    )
+
+
+def test_score_canary_reflect_seat_failed_recall_none(tmp_path, monkeypatch) -> None:
+    """A reflect-seat-failed cell (attempts>0, never recovered) must not report
+    a misleading recall=0.00: canary_recall is None, pollution stays numeric."""
+    rig = _collapse_rig(tmp_path, monkeypatch, collapse=99)
+    try:
+        session = canary_session(36, facts=4, noise=2)
+        run = rig.run_canary(session)
+    finally:
+        rig.close()
+    assert run.reflect_collapse_attempts == 3
+    assert run.reflect_recovered is False
+    metrics = score_canary(session, run)
+    assert metrics.canary_recall is None  # reflect-seat-failed, not recall=0.00
+    assert metrics.noise_pollution == 0  # pollution stays numeric (KISS)
+    assert metrics.facts_total == 4
+
+
+def test_score_canary_recovered_recall_numeric(tmp_path, monkeypatch) -> None:
+    """A recovered cell (attempts>0, reflect_recovered=True) still scores its
+    numeric recall: only the never-recovered signature yields None."""
+    rig = _collapse_rig(tmp_path, monkeypatch, collapse=1)
+    try:
+        session = canary_session(37, facts=4, noise=2)
+        run = rig.run_canary(session)
+    finally:
+        rig.close()
+    assert run.reflect_collapse_attempts == 1
+    assert run.reflect_recovered is True
+    assert score_canary(session, run).canary_recall == 1.0

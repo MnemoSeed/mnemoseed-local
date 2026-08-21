@@ -264,3 +264,74 @@ def test_rig_records_seat_seed_from_reflect_route(tmp_path: Path) -> None:
     assert run.seat_seed == 42
     assert run.reflect_collapse_attempts == 0
     assert run.reflect_recovered is False
+
+
+# ---------------------------------------------------------------- B4c recovery ladder
+
+
+def _record_driver_builds(monkeypatch: pytest.MonkeyPatch) -> list[int | None]:
+    """Wrap the LLM driver registry so every reflect-seat construction records
+    its sampling seed (None for unseeded roles like the stub verifier)."""
+    from typing import Any
+
+    from mnemoseed_local.llm import LLM_DRIVERS
+
+    seeds: list[int | None] = []
+    original_build = LLM_DRIVERS.build
+
+    def recorder(name: str, params: dict[str, Any] | None = None) -> Any:
+        seeds.append(dict(params or {}).get("seed"))
+        return original_build(name, params)
+
+    monkeypatch.setattr(LLM_DRIVERS, "build", recorder)
+    return seeds
+
+
+def _seeded_stub_cell() -> EvalCell:
+    return EvalCell(
+        reflect=EvalRoute(driver="stub", model="stub-a", params=(("seed", 42),)),
+        ensemble="off",
+        verifier=STUB_B,
+    )
+
+
+def test_collapse_ladder_rerolls_seeded_seats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each collapse retry rebuilds the reflect seat with seed=base+attempt:
+    the retry ring must explore a different sampling trajectory, not re-roll
+    the identical seeded one."""
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, calls = _collapse_stub_chat(StubLLM.chat, collapse=99)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    seeds = _record_driver_builds(monkeypatch)
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), _seeded_stub_cell(), sleep=lambda _: None)
+    try:
+        run = rig.run_canary(canary_session(55, facts=4, noise=2))
+    finally:
+        rig.close()
+    assert calls() == 3  # max_retries=2 -> exactly 3 attempts, no crash
+    assert [s for s in seeds if s is not None] == [42, 43, 44]  # base+0, base+1, base+2
+    assert run.reflect_collapse_attempts == 3
+    assert run.reflect_recovered is False
+
+
+def test_collapse_ladder_recovers_with_mutated_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse on the first two attempts, full extraction on the third: the
+    mutated-seed rebuild recovers, and recall reflects the attempt-3 output."""
+    from mnemoseed_local.eval.metrics import score_canary
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    fake, calls = _collapse_stub_chat(StubLLM.chat, collapse=2)
+    monkeypatch.setattr(StubLLM, "chat", fake)
+    seeds = _record_driver_builds(monkeypatch)
+    rig = EvalRig(RigPaths(root=tmp_path / "rig"), _seeded_stub_cell(), sleep=lambda _: None)
+    try:
+        session = canary_session(56, facts=4, noise=2)
+        run = rig.run_canary(session)
+    finally:
+        rig.close()
+    assert calls() == 3  # two collapses, then one full-extraction retry
+    assert [s for s in seeds if s is not None] == [42, 43, 44]
+    assert run.reflect_collapse_attempts == 2
+    assert run.reflect_recovered is True
+    assert score_canary(session, run).canary_recall == 1.0  # the attempt-3 output

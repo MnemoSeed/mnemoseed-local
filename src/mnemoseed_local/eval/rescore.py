@@ -11,6 +11,9 @@ Honestly NOT recomputable offline:
 - ``noise_pollution`` — the pollution judgment needs chunk-level attribution
   (noise turn -> mini-session -> chunk ids), which is rig-run state, not
   report content. The original value is CARRIED OVER verbatim.
+- a reflect-seat-failed cell (collapse attempts > 0, never recovered) — its
+  recall is None by signature; recomputing would revive a misleading 0.00, so
+  it is carried over verbatim.
 - verify/cost blocks — carrides over untouched by definition.
 
 The rescored report writes beside the source with a ``-rescored`` suffix.
@@ -34,6 +37,10 @@ def _rescore_canary(cell: CellReport, truth_by_name: dict[str, CanarySession]) -
     """Recompute the recall-shaped fields; carry pollution + everything else."""
     if cell.canary is None:
         return None
+    if cell.reflect_collapse_attempts > 0 and not cell.reflect_recovered:
+        # reflect-seat-failed: an offline rejudge would revive a misleading
+        # 0.00 — preserve the failure signature verbatim.
+        return cell.canary
     session = truth_by_name.get(cell.material)
     if session is None:
         return cell.canary  # replay material or unknown canary cell: carry
