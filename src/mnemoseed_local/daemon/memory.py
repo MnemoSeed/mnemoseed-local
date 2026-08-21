@@ -796,8 +796,9 @@ class MemoryService:
         """Embedding-free focal selection (D3): cue entities anchor a metadata
         read over the vector and graph stores at the focal decay floor; the
         requesting session and the daemon-seen ids are excluded; the budget
-        admits greedily by decay (tie newest-first) with the T1 slice
-        semantics (D4). Returns (items, non_focal_above_floor)."""
+        admits greedily by decay (tie newest-first: ingested_at ms desc, then
+        turn_start desc) with the T1 slice semantics (D4). Returns (items,
+        non_focal_above_floor)."""
         entities = tuple(self._cues.extract(text).cues.entities)
         query_folded = {str.casefold(e) for e in entities}
         if not entities:
@@ -809,14 +810,17 @@ class MemoryService:
             ChunkFilter(profile_id=profile_id, entities=entities, min_decay=floor),
             Page(0, _SCAN_PAGE_LIMIT),
         )
-        # decay, recency-stamp, kind, id, text — sorted greedily by decay desc
-        # then newest-first (D4). The stamp is quantized to millisecond
-        # precision: the graph driver persists updated_at through an ISO8601
-        # ms round-trip (storage/drivers/_time.py), so a chunk ingested_at
-        # with sub-ms noise and a node updated_at from the same instant only
-        # tie when compared at the coarser (representable) precision — the
-        # cross-store tie then falls to page-order stability (chunks first).
-        candidates: list[tuple[float, float, str, str, str]] = []
+        # decay, recency-stamp, turn_start, kind, id, text — sorted greedily
+        # by decay desc then newest-first (D4): stamp desc, then turn_start
+        # desc. The stamp is quantized to millisecond precision: the graph
+        # driver persists updated_at through an ISO8601 ms round-trip
+        # (storage/drivers/_time.py), so a chunk ingested_at with sub-ms noise
+        # and a node updated_at from the same instant only tie when compared
+        # at the coarser (representable) precision. The turn_start third key
+        # breaks the same-stamp tie in reading order; nodes carry the -1
+        # sentinel (they have no turn window) so a chunk always precedes a
+        # node on a full tie (chunks first).
+        candidates: list[tuple[float, float, int, str, str, str]] = []
         for chunk in page.items:
             if chunk.provenance.session_id == session_id:
                 continue  # the requesting session never sees its own chunks
@@ -826,7 +830,14 @@ class MemoryService:
             if not stored & query_folded:
                 continue  # the casefold authority (mirror of the Freshness probe)
             candidates.append(
-                (chunk.decay_weight, round(chunk.ingested_at, 3), "chunk", chunk.chunk_id, chunk.text)
+                (
+                    chunk.decay_weight,
+                    round(chunk.ingested_at, 3),
+                    chunk.turn_start if chunk.turn_start is not None else -1,
+                    "chunk",
+                    chunk.chunk_id,
+                    chunk.text,
+                )
             )
         node_page = self._stores.graph.list_nodes(
             NodeFilter(profile_id=profile_id, entities=entities, min_decay=floor),
@@ -839,11 +850,17 @@ class MemoryService:
             stored = {str.casefold(e) for e in node.entities}
             if not stored & query_folded:
                 continue
-            candidates.append((node.decay_weight, round(node.updated_at, 3), "node", node.node_id, statement))
+            # Sentinel -1: node has no turn_start. -1 and 0 are equivalent for
+            # chunks-first (both ≤ any chunk turn_start ≥ 0); -1 is canonical.
+            candidates.append(
+                (node.decay_weight, round(node.updated_at, 3), -1, "node", node.node_id, statement)
+            )
         budget = self._config.capture.auto_recall_budget_chars
         items: list[dict[str, str]] = []
         remaining = budget
-        for _decay, _stamp, kind, candidate_id, text in sorted(candidates, key=lambda c: (-c[0], -c[1])):
+        for _decay, _stamp, _turn_start, kind, candidate_id, text in sorted(
+            candidates, key=lambda c: (-c[0], -c[1], -c[2])
+        ):
             cost = len(text) + 1
             if cost <= remaining:
                 items.append({"kind": kind, "id": candidate_id, "text": text})

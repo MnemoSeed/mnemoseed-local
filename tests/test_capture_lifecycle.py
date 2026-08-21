@@ -332,3 +332,22 @@ def test_crash_replay_of_host_history_is_absorbed_and_never_duplicated(config_pa
             "user: 崩溃前的用户消息\nassistant: 崩溃前的助手回复",
             "user: 重启后的新消息\nassistant: 重启后的新回复",
         ], f"unexpected tail: {texts}"
+
+
+def test_batch_drain_tail_keeps_ascending_reading_order(config_path: Path) -> None:
+    """B6 batch write keeps the /session/recent reading order honest: one drain
+    writes a whole session's turns with constructively monotonic ingested_at
+    (now + i * 1ms), so the tail stays ascending even though every stamp shares
+    the same real clock tick."""
+    session = "sess-batch"
+    with TestClient(create_app()) as client:
+        for i in range(3):
+            _post(client, "user_prompt", session, float(i + 1), f"批写第{i + 1}轮提问")
+            _post(client, "assistant_message", session, float(i + 1) + 0.5, f"批写第{i + 1}轮回答")
+        _flush(client, session)
+        texts = _tail_texts(client, session)
+        assert texts == [
+            "user: 批写第1轮提问\nassistant: 批写第1轮回答",
+            "user: 批写第2轮提问\nassistant: 批写第2轮回答",
+            "user: 批写第3轮提问\nassistant: 批写第3轮回答",
+        ], f"unexpected tail: {texts}"

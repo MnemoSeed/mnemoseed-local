@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.graph import GraphNode, NodeType
-from mnemoseed_local.schema.stamp import Provenance
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -315,6 +315,36 @@ def _budget_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: int)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
     return cfg
+
+
+def test_recall_pending_same_stamp_tie_breaks_by_turn_start(recall_config_path: Path) -> None:
+    """D4 tie-break three-key pin: two chunks with the SAME decay_weight and
+    the SAME ingested_at (a B6 batch drain stamps one clock tick) are selected
+    by turn_start desc — the tie no longer depends on timestamp uniqueness."""
+    with TestClient(create_app()) as client:
+        stores = client.app.state.stores
+        for turn_start, chunk_id, text in [
+            (1, "tie-newer", "LanceDb 平局的新轮"),
+            (0, "tie-older", "LanceDb 平局的旧轮"),
+        ]:
+            stamp = ChunkStamp(
+                chunk_id=chunk_id,
+                profile_id=PROFILE,
+                text=text,
+                cognitive_tier=CognitiveTier.TIER_1,
+                model_id="test-model",
+                cues=Cues(entities=["LanceDb"]),
+                provenance=Provenance(asserted_by="user", session_id="sess-a", source="manual"),
+                decay_weight=0.9,
+                ingested_at=1000.0,
+                turn_start=turn_start,
+                turn_end=turn_start,
+            )
+            embedded = stores.embed.embed(text)
+            stores.vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
+        _ingest(client, "sess-b", 2.0, "LanceDb 相关")
+        items = _pull(client, "sess-b")["items"]
+        assert [item["id"] for item in items] == ["tie-newer", "tie-older"], items
 
 
 def test_recall_pending_budget_admits_greedy_decay_and_drops_the_rest(

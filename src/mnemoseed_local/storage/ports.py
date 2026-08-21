@@ -495,6 +495,18 @@ class VectorStore(Protocol):
     ) -> None:
         raise NotImplementedError
 
+    def upsert_chunks(
+        self,
+        entries: Sequence[tuple[ChunkStamp, Sequence[float], SparseVector | None]],
+    ) -> None:
+        """Bulk upsert of many chunks in one commit (B6 drain batch write).
+
+        The capture drain can flush an entire session's new chunks in a single
+        store commit instead of one lock/commit round-trip per turn. Each entry
+        is ``(chunk, dense, sparse)`` mirroring ``upsert_chunk``.
+        """
+        raise NotImplementedError
+
     def get_chunk(self, chunk_id: str) -> ChunkStamp | None:
         raise NotImplementedError
 
@@ -516,6 +528,19 @@ class VectorStore(Protocol):
         ``profile_id`` scopes the probe to a single profile — same isolation
         contract as ChunkFilter. The capture path (FR-1.8) must never scan
         another profile's chunks when deciding reinforce/reconcile/new.
+        """
+        raise NotImplementedError
+
+    def near_duplicate_ranked(
+        self, vector: Sequence[float], threshold: float, profile_id: str
+    ) -> list[tuple[ChunkStamp, float]]:
+        """Near-duplicate probe returning ``(chunk, similarity)`` pairs.
+
+        Same isolation contract as ``near_duplicate``; the pairs are sorted by
+        similarity desc then chunk_id asc. The capture drain path (B6) probes
+        once at the conflict threshold and partitions the result into the
+        strong (>= reinforce) and band (>= conflict) near-duplicate sets,
+        halving the ANN searches per turn on the drain hot path.
         """
         raise NotImplementedError
 

@@ -5,6 +5,7 @@ inner ScoringPipeline. Outcomes land in stats.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Sequence
 
@@ -48,6 +49,7 @@ class _FakeVectorStore:
     def __init__(self) -> None:
         self.chunks: dict[str, ChunkStamp] = {}
         self.upserts: list[ChunkStamp] = []
+        self.upsert_chunks_calls: int = 0
         self.script: dict[float, list[ChunkStamp]] = {}
         self.probe_thresholds: list[float] = []
         self.probe_profiles: list[str] = []
@@ -55,9 +57,16 @@ class _FakeVectorStore:
         self.reconcile_flags: set[str] = set()
 
     def near_duplicate(self, vector: Sequence[float], threshold: float, profile_id: str) -> list[ChunkStamp]:
+        return [chunk for chunk, _ in self.near_duplicate_ranked(vector, threshold, profile_id)]
+
+    def near_duplicate_ranked(
+        self, vector: Sequence[float], threshold: float, profile_id: str
+    ) -> list[tuple[ChunkStamp, float]]:
         self.probe_thresholds.append(threshold)
         self.probe_profiles.append(profile_id)
-        return [chunk for chunk in self.script.get(threshold, []) if chunk.profile_id == profile_id]
+        strong_ids = {chunk.chunk_id for chunk in self.script.get(0.9, []) if chunk.profile_id == profile_id}
+        band = [chunk for chunk in self.script.get(threshold, []) if chunk.profile_id == profile_id]
+        return [(chunk, 0.95 if chunk.chunk_id in strong_ids else 0.85) for chunk in band]
 
     def upsert_chunk(
         self,
@@ -67,6 +76,13 @@ class _FakeVectorStore:
     ) -> None:
         self.chunks[chunk.chunk_id] = chunk
         self.upserts.append(chunk)
+
+    def upsert_chunks(
+        self, entries: Sequence[tuple[ChunkStamp, Sequence[float], SparseVector | None]]
+    ) -> None:
+        self.upsert_chunks_calls += 1
+        for chunk, dense, sparse in entries:
+            self.upsert_chunk(chunk, dense, sparse)
 
     def update_weights(self, updates: Sequence[WeightUpdate]) -> None:
         for update in updates:
@@ -241,8 +257,67 @@ def test_cross_profile_identical_text_writes_fresh_chunk_for_second_profile() ->
     bob_outcomes = pipe.drain(SESSION_B)
     assert [o.kind for o in bob_outcomes] == [WriteOutcomeKind.NEW_CHUNK]
     assert store.upserts[-1].profile_id == BOB
-    assert store.probe_profiles == [ALICE, ALICE, BOB, BOB]
+    assert store.probe_profiles == [ALICE, BOB]  # B6: one ranked probe per write
     # the only weight update is ALICE's own reinforcement; BOB's write settled
     # into his own fresh chunk without touching ALICE's decay/last_reinforced
     assert list(store.weight_updates) == ["chunk-alice"]
     assert store.weight_updates["chunk-alice"].decay_weight == pytest.approx(0.8)
+
+
+def test_drain_batches_new_chunk_upserts_into_single_call() -> None:
+    """B6 batch write at the drain boundary: a multi-turn session drain persists
+    every new chunk in ONE upsert_chunks call (one store commit), not one
+    per-turn commit. One ranked probe per turn at the conflict threshold."""
+    store = _FakeVectorStore()
+    pipe = _writing_pipeline(store, _Clock())
+    for i in range(4):
+        pipe.submit_turn(_turn(f"我 review 喜欢简洁 {i}", index=i))
+
+    outcomes = pipe.drain(SESSION)
+
+    assert len(outcomes) == 4
+    assert all(o.kind is WriteOutcomeKind.NEW_CHUNK for o in outcomes)
+    assert store.upsert_chunks_calls == 1
+    assert len(store.upserts) == 4
+    assert store.probe_thresholds == [0.85] * 4
+    assert pipe.stats.new_chunks == 4
+
+
+# ---------------------------------------------------------------- drain perf (B6)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MNEMOSED_DRAIN_PERF"),
+    reason="set MNEMOSED_DRAIN_PERF=1 for the drain-latency measurement "
+    "(real LanceDB store, multi-turn session; B6 p95 target < 300ms)",
+)
+def test_drain_latency_at_batch_scale(tmp_path) -> None:
+    """B6 latency measurement: a multi-turn session drain over the REAL
+    LanceDB store with the synthetic embedder must stay far inside the p95
+    budget (generous CI bound; the optimizations are single ranked probe per
+    turn + one batched upsert commit). Prints the measured drain time for the
+    handoff record."""
+    from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
+
+    store = LanceDbEmbeddedStore(uri=tmp_path / "chunks.lance", dimensions=64)
+    embedder = SyntheticEmbedder()
+    inner = ScoringPipeline(scorer=TurnScorer(embedder=embedder), pool=ScorePool(clock=time.monotonic))
+    pipe = WritingPipeline(store, inner, clock=time.time)
+
+    # A realistic session flush is a handful of user/assistant exchanges (the
+    # opencode host flushes per idle); 10 turns is a generous upper bound on a
+    # single drain. The p95 target (< 300ms) is the whole /healthz stall the
+    # drain used to cause; this isolated path must clear it with room to spare.
+    turn_count = 10
+    for index in range(turn_count):
+        pipe.submit_turn(_turn(f"我 review 喜欢简洁 {index}", index=index))
+
+    started = time.perf_counter()
+    outcomes = pipe.drain(SESSION)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    assert len(outcomes) == turn_count
+    assert pipe.stats.new_chunks == turn_count
+    # generous CI bound — the live p95 target is < 300ms; CI machines are noisy
+    assert elapsed_ms < 300.0, f"drain exceeded the p95 budget: {elapsed_ms:.1f}ms"
+    print(f"[drain@{turn_count}] batch={elapsed_ms:.1f}ms new_chunks={pipe.stats.new_chunks}")

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -32,9 +32,22 @@ from mnemoseed_local.schema.stamp import (
     ProvenanceEvent,
 )
 from mnemoseed_local.schema.turn import Turn, TurnRole
-from mnemoseed_local.storage.ports import Embedder, TurnRange, VectorStore, WeightUpdate
+from mnemoseed_local.storage.ports import (
+    Embedder,
+    SparseVector,
+    TurnRange,
+    VectorStore,
+    WeightUpdate,
+)
 
 # ---------------------------------------------------------------- configuration
+
+# B6 batch drain: intra-batch ingested_at is constructively monotonic
+# (now + i * step), not per-item real clock reads — the pre-B6 write
+# semantics are reproduced as-is.
+# MUST keep ε >= 1ms: _focal_scan rounds ingested_at to 3 decimals; a smaller
+# epsilon may collapse back to a tie for some timestamps (value-dependent).
+_BATCH_INGEST_STEP_S = 0.001
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,25 @@ class WriteOutcome:
     kind: WriteOutcomeKind
     chunk_id: str
     similarity: float | None = None
+
+
+@dataclass(frozen=True)
+class _PendingWrite:
+    """One decided-but-not-yet-persisted write (B6 drain batching).
+
+    Exactly one persistence action is set: a fresh ``chunk`` (with its dense/
+    sparse vectors) for a new write, a ``weight_update`` for a reinforcement,
+    or a ``reconcile_id`` for a conflict flag. The caller applies it either
+    immediately (``write``) or batches same-kind actions into one store call
+    (``write_many``).
+    """
+
+    outcome: WriteOutcome
+    chunk: ChunkStamp | None = None
+    dense: Sequence[float] | None = None
+    sparse: SparseVector | None = None
+    weight_update: WeightUpdate | None = None
+    reconcile_id: str | None = None
 
 
 # --------------------------------------------------------------- text assembly
@@ -218,49 +250,118 @@ class StampWriter:
         credits the pool with the prediction-error bonus, anything else is
         upserted as a fresh chunk.
         """
+        pending = self._decide(scored, ctx, self._clock())
+        self._flush_single(pending, scored, ctx)
+        return pending.outcome
+
+    def write_many(self, items: Sequence[tuple[ScoredTurn, WriteContext]]) -> list[WriteOutcome]:
+        """Write several scored turns, batching the store persistence (B6).
+
+        Each turn is decided exactly as ``write`` (same single ranked probe at
+        the conflict threshold), but the new-chunk upserts, reinforcement
+        weight updates, and reconcile flags are each flushed in ONE batched
+        store call instead of one per turn — a single lock/commit per action
+        kind for the whole drain, not per turn. The pool prediction-error
+        credits still fire per conflict (they are in-memory ledgers, not store
+        round-trips). Returns one outcome per item, in order. As-is boundary:
+        intra-batch ingested_at is constructively monotonic (``now + i * 1ms``
+        in items order), not a per-item real clock read — isomorphic to the
+        pre-B6 per-write semantics.
+        """
         now = self._clock()
+        pendings = [
+            self._decide(item, ctx, now + index * _BATCH_INGEST_STEP_S)
+            for index, (item, ctx) in enumerate(items)
+        ]
+        self._flush_batch(pendings, items)
+        return [pending.outcome for pending in pendings]
+
+    def _decide(self, scored: ScoredTurn, ctx: WriteContext, now: float) -> _PendingWrite:
+        """Probe + near-duplicate decision for one turn, with no persistence.
+
+        Pure of store writes: a single ranked probe at the conflict threshold
+        serves both the strong (>= reinforce) and band (>= conflict) sets, so
+        the drain path runs one ANN search per turn instead of two. The result
+        carries the concrete persistence action (new chunk / weight update /
+        reconcile flag) for the caller to apply single or batched.
+        """
         stamp = self._assemble(scored, ctx, now)
         embedded = self._embedder.embed(stamp.text)
         config = self._config
 
-        # The drivers return near-duplicates sorted by similarity desc, so the
-        # probe at the reinforce threshold identifies the >= 0.9 set and the
-        # probe at the conflict threshold the full >= 0.85 band. Both probes are
-        # scoped to the writing profile (D5): another profile's identical or
-        # conflicting chunk must never steer this profile's write.
-        strong = self._store.near_duplicate(
-            embedded.dense, config.reinforce_threshold, profile_id=ctx.profile_id
-        )
-        band = self._store.near_duplicate(
+        # B6 single probe: near_duplicate_ranked at the conflict threshold
+        # returns everything >= 0.85 (sorted desc); strong membership is those
+        # at/above the reinforce threshold. The drivers' rank order pins band[0]
+        # as the strongest match (dense desc, chunk_id asc).
+        ranked = self._store.near_duplicate_ranked(
             embedded.dense, config.conflict_threshold, profile_id=ctx.profile_id
         )
-        if not band:
-            self._store.upsert_chunk(stamp, embedded.dense, embedded.sparse)
-            return WriteOutcome(WriteOutcomeKind.NEW_CHUNK, stamp.chunk_id)
+        if not ranked:
+            return _PendingWrite(
+                WriteOutcome(WriteOutcomeKind.NEW_CHUNK, stamp.chunk_id),
+                chunk=stamp,
+                dense=embedded.dense,
+                sparse=embedded.sparse,
+            )
 
-        hit = band[0]
-        strong_ids = {chunk.chunk_id for chunk in strong}
+        hit, hit_sim = ranked[0]
+        strong_ids = {hit.chunk_id for hit, sim in ranked if sim >= config.reinforce_threshold}
         verdict = self._checker.check(stamp.text, hit.text)
 
         if hit.chunk_id in strong_ids and verdict is ConsistencyVerdict.CONSISTENT:
-            self._reinforce(hit, now)
-            return WriteOutcome(WriteOutcomeKind.REINFORCED, hit.chunk_id)
+            rebound = min(1.0, hit.decay_weight + config.reinforce_bonus)
+            return _PendingWrite(
+                WriteOutcome(WriteOutcomeKind.REINFORCED, hit.chunk_id),
+                weight_update=WeightUpdate(hit.chunk_id, decay_weight=rebound, last_reinforced=now),
+            )
         if verdict is ConsistencyVerdict.CONFLICT:
-            self._store.update_chunk_state([hit.chunk_id], needs_reconcile=True)
+            return _PendingWrite(
+                WriteOutcome(WriteOutcomeKind.NEEDS_RECONCILE, hit.chunk_id),
+                reconcile_id=hit.chunk_id,
+            )
+        return _PendingWrite(
+            WriteOutcome(WriteOutcomeKind.NEW_CHUNK, stamp.chunk_id),
+            chunk=stamp,
+            dense=embedded.dense,
+            sparse=embedded.sparse,
+        )
+
+    def _flush_single(self, pending: _PendingWrite, scored: ScoredTurn, ctx: WriteContext) -> None:
+        """Apply one pending write's persistence immediately (the standalone
+        ``write`` path)."""
+        if pending.chunk is not None:
+            self._store.upsert_chunk(pending.chunk, pending.dense or [], pending.sparse)
+        if pending.weight_update is not None:
+            self._store.update_weights([pending.weight_update])
+        if pending.reconcile_id is not None:
+            self._store.update_chunk_state([pending.reconcile_id], needs_reconcile=True)
+        if pending.outcome.kind is WriteOutcomeKind.NEEDS_RECONCILE:
             self._credit_prediction_error(ctx, scored.turn.turn_index)
-            return WriteOutcome(WriteOutcomeKind.NEEDS_RECONCILE, hit.chunk_id)
-        self._store.upsert_chunk(stamp, embedded.dense, embedded.sparse)
-        return WriteOutcome(WriteOutcomeKind.NEW_CHUNK, stamp.chunk_id)
 
-    def _reinforce(self, chunk: ChunkStamp, now: float) -> None:
-        """Hebbian rebound: refresh last_reinforced and bounce decay_weight.
-
-        ``reinforce_count`` is an absolute-set column that ChunkStamp does not
-        expose on the read path, so the rebound carries decay + timestamp only.
-        """
-        config = self._config
-        rebound = min(1.0, chunk.decay_weight + config.reinforce_bonus)
-        self._store.update_weights([WeightUpdate(chunk.chunk_id, decay_weight=rebound, last_reinforced=now)])
+    def _flush_batch(
+        self, pendings: Sequence[_PendingWrite], items: Sequence[tuple[ScoredTurn, WriteContext]]
+    ) -> None:
+        """Apply the pending writes of a drain, one batched store call per
+        action kind (B6)."""
+        new_entries: list[tuple[ChunkStamp, Sequence[float], SparseVector | None]] = []
+        weight_updates: list[WeightUpdate] = []
+        reconcile_ids: list[str] = []
+        for pending in pendings:
+            if pending.chunk is not None:
+                new_entries.append((pending.chunk, pending.dense or [], pending.sparse))
+            if pending.weight_update is not None:
+                weight_updates.append(pending.weight_update)
+            if pending.reconcile_id is not None:
+                reconcile_ids.append(pending.reconcile_id)
+        if new_entries:
+            self._store.upsert_chunks(new_entries)
+        if weight_updates:
+            self._store.update_weights(weight_updates)
+        if reconcile_ids:
+            self._store.update_chunk_state(reconcile_ids, needs_reconcile=True)
+        for pending, (scored, ctx) in zip(pendings, items, strict=True):
+            if pending.outcome.kind is WriteOutcomeKind.NEEDS_RECONCILE:
+                self._credit_prediction_error(ctx, scored.turn.turn_index)
 
     def _credit_prediction_error(self, ctx: WriteContext, turn_index: int) -> None:
         """FR-1.8: prediction-error acceleration on a detected conflict."""

@@ -135,6 +135,24 @@ class LanceDbEmbeddedStore:
                 [self._to_row(chunk, dense, sparse)]
             )
 
+    def upsert_chunks(
+        self,
+        entries: Sequence[tuple[ChunkStamp, Sequence[float], SparseVector | None]],
+    ) -> None:
+        """Bulk upsert of many chunks in ONE merge commit (B6 drain batch write).
+
+        The capture drain collects a whole session's new chunks and flushes them
+        together — a single lock acquisition and LanceDB commit instead of one
+        per turn. Empty entry list is a no-op.
+        """
+        rows = [self._to_row(chunk, dense, sparse) for chunk, dense, sparse in entries]
+        if not rows:
+            return
+        with self._write_lock:
+            self._table.merge_insert(
+                "chunk_id"
+            ).when_matched_update_all().when_not_matched_insert_all().execute(rows)
+
     def delete_chunk(self, chunk_id: str) -> None:
         with self._write_lock:
             self._table.delete(f"chunk_id = {_escape(chunk_id)}")
@@ -237,15 +255,25 @@ class LanceDbEmbeddedStore:
     def near_duplicate(
         self, vector: Sequence[float], threshold: float, profile_id: str | None = None
     ) -> list[ChunkStamp]:
-        """Capped top-K scan + exact cosine re-score probe. profile_id scopes
-        the probe to one profile (D5 isolation); when omitted the whole table
-        is probed. The top-K cap widens while its K-th candidate's dense
-        similarity stays within MARGIN of the threshold, so a true duplicate
-        ranked just beyond the initial K is still caught. Residual envelope:
-        a duplicate whose top-K rank lands beyond the widened K, or whose
-        dense similarity sits below the threshold, is missed — the sparse
-        signature never rescues the probe. Ties order dense-desc then
-        chunk_id asc.
+        """Capped top-K scan + exact cosine re-score probe; returns the stamps.
+        Thin wrapper over ``near_duplicate_ranked`` (the shared probe)."""
+        return [chunk for chunk, _ in self.near_duplicate_ranked(vector, threshold, profile_id)]
+
+    def near_duplicate_ranked(
+        self, vector: Sequence[float], threshold: float, profile_id: str | None = None
+    ) -> list[tuple[ChunkStamp, float]]:
+        """Capped top-K scan + exact cosine re-score probe, returning
+        ``(chunk, similarity)`` pairs sorted by similarity desc then chunk_id
+        asc. profile_id scopes the probe to one profile (D5 isolation); when
+        omitted the whole table is probed. The top-K cap widens while its K-th
+        candidate's dense similarity stays within MARGIN of the threshold, so a
+        true duplicate ranked just beyond the initial K is still caught.
+        Residual envelope: a duplicate whose top-K rank lands beyond the widened
+        K, or whose dense similarity sits below the threshold, is missed — the
+        sparse signature never rescues the probe. Each match is reconstructed
+        from the probe rows themselves — never re-read through ``get_chunk``
+        (B6 round-trip elimination: no per-match table re-read on the drain
+        hot path).
         """
         global _widening_count
         query = [float(value) for value in vector]
@@ -275,12 +303,8 @@ class LanceDbEmbeddedStore:
         if not matches:
             return []
         matches.sort(key=lambda entry: (-entry[0], entry[1]))
-        chunks: list[ChunkStamp] = []
-        for _similarity, chunk_id in matches:
-            stamp = self.get_chunk(chunk_id)
-            if stamp is not None:
-                chunks.append(stamp)
-        return chunks
+        rows_by_id = {str(row["chunk_id"]): row for row in rows}
+        return [(self._to_stamp(rows_by_id[chunk_id]), similarity) for similarity, chunk_id in matches]
 
     def snapshot_read(self, filter: ChunkFilter) -> list[ChunkStamp]:
         version = self._table.version
