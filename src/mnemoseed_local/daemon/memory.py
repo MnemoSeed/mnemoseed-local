@@ -71,8 +71,9 @@ from mnemoseed_local.storage.ports import (
     ChunkFilter,
     NodeFilter,
     Page,
+    RecallRule,
+    RulesBudgetBlock,
     VectorStore,
-    WeightUpdate,
 )
 
 logger = logging.getLogger("mnemoseed_local.daemon.memory")
@@ -121,6 +122,7 @@ class RecallRequest(BaseModel):
 class RememberRequest(BaseModel):
     profile_id: ProfileRef
     text: NonBlankText
+    rules: list[RecallRule] | None = None
 
 
 class AuditRequest(BaseModel):
@@ -385,6 +387,9 @@ class MemoryService:
         self._scan_seq: dict[tuple[str, str], int] = {}
         self._session_epoch: dict[tuple[str, str], int] = {}
         self._pending_lock = threading.Lock()
+        # B2.7: per-session daemon-side T2 char count (served items), reported
+        # as ``rules_budget.budget_consumed`` — the hook only reads it.
+        self._budget_consumed: dict[tuple[str, str], int] = {}
 
     @property
     def retriever(self) -> HybridRetriever:
@@ -496,13 +501,23 @@ class MemoryService:
 
     # ------------------------------------------------------------ remember
 
-    def remember(self, *, profile_id: str, text: str, actor: str = "console") -> dict[str, Any]:
+    def remember(
+        self,
+        *,
+        profile_id: str,
+        text: str,
+        actor: str = "console",
+        rules: Sequence[RecallRule] | None = None,
+    ) -> dict[str, Any]:
         """Write an explicit user pin, mirroring the StampWriter's dual-branch
         near-duplicate flow: a strong consistent hit reinforces in place, a
         conflict flags needs_reconcile, anything else becomes a new chunk.
         Provenance is append-only; the explicit-pin source is never rewritten.
-        """
+        B2.7: every branch persists the standing ``rules`` on the chunk
+        (``rules_json``) — the driver merges them by identity on a re-upsert, so
+        a near-duplicate re-pin never drops rules."""
         now = time.time()
+        rules_dicts = [rule.model_dump() for rule in rules] if rules else []
         extracted = self._cues.extract(text)
         vector = self._stores.vector
         embedded = self._stores.embed.embed(text)
@@ -525,6 +540,7 @@ class MemoryService:
             decay_weight=1.0,
             score=1.0,
             ingested_at=now,
+            rules=rules_dicts,
         )
         strong = vector.near_duplicate(embedded.dense, config.reinforce_threshold, profile_id=profile_id)
         band = vector.near_duplicate(embedded.dense, config.conflict_threshold, profile_id=profile_id)
@@ -539,7 +555,14 @@ class MemoryService:
         verdict = NearDuplicateChecker().check(stamp.text, hit.text)
         if hit.chunk_id in strong_ids and verdict is ConsistencyVerdict.CONSISTENT:
             rebound = min(1.0, hit.decay_weight + config.reinforce_bonus)
-            vector.update_weights([WeightUpdate(hit.chunk_id, decay_weight=rebound, last_reinforced=now)])
+            hit_emb = self._stores.embed.embed(hit.text)
+            vector.upsert_chunk(
+                hit.model_copy(
+                    update={"decay_weight": rebound, "last_reinforced": now, "rules": rules_dicts}
+                ),
+                hit_emb.dense,
+                hit_emb.sparse,
+            )
             self._audit(
                 profile_id,
                 "remember",
@@ -548,6 +571,12 @@ class MemoryService:
             )
             return {"outcome": "reinforced", "chunk_id": hit.chunk_id}
         if verdict is ConsistencyVerdict.CONFLICT:
+            hit_emb = self._stores.embed.embed(hit.text)
+            vector.upsert_chunk(
+                hit.model_copy(update={"rules": rules_dicts}),
+                hit_emb.dense,
+                hit_emb.sparse,
+            )
             vector.update_chunk_state([hit.chunk_id], needs_reconcile=True)
             self._audit(
                 profile_id,
@@ -721,11 +750,79 @@ class MemoryService:
                     "chunk_count": window.chunk_count,
                     "active": self_session_id in active_sessions,
                 }
-        return {
+        result: dict[str, Any] = {
             "profile_id": profile_id,
             "sessions": groups,
             "self_window": self_window,
         }
+        rules_budget = self._build_rules_budget(
+            profile_id=profile_id, session_id=self_session_id, per_session=per_session
+        )
+        if rules_budget is not None:
+            result["rules_budget"] = rules_budget.model_dump()
+        return result
+
+    def _build_rules_budget(
+        self,
+        *,
+        profile_id: str,
+        session_id: str | None,
+        per_session: int,
+    ) -> RulesBudgetBlock | None:
+        """B2.7 Scheme 3: aggregate the standing rules the caller's session may
+        rely on. Only scope=session for THIS session + scope=profile + scope=
+        global participate; another session's session-scoped rules never leak.
+        Returns None when no applicable rule exists (absent semantics — the
+        caller omits the ``rules_budget`` key)."""
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id, rules_not_null=True),
+            Page(offset=0, limit=1000),
+        )
+        exclude: list[str] = []
+        boost: dict[str, float] = {}
+        seen_exclude: set[str] = set()
+        found = False
+        for chunk in page.items:
+            for rule_dict in chunk.rules:
+                rule = RecallRule(**rule_dict)
+                if not self._rule_in_scope(rule, session_id):
+                    continue
+                found = True
+                if rule.kind == "exclude_entities":
+                    for excluded in rule.value if isinstance(rule.value, list) else []:
+                        if excluded not in seen_exclude:
+                            seen_exclude.add(excluded)
+                            exclude.append(excluded)
+                elif rule.kind == "entity_boost":
+                    entity, coefficient = self._entity_boost_value(rule.value)
+                    if entity is not None:
+                        boost[entity] = max(boost.get(entity, 0.0), coefficient)
+        if not found:
+            return None
+        return RulesBudgetBlock(
+            auto_recall_focal_floor=self._config.capture.auto_recall_focal_floor,
+            auto_recall_budget_chars=self._config.capture.auto_recall_budget_chars,
+            exclude_entities=exclude,
+            entity_boost=boost,
+            time_window_turns=per_session,
+            budget_consumed=self._budget_consumed.get((profile_id, session_id or ""), 0),
+        )
+
+    @staticmethod
+    def _rule_in_scope(rule: RecallRule, session_id: str | None) -> bool:
+        if rule.scope != "session":
+            return True
+        return session_id is not None and rule.session_id == session_id
+
+    @staticmethod
+    def _entity_boost_value(value: float | str | list[str]) -> tuple[str | None, float]:
+        """Decode an entity_boost rule's ``value`` (``[entity, coefficient]``)."""
+        if isinstance(value, list) and len(value) >= 2:
+            try:
+                return str(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return None, 0.0
+        return None, 0.0
 
     def session_windows(
         self,
@@ -944,6 +1041,10 @@ class MemoryService:
                 self._pending_slots.pop(key, None)
                 non_focal = self._pending_non_focal.pop(key, 0)
                 self._pending_consumed[key] = True  # the serve leaves its tombstone
+                # B2.7: accrue the daemon-side T2 char count (budget_consumed).
+                self._budget_consumed[key] = self._budget_consumed.get(key, 0) + sum(
+                    len(item["text"]) + 1 for item in items
+                )
                 slot_consumed = True
             elif slot is not None:
                 # D6 empty serve: the slot survives so a fresh pull can still
@@ -977,6 +1078,7 @@ class MemoryService:
             self._pending_non_focal.pop(key, None)
             self._seen_chunk_ids.pop(key, None)
             self._pending_consumed.pop(key, None)
+            self._budget_consumed.pop(key, None)
             self._scan_seq.pop(key, None)
             self._session_epoch[key] = self._session_epoch.get(key, 0) + 1
 
@@ -1109,7 +1211,12 @@ def memory_recall(req: RecallRequest, request: Request) -> dict[str, Any]:
 @router.post("/memory/remember")
 def memory_remember(req: RememberRequest, request: Request) -> dict[str, Any]:
     service: MemoryService = request.app.state.memory
-    return service.remember(profile_id=req.profile_id, text=req.text, actor=resolve_actor(request))
+    return service.remember(
+        profile_id=req.profile_id,
+        text=req.text,
+        actor=resolve_actor(request),
+        rules=req.rules,
+    )
 
 
 @router.post("/memory/audit")

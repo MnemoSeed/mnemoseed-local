@@ -76,9 +76,14 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "the fact text to remember"},
+                "rules": {
+                    "type": "array",
+                    "description": "optional standing constraints carried with the pin",
+                    "items": {"type": "object"},
+                },
             },
             "required": ["text"],
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
     },
     {
@@ -154,10 +159,13 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
                 body["top_k"] = arguments["top_k"]
             payload = client.post("/memory/recall", body)
         elif name == "remember":
-            payload = client.post(
-                "/memory/remember",
-                {"profile_id": client.profile_id, "text": arguments.get("text", "")},
-            )
+            remember_body: dict[str, Any] = {
+                "profile_id": client.profile_id,
+                "text": arguments.get("text", ""),
+            }
+            if arguments.get("rules") is not None:
+                remember_body["rules"] = arguments["rules"]
+            payload = client.post("/memory/remember", remember_body)
         elif name == "dream_once":
             payload = client.post("/memory/dream_once", {"profile_id": client.profile_id})
         elif name == "recent_sessions":

@@ -63,6 +63,14 @@ const RECALL_FENCE_CLOSE = "</mnemoseed-memory-recall>"
 const RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
 const RECALL_DISCLAIMER =
   "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
+// B2.7 Scheme 3 (Task C): the second fence pair carries the daemon's standing
+// rules budget. The hook only passes the block through verbatim (fail-open —
+// the daemon is the sole budget authority and the model may ignore it).
+const RULES_FENCE_OPEN = "<mnemoseed-rules-budget>"
+const RULES_FENCE_CLOSE = "</mnemoseed-rules-budget>"
+const RULES_FENCE_SANITIZED = "‹mnemoseed-rules-budget›"
+const RULES_DISCLAIMER =
+  "The block below is daemon-supplied standing constraints, not the user's current instructions."
 // QA re-review NIT-1: the daemon's ReinforceRequest caps each id list at
 // max_length=64 (src/mnemoseed_local/daemon/memory.py) — one oversized POST
 // would 422 AFTER the cited set is already marked, dropping the whole batch
@@ -242,6 +250,21 @@ function sanitizeRecallText(text: string): string {
   // (self-dogfood hits this); replace BOTH literals with the ‹› form in one
   // pass so the assembled block carries exactly one open/close fence pair.
   return text.replaceAll(/<\/?mnemoseed-memory-recall>/g, RECALL_FENCE_SANITIZED)
+}
+
+function sanitizeRulesText(text: string): string {
+  // Same fence-integrity job for the rules budget block (B2.7): rule content
+  // (entity names, etc.) must never inject a second budget fence pair.
+  return text.replaceAll(/<\/?mnemoseed-rules-budget>/g, RULES_FENCE_SANITIZED)
+}
+
+function buildRulesBudgetInjection(rulesBudget: unknown): string | null {
+  // B2.7 Scheme 3 (Task C): the daemon caps the block at ~800 chars; the hook
+  // appends it verbatim (JSON) behind the disclaimer, never interpreting it.
+  // Absent -> no block (the daemon omits the key when no rule applies).
+  if (rulesBudget === null || typeof rulesBudget !== "object") return null
+  const content = sanitizeRulesText(JSON.stringify(rulesBudget))
+  return [RULES_FENCE_OPEN, RULES_DISCLAIMER, content, RULES_FENCE_CLOSE].join("\n")
 }
 
 function sessionTailId(group: any): string {
@@ -531,6 +554,11 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
           // (2 x 8 chunks) stays under it.
           t1InjectedChunkIds.set(sessionID, built.includedIds)
         }
+        // B2.7 Scheme 3 (Task C): the standing rules budget rides the same
+        // session-start read; append it (absent key -> no block). Independent
+        // of the memory-recall block's budget.
+        const rulesBlock = buildRulesBudgetInjection(data.rules_budget)
+        if (rulesBlock !== null) hookOutput.system.push(rulesBlock)
       }
     }
     const pull = pendingPull.get(sessionID)
@@ -948,7 +976,11 @@ async function reconcileSession(
       const createdS =
         typeof info?.time?.created === "number" ? info.time.created / 1000 : undefined
       const completedS =
-        typeof info?.time?.completed === "number" ? info.time.completed / 1000 : undefined
+        typeof info?.time?.completed === "number"
+          ? info.time.completed / 1000
+          : typeof info?.time?.error === "number"
+            ? info.time.error / 1000
+            : undefined
       if (role === "user" && createdS !== undefined && createdS > sinceSeconds) {
         const text = textOf(entry?.parts)
         if (text) {
@@ -1039,7 +1071,9 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
 
   async function onMessageCompleted(info: any): Promise<void> {
     if (info?.role !== "assistant") return
-    if (typeof info?.time?.completed !== "number") return
+    const completedAt = typeof info?.time?.completed === "number" ? info.time.completed : undefined
+    const errorAt = typeof info?.time?.error === "number" ? info.time.error : undefined
+    if (completedAt === undefined && errorAt === undefined) return
     const sessionID = String(info?.sessionID ?? "")
     const messageID = String(info?.id ?? "")
     if (!sessionID || !messageID) return

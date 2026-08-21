@@ -129,11 +129,60 @@ class LanceDbEmbeddedStore:
         sparse: SparseVector | None = None,
     ) -> None:
         with self._write_lock:
+            row = self._to_row(chunk, dense, sparse)
+            existing = self._find_row(chunk.chunk_id)
+            if existing is not None:
+                # B2.7 rules merge: a re-upsert of the same chunk_id carries the
+                # row's usage counters forward and merges the rules_json (union,
+                # ttl_turns takes the larger) instead of overwriting the row.
+                row = self._merge_upsert_row(existing, row)
             self._table.merge_insert(
                 "chunk_id"
-            ).when_matched_update_all().when_not_matched_insert_all().execute(
-                [self._to_row(chunk, dense, sparse)]
+            ).when_matched_update_all().when_not_matched_insert_all().execute([row])
+
+    def _find_row(self, chunk_id: str) -> dict[str, Any] | None:
+        rows = self._table.search().where(f"chunk_id = {_escape(chunk_id)}").limit(1).to_list()
+        return rows[0] if rows else None
+
+    def _merge_upsert_row(self, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        """Fold a matched upsert onto the existing row: the incoming values win
+        for the fields it models, while the usage counters and the reconcile
+        flag (absent from ChunkStamp) are carried forward, and the rules merge
+        by identity."""
+        merged = dict(incoming)
+        for key in ("hit_count", "reinforce_count", "last_hit_at", "needs_reconcile"):
+            if existing.get(key) is not None:
+                merged[key] = existing[key]
+        merged["rules_json"] = self._merge_rules_json(existing.get("rules_json"), incoming.get("rules_json"))
+        return merged
+
+    @staticmethod
+    def _merge_rules_json(old_json: object, new_json: object) -> object:
+        """Union two rules_json payloads by rule identity; same-identity rules
+        keep the larger ttl_turns. Either side empty falls through to the other."""
+        old: list[dict[str, Any]] = json.loads(old_json) if isinstance(old_json, str) else []
+        new: list[dict[str, Any]] = json.loads(new_json) if isinstance(new_json, str) else []
+        if not old:
+            return new_json
+        if not new:
+            return old_json
+        merged: list[dict[str, Any]] = []
+        index: dict[tuple[str, str, str, str | None], int] = {}
+        for rule in [*old, *new]:
+            key = (
+                str(rule.get("kind", "")),
+                json.dumps(rule.get("value"), sort_keys=True, ensure_ascii=False),
+                str(rule.get("scope", "session")),
+                rule.get("session_id"),
             )
+            if key in index:
+                merged[index[key]]["ttl_turns"] = max(
+                    merged[index[key]].get("ttl_turns", 0), rule.get("ttl_turns", 0)
+                )
+            else:
+                index[key] = len(merged)
+                merged.append(dict(rule))
+        return json.dumps(merged, separators=(",", ":"), ensure_ascii=False)
 
     def upsert_chunks(
         self,
@@ -414,6 +463,8 @@ class LanceDbEmbeddedStore:
                 pa.field("reinforce_count", pa.int64()),
                 # denormalized filter index (internal, prd-08 A.4)
                 pa.field("entities_filter", pa.string()),
+                # B2.7 Scheme 2-lite: verbatim standing-constraint JSON
+                pa.field("rules_json", pa.string()),
             ]
         )
 
@@ -502,6 +553,9 @@ class LanceDbEmbeddedStore:
             "last_hit_at": None,
             "reinforce_count": 0,
             "entities_filter": ",".join(cues.entities),
+            "rules_json": (
+                json.dumps(chunk.rules, separators=(",", ":"), ensure_ascii=False) if chunk.rules else None
+            ),
         }
 
     def _to_stamp(self, row: dict[str, Any]) -> ChunkStamp:
@@ -549,7 +603,18 @@ class LanceDbEmbeddedStore:
             ingested_at=float(row["ingested_at"]),
             turn_start=int(row["turn_start"]) if row.get("turn_start") is not None else None,
             turn_end=int(row["turn_end"]) if row.get("turn_end") is not None else None,
+            rules=self._parse_rules(row.get("rules_json")),
         )
+
+    @staticmethod
+    def _parse_rules(raw: object) -> list[dict[str, Any]]:
+        if not isinstance(raw, str) or not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
 
     # ------------------------------------------------------------- helpers
 
@@ -621,6 +686,8 @@ class LanceDbEmbeddedStore:
             parts.append("consolidated = " + ("true" if filter.consolidated else "false"))
         if filter.needs_reconcile is not None:
             parts.append("needs_reconcile = " + ("true" if filter.needs_reconcile else "false"))
+        if filter.rules_not_null:
+            parts.append("rules_json IS NOT NULL AND rules_json <> ''")
         return parts
 
     def _dense_similarity(self, query: Sequence[float], query_norm: float, row: dict[str, Any]) -> float:
