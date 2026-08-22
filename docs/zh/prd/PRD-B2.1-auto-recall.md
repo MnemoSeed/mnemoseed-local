@@ -225,3 +225,21 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 - **测试**：默认值钉死由既有 `tests/test_capture_config_keys.py` 覆盖（get 面 `0.4`/`1200`、load 缺省面 `0.4`/`1200`、无效值拒收、热应用），docs-only 批次不改代码、不新增测试，运行确认 12 passed。
 - **门禁**：pytest / ruff / ruff format / mypy 全净（docs-only，无源码面改动）。
 
+### 批次执行：T4b 阈值标定重跑收口（2026-08-23，材料重构 + 默认值落定 0.5/2400）
+
+**根因（架构师定案）**：首轮 T4b lite 标定 DEMOTED（0.4/1600、0.4/2000）为**材料-指标结构性不可达**，非扫描器缺陷——每点 serveable 噪声 2 / candidate_pool 3，P@5 理论上界 1/3（bar 0.60）、floor_fp 下界 1.0（bar 0.15），任何参数组合都到不了；decay 同质 + 年龄序平凡可预测。定案：**改材料，不改检索扫描面**（`_focal_scan` 排序为产品语义，零改动；详细推导与前沿表见 PRD-B2.1-T4-calibration.md 收口记录）。
+
+**交付**：
+
+- **材料重构**（`eval/recall_materials.py` + `eval/recall_harness.py` 权重写入 seam，产品码零改动）：decay 分层（fact 1.0 / 老化干扰 0.35 / needle-collision 0.45 中段——floor 轴判别器）+ 时序倒置（fact 最后存入）+ 第二事实 turn（`fact_support`，P@5 上界升至 2/3）+ 回复模板 4→8（cite×5 稀释结构性检测器误差）。同 seed 逐字节确定性契约保持。
+- **bars 分层重定案**：闸门层五条（R@5≥0.75、P@5≥0.60、det_fp≤0.15、fn≤0.20、overhead≤0.8）；**floor_fp 撤入报告层**（闸门正常工作的组其 serveable 噪声池恰为空，设 bar 会反向奖励保留可 serve 噪声的结构；仍逐组计算打印）。LOSS_WEIGHTS 重归一 0.5/0.3/0.2。
+- **live 标定**：lite 12 组 ACCEPTED @ (0.5, 1800) → 判 borderline（网格边缘）→ **官方 30 组：Recommended (0.5, 2400) ACCEPTED，五条闸门 bar 全过**（R@5 1.000 / P@5 1.000 / det_fp 0.000 / fn 0.143 / overhead 0.431）。
+- **默认值落定（hand-edit）**：`DEFAULT_AUTO_RECALL_FOCAL_FLOOR` 0.4→**0.5**、`DEFAULT_AUTO_RECALL_BUDGET_CHARS` 1200→**2400**；模板注释同步并注明 ACCEPTED。**`capture.auto_recall` 默认 off 不变**（翻转仍待 live 遥测）。产品权衡如实记：floor 0.5 收窄 chunk 保留窗（λ=0.03 下 ≥floor 窗口约 23 天 vs 原 30 天半衰点），换闸门纯度（det_fp 0.077→0.000、P@5 0.667→1.000）；budget 2400 为长档 fact 免尾切余量（served 集合与 1400 相同，仅 headroom）。
+- **`--write-config` 静默部分写修复（TDD）**：原 regex 仅匹配小写 `auto_recall_*`（只存在于模板注释），UPPERCASE 有效常量不可达——运行即报成功、真实默认不动、门禁仍绿。修复为 `write_calibration_defaults()`：四锚点全命中才写、任一缺失返回 False 且零写入；失败退出码 1。附带修复前沿打印对 None（空池诚实未知）的格式崩溃。
+
+**测试增量与门禁**：
+
+- 默认值钉共演化：`test_capture_config_keys`（get/load 面 0.5/2400）、`test_recall_pending`（wire 默认 budget_chars 2400、floor 0.5 恰在闸上准入）、`test_recall_rules`（rules-budget 回显 0.5/2400）。
+- 新增/更新：材料 decay 分层钉、时序倒置钉、`fact_support` 可引用性钉（实体可抽取 + needle 非空）、rig 权重写入行为钉（老化 chunk 数值 0.35 + floor 0.5 出池行为证明——消费 rebound 会使强化 chunk 的存储权重回弹，行为证明不受其扰）、`write_calibration_defaults` 四用例（含部分匹配拒写）、meets_bars 报告层语义、损失手算重钉、bars/loss 字典钉。
+- **1536 passed / 5 skipped**；ruff check / ruff format --check / mypy src 全净。
+

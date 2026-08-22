@@ -154,7 +154,7 @@ def test_recall_pending_is_disabled_by_default(config_path: Path) -> None:
             "enabled": False,
             "items": [],
             "non_focal_above_floor": 0,
-            "budget_chars": 1200,
+            "budget_chars": 2400,
             "slot_consumed": False,
         }
 
@@ -171,7 +171,7 @@ def test_recall_pending_serves_focal_entities_once_and_marks_seen(recall_config_
         payload = _pull(client, "sess-b")
         assert payload["enabled"] is True
         assert payload["non_focal_above_floor"] == 0
-        assert payload["budget_chars"] == 1200
+        assert payload["budget_chars"] == 2400
         assert payload["slot_consumed"] is True
         items = payload["items"]
         assert len(items) == 1, items
@@ -205,7 +205,7 @@ def test_recall_pending_consumed_tombstone_survives_until_session_end(recall_con
             "enabled": True,
             "items": [],
             "non_focal_above_floor": 0,
-            "budget_chars": 1200,
+            "budget_chars": 2400,
             "slot_consumed": True,
         }
         # the settle is terminal for the tombstone too
@@ -457,13 +457,13 @@ def test_recall_pending_rejects_bad_bodies(config_path: Path) -> None:
 
 
 def test_recall_pending_admits_decay_exactly_at_the_focal_floor(recall_config_path: Path) -> None:
-    """The focal floor is a >= gate: decay_weight == 0.4 (the default floor)
+    """The focal floor is a >= gate: decay_weight == 0.5 (the default floor)
     IS admitted — the 0.3-excluded pin above pins the other side."""
     with TestClient(create_app()) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb 相关内容")
         _settle(client, "sess-a")
         chunk_id = _store_chunks(client)["user: LanceDb 相关内容"]
-        client.app.state.stores.vector.update_weights([WeightUpdate(chunk_id, decay_weight=0.4)])
+        client.app.state.stores.vector.update_weights([WeightUpdate(chunk_id, decay_weight=0.5)])
         _ingest(client, "sess-b", 2.0, "LanceDb 相关")
         items = _pull(client, "sess-b")["items"]
         assert len(items) == 1, items

@@ -20,6 +20,7 @@ skips (0), material/run failures are failures (1).
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -129,6 +130,31 @@ def _rescore_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def write_calibration_defaults(config_path: Path, focal_floor: float, budget_chars: int) -> bool:
+    """Land a calibration outcome into config.py by hand-editing rules.
+
+    The effective defaults are the UPPERCASE module constants; the lowercase
+    ``auto_recall_*`` assignments exist only inside the generated-toml
+    template comments and are kept in sync. Returns False (writing nothing)
+    unless every constant line matched — a partial match would silently
+    drift documentation from behavior.
+    """
+    content = config_path.read_text(encoding="utf-8")
+    replacements = (
+        (r"(DEFAULT_AUTO_RECALL_FOCAL_FLOOR:\s*float\s*=\s*)[\d.]+", repr(focal_floor)),
+        (r"(DEFAULT_AUTO_RECALL_BUDGET_CHARS:\s*int\s*=\s*)\d+", str(budget_chars)),
+        (r"(#\s*auto_recall_focal_floor\s*=\s*)[\d.]+", repr(focal_floor)),
+        (r"(#\s*auto_recall_budget_chars\s*=\s*)\d+", str(budget_chars)),
+    )
+    updated = content
+    for pattern, value in replacements:
+        updated, count = re.subn(pattern, rf"\g<1>{value}", updated)
+        if count == 0:
+            return False
+    config_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 def _recall_command(args: argparse.Namespace) -> int:
     """T4b live calibration: run coordinate descent over the T2 pipeline rig
     and emit recommended (focal_floor, budget_chars). Optionally writes to
@@ -168,6 +194,12 @@ def _recall_command(args: argparse.Namespace) -> int:
 
     # Print the final frontier summary
     print("\nFrontier summary (median over 24 points):")
+
+    def fmt(value: float | None) -> str:
+        # a vacuous scalar (empty pool, e.g. floor_fp with no serveable noise)
+        # is an honest None, never a formatted zero
+        return "None" if value is None else f"{value:.3f}"
+
     for res in outcome.results:
         if res.aggregate is None:
             print(f"  floor={res.group.focal_floor:.2f} budget={res.group.budget_chars}: NO DATA")
@@ -175,31 +207,20 @@ def _recall_command(args: argparse.Namespace) -> int:
         agg = res.aggregate
         print(
             f"  floor={res.group.focal_floor:.2f} budget={res.group.budget_chars}: "
-            f"R@5={agg.recall_at_5:.3f} P@5={agg.precision_at_5:.3f} "
-            f"floor_fp={agg.floor_fp:.3f} detector_fp={agg.detector_fp:.3f} "
-            f"fn_rate={agg.fn_rate:.3f} overhead={agg.token_overhead:.3f} "
+            f"R@5={fmt(agg.recall_at_5)} P@5={fmt(agg.precision_at_5)} "
+            f"floor_fp={fmt(agg.floor_fp)} detector_fp={fmt(agg.detector_fp)} "
+            f"fn_rate={fmt(agg.fn_rate)} overhead={fmt(agg.token_overhead)} "
             f"points={agg.points}"
         )
 
     # Write to config.py if requested
     if args.write_config:
         config_path = Path("src/mnemoseed_local/config.py")
-        import re
-
-        content = config_path.read_text(encoding="utf-8")
-        # Update the two default constants
-        content = re.sub(
-            r"(auto_recall_focal_floor\s*=\s*)[\d.]+",
-            rf"\g<1>{floor}",
-            content,
-        )
-        content = re.sub(
-            r"(auto_recall_budget_chars\s*=\s*)\d+",
-            rf"\g<1>{budget}",
-            content,
-        )
-        config_path.write_text(content, encoding="utf-8")
-        print(f"Updated {config_path} with focal_floor={floor}, budget_chars={budget}")
+        if write_calibration_defaults(config_path, floor, budget):
+            print(f"Updated {config_path} with focal_floor={floor}, budget_chars={budget}")
+        else:
+            print(f"FAILED to update {config_path}: calibration constants not found")
+            return 1
 
     return 0
 

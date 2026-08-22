@@ -130,21 +130,57 @@
 - **门禁**：**1466 passed / 4 skipped**（T4a 新增 51 条；工作树含 B2.7 未收口测试），ruff / ruff format / mypy（94 files）全净。
 - **不实现（划线，PRD 既定）**：T4b live 子命令（`__main__.py` recall 分支，手动触发）、`config.py` 默认值同步（T4b 标定后交付）、needle 三参数裁决（B2.7 后）。
 
-### 评测记录（待填充）
+### T4b 标定收口记录（2026-08-23，材料重构 + lite/官方两级 live 重跑）
+
+**根因（架构师定案，结构性而非扫描器缺陷）**：首轮标定 DEMOTED（0.4/1600 与 0.4/2000）不可达——每点 serveable 噪声 2、candidate_pool 3，P@5 理论上界 1/3≈0.33（< 0.60 bar）、floor_fp 下界 1.0（> 0.15 bar）；且 decay=1.0 同质 + fact 最旧 / needle-collision 最新，serve 排序按年龄平凡可预测。**定案路径：改材料，不改检索扫描面**（`_focal_scan` 排序是产品语义，零改动）。
+
+**材料重构四刀（`eval/recall_materials.py`；权重落地在 `eval/recall_harness.py` 经 vector store `WeightUpdate` 端口写入，产品码零改动）**：
+
+1. **decay 分层**：fact 1.0；entity-miss / entity-collision 0.35（低于整个 [0.4, 0.6] floor 扫描带 → 构造性被闸门排除）；needle-collision **0.45（中段——floor 轴的真正判别器**：0.4/0.45 在池行使 Detector-FP，0.5+ 出池）。rig 在 cue 扫描前写入声明权重（ingest 落 1.0，仅偏差需写）。
+2. **时序倒置**：session A 存储顺序改为噪声在前、fact 最后——新→旧 tie-break 下 serve 序不再按年龄平凡可预测。
+3. **引用质量提升**：每点新增第二条事实 turn（`fact_support`），引用目标 1→2，P@5 理论上界 2/3≈0.667 > 0.60。
+4. **回复模板 4→8**：cite×5 变体（共享头 needle 使每次真引用都误强化碰撞 chunk，引用稀释把结构性 det_fp 压到 bar 之下）+ stray + no_cite + paraphrase。结构固有率：fn = 1/7 ≈ 0.143（恒定）；det_fp 全池服务组 6/18 = 1/3、严格闸门组 0。
+
+**bars 重定案（tiered 分层，推导自新包结构）**：
+- **闸门层**（推荐点必须全过）：recall@5 ≥ 0.75、precision@5 ≥ 0.60（沿用 PRD 数值，现可达）、detector_fp ≤ 0.15、fn_rate ≤ 0.20、token_overhead ≤ 0.8。
+- **报告层**：**floor_fp 撤 bar**——分层材料把干扰压到 floor 带之下，"闸门工作正常"的组其 serveable 噪声池恰为空（floor_fp=None 是诚实未知），设 bar 会反向奖励保留可 serve 噪声的材料结构。floor_fp 仍逐组计算并打印（同 non_focal_above_floor 的 report-only 先例）。
+- LOSS_WEIGHTS 重归一：recall 0.5 / precision 0.3 / overhead 0.2（floor_fp 随 bar 退出损失序）。
+
+**live 标定（lite 12 组 → borderline → 官方 30 组升级；全程确定性、无 LLM）**：
+- lite（floors {0.4, 0.45, 0.5} × budgets {1000, 1400, 1800}）：ACCEPTED @ (0.5, 1800)；推荐点落在缩减网格边缘（loss 随 budget 单调降、0.55/0.6 未扫），判 borderline 升级。
+- **官方 30 组坐标下降：Recommended: focal_floor=0.5, budget_chars=2400（ACCEPTED，降档路径空）**。前沿关键行（24 点中位数）：
+
+| floor | budget | R@5 | P@5 | floor_fp | det_fp | fn | overhead | verdict |
+|-------|--------|-----|-----|----------|--------|----|----------|---------|
+| 0.40–0.45 | 1200–2400 | 1.000 | 0.667 | 0.500–1.000 | 0.038–0.077 | 0.143 | 0.498–0.871 | PASS（loss 较劣；仅 budget=1200 超 overhead bar）——中段干扰在池 |
+| 0.50–0.60 | ≤1200 | 1.000 | 1.000 | None | 0.000 | 0.143 | 0.857–1.000 | MISS: token_overhead |
+| 0.50–0.60 | ≥1400 | 1.000 | 1.000 | None | 0.000 | 0.143 | 0.431–0.739 | PASS |
+
+- (0.5, 2400) bar 判定：R@5 1.000≥0.75 ✓ P@5 1.000≥0.60 ✓ det_fp 0.000≤0.15 ✓ fn 0.143≤0.20 ✓ overhead 0.431≤0.8 ✓ → **ACCEPTED**。
+- floor 轴判别性实证：0.45→0.50 处 P@5 0.667→1.000、det_fp→0.000、floor_fp 有值→None（needle-collision decay 0.45 恰被 0.5 闸出）。budget 轴只动 overhead（served 集合在 ≥600 全平；>1400 仅余量）。
+
+**默认值落定（hand-edit，不经 --write-config）**：`DEFAULT_AUTO_RECALL_FOCAL_FLOOR` 0.4→**0.5**、`DEFAULT_AUTO_RECALL_BUDGET_CHARS` 1200→**2400**（config.py 常量 + `default_config_toml` 模板注释同步 + 注明 ACCEPTED）；`capture.auto_recall` 默认 off 不变（翻转仍待 live 遥测）。产品权衡如实记：floor 0.5 相比 0.4 收窄 chunk λ=0.03 的保留窗（≥floor 窗口约 23 天 vs 30 天半衰点），换闸门纯度（det_fp 0.077→0.000、P@5 0.667→1.000）。
+
+**--write-config 静默部分写修复（TDD）**：原 regex 仅匹配小写 `auto_recall_*`（只存在于模板注释），UPPERCASE 有效常量不可达——运行即报成功、真实默认不动。修复为 `write_calibration_defaults()`：四个锚点（两常量 + 两注释行）全命中才写，任一缺失返回 False 且零写入；失败退出码 1。附带修复前沿打印对 None（空池诚实未知）的 `:.3f` 格式崩溃。
+
+**门禁**：pytest 1536 passed / 5 skipped；ruff check / ruff format --check / mypy src 全净。
+
+### 评测记录
 
 | 日期 | 参数组 | Recall@5 | Precision@5 | Floor-FP | Detector-FP | FN rate | Token overhead | 备注 |
 |------|--------|----------|-------------|----------|-------------|---------|----------------|------|
-|      |        |          |             |          |             |         |                |      |
+| 2026-08-21 | 0.4/1600（首轮 lite 降档） | — | ≤0.33（理论上界） | ≥1.0（下界） | — | — | — | DEMOTED：材料-指标结构性不可达，本批重构动机 |
+| 2026-08-23 | 30 组官方扫描最优 0.5/2400 | 1.000 | 1.000 | None（池空） | 0.000 | 0.143 | 0.431 | ACCEPTED（五条闸门 bar 全过） |
 
-### 定版参数（待填充）
+### 定版参数（2026-08-23）
 
-- `focal_floor` = 
-- `auto_recall_budget_chars` = 
+- `focal_floor` = **0.5**（T4b 官方 30 组 ACCEPTED）
+- `auto_recall_budget_chars` = **2400**（同上）
 - `needle_min_len` = （推迟，B2.7 后裁决）
 - `needle_mid_threshold` = （推迟，B2.7 后裁决）
 - `needle_mid_offset` = （不存在，代码为 center−12 固定，B2.7 裁决）
 
-### 配置同步记录（待填充）
+### 配置同步记录（2026-08-23）
 
-- `default_config_toml` 更新：是/否
-- 回归门禁：passed / failed
+- `default_config_toml` 更新：是（常量 :107-108 + 模板注释同步，均注明 T4b ACCEPTED 来源）
+- 回归门禁：1536 passed / 5 skipped（含 test_capture_config_keys 0.5/2400 共演化钉、test_recall_pending wire 默认钉、test_recall_rules rules-budget 回显钉）

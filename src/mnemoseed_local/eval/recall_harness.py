@@ -38,7 +38,7 @@ from fastapi.testclient import TestClient
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.eval.recall_metrics import RecallRunResult, ReplyObservation
 from mnemoseed_local.schema.turn import HostId
-from mnemoseed_local.storage.ports import ChunkFilter, Page
+from mnemoseed_local.storage.ports import ChunkFilter, Page, WeightUpdate
 
 if TYPE_CHECKING:
     from mnemoseed_local.eval.recall_materials import RecallMaterial
@@ -216,6 +216,8 @@ class RecallRig:
         self,
         root: Path,
         *,
+        # Rig start anchor (T4a-era baseline), NOT the shipped default — the
+        # product defaults live in config.py (DEFAULT_AUTO_RECALL_*).
         focal_floor: float = 0.4,
         budget_chars: int = 1200,
         profile_id: str = "t4a",
@@ -270,6 +272,18 @@ class RecallRig:
             self._settle(session_id)
         by_sid = self._chunk_ids_by_session(set(label_to_sid.values()))
         label_to_id = {label: by_sid[sid] for label, sid in label_to_sid.items() if sid in by_sid}
+        # The materials declare per-turn decay weights; ingest stamps 1.0, so
+        # only the deviations need a write BEFORE the cue scan runs (the
+        # layering is what makes the focal-floor axis discriminative).
+        updates = [
+            WeightUpdate(chunk_id=label_to_id[label], decay_weight=decay)
+            for label, decay in zip(
+                (label for label, _ in material.stored_turns), material.turn_decays, strict=True
+            )
+            if decay < 1.0 and label in label_to_id
+        ]
+        if updates:
+            self._state.stores.vector.update_weights(updates)
         bsid = f"{material.point_id}-b00"
         self._ingest(bsid, material.cue_turn, ts + len(material.stored_turns) + 1)
         pull = self._pull(bsid)

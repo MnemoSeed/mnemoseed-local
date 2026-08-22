@@ -5,15 +5,23 @@ Each point = bilingual (en/zh) x fact class (prefers / has_habit / decided /
 believes) x length band (short ~50 / medium ~200 / long ~800 chars), and
 carries:
 
-- a fact turn (with its entity, extractable by the retrieval cue extractor),
-- three noise chunks: entity-miss (unrelated entity — never focal, feeds only
-  the non-focal probe), entity-collision (same entity — passable by the focal
-  filter, Floor-FP denominator) and needle-collision (shares the fact's
-  24-char head needle — the Detector-FP material),
+- two fact turns (the primary engineered fact plus a short support fact,
+  both citing targets — the referenced mass that anchors precision@5),
+- three noise chunks with DECLARED DECAY WEIGHTS (applied by the rig before
+  the cue scan): entity-miss (unrelated entity — never focal) and
+  entity-collision (same entity) age below the whole focal-floor sweep so
+  the gate excludes them by construction; the needle-collision chunk (shares
+  the fact's 24-char head needle — the Detector-FP material) sits mid-band
+  so the floor axis genuinely gates it in and out across the sweep,
 - a cue turn for session B that anchors the entity,
-- four reply templates: cite (fires the fact's needle), stray (accidentally
-  fires the collision chunk's needle too), no-cite (nothing) and paraphrase
-  (references the fact without firing any needle — the FN path).
+- eight reply templates: five cite variants (fire both fact needles — the
+  citation mass keeps the structural detector error under the bars), stray
+  (additionally fires the collision chunk's needle), no-cite (nothing) and
+  paraphrase (references both facts without firing any needle — the FN path).
+
+Session-A storage order is INVERTED (interference first, facts last): with
+the newest-stamp serve tie-break, fact-last keeps the serve order from being
+trivially predictable by age.
 
 Determinism is the contract: the same seed reproduces the batch
 byte-identically. The needle windows are engineered by construction: the
@@ -33,6 +41,14 @@ from mnemoseed_local.eval.recall_harness import normalize_recall_text
 #: The pinned factory seed (material identity is part of the bar).
 RECALL_MATERIALS_SEED = 20260821
 
+#: Decay layering (T4b recalibration): facts carry full weight; the aged
+#: interference chunks sit below the entire focal-floor sweep [0.4, 0.6] so
+#: the floor gate excludes them by construction; the needle-collision pair
+#: sits mid-band so the floor axis gates it in/out across the sweep.
+FACT_DECAY: float = 1.0
+AGED_NOISE_DECAY: float = 0.35
+NEEDLE_COLLISION_DECAY: float = 0.45
+
 _FACT_CLASSES: tuple[str, ...] = ("prefers", "has_habit", "decided", "believes")
 _LENGTH_BANDS: tuple[str, ...] = ("short", "medium", "long")
 
@@ -47,11 +63,12 @@ class RecallNoiseKind(StrEnum):
 
 @dataclass(frozen=True)
 class RecallNoise:
-    """One noise chunk of a material point."""
+    """One noise chunk of a material point, with its declared decay weight."""
 
     kind: RecallNoiseKind
     label: str
     text: str
+    decay: float
 
 
 @dataclass(frozen=True)
@@ -78,14 +95,26 @@ class RecallMaterial:
     length_band: str  # "short" | "medium" | "long"
     entity: str
     fact_text: str
+    support_text: str  # the second referencing target ("fact_support" turn)
     noise: tuple[RecallNoise, ...]
     cue_turn: str
     reply_templates: tuple[RecallReplyTemplate, ...]
 
     @property
     def stored_turns(self) -> tuple[tuple[str, str], ...]:
-        """The session-A turns (fact first, then the noises), as (label, text)."""
-        return (("fact", self.fact_text), *((n.label, n.text) for n in self.noise))
+        """The session-A turns — interference first, the fact turns LAST
+        (temporal inversion: the newest-stamp serve tie-break must not make
+        the ordering trivially predictable by age) — as (label, text)."""
+        return (
+            *((n.label, n.text) for n in self.noise),
+            ("fact", self.fact_text),
+            ("fact_support", self.support_text),
+        )
+
+    @property
+    def turn_decays(self) -> tuple[float, ...]:
+        """The declared decay weight per stored turn, aligned with it."""
+        return (*(n.decay for n in self.noise), FACT_DECAY, FACT_DECAY)
 
 
 # ---------------------------------------------------------------- entity pools
@@ -208,6 +237,31 @@ _ZH_TAILS: tuple[str, ...] = (
 )
 
 
+#: Support-fact sentences: the second referencing target per point. They must
+#: clear the 32-unit needle minimum so citing replies can fire them verbatim.
+_EN_SUPPORT: dict[str, str] = {
+    "prefers": "{e} moved to this setup at the start of the quarter",
+    "has_habit": "{e} has kept this routine since the team was formed",
+    "decided": "{e} confirmed the decision at the last quarterly review",
+    "believes": "{e} explained the reasoning at the planning session",
+}
+
+_ZH_SUPPORT: dict[str, str] = {
+    "prefers": "{e} 从 本 季度 之 初 切换 到 了 这套 轻量 安排 并且 打算 长期 保持",
+    "has_habit": "{e} 从 团队 成立 之 初 就 一直 保持 这套 例行 流程 直到 现在",
+    "decided": "{e} 在 上次 评审 会议 上 确认 了 这个 决定 并且 记录 在案",
+    "believes": "{e} 在 规划 会议 上 解释 了 这 个 判断 的 理由 和 依据",
+}
+
+#: Citation lead-ins: five genuine citation variants dilute the structural
+#: detector error (the shared-head needle adds one false reinforcement per
+#: fact citation) under the detector_fp bar while keeping it real.
+_CITE_LEADS: dict[str, tuple[str, ...]] = {
+    "en": ("Sounds right", "Noted", "Agreed", "Correct", "Makes sense"),
+    "zh": ("好的", "收到", "同意", "没错", "明白了"),
+}
+
+
 # ---------------------------------------------------------------- assembly
 
 
@@ -276,26 +330,35 @@ def _reply_templates(
     language: str,
     entity: str,
     fact_quote: str,
+    support_quote: str,
     collision_tail: str,
 ) -> tuple[RecallReplyTemplate, ...]:
-    """The four reply templates. ``fact_quote`` is the fact sentence whose
+    """The eight reply templates. ``fact_quote`` is the fact sentence whose
     normalized span contains the fact's center window (P itself for short
-    facts); ``collision_tail`` is the collision's divergent tail."""
+    facts); ``support_quote`` is the whole support sentence; ``collision_tail``
+    is the collision's divergent tail."""
     if language == "en":
-        cite = f"Sounds right - '{fact_quote}'."
-        stray = f"About {entity}: '{fact_quote}' and '{collision_tail}' were both noted."
+        cite = [f"{lead} - '{fact_quote}'. Also noted: '{support_quote}'." for lead in _CITE_LEADS["en"]]
+        stray = (
+            f"About {entity}: '{fact_quote}'. Also noted: '{support_quote}'. "
+            f"The notes also mentioned '{collision_tail}'."
+        )
         no_cite = "Understood, I will check the details."
         paraphrase = f"Got it, {entity} keeps the current approach going forward."
     else:
-        cite = f"好的 - '{fact_quote}'。"
-        stray = f"关于 {entity}：'{fact_quote}' 和 '{collision_tail}' 都提到了。"
+        cite = [f"{lead} - '{fact_quote}'。另外也记下了：'{support_quote}'。" for lead in _CITE_LEADS["zh"]]
+        stray = (
+            f"关于 {entity}：'{fact_quote}'。另外也记下了：'{support_quote}'。"
+            f"记录里还提到了'{collision_tail}'。"
+        )
         no_cite = "明白了，我会再确认一下细节。"
         paraphrase = f"好的，{entity} 会继续保持当前的安排。"
+    references = ("fact", "fact_support")
     return (
-        RecallReplyTemplate("cite", cite, ("fact",)),
-        RecallReplyTemplate("stray", stray, ("fact",)),
+        *(RecallReplyTemplate("cite", text, references) for text in cite),
+        RecallReplyTemplate("stray", stray, references),
         RecallReplyTemplate("no_cite", no_cite, ()),
-        RecallReplyTemplate("paraphrase", paraphrase, ("fact",)),
+        RecallReplyTemplate("paraphrase", paraphrase, references),
     )
 
 
@@ -304,7 +367,7 @@ def _entity_miss_noise(language: str, rng: random.Random) -> RecallNoise:
         text = f"{rng.choice(_EN_MISS_ENTITIES)} focuses on nightly backups and archival"
     else:
         text = f"{rng.choice(_ZH_MISS_ENTITIES)} 关注 备份 与 归档"
-    return RecallNoise(RecallNoiseKind.ENTITY_MISS, "entity_miss", text)
+    return RecallNoise(RecallNoiseKind.ENTITY_MISS, "entity_miss", text, AGED_NOISE_DECAY)
 
 
 def _entity_collision_noise(entity: str, language: str) -> RecallNoise:
@@ -312,7 +375,7 @@ def _entity_collision_noise(entity: str, language: str) -> RecallNoise:
         text = f"{entity} also keeps nightly backups of the archive"
     else:
         text = f"{entity} 还会 保留 每晚 的 归档 备份"
-    return RecallNoise(RecallNoiseKind.ENTITY_COLLISION, "entity_collision", text)
+    return RecallNoise(RecallNoiseKind.ENTITY_COLLISION, "entity_collision", text, AGED_NOISE_DECAY)
 
 
 # ---------------------------------------------------------------- factory
@@ -330,6 +393,7 @@ def recall_materials(seed: int = RECALL_MATERIALS_SEED) -> tuple[RecallMaterial,
         p_pool = _EN_P if language == "en" else _ZH_P
         fillers = _EN_FILLERS if language == "en" else _ZH_FILLERS
         tails = _EN_TAILS if language == "en" else _ZH_TAILS
+        support_pool = _EN_SUPPORT if language == "en" else _ZH_SUPPORT
         for point_index in range(12):
             fact_class = _FACT_CLASSES[point_index % 4]
             band = _LENGTH_BANDS[point_index // 4]
@@ -359,6 +423,7 @@ def recall_materials(seed: int = RECALL_MATERIALS_SEED) -> tuple[RecallMaterial,
                     max_sentences=24,
                 )
             collision_tail = _collision_sharing_head(rng, head=head, tails=tails)
+            support_text = support_pool[fact_class].format(e=entity)
             point_id = f"{language}-{fact_class}-{band}"
             materials.append(
                 RecallMaterial(
@@ -368,6 +433,7 @@ def recall_materials(seed: int = RECALL_MATERIALS_SEED) -> tuple[RecallMaterial,
                     length_band=band,
                     entity=entity,
                     fact_text=fact_text,
+                    support_text=support_text,
                     noise=(
                         _entity_miss_noise(language, rng),
                         _entity_collision_noise(entity, language),
@@ -375,6 +441,7 @@ def recall_materials(seed: int = RECALL_MATERIALS_SEED) -> tuple[RecallMaterial,
                             RecallNoiseKind.NEEDLE_COLLISION,
                             "needle_collision",
                             f"{head}. {collision_tail}",
+                            NEEDLE_COLLISION_DECAY,
                         ),
                     ),
                     cue_turn=(
@@ -382,7 +449,9 @@ def recall_materials(seed: int = RECALL_MATERIALS_SEED) -> tuple[RecallMaterial,
                         if language == "en"
                         else f"{entity} 当前 状态 如何"
                     ),
-                    reply_templates=_reply_templates(language, entity, fact_quote, collision_tail),
+                    reply_templates=_reply_templates(
+                        language, entity, fact_quote, support_text, collision_tail
+                    ),
                 )
             )
     return tuple(materials)

@@ -90,7 +90,7 @@ const REINFORCE_BATCH_SIZE = 64
 
 // B2.1 T2 mid-session auto-recall (PRD-B2.1): a bounded pending-recall pull
 // per ACKED user ingest. The daemon is the ONLY budget authority
-// (capture.auto_recall_budget_chars, default 1200, reported on the wire as
+// (capture.auto_recall_budget_chars, default 2400, reported on the wire as
 // budget_chars); the hook uses that wire value as the ITEM budget and
 // re-verifies the assembled block fail-closed (defense in depth, unreachable
 // by design). RECALL_PULL_MAX_CHARS is the FALLBACK item budget when a daemon
