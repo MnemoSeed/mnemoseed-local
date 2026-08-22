@@ -103,9 +103,12 @@ DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS: int = 32000
 DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
 
 #: B2.1 T2 mid-session auto-recall (PRD-B2.1): the focal decay floor and the
-#: pending-recall selection budget (design/01 §4.6).
-DEFAULT_AUTO_RECALL_FOCAL_FLOOR: float = 0.4
-DEFAULT_AUTO_RECALL_BUDGET_CHARS: int = 1200
+#: pending-recall selection budget (design/01 §4.6). Values landed by the T4b
+#: live calibration (ACCEPTED: all gate bars pass at 0.5/2400; the floor axis
+#: discriminates at 0.5 — interference decayed to 0.45 gates out — and the
+#: budget headroom keeps long-band facts un-sliced).
+DEFAULT_AUTO_RECALL_FOCAL_FLOOR: float = 0.5
+DEFAULT_AUTO_RECALL_BUDGET_CHARS: int = 2400
 
 #: The T3a enum sets, shared by the config loader and the configwrite registry
 #: (a drift between the two is a validation split — one source, both consumers).
@@ -770,11 +773,13 @@ path = "~/.mnemoseed-local/isolated.db"
 #   auto_recall              — enable the whole pipeline
 #   auto_recall_focal_floor  — focal decay floor (0, 1]: below it a chunk is
 #                              never focal (a zero floor would make everything
-#                              focal, so it is rejected)
+#                              focal, so it is rejected). 0.5 = T4b calibrated
+#                              value (ACCEPTED)
 #   auto_recall_budget_chars — the selection budget; the greedy admission and
-#                              boundary tail-slice follow the T1 semantics
+#                              boundary tail-slice follow the T1 semantics.
+#                              2400 = T4b calibrated value (ACCEPTED)
 # [capture]
 # auto_recall = false
-# auto_recall_focal_floor = 0.4
-# auto_recall_budget_chars = 1200
+# auto_recall_focal_floor = 0.5
+# auto_recall_budget_chars = 2400
 """

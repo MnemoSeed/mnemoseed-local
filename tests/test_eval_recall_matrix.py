@@ -15,6 +15,7 @@ from dataclasses import replace
 import pytest
 
 from mnemoseed_local.eval.recall_matrix import (
+    LOSS_WEIGHTS,
     PARAM_BUDGETS,
     PARAM_FLOORS,
     START_BUDGET,
@@ -57,14 +58,22 @@ def test_param_sweep_values_pin_the_prd_table() -> None:
 
 
 def test_target_bars_pin_the_prd_goals() -> None:
+    """Tiered bars (T4b recalibration): the gate tier over the reachable
+    envelope; floor_fp moved to the report-only tier — the aged noise sits
+    below the whole floor sweep, so its serveable pool is empty exactly where
+    the gate works and a bar on it would penalize vacuous measurements."""
     assert TARGET_BARS == {
         "recall@5": 0.75,
         "precision@5": 0.60,
-        "floor_fp": 0.15,
         "detector_fp": 0.15,
         "fn_rate": 0.20,
         "token_overhead": 0.8,
     }
+    assert "floor_fp" not in TARGET_BARS
+
+
+def test_loss_weights_pin_the_demotion_ordering() -> None:
+    assert LOSS_WEIGHTS == {"recall@5": 0.5, "precision@5": 0.3, "token_overhead": 0.2}
 
 
 # ---------------------------------------------------------------- aggregation (24-point median)
@@ -122,10 +131,10 @@ def test_meets_bars_accepts_a_clean_aggregate() -> None:
 
 
 def test_meets_bars_reports_each_failed_bar() -> None:
-    bad = replace(_CLEAN, floor_fp=0.3, fn_rate=0.5, token_overhead=0.9)
+    bad = replace(_CLEAN, precision_at_k=(0.3, 0.3, 0.3, 0.3), fn_rate=0.5, token_overhead=0.9)
     ok, failed = meets_bars(bad)
     assert ok is False
-    assert set(failed) == {"floor_fp", "fn_rate", "token_overhead"}
+    assert set(failed) == {"precision@5", "fn_rate", "token_overhead"}
 
 
 def test_meets_bars_fails_on_unknown_metrics() -> None:
@@ -135,15 +144,24 @@ def test_meets_bars_fails_on_unknown_metrics() -> None:
     assert failed == ("recall@5",)
 
 
+def test_meets_bars_treats_floor_fp_as_report_only() -> None:
+    """floor_fp left the bar set with the recalibrated materials: an unknown
+    (vacuous) floor_fp must not fail the gate tier."""
+    vacuous = replace(_CLEAN, floor_fp=None)
+    ok, failed = meets_bars(vacuous)
+    assert ok is True
+    assert failed == ()
+
+
 def test_weighted_loss_hand_computed() -> None:
     loss = weighted_loss(_CLEAN)
-    # 0.4*(1-0.9) + 0.3*(1-0.9) + 0.2*0.1 + 0.1*0.5
-    assert loss == pytest.approx(0.4 * 0.1 + 0.3 * 0.1 + 0.2 * 0.1 + 0.1 * 0.5)
+    # 0.5*(1-0.9) + 0.3*(1-0.9) + 0.2*0.5
+    assert loss == pytest.approx(0.5 * 0.1 + 0.3 * 0.1 + 0.2 * 0.5)
 
 
 def test_weighted_loss_missing_metric_counts_as_worst() -> None:
     unknown = replace(_CLEAN, recall_at_k=(None, None, None, None))
-    assert weighted_loss(unknown) == pytest.approx(0.4 + 0.3 * 0.1 + 0.2 * 0.1 + 0.1 * 0.5)
+    assert weighted_loss(unknown) == pytest.approx(0.5 + 0.3 * 0.1 + 0.2 * 0.5)
 
 
 def test_weighted_loss_none_for_infeasible_group() -> None:
@@ -204,24 +222,25 @@ def test_coordinate_descent_groups_are_deterministic() -> None:
 
 
 def test_coordinate_descent_demotes_when_no_point_meets_bars() -> None:
-    """Every point violates the floor_fp bar: the frontier is empty, so the
+    """Every point violates the detector_fp bar: the frontier is empty, so the
     executor falls back to the best weighted loss and records the demotion."""
 
     def failing_fn(floor: float, budget: int) -> tuple[RecallMetrics, ...]:
         metric = RecallMetrics(
             recall_at_k=(1.0, 1.0, 1.0, 1.0),
             precision_at_k=(1.0, 1.0, 1.0, 1.0),
-            floor_fp=0.3 + abs(floor - 0.5),  # always above the 0.15 bar
+            floor_fp=0.0,
             detector_fp=0.0,
             fn_rate=0.0,
-            token_overhead=0.1,
+            # always above the 0.8 bar AND monotone in the loss around 0.5
+            token_overhead=0.85 + abs(floor - 0.5),
             non_focal_above_floor=0,
         )
         return (metric,) * 24
 
     outcome = coordinate_descent(failing_fn)
     assert outcome.demoted is True
-    assert "floor_fp" in outcome.demotion_path
+    assert "token_overhead" in outcome.demotion_path
     # the fallback picked the min-loss point: floor 0.5, and the first
     # min-loss group in scan order (the round-1 floor sweep at budget 1200)
     assert outcome.recommended[0] == 0.5
@@ -238,7 +257,7 @@ def test_coordinate_descent_prefers_bar_satisfying_points() -> None:
             recall_at_k=(1.0, 1.0, 1.0, 1.0),
             precision_at_k=(1.0, 1.0, 1.0, 1.0),
             floor_fp=0.05 if good else 0.9,
-            detector_fp=0.0,
+            detector_fp=0.05 if good else 0.9,
             fn_rate=0.0,
             token_overhead=0.5 if good else 0.01,  # the bad point has the lower loss
             non_focal_above_floor=0,

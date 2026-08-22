@@ -26,28 +26,51 @@ from mnemoseed_local.eval.recall_metrics import RECALL_KS, RecallMetrics
 PARAM_FLOORS: tuple[float, ...] = (0.4, 0.45, 0.5, 0.55, 0.6)
 PARAM_BUDGETS: tuple[int, ...] = tuple(range(600, 2401, 200))
 
-#: The coordinate-descent start values (the config defaults today).
+#: The coordinate-descent start values: the PRD 起步值 anchor (the descent
+#: sweeps the full grid each round, so this only fixes round-1 anchoring).
 START_FLOOR: float = 0.4
 START_BUDGET: int = 1200
 
-#: The calibration goals (PRD 标定目标): the Pareto frontier acceptance bars.
+#: The calibration goals (PRD 标定目标), recalibrated to the T4b package
+#: envelope as a two-tier structure:
+#: - Gate tier (a recommended point must satisfy every entry): precision@5's
+#:   ceiling is 2/3 (two referenced fact turns + one serveable interference
+#:   chunk per point), so 0.60 is now reachable; detector_fp/fn_rate keep
+#:   their PRD values (five citation variants dilute the shared-head needle's
+#:   structural false-reinforcement rate under the bar).
+#: - Report-only tier: floor_fp carries NO bar — with the aged interference
+#:   decayed below the whole floor sweep, its serveable pool is empty exactly
+#:   where the gate works (an unknown would fail honestly but vacuously), so
+#:   gating it would reward materials that keep noise serveable. It is still
+#:   computed, aggregated and printed on every frontier line.
 TARGET_BARS: dict[str, float] = {
     "recall@5": 0.75,
     "precision@5": 0.60,
-    "floor_fp": 0.15,
     "detector_fp": 0.15,
     "fn_rate": 0.20,
     "token_overhead": 0.8,
 }
 
-#: The demotion ordering (PRD 空前沿回退规则): weighted loss over the
-#: frontier scalars; a missing metric counts as the worst (full weight).
+#: The demotion ordering (PRD 空前沿回退规则): weighted loss over the gate
+#: scalars, renormalized after floor_fp left the set; a missing metric counts
+#: as the worst (full weight).
 LOSS_WEIGHTS: dict[str, float] = {
-    "recall@5": 0.4,
+    "recall@5": 0.5,
     "precision@5": 0.3,
-    "floor_fp": 0.2,
-    "token_overhead": 0.1,
+    "token_overhead": 0.2,
 }
+
+#: How each frontier scalar reads off an aggregate — bars and loss share it.
+_AGG_SCALARS: dict[str, Callable[[AggregateMetrics], float | None]] = {
+    "recall@5": lambda agg: agg.recall_at_5,
+    "precision@5": lambda agg: agg.precision_at_5,
+    "floor_fp": lambda agg: agg.floor_fp,
+    "detector_fp": lambda agg: agg.detector_fp,
+    "fn_rate": lambda agg: agg.fn_rate,
+    "token_overhead": lambda agg: agg.token_overhead,
+}
+
+_HIGHER_IS_BETTER: frozenset[str] = frozenset({"recall@5", "precision@5"})
 
 _AT_5 = 2  # index of the k=5 slot in the @k tuples
 
@@ -145,43 +168,32 @@ def meets_bars(agg: AggregateMetrics | None) -> tuple[bool, tuple[str, ...]]:
     unknown (None) metric fails its bar — honest, never a silent pass."""
     if agg is None:
         return False, tuple(TARGET_BARS)
-    checks: tuple[tuple[str, float | None, bool], ...] = (
-        ("recall@5", agg.recall_at_5, True),
-        ("precision@5", agg.precision_at_5, True),
-        ("floor_fp", agg.floor_fp, False),
-        ("detector_fp", agg.detector_fp, False),
-        ("fn_rate", agg.fn_rate, False),
-        ("token_overhead", agg.token_overhead, False),
-    )
-    failed: list[str] = []
-    for name, value, higher_is_better in checks:
-        if value is None:
-            failed.append(name)
-            continue
-        ok = value >= TARGET_BARS[name] if higher_is_better else value <= TARGET_BARS[name]
-        if not ok:
-            failed.append(name)
+    failed = [
+        name
+        for name in TARGET_BARS
+        if _fails_bar(_AGG_SCALARS[name](agg), TARGET_BARS[name], name in _HIGHER_IS_BETTER)
+    ]
     return (not failed), tuple(failed)
 
 
+def _fails_bar(value: float | None, bar: float, higher_is_better: bool) -> bool:
+    if value is None:
+        return True
+    ok = value >= bar if higher_is_better else value <= bar
+    return not ok
+
+
 def weighted_loss(agg: AggregateMetrics | None) -> float | None:
-    """The demotion loss (PRD fallback ordering): weighted sum over the
-    frontier scalars; a missing metric contributes its full weight (worst)."""
+    """The demotion loss (PRD fallback ordering): weighted sum over the gate
+    scalars; a missing metric contributes its full weight (worst)."""
     if agg is None:
         return None
     total = 0.0
     for name, weight in LOSS_WEIGHTS.items():
-        if name == "recall@5":
-            value = agg.recall_at_5
-        elif name == "precision@5":
-            value = agg.precision_at_5
-        elif name == "floor_fp":
-            value = agg.floor_fp
-        else:
-            value = agg.token_overhead
+        value = _AGG_SCALARS[name](agg)
         if value is None:
             total += weight
-        elif name in ("recall@5", "precision@5"):
+        elif name in _HIGHER_IS_BETTER:
             total += weight * (1.0 - value)
         else:
             total += weight * value

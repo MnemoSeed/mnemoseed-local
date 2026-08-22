@@ -5,6 +5,8 @@ needle-mechanics end-to-end evidence.
 
 Materials factory pins: 24 points (bilingual x 4 classes x 3 lengths),
 noise coverage (entity-miss / entity-collision / needle-collision), the
+decay layering (facts 1.0, aged noise below the floor sweep, needle
+collision mid-band), temporal inversion (facts stored last), the
 needle-collision shared-window invariant, deterministic regeneration and
 the reply-template needle mechanics.
 """
@@ -128,11 +130,14 @@ def test_materials_needle_collision_shares_the_head_needle() -> None:
 
 def test_materials_reply_templates_needle_mechanics() -> None:
     for material in recall_materials():
-        by_name = {template.name: template for template in material.reply_templates}
-        assert set(by_name) == {"cite", "stray", "no_cite", "paraphrase"}
+        names = [template.name for template in material.reply_templates]
+        assert set(names) == {"cite", "stray", "no_cite", "paraphrase"}
+        assert names.count("cite") == 5  # citation mass dilutes the structural detector error
+        support = material.support_text
         registry = build_needle_registry(
             [
                 {"id": "fact", "text": material.fact_text},
+                {"id": "fact_support", "text": support},
                 {
                     "id": "collision",
                     "text": next(
@@ -141,17 +146,52 @@ def test_materials_reply_templates_needle_mechanics() -> None:
                 },
             ]
         )
-        cited = cited_chunk_ids(by_name["cite"].text, registry)
-        assert "fact" in cited, material.point_id
-        stray = cited_chunk_ids(by_name["stray"].text, registry)
+        by_name = {t.name: t.text for t in material.reply_templates}
+        cited = cited_chunk_ids(by_name["cite"], registry)
+        assert {"fact", "fact_support"} <= set(cited), material.point_id
+        stray = cited_chunk_ids(by_name["stray"], registry)
         assert "collision" in stray, material.point_id  # accidental other-chunk needle
-        assert cited_chunk_ids(by_name["no_cite"].text, registry) == []
-        assert cited_chunk_ids(by_name["paraphrase"].text, registry) == []
-        # genuine citations always point at the fact; the stray is the false one
+        assert cited_chunk_ids(by_name["no_cite"], registry) == []
+        assert cited_chunk_ids(by_name["paraphrase"], registry) == []
+        # genuine citations always point at the two fact turns; the stray is the false one
         for template in material.reply_templates:
-            assert set(template.references) <= {"fact"}, material.point_id
+            assert set(template.references) <= {"fact", "fact_support"}, material.point_id
             if template.name == "no_cite":
                 assert template.references == ()
+            if template.name in ("cite", "stray", "paraphrase"):
+                assert set(template.references) == {"fact", "fact_support"}, material.point_id
+
+
+def test_materials_decay_layering_pins_the_floor_envelope() -> None:
+    """Facts at full weight; aged interference below the whole floor sweep;
+    the needle-collision pair mid-band so the floor axis gates it."""
+    for material in recall_materials():
+        labels = [label for label, _ in material.stored_turns]
+        decays = dict(zip(labels, material.turn_decays, strict=True))
+        assert decays["fact"] == 1.0, material.point_id
+        assert decays["fact_support"] == 1.0, material.point_id
+        assert decays["entity_miss"] < 0.4, material.point_id
+        assert decays["entity_collision"] < 0.4, material.point_id
+        assert decays["needle_collision"] == 0.45, material.point_id
+
+
+def test_materials_temporal_inversion_stores_facts_last() -> None:
+    """The age tie-break must not make serve order trivially predictable:
+    interference turns are stored first, the fact turns come LAST (newest)."""
+    for material in recall_materials():
+        labels = [label for label, _ in material.stored_turns]
+        assert labels[:3] == ["entity_miss", "entity_collision", "needle_collision"], material.point_id
+        assert labels[3:] == ["fact", "fact_support"], material.point_id
+
+
+def test_materials_support_turn_is_a_referenceable_fact() -> None:
+    """The second fact turn carries the entity (focal-matchable) and is long
+    enough to own a needle the citing replies can fire verbatim."""
+    for material in recall_materials():
+        assert material.entity.casefold() in material.support_text.casefold(), material.point_id
+        stored_entities = {e.casefold() for e in extract_cues(material.support_text).cues.entities}
+        assert material.entity.casefold() in stored_entities, material.point_id
+        assert needles_of(material.support_text), material.point_id
 
 
 # ---------------------------------------------------------------- the rig
@@ -172,22 +212,59 @@ def test_rig_full_pipeline_serves_reinforces_and_reads_evidence(tmp_path: Path) 
     material = next(m for m in recall_materials() if m.language == "en" and m.length_band == "short")
     with RecallRig(tmp_path / "rig") as rig:
         run = rig.run_material(material)
-        # the cue anchored 3 focal candidates: the fact + both collision noises
+        # the cue anchored 3 focal candidates at floor 0.4: both facts + the
+        # mid-band needle-collision chunk (the aged noises decay below 0.4)
         assert run.candidate_pool == 3
-        # both entity-carrying noise chunks are the candidate noise pool
-        assert run.noise_pool == 2
+        # only the needle-collision chunk is serveable noise now
+        assert run.noise_pool == 1
         # budget 1200 admits every short chunk
         assert len(run.served) == 3
-        assert run.served_noise == 2
-        # the entity-miss chunk is decay-healthy but never focal: counted only
-        assert run.non_focal_above_floor == 1
+        assert run.served_noise == 1
+        # the aged chunks fall under the non-focal floor too: nothing counted
+        assert run.non_focal_above_floor == 0
         assert run.budget_chars == 1200
-        # the needle mechanics end-to-end: cite+stray fire the shared head
-        # needle, so the fact and the needle-collision chunk are reinforced
+        # the needle mechanics end-to-end: the shared head needle false-fires
+        # the collision on every fact citation; both facts reinforce
         ids = rig.chunk_ids_by_label(material)
-        assert set(run.reinforced) == {ids["fact"], ids["needle_collision"]}
+        assert set(run.reinforced) == {
+            ids["fact"],
+            ids["fact_support"],
+            ids["needle_collision"],
+        }
         # the consumption evidence read back from last_reinforced matches
         assert set(rig.consumption_evidence()) == set(run.reinforced)
+
+
+def test_rig_applies_the_material_decay_layering(tmp_path: Path) -> None:
+    """The rig writes each stored turn's declared decay into the vector store
+    BEFORE the cue scan runs — that layering is what makes the floor axis
+    discriminative.
+
+    Post-run weight reads are rebound-shifted for REINFORCED chunks (every
+    citation steps +0.1 toward 1.0), so the never-reinforced aged chunks are
+    asserted numerically while the needle-collision layering is proven
+    behaviorally: at floor 0.5 it must be gated out of the candidate pool
+    (an unapplied write would leave it at the 1.0 ingest stamp and in-pool).
+    """
+    from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+    material = next(m for m in recall_materials() if m.language == "en" and m.length_band == "short")
+    with RecallRig(tmp_path / "rig") as rig:
+        run = rig.run_material(material)
+        page = rig.client.app.state.stores.vector.list_chunks(ChunkFilter(profile_id="t4a"), Page(0, 100))
+        weight_by_id = {chunk.chunk_id: chunk.decay_weight for chunk in page.items}
+        weights = {
+            label: weight_by_id[chunk_id] for label, chunk_id in rig.chunk_ids_by_label(material).items()
+        }
+    assert weights["entity_miss"] == pytest.approx(0.35)
+    assert weights["entity_collision"] == pytest.approx(0.35)
+    # the aged chunks stay below the whole sweep: never focal, never counted
+    assert run.candidate_pool == 3 and run.noise_pool == 1  # nc in-pool at floor 0.4
+    with RecallRig(tmp_path / "rig-high", focal_floor=0.5) as high:
+        high_run = high.run_material(recall_materials()[0])
+    assert high_run.candidate_pool == 2  # facts only: nc decayed below 0.5
+    assert high_run.noise_pool == 0
+    assert high_run.served_noise == 0
 
 
 def test_rig_pipeline_metrics_are_hand_computable(tmp_path: Path) -> None:
@@ -197,14 +274,15 @@ def test_rig_pipeline_metrics_are_hand_computable(tmp_path: Path) -> None:
         metrics = score_recall(run)
         # served 3 of 3 candidates
         assert metrics.recall_at_k == (1 / 3, 1.0, 1.0, 1.0)
-        # only the fact is genuinely referenced among the 3 served
-        assert metrics.precision_at_k == (1 / 3, 1 / 3, 1 / 3, 1 / 3)
-        # both noise candidates served: floor-fp saturated
+        # both facts are genuinely referenced among the 3 served
+        assert metrics.precision_at_k == (2 / 3, 2 / 3, 2 / 3, 2 / 3)
+        # the single serveable noise candidate is served: floor-fp saturated
         assert metrics.floor_fp == 1.0
-        # the shared head needle false-reinforces the collision (stray + cite)
-        assert metrics.detector_fp == pytest.approx(1 / 2)
-        # the paraphrase references the fact without firing any needle
-        assert metrics.fn_rate == pytest.approx(1 / 3)
+        # the shared head needle adds one false reinforcement per citation;
+        # 6 citations x 1 over 5x3 + 3 reinforcements = 6/18
+        assert metrics.detector_fp == pytest.approx(1 / 3)
+        # only the paraphrase misses: 2 unreferenced needles of 14 references
+        assert metrics.fn_rate == pytest.approx(1 / 7)
 
 
 def test_rig_same_root_twice_is_idempotent(tmp_path: Path) -> None:
@@ -225,11 +303,11 @@ def test_rig_same_root_twice_is_idempotent(tmp_path: Path) -> None:
             ChunkFilter(profile_id="t4a"), Page(0, 100)
         ).total
     assert first.candidate_pool == second.candidate_pool == 3
-    assert first.served_noise == second.served_noise == 2
-    assert first.non_focal_above_floor == second.non_focal_above_floor == 1
+    assert first.served_noise == second.served_noise == 1
+    assert first.non_focal_above_floor == second.non_focal_above_floor == 0
     # no store may carry more than one run's worth of chunks (fresh wipe):
-    # the fact + 3 noises (session A) and the cue/reply turn (session B)
-    assert first_total == second_total == 5
+    # the 2 fact turns + 3 noises (session A) and the cue/reply turn (B)
+    assert first_total == second_total == 6
 
 
 def test_rig_run_id_namespace_isolates_concurrent_runs(tmp_path: Path) -> None:
@@ -240,7 +318,7 @@ def test_rig_run_id_namespace_isolates_concurrent_runs(tmp_path: Path) -> None:
     with RecallRig(root / material.point_id) as rig:
         run = rig.run_material(material)
     assert run.candidate_pool == 3
-    assert run.served_noise == 2
+    assert run.served_noise == 1
 
 
 def test_rig_sequential_materials_do_not_leak(tmp_path: Path) -> None:

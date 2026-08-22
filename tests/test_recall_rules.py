@@ -302,8 +302,8 @@ def test_session_recent_rules_budget_aggregates_and_scopes(config_path: Path) ->
         rb = payload["rules_budget"]
         assert set(rb["exclude_entities"]) == {"secret1", "secret2"}
         assert rb["entity_boost"] == {"boosted": 2.0}
-        assert rb["auto_recall_focal_floor"] == 0.4
-        assert rb["auto_recall_budget_chars"] == 1200
+        assert rb["auto_recall_focal_floor"] == 0.5
+        assert rb["auto_recall_budget_chars"] == 2400
         assert rb["time_window_turns"] == 20
 
 
