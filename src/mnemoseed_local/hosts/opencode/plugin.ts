@@ -32,6 +32,15 @@
 //   import type { Plugin } from "@opencode-ai/plugin"
 // The module's default export is the plugin function; OpenCode's loader
 // treats every exported function-valued value as a plugin instance.
+//
+// B2.6 host-plugin bundling: the bundle carries its own MCP registration —
+// the config hook injects cfg.mcp["mnemoseed"] create-if-absent (a user's
+// existing manual entry wins untouched) into the cfg of the HOST that loaded
+// this file (per-host isolation: each host's plugin dir and config are its
+// own). The single switch is the ["spec", { enabled: false }] plugin-array
+// tuple: the entry short-circuits the WHOLE bundle (no hooks, no config
+// injection). Probe-confirmed on this version: the options tuple reaches the
+// plugin and config-hook cfg.mcp mutations stick (B2.6 probe rounds 1+2).
 
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -1047,7 +1056,20 @@ function stringifyReplayedToolOutput(part: any): string {
   return text
 }
 
-export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) {
+export default async function MnemoSeedLocalPlugin(
+  input: { client?: unknown },
+  options?: unknown,
+) {
+  // B2.6 single bundle switch: the ["spec", { enabled: false }] plugin-array
+  // tuple short-circuits the WHOLE bundle — no hooks, no config injection
+  // (the config hook lives in the return object, so returning {} skips it).
+  if (
+    options !== null &&
+    typeof options === "object" &&
+    (options as JsonRecord)["enabled"] === false
+  ) {
+    return {}
+  }
   const client = input?.client as
     | { session?: { messages?: (options: unknown) => Promise<unknown> } }
     | undefined
@@ -1077,6 +1099,18 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
     if (info?.role !== "assistant") return
     const completedAt = typeof info?.time?.completed === "number" ? info.time.completed : undefined
     const errorAt = typeof info?.time?.error === "number" ? info.time.error : undefined
+    // DEBUG: log the completion shape for abort diagnosis (senior QA finding 12b)
+    if (DEBUG) {
+      debugLog("assistant completion shape", {
+        sessionID: info?.sessionID,
+        messageID: info?.id,
+        role: info?.role,
+        hasCompleted: typeof info?.time?.completed === "number",
+        completed: info?.time?.completed,
+        hasError: !!info?.metadata?.error,
+        error: info?.metadata?.error ?? info?.error ?? null,
+      })
+    }
     if (completedAt === undefined && errorAt === undefined) return
     const sessionID = String(info?.sessionID ?? "")
     const messageID = String(info?.id ?? "")
@@ -1187,6 +1221,24 @@ export default async function MnemoSeedLocalPlugin(input: { client?: unknown }) 
     }
   }
   return {
+    // B2.6 bundling: register the daemon's MCP server into the loading host's
+    // config. Create-if-absent at BOTH levels — cfg.mcp ??= {} (the map) and
+    // mcp["mnemoseed"] ??= {..} (the entry) — so a user's existing manual
+    // "mnemoseed" registration (README §MCP gateway) wins untouched. The
+    // entry shape matches the A3 README sample plus an explicit enabled flag.
+    "config": async (cfg: any): Promise<void> => {
+      try {
+        if (cfg === null || typeof cfg !== "object") return
+        const mcp = (cfg.mcp ??= {}) as Record<string, unknown>
+        mcp["mnemoseed"] ??= {
+          "type": "local",
+          "command": ["mnemoseed-local", "mcp"],
+          "enabled": true,
+        }
+      } catch (error) {
+        console.debug("mnemoseed-local: config hook failed:", error)
+      }
+    },
     "chat.message": async (hookInput: any, hookOutput: any) => onChatMessage(hookInput, hookOutput),
     "chat.system.transform": async (hookInput: any, hookOutput: any) =>
       onChatSystemTransform(hookInput, hookOutput),

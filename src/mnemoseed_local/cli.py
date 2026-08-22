@@ -471,38 +471,101 @@ def _dream_model_check(config: Config) -> tuple[bool, str]:
 
 
 def _ensemble_verifier_check(config: Config) -> tuple[str, bool, str]:
-    """B1 T3: the ensemble verify judging seat's model must be pulled when the
-    user opted into verify mode.
+    """B1 T3: the verify judging seat's model must be pulled when the user
+    opted into verify mode.
 
-    Dormant (ensemble off) or non-ollama routes skip. A missing model FAILS
-    doctor with the pull hint — never a silent pull — while the runtime
-    fallback stays the safety net (the dream still ships A's unverified result
-    + audit; doctor is the honest report, not a boot gate)."""
-    if config.dream.ensemble != "verify":
+    Dormant (ensemble off) skips. In vote mode seat B is an independent
+    generator — ``dream_vote`` when configured, otherwise it falls back to the
+    ``dream_verifier`` judging route (daemon ``_build_vote_llm`` — still a
+    distinct model from the dream generator). Doctor validates the effective
+    vote seat's model so the preflight stays consistent with the runtime
+    fallback; a missing model FAILS with the pull hint while the runtime
+    fallback remains the safety net."""
+    if config.dream.ensemble == "off":
         return (
             "ensemble verifier",
             True,
             f"ensemble mode {config.dream.ensemble!r}; verifier model check skipped",
         )
+    if config.dream.ensemble == "vote":
+        vote_role = "dream_vote" if "dream_vote" in config.llm else "dream_verifier"
+        ok, detail = _role_model_check(config, vote_role)
+        if ok:
+            try:
+                vote_model = config.llm[vote_role].model
+                dream_model = config.llm["dream"].model
+                if vote_model == dream_model:
+                    return (
+                        "ensemble verifier",
+                        False,
+                        f"vote seat model {vote_model!r} must be distinct from dream model {dream_model!r}",
+                    )
+            except Exception:
+                pass
+        return ("ensemble verifier", ok, detail)
     ok, detail = _role_model_check(config, "dream_verifier")
     return ("ensemble verifier", ok, detail)
 
 
 def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
-    """B1.1 (live finding Q7): the verify seat's ctx window must fit its judging load.
+    """B1.1: the verify judging seat's ctx window must fit its load.
 
     Static sanity with its assumption labeled: candidates repeat their evidence
     blocks per judge item (2026-08-18 live: 25 candidates over a 1.7k delta
     rendered an 18.3k verify prompt — nearly 11x the delta), so the formula
     double-covers the delta ceiling, and the TripleVerifier's per-run estimate
-    guard is the exact instrument on top of it. Dormant (ensemble off) or
-    non-ollama / unconfigured routes skip like the dream-side check does.
+    guard is the exact instrument on top of it. Dormant (ensemble off) skips.
+    In vote mode seat B is an independent generator — ``dream_vote`` when
+    configured, otherwise the ``dream_verifier`` fallback (daemon
+    ``_build_vote_llm``). Its window is validated against the same
+    double-ceiling estimate as the verify seat so a too-small num_ctx is
+    reported before the daemon would degrade.
     """
-    if config.dream.ensemble != "verify":
+    if config.dream.ensemble == "off":
         return (
             "verifier ctx window",
             True,
             f"ensemble mode {config.dream.ensemble!r}; verifier ctx-window check skipped",
+        )
+    if config.dream.ensemble == "vote":
+        vote_role = "dream_vote" if "dream_vote" in config.llm else "dream_verifier"
+        route = config.llm[vote_role]
+        if route.driver != "ollama":
+            return (
+                "verifier ctx window",
+                True,
+                f"route driver {route.driver!r} is not ollama; ctx-window check skipped",
+            )
+        num_ctx_raw = route.params.get("num_ctx")
+        if num_ctx_raw is None:
+            return (
+                "verifier ctx window",
+                True,
+                f"num_ctx is not configured; set num_ctx under [dream.llm.{vote_role}] "
+                "so doctor can verify the window fits",
+            )
+        try:
+            num_ctx = int(num_ctx_raw)
+        except (TypeError, ValueError):
+            return ("verifier ctx window", False, f"num_ctx must be an integer, got {num_ctx_raw!r}")
+        from mnemoseed_local.dream.delta import estimate_tokens
+        from mnemoseed_local.dream.verify import VERIFY_MARGIN_TOKENS, build_verify_prefix
+
+        prefix_tokens = estimate_tokens(build_verify_prefix())
+        ceiling = config.dream.delta_budget_ceiling_tokens
+        needed = prefix_tokens + 2 * ceiling + VERIFY_MARGIN_TOKENS
+        if needed <= num_ctx:
+            return (
+                "verifier ctx window",
+                True,
+                f"prefix+2x ceiling+margin={needed} <= num_ctx={num_ctx}",
+            )
+        return (
+            "verifier ctx window",
+            False,
+            f"prefix+2x delta ceiling+margin={needed} > num_ctx={num_ctx}; raise "
+            f"dream.llm.{vote_role} num_ctx or lower dream.delta_budget_ceiling_tokens "
+            "(large extractions otherwise fall back unverified: window_exceeded)",
         )
     route = config.llm["dream_verifier"]
     if route.driver != "ollama":
@@ -824,11 +887,28 @@ def cmd_hook(args: argparse.Namespace) -> int:
             print(f"hook not installed: {path}")
         print("restart opencode for the removal to take effect")
         return 0
+    if args.hook_command == "disable":
+        path, changed = hook.disable_plugin()
+        if changed:
+            print(f"disabled hook: {path}")
+        else:
+            print(f"hook not installed or already disabled: {path}")
+        print("restart opencode for the switch to take effect (plugin files load at startup)")
+        return 0
+    if args.hook_command == "enable":
+        path, changed = hook.enable_plugin()
+        if changed:
+            print(f"enabled hook: {path}")
+        else:
+            print(f"hook not disabled or not installed: {path}")
+        print("restart opencode for the switch to take effect (plugin files load at startup)")
+        return 0
     info = hook.hook_status()
     state_label = {
         "not-installed": "not installed",
         "match": "installed (matches shipped plugin)",
         "differs": "installed (differs from shipped plugin)",
+        "disabled": "installed (disabled)",
     }[info.state]
     print(f"hook: {state_label}")
     print(f"path: {info.path}")
@@ -950,9 +1030,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hook = sub.add_parser("hook", help="manage a host hook (host adapter plugin lifecycle)")
     p_hook.add_argument(
         "hook_command",
-        choices=("install", "uninstall", "status"),
+        choices=("install", "uninstall", "status", "disable", "enable"),
         help="install writes the plugin into the host config root; "
-        "uninstall removes it; status reports the install state and daemon reachability",
+        "uninstall removes it; disable/enable rename it to the non-loading "
+        "*.ts.disabled suffix (the bundle switch); status reports the "
+        "install state and daemon reachability",
     )
     p_hook.add_argument(
         "host",

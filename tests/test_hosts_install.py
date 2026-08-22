@@ -26,6 +26,8 @@ ENV_VARS = (
 
 PLUGIN_RELATIVE = Path(".config") / "opencode" / "plugin" / "mnemoseed-local.ts"
 
+DISABLED_PLUGIN_RELATIVE = Path(".config") / "opencode" / "plugin" / "mnemoseed-local.ts.disabled"
+
 
 @pytest.fixture
 def opencode_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -98,6 +100,143 @@ def test_uninstall_removes_and_reports(opencode_home: Path) -> None:
     assert not path.exists()
     # uninstall never touches anything else (the plugin directory stays).
     assert path.parent.exists()
+
+
+# ---------------------------------------------------------------- B2.6 rename-switch (disable/enable)
+
+
+def test_disable_renames_the_plugin_to_the_non_loading_suffix(opencode_home: Path) -> None:
+    """B2.6 install-surface switch: the host's plugin glob matches only
+    *.ts/*.js, so renaming the file to *.ts.disabled stops it loading without
+    deleting it (research doc §1/§5)."""
+    install.install_plugin()
+    path, changed = install.disable_plugin()
+    assert changed is True
+    assert path == opencode_home / "plugin" / "mnemoseed-local.ts"
+    assert not path.exists()
+    assert (opencode_home / "plugin" / "mnemoseed-local.ts.disabled").is_file()
+
+
+def test_disable_is_idempotent_and_reports_when_absent(opencode_home: Path) -> None:
+    assert install.disable_plugin()[1] is False  # nothing installed
+    install.install_plugin()
+    assert install.disable_plugin()[1] is True
+    assert install.disable_plugin()[1] is False  # already disabled
+
+
+def test_enable_restores_the_disabled_plugin_byte_identical(opencode_home: Path) -> None:
+    install.install_plugin()
+    install.disable_plugin()
+    path, changed = install.enable_plugin()
+    assert changed is True
+    assert path.is_file()
+    assert path.read_bytes() == install.plugin_bytes()
+    assert not install.disabled_path().exists()
+
+
+def test_enable_is_idempotent(opencode_home: Path) -> None:
+    install.install_plugin()
+    assert install.enable_plugin()[1] is False  # already active
+    install.disable_plugin()
+    assert install.enable_plugin()[1] is True
+    assert install.enable_plugin()[1] is False  # active again
+
+
+def test_install_clears_a_disabled_remnant(opencode_home: Path) -> None:
+    """Install = enabled: a stale disabled remnant is replaced by the active
+    file so install/status/uninstall always see one coherent state."""
+    install.install_plugin()
+    install.disable_plugin()
+    path, changed = install.install_plugin()
+    assert changed is True
+    assert path.is_file()
+    assert not install.disabled_path().exists()
+
+
+def test_uninstall_removes_the_disabled_file_too(opencode_home: Path) -> None:
+    """Uninstall means fully gone: a disabled remnant is removed with the
+    active file, and the existence report covers either form."""
+    install.install_plugin()
+    install.disable_plugin()
+    path, existed = install.uninstall_plugin()
+    assert existed is True
+    assert not path.exists()
+    assert not install.disabled_path().exists()
+
+
+def test_status_reports_disabled(opencode_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    install.install_plugin()
+    install.disable_plugin()
+    _stub_probe(monkeypatch, True)
+    assert install.hook_status().state == "disabled"
+
+
+def test_concurrent_disable_enable_is_atomic_and_lossless(
+    opencode_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2.6 I2 BLOCKER B1: concurrent disable↔enable must not lose the file.
+
+    20 threads mix disable/enable/status each 50 times; final state is either
+    active or disabled, no exception, and the surviving file is byte-identical.
+    """
+    import concurrent.futures
+
+    _stub_probe(monkeypatch, True)
+    # start from installed active state
+    install.install_plugin()
+    expected = install.plugin_bytes()
+    errors: list[BaseException] = []
+
+    def do_disable() -> None:
+        try:
+            install.disable_plugin()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def do_enable() -> None:
+        try:
+            install.enable_plugin()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def do_status() -> None:
+        try:
+            install.hook_status()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        futures = []
+        for _ in range(50):
+            futures.append(pool.submit(do_disable))
+            futures.append(pool.submit(do_enable))
+            futures.append(pool.submit(do_status))
+        concurrent.futures.wait(futures)
+        for fut in futures:
+            # also surface any future exception
+            exc = fut.exception()
+            if exc is not None:
+                errors.append(exc)
+
+    assert not errors, f"concurrent ops raised: {errors}"
+    state = install.hook_status().state
+    assert state in {"match", "differs", "disabled"}, f"unexpected terminal state {state}"
+    # byte-identical check: whichever file exists must carry the shipped bytes
+    active = install.target_path()
+    disabled = install.disabled_path()
+    if active.is_file():
+        assert active.read_bytes() == expected, "active file must stay byte-identical"
+        # at most one copy should exist after the storm (atomic replace, no duplication)
+        # a stale remnant would mean a lost unlink, but concurrent disable/enable may leave
+        # exactly one file (either active or disabled). We tolerate at most one surviving
+        # disabled copy when active exists only if a race left both — but we assert no loss.
+        assert not (active.is_file() and disabled.is_file() and active.read_bytes() != expected)
+    elif disabled.is_file():
+        assert disabled.read_bytes() == expected, "disabled file must stay byte-identical"
+    else:
+        pytest.fail("concurrent storm lost the plugin file entirely")
+    # exactly one of the two paths holds the file after the storm (no duplication/no loss)
+    assert active.is_file() ^ disabled.is_file(), "exactly one of active/disabled must exist"
 
 
 # ---------------------------------------------------------------- status
@@ -185,6 +324,21 @@ def test_cli_hook_install_status_uninstall_cycle(
     out = capsys.readouterr().out
     assert "installed (matches shipped plugin)" in out
     assert "daemon: reachable" in out
+
+    assert main(["hook", "disable", "opencode"]) == 0
+    assert not target.exists()
+    assert (tmp_path / DISABLED_PLUGIN_RELATIVE).is_file()
+    assert "disabled hook" in capsys.readouterr().out
+
+    assert main(["hook", "status", "opencode"]) == 0
+    assert "installed (disabled)" in capsys.readouterr().out
+
+    assert main(["hook", "enable", "opencode"]) == 0
+    assert target.is_file()
+    assert "enabled hook" in capsys.readouterr().out
+
+    assert main(["hook", "status", "opencode"]) == 0
+    assert "installed (matches shipped plugin)" in capsys.readouterr().out
 
     assert main(["hook", "uninstall", "opencode"]) == 0
     assert not target.exists()

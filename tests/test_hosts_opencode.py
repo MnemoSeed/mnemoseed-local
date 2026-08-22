@@ -203,11 +203,41 @@ def test_plugin_ts_is_shipped_as_package_data() -> None:
 
 def test_plugin_registers_the_required_hooks() -> None:
     source = _plugin_source()
+    assert '"config": async' in source
     assert '"chat.message": async' in source
     assert '"chat.system.transform": async' in source
     assert '"tool.execute.after": async' in source
     assert '"experimental.session.compacting": async' in source
     assert re.search(r"(?m)^\s*event: async", source)
+
+
+def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_config_hook() -> None:
+    """B2.6 host-plugin bundling: the config hook registers the daemon's MCP
+    server into the loading host's config (per-host isolation — cfg belongs
+    to the host whose plugin dir loaded this file). Create-if-absent at BOTH
+    levels — cfg.mcp ??= {} (the map) and mcp["mnemoseed"] ??= {..} (the
+    entry) — so a user's existing manual "mnemoseed" registration (README
+    §MCP gateway) is never overwritten; the entry shape matches the A3 README
+    sample plus an explicit enabled flag."""
+    source = _plugin_source()
+    assert "cfg.mcp ??=" in source, "the mcp map must be created when absent"
+    assert 'mcp["mnemoseed"] ??=' in source, "an existing manual registration must win untouched"
+    for token in ('"mnemoseed"', '"mnemoseed-local"', '"mcp"', '"type": "local"', '"enabled": true'):
+        assert token in source, token
+
+
+def test_plugin_short_circuits_the_whole_bundle_on_the_options_tuple_switch() -> None:
+    """B2.6 single switch: the ["spec", {enabled:false}] plugin-array tuple
+    short-circuits the WHOLE bundle — the entry returns {} so neither the
+    config hook nor any hook is registered (research doc §7: the options
+    tuple is the only official per-plugin channel; probe round 2 confirmed
+    the options object reaches the plugin's second argument)."""
+    source = _plugin_source()
+    assert re.search(r"export default async function MnemoSeedLocalPlugin\([^)]*options", source, re.S), (
+        "the plugin entry must accept the tuple's options argument"
+    )
+    assert "=== false" in source, "only an explicit enabled:false disables"
+    assert "return {}" in source, "the disabled bundle registers nothing"
 
 
 def test_plugin_mentions_all_daemon_endpoints_and_host_id() -> None:

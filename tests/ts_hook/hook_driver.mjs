@@ -1144,6 +1144,143 @@ async function main() {
       break
     }
 
+    case "completion-shape-debug": {
+      // the DEBUG-gated shape lane: aborted assistant messages (no
+      // time.completed) are logged into hook-debug.jsonl BEFORE the gate
+      // drops them — with and without host error fields.
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m_aborted_meta",
+              role: "assistant",
+              sessionID: SES,
+              time: { error: 42 },
+              metadata: { error: "The operation was aborted due to timeout" },
+            },
+            sessionID: SES,
+          },
+        },
+      })
+      await delay(100)
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m_aborted_plain",
+              role: "assistant",
+              sessionID: SES,
+              time: { error: 42 },
+            },
+            sessionID: SES,
+          },
+        },
+      })
+      await delay(100)
+      const raw = await readFile(
+        join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"),
+        "utf8",
+      ).catch(() => "")
+      const shapes = raw
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((line) => line.tag === "assistant completion shape")
+        .map((line) => line.payload)
+      console.log(JSON.stringify({ shapes }))
+      break
+    }
+
+    case "config-inject": {
+      // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
+      // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual
+      // registration (which must win untouched); a null cfg is a no-op.
+      const empty = {}
+      await hooks.config(empty)
+      const bare = { mcp: {} }
+      await hooks.config(bare)
+      const manual = { mcp: { mnemoseed: { type: "remote", url: "http://mcp.example" } } }
+      await hooks.config(manual)
+      let noThrow = true
+      try {
+        await hooks.config(null)
+      } catch {
+        noThrow = false
+      }
+      console.log(JSON.stringify({ empty, bare, manual, noThrow }))
+      break
+    }
+
+    case "config-inject-frozen": {
+      // B2.6 I3: the config hook must be fail-open on frozen objects — a frozen
+      // cfg and a frozen cfg.mcp must not throw, and must not overwrite other
+      // keys. Both cases exercise the ??= paths with Object.freeze.
+      let noThrow = true
+      let frozenCfgOther = null
+      let frozenMcpOther = null
+      let frozenCfgMcp = null
+      let frozenCfgHasMnemoseed = null
+      let frozenMcpHasMnemoseed = null
+      try {
+        const frozenCfg = Object.freeze({ other: "keep" })
+        await hooks.config(frozenCfg)
+        frozenCfgOther = frozenCfg.other
+        frozenCfgMcp = frozenCfg.mcp ?? null
+        frozenCfgHasMnemoseed = frozenCfg.mcp?.mnemoseed ?? null
+      } catch {
+        noThrow = false
+      }
+      try {
+        const frozenMcp = { other: "keep2", mcp: Object.freeze({ otherMcp: "keep2" }) }
+        await hooks.config(frozenMcp)
+        frozenMcpOther = frozenMcp.other
+        frozenMcpHasMnemoseed = frozenMcp.mcp?.mnemoseed ?? null
+      } catch {
+        noThrow = false
+      }
+      // also check that a normal cfg still works after frozen attempts
+      const after = { other: "keep3", mcp: {} }
+      try {
+        await hooks.config(after)
+      } catch {
+        noThrow = false
+      }
+      console.log(
+        JSON.stringify({
+          noThrow,
+          frozenCfgOther,
+          frozenCfgMcp,
+          frozenCfgHasMnemoseed,
+          frozenMcpOther,
+          frozenMcpHasMnemoseed,
+          afterMnemoseed: after.mcp?.mnemoseed,
+        }),
+      )
+      break
+    }
+
+    case "switch-short-circuit": {
+      // B2.6: the ["spec", {enabled:false}] tuple short-circuits the WHOLE
+      // bundle — the factory returns {} (no config hook, no hooks);
+      // enabled:true, empty options and absent options all load normally.
+      const off = await pluginFactory({ client: fakeClient }, { enabled: false })
+      const on = await pluginFactory({ client: fakeClient }, { enabled: true })
+      const bare = await pluginFactory({ client: fakeClient }, {})
+      const none = await pluginFactory({ client: fakeClient })
+      console.log(
+        JSON.stringify({
+          offKeys: Object.keys(off),
+          onKeys: Object.keys(on),
+          bareKeys: Object.keys(bare),
+          noneKeys: Object.keys(none),
+        }),
+      )
+      break
+    }
+
     default:
       console.error(`unknown scenario: ${scenario}`)
       process.exit(64)

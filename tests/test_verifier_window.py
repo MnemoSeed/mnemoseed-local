@@ -290,21 +290,46 @@ def test_doctor_verifier_ctx_window_skips_non_ollama_route(doctor_home: Path, ca
     assert "skipped" in line
 
 
-def test_doctor_verifier_ctx_window_skips_in_vote_mode(doctor_home: Path, capsys) -> None:
-    """B5 vote (QA): seat B reuses the DREAM route (it falls back to A's
-    generator — reflect.py ``_vote_llm``), so the verifier ctx-window check
-    SKIPS in vote mode. The dream_verifier route is never sized for a seat
-    that never uses it; the dream route's window is already covered by the
-    dream ctx-window check."""
+def test_doctor_verifier_ctx_window_validates_vote_fallback(doctor_home: Path, capsys) -> None:
+    """B5 vote I1: seat B is an independent generator — ``dream_vote`` when
+    configured, otherwise the ``dream_verifier`` fallback (daemon
+    ``_build_vote_llm``). Doctor validates the effective vote seat's window
+    so a too-small num_ctx is reported, not skipped."""
     from mnemoseed_local.cli import main
 
-    # a tight dream_verifier num_ctx never fails doctor in vote mode: seat B
-    # does not use the verifier route, so its window is irrelevant to the dream
+    # vote without a dedicated dream_vote route falls back to dream_verifier;
+    # a tight fallback window must FAIL, not be skipped
     _write_doctor_config(
         doctor_home,
         '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 5000\n',
     )
+    assert main(["doctor"]) == 1
+    line = _ctx_line(capsys.readouterr().out)
+    assert "FAIL" in line
+    assert "num_ctx" in line
+
+    # fitting fallback window passes
+    _write_doctor_config(
+        doctor_home,
+        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+    )
     assert main(["doctor"]) == 0
     line = _ctx_line(capsys.readouterr().out)
-    assert "skipped" in line
-    assert "num_ctx" not in line  # the dream_verifier window is not consulted
+    assert "ok" in line
+
+
+def test_doctor_verifier_ctx_window_validates_dedicated_vote_route(doctor_home: Path, capsys) -> None:
+    """B5 vote: when ``[dream.llm.dream_vote]`` is configured, doctor validates
+    that dedicated route's window (daemon ``_build_vote_llm`` resolves it first)."""
+    from mnemoseed_local.cli import main
+
+    _write_doctor_config(
+        doctor_home,
+        '[dream]\nensemble = "vote"\n'
+        "[dream.llm.dream_verifier]\nnum_ctx = 67000\n"
+        '[dream.llm.dream_vote]\ndriver = "ollama"\nmodel = "qwen3.5:7b"\nnum_ctx = 5000\n',
+    )
+    assert main(["doctor"]) == 1
+    line = _ctx_line(capsys.readouterr().out)
+    assert "dream_vote" in line
+    assert "FAIL" in line
