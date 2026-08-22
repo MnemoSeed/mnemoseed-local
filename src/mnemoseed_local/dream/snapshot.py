@@ -50,6 +50,12 @@ class SnapshotPhase(StrEnum):
 
     SNAPSHOT_DONE = "snapshot_done"
     REFLECT_DONE = "reflect_done"
+    # B5 vote ensemble (mvp-design decision 1): the dual-reflect journal carries
+    # a per-seat phase for A and B, then a COMBINE_DONE boundary after the
+    # deterministic combiner folds them into the single merge-facing result.
+    REFLECT_A_DONE = "reflect_a_done"
+    REFLECT_B_DONE = "reflect_b_done"
+    COMBINE_DONE = "combine_done"
     MERGE_DONE = "merge_done"
 
 
@@ -104,6 +110,10 @@ class Snapshot:
     created_at: float
     phases: frozenset[str]
     reflect_result: dict[str, Any] | None = None
+    # B5 vote ensemble: the per-seat phase carriers ("a" / "b" reflection
+    # payloads) that the combiner consumes before writing the single combined
+    # ``reflect_result``. None outside vote mode.
+    vote_results: dict[str, Any] | None = None
 
     def with_phase(self, phase: str) -> Snapshot:
         return Snapshot(
@@ -114,6 +124,7 @@ class Snapshot:
             created_at=self.created_at,
             phases=frozenset({*self.phases, phase}),
             reflect_result=self.reflect_result,
+            vote_results=self.vote_results,
         )
 
     def with_reflect(self, payload: dict[str, Any] | None) -> Snapshot:
@@ -126,6 +137,29 @@ class Snapshot:
             created_at=self.created_at,
             phases=self.phases,
             reflect_result=payload,
+            vote_results=self.vote_results,
+        )
+
+    def with_vote_seat(self, seat: str, payload: dict[str, Any] | None) -> Snapshot:
+        """Return a copy carrying one vote seat's journal payload (vote mode).
+
+        ``seat`` is the "a" or "b" reflector; the payload is that seat's
+        reflection result, keyed so the combiner can consume both later.
+        """
+        carried = dict(self.vote_results) if self.vote_results else {}
+        if payload is None:
+            carried.pop(seat, None)
+        else:
+            carried[seat] = payload
+        return Snapshot(
+            snapshot_id=self.snapshot_id,
+            profile_id=self.profile_id,
+            turn_range=self.turn_range,
+            chunks=self.chunks,
+            created_at=self.created_at,
+            phases=self.phases,
+            reflect_result=self.reflect_result,
+            vote_results=carried or None,
         )
 
 
@@ -358,12 +392,22 @@ def resume_boundary(snapshot: Snapshot) -> str | None:
     """The phase boundary at which an interrupted dream resumes.
 
     None when the dream fully completed (merge committed); otherwise the phase
-    that produced the snapshot still needs to run: ``"reflect"`` for a fresh
-    snapshot, ``"merge"`` once reflect wrote back. Unknown markers never
+    that produced the snapshot still needs to run. The single-model path maps a
+    fresh snapshot to ``"reflect"`` and a reflect-done one to ``"merge"``. The
+    B5 vote path adds the dual-seat progression: ``"reflect"`` (fresh -> A),
+    ``"reflect_b"`` (A done -> B), ``"combine"`` (A+B done -> combiner),
+    ``"merge"`` (combined done -> single merge). Unknown markers never
     influence the boundary.
     """
     if SnapshotPhase.MERGE_DONE.value in snapshot.phases:
         return None
+    # B5 vote path: a vote dream marks its seats before the single merge.
+    if SnapshotPhase.REFLECT_B_DONE.value in snapshot.phases:
+        if SnapshotPhase.COMBINE_DONE.value in snapshot.phases:
+            return "merge"
+        return "combine"
+    if SnapshotPhase.REFLECT_A_DONE.value in snapshot.phases:
+        return "reflect_b"
     if SnapshotPhase.REFLECT_DONE.value in snapshot.phases:
         return "merge"
     return "reflect"
@@ -430,6 +474,7 @@ def _snapshot_to_json(snapshot: Snapshot) -> str:
         "created_at": snapshot.created_at,
         "phases": sorted(snapshot.phases),
         "reflect_result": snapshot.reflect_result,
+        "vote_results": snapshot.vote_results,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
 
@@ -448,6 +493,8 @@ def _snapshot_from_dict(data: Any) -> Snapshot | None:
         chunks.append(chunk)
     reflect_raw = data.get("reflect_result")
     reflect_result = reflect_raw if isinstance(reflect_raw, dict) else None
+    vote_raw = data.get("vote_results")
+    vote_results = vote_raw if isinstance(vote_raw, dict) else None
     return Snapshot(
         snapshot_id=str(data.get("snapshot_id", "")),
         profile_id=str(data.get("profile_id", "")),
@@ -456,6 +503,7 @@ def _snapshot_from_dict(data: Any) -> Snapshot | None:
         created_at=float(data.get("created_at", 0.0)),
         phases=frozenset(str(p) for p in data.get("phases") or ()),
         reflect_result=reflect_result,
+        vote_results=vote_results,
     )
 
 

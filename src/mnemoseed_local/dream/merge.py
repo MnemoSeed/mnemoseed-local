@@ -270,6 +270,10 @@ class Merger:
             confidence=triple.confidence,
             cognitive_tier=max((int(t) for t in triple.tiers), default=1),
             provenance=_build_provenance(snapshot, triple, now),
+            # B5 vote divergence (the combiner's isolated lane) is surfaced on
+            # the reconcile-queue surface so the disputed fact is re-visited.
+            needs_reconcile=triple.vote_disagreement,
+            conflict_flag=triple.vote_disagreement,
             created_at=now,
             updated_at=now,
             last_reinforced=now,
@@ -298,6 +302,9 @@ class Merger:
                 "reinforce_count": existing.reinforce_count + 1,
                 "updated_at": now,
                 "provenance": provenance,
+                # a reinforced vote-disagreement stays on the reconcile surface
+                "needs_reconcile": existing.needs_reconcile or triple.vote_disagreement,
+                "conflict_flag": existing.conflict_flag or triple.vote_disagreement,
             }
         )
 

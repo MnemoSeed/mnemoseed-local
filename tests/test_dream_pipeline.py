@@ -480,3 +480,208 @@ def test_pipeline_reports_success_to_outcome_seam(tmp_path: Path) -> None:
     pipeline.run(snap)
 
     assert outcomes == [(_PROFILE, _RANGE, True, None)]
+
+
+# ---------------------------------------------------------------- B5 vote dispatch
+
+
+class _VoteReflector:
+    """Reflector spy recording every vote-phase call and returning the canned
+    outcomes. ``reflect`` (single) is not invoked in vote mode."""
+
+    def __init__(self, *, a=None, b=None, combined=None) -> None:
+        self.a_outcome = a if a is not None else ReflectOutcome(ok=True, result=_result())
+        self.b_outcome = b if b is not None else self.a_outcome
+        self.combined_outcome = combined if combined is not None else self.a_outcome
+        self.a_calls: list[Snapshot] = []
+        self.b_calls: list[Snapshot] = []
+        self.combine_calls: list[Snapshot] = []
+        self.reflect_calls: list[Snapshot] = []
+
+    def reflect_vote_a(self, snapshot: Snapshot) -> ReflectOutcome:
+        self.a_calls.append(snapshot)
+        return self.a_outcome
+
+    def reflect_vote_b(self, snapshot: Snapshot) -> ReflectOutcome:
+        self.b_calls.append(snapshot)
+        return self.b_outcome
+
+    def combine(self, snapshot: Snapshot) -> ReflectOutcome:
+        self.combine_calls.append(snapshot)
+        return self.combined_outcome
+
+    def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
+        self.reflect_calls.append(snapshot)
+        return self.a_outcome
+
+
+def _vote_pipeline(
+    *,
+    reflector: _VoteReflector | None = None,
+    merger: object | None = None,
+    mode: str = "vote",
+    on_outcome: object | None = None,
+) -> DreamPipeline:
+    return DreamPipeline(
+        trigger=DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=True),
+        snapshotter=_NoActive(),  # type: ignore[arg-type]
+        reflector=reflector if reflector is not None else _VoteReflector(),
+        merger=merger if merger is not None else _SpyMerger(),
+        mode=lambda: mode,
+        on_outcome=on_outcome,  # type: ignore[arg-type]
+    )
+
+
+def test_vote_fresh_runs_a_then_b_then_combine_then_merge(tmp_path: Path) -> None:
+    """A fresh snapshot in vote mode drives the full dual-seat chain: A -> B ->
+    combine -> a single merge. The single-model ``reflect`` seam is never used."""
+    snap = _snap(_stamp("I prefer dark mode"))
+    reflector = _VoteReflector()
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(snap)
+
+    assert len(reflector.a_calls) == 1
+    assert len(reflector.b_calls) == 1
+    assert len(reflector.combine_calls) == 1
+    assert reflector.reflect_calls == []  # single-model seam never used in vote
+    assert len(merger.calls) == 1  # exactly one merge, not two
+
+
+def test_vote_b_failure_degrades_without_merge(tmp_path: Path) -> None:
+    """If seat B fails, the dream degrades (never merges, never raises): A's
+    journaled REFLECT_A_DONE means recovery re-runs only B."""
+    snap = _snap(_stamp("I prefer dark mode"))
+    reflector = _VoteReflector(b=ReflectOutcome(ok=False, error="B seat unreachable"))
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(snap)
+
+    assert len(reflector.a_calls) == 1
+    assert len(reflector.b_calls) == 1
+    assert reflector.combine_calls == []  # never reached
+    assert merger.calls == []
+
+
+def test_vote_a_failure_degrades_without_b(tmp_path: Path) -> None:
+    snap = _snap(_stamp("I prefer dark mode"))
+    reflector = _VoteReflector(a=ReflectOutcome(ok=False, error="A seat unreachable"))
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(snap)
+
+    assert len(reflector.a_calls) == 1
+    assert reflector.b_calls == []
+    assert reflector.combine_calls == []
+    assert merger.calls == []
+
+
+def test_vote_reflect_b_boundary_reruns_only_b(tmp_path: Path) -> None:
+    """Recovery at the REFLECT_A_DONE boundary (resume_boundary == "reflect_b")
+    re-runs only B then combine -> merge; A is never re-run."""
+    a_done = _snap(_stamp("I prefer dark mode"))
+    a_done = a_done.__class__(**{**a_done.__dict__, "phases": frozenset({"snapshot_done", "reflect_a_done"})})
+    assert resume_boundary(a_done) == "reflect_b"
+    reflector = _VoteReflector()
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(a_done)
+
+    assert reflector.a_calls == []  # A already journaled; never re-run
+    assert len(reflector.b_calls) == 1
+    assert len(reflector.combine_calls) == 1
+    assert len(merger.calls) == 1
+
+
+def test_vote_combine_boundary_runs_only_combine_then_merge(tmp_path: Path) -> None:
+    """Recovery at the REFLECT_B_DONE boundary (resume_boundary == "combine")
+    runs only the combiner then the single merge; neither seat re-runs."""
+    b_done = _snap(_stamp("I prefer dark mode"))
+    b_done = b_done.__class__(
+        **{
+            **b_done.__dict__,
+            "phases": frozenset({"snapshot_done", "reflect_a_done", "reflect_b_done"}),
+        }
+    )
+    assert resume_boundary(b_done) == "combine"
+    reflector = _VoteReflector()
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(b_done)
+
+    assert reflector.a_calls == []
+    assert reflector.b_calls == []
+    assert len(reflector.combine_calls) == 1
+    assert len(merger.calls) == 1
+
+
+def test_vote_merge_boundary_merges_combined_result(tmp_path: Path) -> None:
+    """Recovery at the COMBINE_DONE boundary (resume_boundary == "merge") merges
+    the combined result with no seat re-run and no re-combine."""
+    combined_done = _snap(_stamp("I prefer dark mode"))
+    combined_done = combined_done.__class__(
+        **{
+            **combined_done.__dict__,
+            "phases": frozenset({"snapshot_done", "reflect_a_done", "reflect_b_done", "combine_done"}),
+            "reflect_result": {
+                "snapshot_id": _SNAP_ID,
+                "profile_id": _PROFILE,
+                "turn_range": {"start": 0, "end": 2},
+                "prompt_version": "v1",
+                "conflicts": [],
+                "delta_overflow": [],
+                "consumed_chunk_ids": [],
+                "triples": [
+                    {
+                        "subject": "user",
+                        "predicate": "prefers",
+                        "object": "dark mode",
+                        "tiers": [1],
+                        "chunk_ids": ["c1"],
+                        "turn_range": {"start": 0, "end": 2},
+                        "confidence": 0.75,
+                        "route": "core",
+                        "preference": True,
+                        "polarity": "positive",
+                    }
+                ],
+            },
+        }
+    )
+    assert resume_boundary(combined_done) == "merge"
+    reflector = _VoteReflector()
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger)
+
+    pipeline.run(combined_done)
+
+    assert reflector.a_calls == []
+    assert reflector.b_calls == []
+    assert reflector.combine_calls == []
+    assert len(merger.calls) == 1
+    # the merged result is the single combined result (one seam)
+    _, result = merger.calls[0]
+    assert result is not None
+    assert result.triples[0].object == "dark mode"
+
+
+def test_single_mode_never_uses_vote_seats(tmp_path: Path) -> None:
+    """In single (off) mode a fresh snapshot uses the single-model reflect seam,
+    never the vote seats."""
+    snap = _snap(_stamp("I prefer dark mode"))
+    reflector = _VoteReflector()
+    merger = _SpyMerger()
+    pipeline = _vote_pipeline(reflector=reflector, merger=merger, mode="off")
+
+    pipeline.run(snap)
+
+    assert len(reflector.reflect_calls) == 1
+    assert reflector.a_calls == []
+    assert reflector.b_calls == []
+    assert reflector.combine_calls == []
+    assert len(merger.calls) == 1

@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
 from mnemoseed_local.daemon.app import DreamWorker, create_app
-from mnemoseed_local.dream import DreamTrigger, SnapshotResult
+from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.ports import TurnRange
 
@@ -613,6 +613,46 @@ def test_ensemble_verify_broken_judge_route_falls_back_and_audits(config_path: P
         assert committed["total"] >= 1
         verified = client.get("/api/v1/audit", params={"action": "ensemble_verified"}).json()
         assert verified["total"] == 0
+
+
+def _enable_ensemble_vote(config_path: Path) -> None:
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
+        encoding="utf-8",
+    )
+
+
+def test_ensemble_vote_runs_both_seats_and_combines(config_path: Path, tmp_path: Path) -> None:
+    """B5 vote daemon wiring (BLOCKER-1): with dream.ensemble=vote the daemon
+    must wire the pipeline's live mode AND the vote seat LLM. A dream then runs
+    seat A, seat B, and the combiner — journaling BOTH per-seat results and a
+    combine-done marker. Before the fix the mode/vote_llm wiring was missing, so
+    a vote dream silently ran the single-model reflect path (dead config)."""
+    _enable_ensemble_vote(config_path)
+    with _boot(config_path) as client:
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        dream = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+        assert dream["launched"] is True
+        _wait_dream_idle(client)
+
+        committed = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()
+        assert committed["total"] >= 1
+
+    # the journal (marked MERGE_DONE, never deleted) must carry BOTH seat
+    # results and the combine marker — proof the vote chain actually ran
+    journal = list(tmp_path.glob("dreams/*.json"))
+    assert journal, "no dream journal written"
+    snap = load_snapshot_file(journal[0])
+    assert snap is not None
+    assert snap.vote_results is not None
+    assert "a" in snap.vote_results and "b" in snap.vote_results
+    phases = set(snap.phases)
+    assert "combine_done" in phases
+    assert "merge_done" in phases
 
 
 def test_healthz_and_ingest_stay_responsive_during_dream(

@@ -49,10 +49,15 @@ def _write(path: Any, text: str) -> None:
 
 
 def test_default_roles_are_exactly_the_dream_and_verifier_roles() -> None:
-    """B1 (ensemble verify): the second LLM role is the judging model B
-    (design/01 decision 1). No third role until vote lands as a journal change."""
-    assert LLM_ROLES == ("dream", "dream_verifier")
-    assert set(DEFAULT_LLM_ROUTES) == set(LLM_ROLES)
+    """B5 (vote seat B): the third role is the independent vote generator
+    ``dream_vote`` (a separate seat from the judging verifier). Vote is a
+    second full generation over the same delta, so it needs its own route —
+    never the same model as A and never the cheaper judge model. It has no
+    factory route: unconfigured, the daemon falls back to the dream_verifier
+    route (still a distinct model from A)."""
+    assert LLM_ROLES == ("dream", "dream_verifier", "dream_vote")
+    assert set(DEFAULT_LLM_ROUTES) == {"dream", "dream_verifier"}
+    assert "dream_vote" not in DEFAULT_LLM_ROUTES
 
 
 def test_defaults_follow_the_local_ollama_track(monkeypatch) -> None:
@@ -62,7 +67,7 @@ def test_defaults_follow_the_local_ollama_track(monkeypatch) -> None:
     assert dream.driver == "ollama"
     assert dream.model == "qwen3.5:9b"
     assert dream.params["base_url"] == "http://localhost:11434"
-    assert set(cfg.llm) == set(LLM_ROLES)
+    assert set(cfg.llm) == set(DEFAULT_LLM_ROUTES)  # dream_vote has no factory route
 
 
 def test_verifier_role_defaults_follow_the_small_judge_track(monkeypatch) -> None:
@@ -83,7 +88,10 @@ def test_verifier_role_defaults_follow_the_small_judge_track(monkeypatch) -> Non
 
 def test_default_key_references_are_env_var_names_never_literals() -> None:
     for role in LLM_ROLES:
-        env_name = DEFAULT_LLM_ROUTES[role].params.get("api_key_env")
+        route = DEFAULT_LLM_ROUTES.get(role)
+        if route is None:
+            continue  # B5 dream_vote has no factory route (resolves via fallback)
+        env_name = route.params.get("api_key_env")
         if env_name is not None:
             assert env_name == env_name.upper()
             assert env_name and not any(ch.isspace() for ch in env_name)
@@ -131,6 +139,37 @@ def test_dream_verifier_llm_table_parses(tmp_path, monkeypatch) -> None:
     assert verifier.model == "judge-model"
     assert verifier.params["api_key_env"] == "MNEMOSEED_VERIFIER_API_KEY"
     assert cfg.llm["dream"].driver == "ollama"
+
+
+def test_dream_vote_llm_table_parses(tmp_path, monkeypatch) -> None:
+    """B5: a [dream.llm.dream_vote] override table parses per role; an
+    untouched vote seat keeps the factory independent-generator route."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(
+        p,
+        'preset = "embedded"\n'
+        "[dream.llm.dream_vote]\n"
+        'driver = "openai_compatible"\n'
+        'model = "vote-model"\n'
+        'api_key_env = "MNEMOSEED_VOTE_API_KEY"\n',
+    )
+    cfg = load_config(p)
+    vote = cfg.llm["dream_vote"]
+    assert vote.driver == "openai_compatible"
+    assert vote.model == "vote-model"
+    assert vote.params["api_key_env"] == "MNEMOSEED_VOTE_API_KEY"
+    assert cfg.llm["dream"].driver == "ollama"
+
+
+def test_dream_vote_no_default_requires_explicit_driver_and_model(tmp_path, monkeypatch) -> None:
+    """B5: dream_vote has no factory route, so a partial table (driver but no
+    model) is a load error naming the role — never a silent empty-model route."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, 'preset = "embedded"\n[dream.llm.dream_vote]\ndriver = "openai_compatible"\n')
+    with pytest.raises(ConfigError, match="no default route"):
+        load_config(p)
 
 
 def test_legacy_role_tables_are_accepted_ignored_with_deprecation_warning(
@@ -212,7 +251,9 @@ def test_dream_llm_bad_driver_type_names_key(tmp_path, monkeypatch) -> None:
 
 def test_programmatic_config_carries_dream_llm_defaults() -> None:
     cfg = Config()
-    assert set(cfg.llm) == set(LLM_ROLES)
+    # every factory-default role is present; B5 dream_vote has no factory route
+    assert set(DEFAULT_LLM_ROUTES) == set(cfg.llm)
+    assert "dream_vote" not in cfg.llm
     assert cfg.llm["dream"].driver == "ollama"
 
 
@@ -401,7 +442,7 @@ def test_router_check_unconfigured_role_is_failed_health() -> None:
 
 def test_router_roles_in_config_order() -> None:
     router = _router(Config().llm)
-    assert router.roles() == ("dream", "dream_verifier")
+    assert router.roles() == ("dream", "dream_verifier")  # dream_vote has no factory route
 
 
 def test_router_audit_logs_role_configured_once_env_name_never_value() -> None:

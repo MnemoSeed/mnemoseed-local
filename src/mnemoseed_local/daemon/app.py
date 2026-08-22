@@ -90,9 +90,13 @@ logger = logging.getLogger("mnemoseed_local.daemon")
 
 # The dream role the reflect boundary runs (A2 MVP), and the B1 ensemble
 # verify judging seat (design/01 decision 1): roles stay pipeline-internal
-# params so a future deep/short split can re-open them.
+# params so a future deep/short split can re-open them. The B5 vote seat B's
+# independent generator role (dream_vote) has no factory route; the daemon
+# falls back to the dream_verifier judging route (still a distinct model from
+# A) when it is unconfigured, so vote never degenerates into a same-model pass.
 _REFLECT_ROLE = "dream"
 _VERIFIER_ROLE = "dream_verifier"
+_VOTE_ROLE = "dream_vote"
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -176,6 +180,27 @@ def _build_verifier_llm(router: RoleRouter) -> DreamLLM:
         return _UnavailableLLM(str(exc))
 
 
+def _build_vote_llm(router: RoleRouter) -> DreamLLM:
+    """Materialize the B5 vote seat B's generator route (independent of A).
+
+    Vote is a second full generation over the same delta, so seat B needs its
+    own route — never A's model and never the cheaper judge model re-used as a
+    generator. The dedicated ``dream_vote`` route has no factory default, so it
+    is commonly unconfigured: fall back to the ``dream_verifier`` judging route
+    (still a distinct model from A) with a warning, so vote degrades to an
+    independent-seat pass rather than a same-model duplicate or a crash. A
+    broken dedicated route degrades the same way.
+    """
+    try:
+        return router.resolve(_VOTE_ROLE)
+    except LLMError as exc:
+        logger.warning(
+            "vote route unavailable (%s); seat B falls back to the dream_verifier route",
+            exc,
+        )
+        return _build_verifier_llm(router)
+
+
 def _reflect_unavailable(reason: str) -> None:
     """FR-2.6: log each typed provider outage the reflect boundary refuses."""
     logger.warning("dream reflect model unavailable: %s", reason)
@@ -240,6 +265,8 @@ def _turn_tool_names(turn: Turn) -> tuple[str, ...]:
         if step.role is TurnRole.TOOL and step.tool_name and _is_tool_name(step.tool_name):
             key = step.tool_name.casefold()
             if key in seen:
+                continue
+            if not _is_tool_name(step.tool_name):
                 continue
             seen.add(key)
             names.append(step.tool_name)
@@ -649,6 +676,9 @@ def _build_capture(
     def _resolve_verifier_llm() -> DreamLLM:
         return _build_verifier_llm(router)
 
+    def _resolve_vote_llm() -> DreamLLM:
+        return _build_vote_llm(router)
+
     ledger = TokenLedger(meta=stores.meta)
     verifier = TripleVerifier(
         llm=_resolve_verifier_llm(),
@@ -668,6 +698,13 @@ def _build_capture(
         on_run_started=lambda run_id, model: stores.meta.update_dream_run_model(run_id, model),
         ledger=ledger,
         verifier=verifier,
+        # B5 vote: seat B is a second full generator over the same delta, wired
+        # to its OWN route (dream_vote) so the two seats carry an independent
+        # signal — never A's model. Unconfigured, it falls back to the
+        # dream_verifier judging route (still a distinct model from A), so vote
+        # never degenerates into a same-model duplicate or a crash.
+        vote_llm=_build_vote_llm(router),
+        resolve_vote_llm=_resolve_vote_llm,
     )
     merger = Merger(
         graph_main=stores.graph,
@@ -711,6 +748,10 @@ def _build_capture(
         reflector=reflector,
         merger=merger,
         on_run_committed=_record_run_completion,
+        # B5 vote: the live ensemble mode ("off" | "verify" | "vote") read off
+        # the config each run, so the pipeline dispatches the vote dual-seat
+        # chain when the user opted in (configwrite changes hot-apply).
+        mode=lambda: config.dream.ensemble,
     )
     worker = DreamWorker(trigger)
     relay = _DreamRelay(worker)
@@ -723,6 +764,12 @@ def _build_capture(
             trigger.resume(snapshot.profile_id, snapshot.turn_range)
         elif boundary == "merge":
             trigger.resume_merge(snapshot.profile_id, snapshot.turn_range)
+        elif boundary in ("reflect_b", "combine"):
+            # B5 vote resume: a mid-vote crash left seat B / the combiner
+            # un-run. Resume into DREAMING (like "reflect") so the deferred
+            # resume's merge-commit fires the safe-clear; resume_merge would
+            # wrongly skip the B/combine work this boundary still needs.
+            trigger.resume(snapshot.profile_id, snapshot.turn_range)
         deferred_resumes.append((pipeline, snapshot))
     # The capture pool self-fires at the SAME configured floor/idle keys the
     # scheduler reads (dream.floor_pool_points / dream.idle_min_sec): never a
