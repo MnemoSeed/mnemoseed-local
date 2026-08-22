@@ -473,3 +473,42 @@ def test_replay_distinct_profiles_both_run(frozen_snapshot: Path, tmp_path: Path
     assert len(report.cells) == 2
     assert report.skipped == ()
     assert matrix_exit_code(report) == 0
+
+
+def test_matrix_cli_canary_count_parses_in_list_mode() -> None:
+    """--canary-count exists on the matrix subcommand and parses cleanly."""
+    from mnemoseed_local.eval.__main__ import main
+
+    assert main(["matrix", "--list", "--canary-count", "5"]) == 0
+
+
+def test_matrix_cli_canary_count_wires_to_catalog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """--canary-count controls the canary batch size handed to the material
+    catalog (the B4b multi-session matrix needs more than the default 1)."""
+    from mnemoseed_local.eval.__main__ import main
+    from mnemoseed_local.eval.report import EvalReport
+
+    captured: dict[str, int] = {}
+
+    def fake_run_matrix(
+        cells, materials, *, root, fetch_tags=None, route_checker=None, env=None, base_url="..."
+    ):
+        captured["materials"] = len(materials)
+        return EvalReport(eval_version="v1.1", started_at="2026-08-20T00:00:00Z", cells=(), skipped=())
+
+    monkeypatch.setattr("mnemoseed_local.eval.__main__.run_matrix", fake_run_matrix)
+    code = main(
+        [
+            "matrix",
+            "--models",
+            "qwen3.5:9b",
+            "--canary-count",
+            "3",
+            "--workdir",
+            str(tmp_path / "work"),
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert code == 0
+    assert captured["materials"] == 3

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from mnemoseed_local.eval.canary import canary_session
 from mnemoseed_local.eval.harness import EvalCell, EvalRoute
-from mnemoseed_local.eval.materials import DEFAULT_CANARY_SEED, material_catalog
+from mnemoseed_local.eval.materials import DEFAULT_CANARY_COUNT, DEFAULT_CANARY_SEED, material_catalog
 from mnemoseed_local.eval.matrix import (
     DEFAULT_BASE_URL,
     DEFAULT_NUM_CTX,
@@ -74,6 +74,7 @@ def _matrix_command(args: argparse.Namespace) -> int:
     materials = material_catalog(
         Path(args.materials_dir) if args.materials_dir else None,
         canary_seed=args.seed,
+        canary_count=args.canary_count,
     )
     report = run_matrix(cells, materials, root=Path(args.workdir), base_url=args.base_url)
     out_dir = Path(args.out) if args.out else default_out_dir()
@@ -228,6 +229,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     matrix.add_argument("--materials-dir", default=None, help="directory of replay snapshot journals")
     matrix.add_argument("--seed", type=int, default=DEFAULT_CANARY_SEED, help="canary factory seed")
+    matrix.add_argument(
+        "--canary-count",
+        type=int,
+        default=DEFAULT_CANARY_COUNT,
+        help="number of canary sessions in the material catalog",
+    )
     matrix.add_argument("--out", default=None, help="report dir (default: <CONFIG_DIR>/eval)")
     matrix.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
     matrix.add_argument("--list", action="store_true", help="list expanded cell ids and exit")

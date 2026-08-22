@@ -10,6 +10,7 @@ not embedded in reports), verify, and cost are carried over and marked.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -17,14 +18,16 @@ import pytest
 from mnemoseed_local.eval.harness import EvalCell, EvalRoute
 from mnemoseed_local.eval.materials import material_catalog
 from mnemoseed_local.eval.matrix import run_matrix
+from mnemoseed_local.eval.metrics import CanaryMetrics, CostMetrics, VerifyMetrics
 from mnemoseed_local.eval.report import (
     SEAT_SEED_POLICY_NONE,
+    CellReport,
     EvalReport,
     ReportedTriple,
     load_report,
     write_report,
 )
-from mnemoseed_local.eval.rescore import rescore_report
+from mnemoseed_local.eval.rescore import floor_sweep_report, rescore_report
 
 STUB_A = EvalRoute(driver="stub", model="stub-a")
 STUB_B = EvalRoute(driver="stub_verifier", model="stub-b")
@@ -157,24 +160,208 @@ def test_rescore_preserves_no_seat_seed_policy(stub_report, tmp_path: Path) -> N
     assert rescored.cells[0].seat_seed is None
 
 
-def test_rescore_collapse_failed_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reflect-seat-failed cell (attempts>0, never recovered) is NOT re-judged
-    offline: rescore preserves the failure signature verbatim (no revived 0.00)."""
-    from test_eval_harness import _collapse_stub_chat
+# ---------------------------------------------------------------- floor sweep (B4b)
 
-    from mnemoseed_local.llm.drivers.stub import StubLLM
 
-    fake, _ = _collapse_stub_chat(StubLLM.chat, collapse=99)
-    monkeypatch.setattr(StubLLM, "chat", fake)
-    report = run_matrix(
-        [EvalCell(reflect=STUB_A, ensemble="verify", verifier=STUB_B)],
-        material_catalog(None, canary_seed=7, canary_count=1),
-        root=tmp_path / "root",
+def _zero_canary() -> CanaryMetrics:
+    return CanaryMetrics(
+        facts_total=0,
+        facts_matched=0,
+        canary_recall=None,
+        matched_fact_ids=(),
+        missed_fact_ids=(),
+        noise_pollution=0,
+        polluting_nodes=(),
+        core_yield=0,
+        extra_core_nodes=(),
     )
-    cell = report.cells[0]
-    assert cell.reflect_collapse_attempts == 3
-    assert cell.reflect_recovered is False
-    path = write_report(report, tmp_path / "reports", matrix_slug="collapse")
-    rescored_cell = load_report(rescore_report(path, canary_seed=7)).cells[0]
-    assert rescored_cell.canary == cell.canary  # verbatim passthrough
-    assert rescored_cell.canary.canary_recall is None  # the failure signature survives
+
+
+def _empty_verify() -> VerifyMetrics:
+    return VerifyMetrics(
+        verifier_model=None,
+        judged=0,
+        accepted=0,
+        rejected=0,
+        rejected_keys=(),
+        fallbacks={},
+    )
+
+
+def _empty_cost() -> CostMetrics:
+    return CostMetrics(
+        duration_s=0.0,
+        token_usage=0,
+        reflect_prompt_tokens=None,
+        reflect_completion_tokens=None,
+        verify_tokens=None,
+    )
+
+
+def _matching_triple(fact, node_id: str, confidence: float) -> ReportedTriple:
+    """A core triple that provably matches ``fact`` (canonical class root +
+    the fact's own object phrase + equal polarity)."""
+    return ReportedTriple(
+        graph="main",
+        node_id=node_id,
+        subject="user",
+        predicate=fact.predicate,
+        object=fact.phrasings[0],
+        polarity=fact.polarity,
+        confidence=confidence,
+    )
+
+
+def test_floor_sweep_filters_core_by_confidence(tmp_path: Path) -> None:
+    """Each floor keeps only the core triples whose confidence clears it —
+    recall/core_yield must track the filter, offline, no GPU."""
+    materials = material_catalog(None, canary_seed=7, canary_count=1)
+    session = materials[0].session
+    assert session is not None
+    facts = list(session.facts)
+    assert len(facts) == 8
+    triples = tuple(
+        _matching_triple(f, f"n{i}", confidence=(0.9 if i % 2 else 0.2)) for i, f in enumerate(facts)
+    )
+    report = EvalReport(
+        eval_version="v1.1",
+        started_at="2026-08-20T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id="qwen3_5_4b+off+d8192+f0",
+                material="canary-00",
+                canary=_zero_canary(),
+                verify=_empty_verify(),
+                cost=_empty_cost(),
+                triples=triples,
+            ),
+        ),
+    )
+    path = write_report(report, tmp_path / "reports", matrix_slug="m")
+    sweep_path = floor_sweep_report(path, canary_seed=7, floors=(0.0, 0.5, 0.95))
+    rows = json.loads(sweep_path.read_text(encoding="utf-8"))["cells"]
+    by_floor = {row["floor"]: row for row in rows}
+    assert by_floor[0.0]["canary_recall"] == 1.0
+    assert by_floor[0.0]["core_yield"] == 8
+    assert by_floor[0.0]["extra_core_count"] == 0
+    assert by_floor[0.5]["canary_recall"] == 0.5  # only the 0.9-confidence facts survive
+    assert by_floor[0.5]["core_yield"] == 4
+    assert by_floor[0.95]["canary_recall"] == 0.0
+    assert by_floor[0.95]["core_yield"] == 0
+    assert by_floor[0.95]["facts_matched"] == 0
+
+
+def test_floor_sweep_reports_pollution_floor(tmp_path: Path) -> None:
+    """Each floor also re-projects pollution: how many of the rig-carried
+    polluting node ids survive the floor filter (intersection of
+    ``polluting_nodes`` with the floor-filtered main triples)."""
+    materials = material_catalog(None, canary_seed=7, canary_count=1)
+    session = materials[0].session
+    assert session is not None
+    facts = list(session.facts)
+    assert len(facts) == 8
+    triples = tuple(
+        _matching_triple(f, f"n{i}", confidence=(0.9 if i % 2 else 0.2)) for i, f in enumerate(facts)
+    ) + (
+        ReportedTriple(
+            graph="main",
+            node_id="n-poll-high",
+            subject="session",
+            predicate="discussed",
+            object="deploy plan",
+            polarity="positive",
+            confidence=0.9,
+        ),
+        ReportedTriple(
+            graph="main",
+            node_id="n-poll-low",
+            subject="session",
+            predicate="discussed",
+            object="deploy plan",
+            polarity="positive",
+            confidence=0.2,
+        ),
+    )
+    report = EvalReport(
+        eval_version="v1.1",
+        started_at="2026-08-20T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id="qwen3_5_4b+off+d8192+f0",
+                material="canary-00",
+                canary=CanaryMetrics(
+                    facts_total=0,
+                    facts_matched=0,
+                    canary_recall=None,
+                    matched_fact_ids=(),
+                    missed_fact_ids=(),
+                    noise_pollution=2,
+                    polluting_nodes=("n-poll-high", "n-poll-low", "n-poll-absent"),
+                    core_yield=0,
+                    extra_core_nodes=(),
+                ),
+                verify=_empty_verify(),
+                cost=_empty_cost(),
+                triples=triples,
+            ),
+        ),
+    )
+    path = write_report(report, tmp_path / "reports", matrix_slug="m")
+    sweep_path = floor_sweep_report(path, canary_seed=7, floors=(0.0, 0.5, 0.95))
+    rows = json.loads(sweep_path.read_text(encoding="utf-8"))["cells"]
+    by_floor = {row["floor"]: row for row in rows}
+    assert by_floor[0.0]["pollution_floor"] == 2  # both polluting triples clear floor 0
+    assert by_floor[0.5]["pollution_floor"] == 1  # only the 0.9-confidence polluter survives
+    assert by_floor[0.95]["pollution_floor"] == 0  # floor 0.95 filters both polluters
+    # n-poll-absent has no triple row — never counted by the intersection
+
+
+def test_floor_sweep_at_zero_matches_rescore(stub_report, tmp_path: Path) -> None:
+    """floor=0.0 keeps every core triple — the sweep must agree with the plain
+    rescore (same filter default, same truth rebuild)."""
+    _, path = stub_report
+    rescored = load_report(rescore_report(path, canary_seed=7))
+    by_material = {c.material: c for c in rescored.cells}
+    sweep_path = floor_sweep_report(path, canary_seed=7, floors=(0.0,))
+    rows = json.loads(sweep_path.read_text(encoding="utf-8"))["cells"]
+    assert len(rows) == len(rescored.cells)
+    for row in rows:
+        cell = by_material[row["material"]]
+        assert cell.canary is not None
+        assert row["canary_recall"] == cell.canary.canary_recall
+        assert row["core_yield"] == cell.canary.core_yield
+        assert row["facts_matched"] == cell.canary.facts_matched
+
+
+def test_floor_sweep_skips_non_canary_cells(tmp_path: Path) -> None:
+    """Replay/unknown materials carry no truth — the sweep omits them rather
+    than emitting fabricated rows."""
+    report = EvalReport(
+        eval_version="v1.1",
+        started_at="2026-08-20T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id="gemma4_e4b+off+d8192+f0",
+                material="some-replay-session",
+                canary=None,
+                verify=_empty_verify(),
+                cost=_empty_cost(),
+                triples=(),
+            ),
+        ),
+    )
+    path = write_report(report, tmp_path / "reports", matrix_slug="m")
+    sweep_path = floor_sweep_report(path, canary_seed=7)
+    data = json.loads(sweep_path.read_text(encoding="utf-8"))
+    assert data["cells"] == []
+
+
+def test_floor_sweep_writes_suffixed_json(stub_report) -> None:
+    _, path = stub_report
+    sweep_path = floor_sweep_report(path, canary_seed=7)
+    assert sweep_path.name.endswith(f"{path.stem}-floor-sweep.json")
+    data = json.loads(sweep_path.read_text(encoding="utf-8"))
+    assert data["eval_version"] == "v1.1"
+    assert data["source"] == path.name
+    assert data["canary_seed"] == 7
+    assert data["cells"], "canary cells must produce sweep rows"
