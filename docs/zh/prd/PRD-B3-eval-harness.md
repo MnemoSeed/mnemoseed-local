@@ -413,4 +413,16 @@ senior-qa-reviewer：`1386 passed / 3 skipped` 门绿；ruff/format/mypy（90 fi
 - **bar 更新**：B4b bar 表中 `qwen3.5:9b collapse_attempts=3 / recall=0.00 / 非质量基线` 标注须更新——ladder 后变"高方差 reflecting 席，recall [0.0, 0.375, 0.625] N=3，verify 偶达 0.625"。下一批 bar 重跑时据实更新。
 - **variance characterization**：跨调用方差大是 honest 现实（A5），未来 bar 钉死宜 N≥3 分布而非单点；本批未立项统计范围定版。
 
+## 批次 B4b floor sweep 离线重算（lite 档标定，本批次增量）
+
+> 理论锚：**不适用（not borrowed）**——本批为离线标定表，不引入神经/心理规律；仅在同一报告上按 `core_confidence_floor` 重放召回面，校准 lite 档阈值。
+
+### 范围（本批次 3+3，如实边界）
+
+1. `eval/rescore.py`：`FLOOR_SWEEP_DEFAULT_FLOORS = (0.0, 0.25, 0.5, 0.75, 0.9, 0.95)`；`floor_sweep_report(report, canary_seed, floors, out_dir) -> Path` 按 `confidence >= floor` 过滤 `main` 三元组重算 `facts_total / facts_matched / canary_recall / core_yield / extra_core_count`，`pollution_floor` 为 `polluting_nodes` 与过滤后 core 的交集计数；原始 `noise_pollution` 仍为 rig-carried 原值，verify/cost 原样透传；非 canary cell（`canary is None` 或 replay/未知材料）按无 truth 跳过不造行；输出 `*-floor-sweep.json`（`_write_sweep` 永不覆盖，数值后缀）。
+2. `eval/__main__.py`：`matrix --canary-count N` 透传 `material_catalog(canary_count=N)`（默认 `DEFAULT_CANARY_COUNT`），`--list` 模式亦可解析；不改动 roster/ensemble/verifier 语义。
+3. `docs/zh/prd/PRD-B3-eval-harness.md` 本节如实边界修订。
+
+如实边界：`floor_sweep_report` 不触 live 测，不重烧 GPU，仅重放报告内载荷；`canary_count` 仅影响材料批大小，不改动档位/预算/seed 语义。
+
 
