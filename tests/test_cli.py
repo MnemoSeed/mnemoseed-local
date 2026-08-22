@@ -477,6 +477,94 @@ def test_doctor_verifier_skips_non_ollama_verifier_route(cli_home: Path, monkeyp
     assert "skipped" in line
 
 
+def test_doctor_verifier_present_when_vote_on(cli_home: Path, monkeypatch, capsys) -> None:
+    """B5 vote: seat B is an independent generator — ``dream_vote`` when
+    configured, otherwise it falls back to the ``dream_verifier`` judging route
+    (daemon ``_build_vote_llm`` — still distinct from the dream generator).
+    Doctor validates the effective vote seat so the preflight stays consistent
+    with the runtime fallback; a small verifier window would not have been
+    noticed when the old skip hid the check."""
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=True, detail={"models": ["gemma4:e4b"]}),
+            }
+        ),
+    )
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[  ok] ensemble verifier: model 'gemma4:e4b' present" in out
+    # vote without a dedicated dream_vote route falls back to dream_verifier
+    assert "skipped" not in _verify_line(out)
+
+
+def test_doctor_verifier_fallback_distinct_model_for_vote(cli_home: Path, monkeypatch, capsys) -> None:
+    """B5 vote I1: when ``dream_vote`` is unconfigured the vote seat falls back
+    to ``dream_verifier`` (daemon ``_build_vote_llm``). The fallback must be a
+    distinct model from the dream generator — a same-model vote would degenerate
+    to a duplicate pass."""
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    # dream and verifier share the same model — should fail distinct check
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+            }
+        ),
+    )
+    # configure same model for both roles via file
+    cli_home.joinpath("config.toml").write_text(
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream]\nensemble = "vote"\n'
+        + '[dream.llm.dream_verifier]\nmodel = "qwen3.5:9b"\nnum_ctx = 67000\n',
+        encoding="utf-8",
+    )
+    assert main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "must be distinct" in _verify_line(out)
+
+
+def test_doctor_vote_uses_dedicated_dream_vote_route_when_configured(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    """B5 vote: when ``[dream.llm.dream_vote]`` is configured, doctor validates
+    that dedicated route (daemon ``_build_vote_llm`` resolves it first)."""
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "vote"\n'
+        "[dream.llm.dream_verifier]\nnum_ctx = 67000\n"
+        '[dream.llm.dream_vote]\ndriver = "ollama"\nmodel = "qwen3.5:7b"\nnum_ctx = 67000\n',
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _per_role_router_class(
+            {
+                "dream": HealthReport(ok=True, detail={"models": ["qwen3.5:9b"]}),
+                "dream_verifier": HealthReport(ok=True, detail={"models": ["gemma4:e4b"]}),
+                "dream_vote": HealthReport(ok=True, detail={"models": ["qwen3.5:7b"]}),
+            }
+        ),
+    )
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[  ok] ensemble verifier: model 'qwen3.5:7b' present" in out
+
+
 # ------------------------------------------- A3 T5: model name normalization
 
 

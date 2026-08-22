@@ -20,7 +20,7 @@
 
 - 来源：Tulving & Thomson（1973）encoding specificity principle；"available but not accessible" 是遗忘的主形态。
 - 已验证规律：遗忘的主因是**线索失败**而不是存储失败；提取成功率取决于线索与编码时上下文的重合度。
-- → 设计规则：**回忆的本职是线索工程**——当前轮**原文直接作线索**（不做模型重写式 query）；保留编码时元数据（时间/项目/实体）作为线索面；线索分两级：**实体精确命中 = focal 线索，纯语义相似 = non-focal 线索**，两类分设相关度 floor（阈值经 T4 标定）。
+- → 设计规则：**回忆的本职是线索工程**——当前轮**原文直接作线索**（不做模型重写式 query）；保留编码时元数据（时间/项目/实体）作为线索面；线索分两级：**实体精确命中 = focal 线索，纯语义相似 = non-focal 线索**，两类分设相关度 floor（起步值经 T4 收口定案，标定走 live 遥测 `non_focal_above_floor` 通道）。
 
 ### TA-3 近因优势与无线索态默认（serial-position recency / TCM）—— 会话起始
 
@@ -58,14 +58,14 @@
 - **T1 会话起始回放注入**（TA-3/TA-5）：新 session 首轮注入 recent 尾部 + 围栏标记；hook 契约保持 fail-open（2s 超时、daemon 缺席静默跳过、每 session 至多一次注入）。
 - **T2 中段自动回忆管线**（TA-1/TA-2/TA-4）：daemon 侧新增 `capture.auto_recall`（config 热键，默认 off 起步）——turn 捕获后即跑 recall-in-place：seen-set 会话态（同一 chunk/node 每 session 至多注入一次）+ focal/non-focal 双 floor + token 预算封顶；**判定全在 daemon，hook 只做注入**（可灰度、可回滚）。空注入零 token、延迟离线（捕获后预取）为实现机制，同批落。
 - **T3 消费证据守卫**（TA-6）：注入计入 seen-set；reinforce 仅在 assistant 轮文本实际引用注入内容时记；检测规则与单测同批落。
-- **T4 评测标定**：floor/focality 阈值进 B3 评测臂拿数据后定版（吃现有矩阵基建），报告入数据目录 `eval/`，摘要入本 PRD 收口记录。
+- **T4 阈值标定（2026-08-20 架构师定案：docs-only 收口）**：原"floor/focality 阈值进 B3 评测臂拿数据后定版"路径**作废**——B3 评测臂非检索面（PRD-B3 语义 1：被测对象 = dream 链路 reflect→verify→merge、不含 capture 评分；rig 绕过 ScorePool 时序、矩阵只测合并质量），检索阈值（focal floor / 预算）不在矩阵任何 cell 内，**harness 数据无法标定检索阈值**。收口交付：默认维持 as-is（`capture.auto_recall_focal_floor=0.4` / `capture.auto_recall_budget_chars=1200`，起步值非标定值，理由与 as-is 边界入收口记录）；**校准通道 = live 遥测** `non_focal_above_floor`（T2 起随每次 `recall-pending` 响应上报，只计不选）；检索链路零改动，docs-only。
 
 ## 边界（如实）
 
 - 探针可能证伪首选注入面——届时按 T0 的降级次序执行并如实记录，不硬上。
-- 理论锚管设计动机，不管性能承诺；性能数字属实现与评测（T4 前一切 floor 数字只是起步值）。
+- 理论锚管设计动机，不管性能承诺；性能数字属实现与评测（T4 收口后 floor 数字仍为起步值，标定走 live 遥测）。
 - 本批次不改 capture/dream 核心链；hook 既有火忘契约（fire-and-forget、失败吞没）不变，注入面新增的是 fail-open 的读取路径。
-- `capture.auto_recall` 默认 off：先给观望者与安全验证留门，按 T4 数据再议默认翻转。
+- `capture.auto_recall` 默认 off：先给观望者与安全验证留门，默认翻转待 live 遥测数据（T4 收口定案：评测臂非检索面，拿不到标定数据）。
 
 ## 门禁（不变）
 
@@ -212,7 +212,16 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 
 - `uv tool install --force .` + daemon 重启得新端点；hook 随 opencode 重启生效；**`capture.auto_recall` 默认 off——管线随构建发船但行为不变**，翻转待 T4 评测数据（默认 off 是给观望与安全验证留门）。
 
-**后续挂起**：
+**后续挂起（T4 已于 2026-08-20 收口，见下节收口记录）**：
 
-- **T4 阈值标定**（floor/budget/needle 吃 B3 评测臂）；**QA-7** abort 形态探针；non-focal 注入通道维持"仅 MCP 显式 recall"（TA-4）；tombstone 仅内存态（daemon 重启即 TA-3 语境切换语义，无需持久化）。
+- **QA-7** abort 形态探针；non-focal 注入通道维持"仅 MCP 显式 recall"（TA-4）；tombstone 仅内存态（daemon 重启即 TA-3 语境切换语义，无需持久化）。
+
+### 批次执行：T4 阈值标定收口（2026-08-20，docs-only——检索零改动）
+
+**架构师定案**：B3 评测臂**无法标定检索阈值**（PRD-B3 语义 1：被测对象 = dream 链路 reflect→verify→merge、不含 capture 评分；rig 绕过 ScorePool 时序、矩阵只测合并质量；design 08 语义定版明文"不做 retrieval recall 评测（另行立项）"）——检索阈值（focal floor / budget）不在矩阵任何 cell 内，harness 数据对它们没有可用的观测面。原"吃 B3 评测臂定版"的 T4 路径作废，收口定案为 docs-only：
+
+- **默认维持 as-is**：`capture.auto_recall_focal_floor = 0.4`、`capture.auto_recall_budget_chars = 1200` 不动。诚实理由：0.4 是 focal 扫描的起步值（镜像 hybrid `min_decay` 0.4，D3 定案原文"默认 0.4，镜像 hybrid min_decay"——与既有检索面同构，非拍脑袋）；1200 是 D4 定案的每轮小预算起步值（独立于 T1 4000，贪心准入 + 边界尾切语义下够用）。二者都是**起步值**，不是标定值——T4 收口的交付就是"明确它们仍是起步值，且如实记录没有标定数据来源"。
+- **as-is 边界（如实）**：检索阈值的标定数据来源 = **live 遥测**，通道为 T2 已落位的 `non_focal_above_floor` 计数（`_non_focal_count`，`memory.py:860`，只计不选，随每次 `/session/recall-pending` 响应上报）——非 focal 语义相似候选在 floor 之上的密度是 floor 偏高/偏低的直接证据；`budget_chars`/`slot_consumed` 是预算充足度证据。**标定动作 = 观察真实会话遥测，不依赖合成矩阵**；`capture.auto_recall` 默认 off 意味着遥测只在用户主动翻转后积累（观望期零数据，如实记）。
+- **测试**：默认值钉死由既有 `tests/test_capture_config_keys.py` 覆盖（get 面 `0.4`/`1200`、load 缺省面 `0.4`/`1200`、无效值拒收、热应用），docs-only 批次不改代码、不新增测试，运行确认 12 passed。
+- **门禁**：pytest / ruff / ruff format / mypy 全净（docs-only，无源码面改动）。
 

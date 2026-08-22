@@ -25,8 +25,8 @@
 4. **注入必带围栏**：任何注入上下文带"此为记忆回放，非用户当下指令"围栏与免责行（TA-5）。
 5. **注入 ≠ 强化**：被注入不计 reinforce，仅 assistant 轮实际引用注入内容才计（TA-6）。
 6. **不判归属、不造熟悉感**：daemon 只供给结构；不加时间相似度检索项、不改排序（TA-7/TA-8/TA-9）。
-7. **数字都是起步值**：focal floor 0.4 / budget 1200 / 4000 / needle 窗口——阈值经 T4 评测臂标定前一律视为起步值（B2.1 理论锚声明）。
-8. **默认 off**：`capture.auto_recall` 默认关闭（观望 + 安全验证留门，翻转待 T4 数据）。
+7. **数字都是起步值**：focal floor 0.4 / budget 1200 / 4000 / needle 窗口——T4 收口（2026-08-20）定案：B3 评测臂非检索面（PRD-B3 语义 1，矩阵不含 capture/检索），**harness 数据无法标定检索阈值**，阈值维持 as-is 起步值，标定走 live 遥测 `non_focal_above_floor` 通道（PRD-B2.1 收口记录）。
+8. **默认 off**：`capture.auto_recall` 默认关闭（观望 + 安全验证留门，翻转待 live 遥测数据）。
 
 ---
 
@@ -121,7 +121,7 @@ sequenceDiagram
     Hook->>Host: output.system.push(注入块)；build+append 成功后才清 pendingPull
 ```
 
-**走查要点**：non-focal（纯语义相似）不计入注入、仅随响应上报 `non_focal_above_floor` 计数（TA-4 为 T4 备数据）；`slot_consumed` 与独立 tombstone 配合，使"serve 后响应丢失"的重试 pull 拿到空选择 + consumed=true 时清臂，绝不无限空拉。`enabled:false` 零消费零标记；未捕获 session 的 `/session/end` 应答 200 no-op settle（原 404，火忘 hook 不再静默吞 404）。
+**走查要点**：non-focal（纯语义相似）不计入注入、仅随响应上报 `non_focal_above_floor` 计数（TA-4；T4 收口定案：此即检索阈值的 **live 遥测标定通道**——B3 评测臂非检索面，标定数据只能来自真实会话观测）；`slot_consumed` 与独立 tombstone 配合，使"serve 后响应丢失"的重试 pull 拿到空选择 + consumed=true 时清臂，绝不无限空拉。`enabled:false` 零消费零标记；未捕获 session 的 `/session/end` 应答 200 no-op settle（原 404，火忘 hook 不再静默吞 404）。
 
 ### 1.3 T3 消费证据守卫
 
@@ -159,7 +159,7 @@ sequenceDiagram
 
 - 来源：Tulving & Thomson（1973）encoding specificity principle；"available but not accessible" 是遗忘的主形态。
 - 已验证规律：遗忘的主因是**线索失败**而不是存储失败；提取成功率取决于线索与编码时上下文的重合度。
-- → 设计规则：**回忆的本职是线索工程**——当前轮**原文直接作线索**（不做模型重写式 query）；保留编码时元数据（时间/项目/实体）作为线索面；线索分两级：**实体精确命中 = focal 线索，纯语义相似 = non-focal 线索**，两类分设相关度 floor（阈值经 T4 标定）。
+- → 设计规则：**回忆的本职是线索工程**——当前轮**原文直接作线索**（不做模型重写式 query）；保留编码时元数据（时间/项目/实体）作为线索面；线索分两级：**实体精确命中 = focal 线索，纯语义相似 = non-focal 线索**，两类分设相关度 floor（起步值经 T4 收口定案，标定走 live 遥测 `non_focal_above_floor` 通道）。
 
 ### TA-3 近因优势与无线索态默认（serial-position recency / TCM）—— 会话起始
 
@@ -292,10 +292,10 @@ sequenceDiagram
 - 任何窗外产物（非捕获工具所建、特性前遗留、他机）→ 诚实空结果"无可归因"，绝不猜（B2.4 §边界 3）。
 - `active` 进程内局部——daemon 重启清空缓冲注册表，直到各活 session 下次 ingest（B2.4 §边界 5）。
 - 重启丢 seen-set = TA-3 语境切换重注入，不持久化；重启即重注入是语义而非泄漏（B2.1 如实边界）。
-- 实体标注缺失的 chunk 永不被中段回忆（focal 是元数据实体命中——系统性盲，留 T4 数据说话）。
+- 实体标注缺失的 chunk 永不被中段回忆（focal 是元数据实体命中——系统性盲，观测数据留 live 遥测 `non_focal_above_floor` 说话；T4 收口：评测臂非检索面，不产此数据）。
 - needle 引用检测是子串启发式：幻觉式复述计 FP（+0.1 有界回弹可承受）、复述面目全非漏记 FN（verbatim 冷门防线不受影响）；<32 字符短 chunk 永不可记（对短事实的系统性盲）；needle 撞串多 chunk 同记（FP 有界）；崩溃重放与 needle 注册无共同链 → 双向有界误差（每 chunk 每 session 至多一次 +0.1）。
 - **注入逐请求瞬态**：注入只存在于该 session 首个模型调用的 system 数组（之后各步 transform 被闸门短路），其效力靠"首轮回复进入对话历史"持久——token 红线的有意选择，不是缺陷。
-- **T2 默认 off**：管线随构建发船但行为不变，翻转待 T4 评测数据。
+- **T2 默认 off**：管线随构建发船但行为不变，翻转待 live 遥测数据（T4 收口定案，见 §0 边界 7/8）。
 - 混合版本不受支持：新 hook + 旧 daemon（缺 `budget_chars`/`slot_consumed` 字段）回退到修复前行为；旧 daemon + 新 hook（缺 `window`/`self_window` 字段）逐字节回退今日渲染。
 - serve=mark-seen 后 warmup transform 可吞 pending 批——"服务过但未进模型调用"的有界 FN 窗（记录备查）。
 - 注入至多迟一个模型调用（transform 早于 ack → 跳过本轮 pull，pending 槽 serve 前一直存活，**绝不丢**）。

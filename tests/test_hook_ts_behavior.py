@@ -91,6 +91,30 @@ def test_completed_assistant_posts_exactly_once_across_live_and_replay(tmp_path:
     assert transcript["assistantCount"] == 1, transcript
 
 
+def test_aborted_assistant_shape_lands_in_the_debug_sink(tmp_path: Path) -> None:
+    """An aborted assistant message (time.error, no time.completed) must be
+    logged into hook-debug.jsonl BEFORE the completion gate drops it — the
+    shape line is how a live abort becomes distinguishable from a completed
+    reply in the debug lane. Both the metadata.error trace and the error-less
+    abort trace are recorded."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "completion-shape-debug")
+    shapes = transcript["shapes"]
+    assert len(shapes) == 2, f"both abort shapes must land in the debug sink: {shapes}"
+    by_id = {shape["messageID"]: shape for shape in shapes}
+    meta = by_id["m_aborted_meta"]
+    assert meta["sessionID"] == "sess-behavior"
+    assert meta["role"] == "assistant"
+    assert meta["hasCompleted"] is False, f"an abort must not look completed: {meta}"
+    assert meta.get("completed") is None
+    assert meta["hasError"] is True
+    assert meta["error"] == "The operation was aborted due to timeout"
+    plain = by_id["m_aborted_plain"]
+    assert plain["hasCompleted"] is False
+    assert plain["hasError"] is False
+    assert plain["error"] is None
+
+
 def test_outage_hole_is_replayed_in_process_before_later_acks_leapfrog_it(tmp_path: Path) -> None:
     """Re-review IMPORTANT-NEW-1: daemon bounces mid-conversation — turn A
     rejected, turn B accepted after recovery. The rejected ingest must have
@@ -433,3 +457,52 @@ def test_recall_pull_clears_the_arm_once_the_slot_was_consumed(tmp_path: Path) -
     assert s1 == ["BASE"], "a consumed slot serves nothing"
     assert s2 == ["BASE2"], "the cleared arm must not pull again"
     assert transcript["pullCount"] == 1, transcript["pullCount"]
+
+
+# ---------------------------------------------------------------- B2.6 host-plugin bundling
+
+
+def test_config_hook_injects_the_mcp_registration_create_if_absent(tmp_path: Path) -> None:
+    """B2.6 bundling: the config hook registers cfg.mcp["mnemoseed"] with the
+    A3 MCP-gateway command, creating the mcp map when absent; a user's
+    existing manual registration is never overwritten; a null cfg is a no-op."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "config-inject")
+    expected = {"type": "local", "command": ["mnemoseed-local", "mcp"], "enabled": True}
+    assert transcript["empty"]["mcp"]["mnemoseed"] == expected
+    assert transcript["bare"]["mcp"]["mnemoseed"] == expected
+    assert transcript["manual"]["mcp"]["mnemoseed"] == {"type": "remote", "url": "http://mcp.example"}, (
+        "a user's manual registration must win untouched"
+    )
+    assert transcript["noThrow"] is True
+
+
+def test_options_tuple_switch_short_circuits_the_whole_bundle(tmp_path: Path) -> None:
+    """B2.6 single switch: {enabled:false} via the ["spec", options] tuple
+    makes the factory return {} — NO config hook, NO hooks; enabled:true,
+    empty options and absent options all load the full bundle."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "switch-short-circuit")
+    assert transcript["offKeys"] == [], f"enabled:false must short-circuit everything: {transcript}"
+    for keys in ("onKeys", "bareKeys", "noneKeys"):
+        assert "config" in transcript[keys], keys
+        assert "chat.message" in transcript[keys], keys
+        assert "chat.system.transform" in transcript[keys], keys
+
+
+def test_config_hook_is_fail_open_on_frozen_objects(tmp_path: Path) -> None:
+    """B2.6 I3: the config hook try/catch is fail-open — Object.freeze(cfg) and
+    freeze(cfg.mcp) must not throw, must not overwrite other keys, and a
+    subsequent normal cfg still injects."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "config-inject-frozen")
+    assert transcript["noThrow"] is True, "frozen cfg must not throw"
+    assert transcript["frozenCfgOther"] == "keep", "other keys on frozen cfg must survive"
+    assert transcript["frozenMcpOther"] == "keep2", "other keys on cfg with frozen mcp must survive"
+    # frozen paths are fail-open: no throw and other keys survive; a frozen cfg
+    # without mcp cannot be injected (??= throws), a frozen mcp cannot gain the
+    # entry — both must not overwrite other keys
+    assert transcript["frozenCfgHasMnemoseed"] is None
+    assert transcript["frozenMcpHasMnemoseed"] is None
+    expected = {"type": "local", "command": ["mnemoseed-local", "mcp"], "enabled": True}
+    assert transcript["afterMnemoseed"] == expected
