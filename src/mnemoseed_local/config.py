@@ -220,15 +220,18 @@ class CaptureConfig:
     auto_recall_budget_chars: int = DEFAULT_AUTO_RECALL_BUDGET_CHARS
 
 
-# A2 MVP + B1: the dream LLM roles. The cloud deep_reflection / short_increment
-# split is trimmed for the local single-user daemon; roles remain a
-# pipeline-internal parameter so a future split can re-open them without a
-# schema change. "dream" generates (model A); "dream_verifier" is the ensemble
-# verify judging seat (model B, design/01 decision 1) — dormant unless
-# dream.ensemble=verify. Any legacy [dream.llm.deep_reflection] /
-# [dream.llm.short_increment] tables are tolerated on load and ignored with a
-# warning, never applied.
-LLM_ROLES: tuple[str, ...] = ("dream", "dream_verifier")
+# A2 MVP + B1 + B5: the dream LLM roles. The cloud deep_reflection /
+# short_increment split is trimmed for the local single-user daemon; roles
+# remain a pipeline-internal parameter so a future split can re-open them
+# without a schema change. "dream" generates (model A); "dream_verifier" is the
+# ensemble verify judging seat (model B, design/01 decision 1) — dormant unless
+# dream.ensemble=verify; "dream_vote" is the B5 vote seat B's independent
+# generator (a distinct model from A) — dormant unless dream.ensemble=vote.
+# "dream_vote" has NO default route: vote falls back to the dream_verifier
+# judging route (still a distinct model from A) when the dedicated route is
+# unconfigured. Any legacy [dream.llm.deep_reflection] / [dream.llm.short_increment]
+# tables are tolerated on load and ignored with a warning, never applied.
+LLM_ROLES: tuple[str, ...] = ("dream", "dream_verifier", "dream_vote")
 
 #: Removed role names (A2 trim): recognized for deprecation tolerance.
 LEGACY_ROLES: frozenset[str] = frozenset({"deep_reflection", "short_increment", "local_track"})
@@ -563,15 +566,23 @@ def load_config(path: Path | None = None) -> Config:
                 entry_table = _require_table(entry, role_path)
                 driver = _optional_driver(entry_table.get("driver"), f"{role_path}.driver")
                 model = _optional_driver(entry_table.get("model"), f"{role_path}.model")
-                base = DEFAULT_LLM_ROUTES[role]
+                # A role with no factory default (B5 dream_vote) requires an
+                # explicit driver+model when it appears in the file; a role with
+                # a default falls back to it for any field left unset.
+                base = DEFAULT_LLM_ROUTES.get(role)
+                if base is None and (driver is None or model is None):
+                    raise ConfigError(
+                        role_path,
+                        "this role has no default route and must set both 'driver' and 'model'",
+                    )
                 params = {k: v for k, v in entry_table.items() if k not in ("driver", "model")}
                 if "api_key_env" in params:
                     _validate_api_key_ref(role, params["api_key_env"])
                 llm_routes[role] = RoleLLMConfig(
                     role=role,
-                    driver=driver if driver is not None else base.driver,
-                    model=model if model is not None else base.model,
-                    params={**base.params, **params},
+                    driver=driver if driver is not None else base.driver,  # type: ignore[union-attr]
+                    model=model if model is not None else base.model,  # type: ignore[union-attr]
+                    params={**(base.params if base is not None else {}), **params},
                 )
             unknown = [
                 str(role)

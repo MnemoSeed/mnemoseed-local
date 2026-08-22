@@ -135,6 +135,7 @@ def _triple(
     confidence: float = 0.8,
     preference: bool = False,
     polarity: str = "positive",
+    vote_disagreement: bool = False,
 ) -> ReflectedTriple:
     return ReflectedTriple(
         subject=subject,
@@ -147,6 +148,7 @@ def _triple(
         route=route,
         preference=preference,
         polarity=polarity,
+        vote_disagreement=vote_disagreement,
     )
 
 
@@ -617,3 +619,33 @@ def test_floor_hot_applies_to_next_merge_without_restart(
     assert second.summary.isolated == 1
     assert len(_nodes(main)) == 1  # type: ignore[arg-type]  # only the pre-floor triple
     assert len(_nodes(isolated)) == 1  # type: ignore[arg-type]  # the downgraded triple
+
+
+def test_vote_disagreement_flags_isolated_node_for_reconcile(
+    graphs: tuple[object, object, SqliteMetaDriver], tmp_path: Path
+) -> None:
+    """B5 vote divergence (the combiner's isolated lane) flags the written
+    isolated node ``needs_reconcile`` so the reconcile-queue surface picks the
+    disputed fact up — the vote/needs_reconcile co-operation the roadmap names.
+    A non-disputed isolated triple stays unflagged."""
+    main, isolated, meta = graphs  # type: ignore[misc]
+    snap = _snap(_stamp("c1", "I prefer dark mode"))
+
+    disputed = _result(
+        _triple(obj="dark mode", route=Route.ISOLATED, vote_disagreement=True),
+        _triple(obj="light mode", route=Route.ISOLATED, vote_disagreement=True),
+    )
+    out = _merger(main, isolated, meta).merge(snap, disputed)
+    assert out.ok and out.committed
+    disputed_nodes = _nodes(isolated)  # type: ignore[arg-type]
+    assert len(disputed_nodes) == 2
+    assert all(n.needs_reconcile for n in disputed_nodes)
+    assert all(n.conflict_flag for n in disputed_nodes)
+
+    # a non-disputed isolated write (e.g. floor downgrade) stays unflagged
+    out2 = _merger(main, isolated, meta).merge(
+        snap, _result(_triple(obj="vim", route=Route.ISOLATED, vote_disagreement=False))
+    )
+    assert out2.ok
+    plain = [n for n in _nodes(isolated) if getattr(n, "props", {}).get("object") == "vim"]  # type: ignore[arg-type]
+    assert plain and not plain[0].needs_reconcile

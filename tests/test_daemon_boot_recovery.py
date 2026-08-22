@@ -321,6 +321,149 @@ def test_deferred_resume_runs_and_merges_after_boot(
     assert on_disk is not None and resume_boundary(on_disk) is None
 
 
+def _vote_payload() -> dict[str, Any]:
+    """A minimal seat reflection payload the combiner can consume (empty triples
+    is a valid all-noise seat). It carries the consumed chunk id so the merge's
+    safe-clear marks that exact row consolidated."""
+    return {
+        "snapshot_id": SNAP_ID,
+        "profile_id": PROFILE,
+        "turn_range": {"start": RANGE.start, "end": RANGE.end},
+        "prompt_version": "v1",
+        "model_id": "stub",
+        "triples": [],
+        "conflicts": [],
+        "delta_overflow": [],
+        "consumed_chunk_ids": [CHUNK_ID],
+    }
+
+
+def _seed_vote_combine_journal(tmp_path: Path) -> Snapshot:
+    """A journaled snapshot at the vote COMBINE boundary: A and B both ran and
+    their payloads are persisted, but the combiner never folded them and the
+    single merge never committed — the daemon must resume at combine, merge,
+    and safe-clear the range."""
+    snap = (
+        Snapshot(
+            snapshot_id=SNAP_ID,
+            profile_id=PROFILE,
+            turn_range=RANGE,
+            chunks=(SnapshotChunk.from_stamp(_stamp()),),
+            created_at=1.0,
+            phases=frozenset(
+                {
+                    SnapshotPhase.SNAPSHOT_DONE.value,
+                    SnapshotPhase.REFLECT_A_DONE.value,
+                    SnapshotPhase.REFLECT_B_DONE.value,
+                }
+            ),
+        )
+        .with_vote_seat("a", _vote_payload())
+        .with_vote_seat("b", _vote_payload())
+    )
+    write_snapshot_file(tmp_path / "dreams", snap)
+    return snap
+
+
+def test_vote_combine_boundary_resume_consolidates_chunks(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKER-1: a crash-resume at the vote COMBINE boundary must resume the
+    trigger (DREAMING + current_range) so the deferred combine -> merge ->
+    safe-clear fires. Before the fix the 'combine' boundary fell through with no
+    trigger.resume(), so on_merge_committed no-op'd and the merged chunks were
+    never marked consolidated (double-representation + stale search surface)."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
+        encoding="utf-8",
+    )
+    _seed_vote_combine_journal(config_path.parent)
+    _seed_stores(config_path.parent)
+
+    with _boot() as client:
+        deadline = time.monotonic() + 10.0
+        committed: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            committed = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()
+            if committed["total"] >= 1:
+                break
+            time.sleep(0.05)
+        assert committed is not None and committed["total"] >= 1, "the vote-combine resume never committed"
+        _wait_dream_idle(client)
+
+    on_disk = _journal_state(config_path.parent)
+    assert on_disk is not None and resume_boundary(on_disk) is None
+
+    import lancedb
+
+    db = lancedb.connect(str(config_path.parent / "chunks.lance"))
+    rows = db.open_table("chunks").to_arrow().to_pylist()
+    chunk_row = [row for row in rows if row["chunk_id"] == CHUNK_ID]
+    assert chunk_row and chunk_row[0]["consolidated"] is True
+
+
+def _seed_vote_b_journal(tmp_path: Path) -> Snapshot:
+    """A journaled snapshot at the vote REFLECT_B boundary: A ran and its
+    payload is persisted, but seat B never generated — the daemon must resume
+    at reflect_b, run B, then combine -> merge, and safe-clear the range."""
+    snap = Snapshot(
+        snapshot_id=SNAP_ID,
+        profile_id=PROFILE,
+        turn_range=RANGE,
+        chunks=(SnapshotChunk.from_stamp(_stamp()),),
+        created_at=1.0,
+        phases=frozenset(
+            {
+                SnapshotPhase.SNAPSHOT_DONE.value,
+                SnapshotPhase.REFLECT_A_DONE.value,
+            }
+        ),
+    ).with_vote_seat("a", _vote_payload())
+    write_snapshot_file(tmp_path / "dreams", snap)
+    return snap
+
+
+def test_vote_reflect_b_boundary_resume_runs_b_and_consolidates(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKER-1: a crash-resume at the vote REFLECT_B boundary must resume the
+    trigger (DREAMING + current_range) so the deferred resume runs seat B, then
+    combine -> merge -> safe-clear. Before the fix the 'reflect_b' boundary fell
+    through with no trigger.resume(), so on_merge_committed no-op'd and the
+    merged chunks were never marked consolidated."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
+        encoding="utf-8",
+    )
+    _seed_vote_b_journal(config_path.parent)
+    _seed_stores(config_path.parent)
+
+    with _boot() as client:
+        deadline = time.monotonic() + 10.0
+        committed: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            committed = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()
+            if committed["total"] >= 1:
+                break
+            time.sleep(0.05)
+        assert committed is not None and committed["total"] >= 1, "the vote reflect_b resume never committed"
+        _wait_dream_idle(client)
+
+    on_disk = _journal_state(config_path.parent)
+    assert on_disk is not None and resume_boundary(on_disk) is None
+
+    import lancedb
+
+    db = lancedb.connect(str(config_path.parent / "chunks.lance"))
+    rows = db.open_table("chunks").to_arrow().to_pylist()
+    chunk_row = [row for row in rows if row["chunk_id"] == CHUNK_ID]
+    assert chunk_row and chunk_row[0]["consolidated"] is True
+
+
 def test_scheduler_waits_for_deferred_resumes_before_first_tick(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

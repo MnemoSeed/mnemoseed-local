@@ -397,7 +397,13 @@ def _capture_apply(config: Config, field: str, value: Any) -> None:
 
 def _role_apply(config: Config, role: str, field: str, value: Any) -> None:
     """Rebuild the role's RoleLLMConfig with the new field and mirror raw."""
-    cfg = config.llm[role]
+    cfg = config.llm.get(role)
+    if cfg is None:
+        # A recognized-but-unconfigured role (B5 dream_vote) gains its route on
+        # the first write rather than crashing; a write must set the route
+        # identity, so driver/model default from the written field.
+        cfg = RoleLLMConfig(role=role, driver="", model="")
+        config.llm[role] = cfg
     params = dict(cfg.params)
     if field not in ("driver", "model"):
         if value is None:
@@ -415,7 +421,9 @@ def _role_apply(config: Config, role: str, field: str, value: Any) -> None:
 
 
 def _role_read(config: Config, role: str, field: str) -> Any:
-    cfg = config.llm[role]
+    cfg = config.llm.get(role)
+    if cfg is None:
+        return None  # recognized-but-unconfigured role reads as unset
     if field in ("driver", "model"):
         return getattr(cfg, field)
     return cfg.params.get(field)
@@ -878,7 +886,22 @@ class ConfigWriteService:
         }
 
     def _resolved_role(self, role: str) -> dict[str, Any]:
-        cfg = self._config.llm[role]
+        cfg = self._config.llm.get(role)
+        if cfg is None:
+            # A recognized-but-unconfigured role (B5 dream_vote has no factory
+            # default): surface it as unconfigured so the settings page sees the
+            # role exists without inventing a route.
+            return {
+                "driver": None,
+                "model": None,
+                "base_url": None,
+                "api_key_env": None,
+                "max_tokens": None,
+                "provider": None,
+                "think": None,
+                "num_ctx": None,
+                "num_predict": None,
+            }
         return {
             "driver": cfg.driver,
             "model": cfg.model,

@@ -61,6 +61,7 @@ from mnemoseed_local.dream.prompts import (
 from mnemoseed_local.dream.snapshot import (
     Snapshot,
     SnapshotPhase,
+    load_snapshot_file,
     write_snapshot_file,
 )
 from mnemoseed_local.llm.types import ChatResult, LLMUnavailable, Usage
@@ -95,6 +96,8 @@ class ReflectedTriple:
     route: Route  # core | isolated | salvage; tier-3 provenance never yields core
     preference: bool = False  # preference-type extraction (FR-2.12 boundary)
     polarity: str = "positive"  # "positive" | "negative" (negation guard, g2)
+    model_id: str | None = None  # B5 vote: the generating seat's model (triple-level attribution)
+    vote_disagreement: bool = False  # B5 vote: preserved from a disputed predicate (needs_reconcile)
 
 
 @dataclass(frozen=True)
@@ -479,6 +482,8 @@ class ReflectOrchestrator:
         ledger: TokenLedger | None = None,
         resolve_llm: Callable[[], ChatLLM] | None = None,
         verifier: Verifier | None = None,
+        vote_llm: ChatLLM | None = None,
+        resolve_vote_llm: Callable[[], ChatLLM] | None = None,
     ) -> None:
         self._llm = llm
         # F2 hot-apply seam: when wired, every reflect pass materializes the
@@ -503,24 +508,142 @@ class ReflectOrchestrator:
         # between assembly and the atomic journal write — FALL-SOFT by
         # contract, a verifier failure lands A's original result + audit.
         self._verifier = verifier
+        # B5 vote seam: the B seat's own generation LLM (the same judging-seat
+        # role, reused as a full generator). Falls back to A's boot instance
+        # when not wired, so vote degrades to a same-seat pass rather than crash.
+        self._vote_llm = vote_llm if vote_llm is not None else llm
+        self._resolve_vote_llm = resolve_vote_llm
 
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
-        """Run one reflect pass. The marker gate makes a completed reflect a
-        no-op: a recovered snapshot that already wrote back never re-runs."""
+        """Run the single-model reflect pass (off / verify ensemble modes).
+
+        The marker gate makes a completed reflect a no-op: a recovered snapshot
+        that already wrote back never re-runs."""
         if SnapshotPhase.REFLECT_DONE.value in snapshot.phases:
             return ReflectOutcome(ok=True, result=None, skipped=True)
-
-        # F2: resolve the route fresh for THIS run (pinned per run), unless no
-        # resolver is wired and the boot-time instance is the only seam.
         llm = self._resolve_llm() if self._resolve_llm is not None else self._llm
-        if self._on_run_started is not None:
-            model = str(getattr(llm, "model", "") or "")
-            if model:
-                try:
-                    self._on_run_started(snapshot.snapshot_id, model)
-                except Exception as exc:  # noqa: BLE001 - a recording failure never breaks the dream
-                    logger.warning("dream_runs model recording failed for %s: %s", snapshot.snapshot_id, exc)
+        self._announce_run(snapshot, llm)
+        outcome = self._run_seat(snapshot, llm)
+        if not outcome.ok or outcome.result is None:
+            return outcome
+        result = outcome.result
+        if self._verifier is not None:
+            # B1: verify rides the SAME reflect run — the journaled payload
+            # below is whatever the verifier returned (verified result, or A's
+            # original on fallback), so merge / crash-resume see exactly one
+            # consistent outcome and REFLECT_DONE marker semantics never change.
+            result = self._verifier.verify(snapshot, result)
+        return self._record_and_finalize(
+            snapshot,
+            result,
+            outcome.report,
+            outcome.llm_unavailable,
+            phase=SnapshotPhase.REFLECT_DONE,
+            seat=None,
+        )
 
+    def reflect_vote_a(self, snapshot: Snapshot) -> ReflectOutcome:
+        """B5 vote: run seat A's full generation over the delta and journal its
+        result under REFLECT_A_DONE. A recovered snapshot that already ran A is
+        a no-op (only B / combine / merge remain)."""
+        if SnapshotPhase.REFLECT_A_DONE.value in snapshot.phases:
+            return ReflectOutcome(ok=True, result=None, skipped=True)
+        llm = self._resolve_llm() if self._resolve_llm is not None else self._llm
+        self._announce_run(snapshot, llm)
+        outcome = self._run_seat(snapshot, llm)
+        if not outcome.ok or outcome.result is None:
+            return outcome
+        return self._record_and_finalize(
+            snapshot,
+            outcome.result,
+            outcome.report,
+            outcome.llm_unavailable,
+            phase=SnapshotPhase.REFLECT_A_DONE,
+            seat="a",
+        )
+
+    def reflect_vote_b(self, snapshot: Snapshot) -> ReflectOutcome:
+        """B5 vote: run seat B's full generation over the delta and journal its
+        result under REFLECT_B_DONE. A recovered snapshot that already ran B is
+        a no-op (only combine / merge remain)."""
+        if SnapshotPhase.REFLECT_B_DONE.value in snapshot.phases:
+            return ReflectOutcome(ok=True, result=None, skipped=True)
+        llm = self._resolve_vote_llm() if self._resolve_vote_llm is not None else self._vote_llm
+        self._announce_run(snapshot, llm)
+        outcome = self._run_seat(snapshot, llm)
+        if not outcome.ok or outcome.result is None:
+            return outcome
+        return self._record_and_finalize(
+            snapshot,
+            outcome.result,
+            outcome.report,
+            outcome.llm_unavailable,
+            phase=SnapshotPhase.REFLECT_B_DONE,
+            seat="b",
+        )
+
+    def combine(self, snapshot: Snapshot) -> ReflectOutcome:
+        """B5 vote: fold seat A's and seat B's journaled results into the single
+        merge-facing result (COMBINE_DONE + ``reflect_result``). Pure and
+        deterministic; a no-op once combined."""
+        if SnapshotPhase.COMBINE_DONE.value in snapshot.phases:
+            return ReflectOutcome(ok=True, result=None, skipped=True)
+        base = load_snapshot_file(self._directory / f"{snapshot.snapshot_id}.json") or snapshot
+        votes = base.vote_results or {}
+        a_payload = votes.get("a")
+        b_payload = votes.get("b")
+        if a_payload is None or b_payload is None:
+            logger.warning(
+                "combine for %s: missing vote seat payload (a=%s, b=%s); staying journaled",
+                snapshot.profile_id,
+                a_payload is not None,
+                b_payload is not None,
+            )
+            return ReflectOutcome(
+                ok=False,
+                error="vote combine requires both seat payloads; snapshot stays journaled",
+            )
+        a_result = result_from_payload(a_payload)
+        b_result = result_from_payload(b_payload)
+        if a_result is None or b_result is None:
+            logger.warning(
+                "combine for %s: a vote seat payload is not recoverable; staying journaled",
+                snapshot.profile_id,
+            )
+            return ReflectOutcome(
+                ok=False,
+                error="vote combine: a seat payload is not recoverable; snapshot stays journaled",
+            )
+        # Local import: combine.py imports this module's types, so importing it
+        # at module scope would be a cycle.
+        from mnemoseed_local.dream.combine import combine_results
+
+        combined = combine_results(a_result, b_result)
+        try:
+            self._finalize_combined(snapshot, combined)
+        except Exception as exc:  # noqa: BLE001 - marker before progress
+            logger.warning(
+                "combine done but COMBINE_DONE persist failed for %s: %s", snapshot.profile_id, exc
+            )
+            return ReflectOutcome(ok=False, error=f"persist failed: {exc}")
+        return ReflectOutcome(ok=True, result=combined)
+
+    def _announce_run(self, snapshot: Snapshot, llm: ChatLLM) -> None:
+        """F2: record the run's resolved model once per run (best-effort)."""
+        if self._on_run_started is None:
+            return
+        model = str(getattr(llm, "model", "") or "")
+        if not model:
+            return
+        try:
+            self._on_run_started(snapshot.snapshot_id, model)
+        except Exception as exc:  # noqa: BLE001 - a recording failure never breaks the dream
+            logger.warning("dream_runs model recording failed for %s: %s", snapshot.snapshot_id, exc)
+
+    def _run_seat(self, snapshot: Snapshot, llm: ChatLLM) -> ReflectOutcome:
+        """Run one full generation pass against a seat LLM (pack -> retry ->
+        assemble). Returns a typed outcome: ok=True with ``result`` set on
+        success, a degraded outcome (defer / retries exhausted) otherwise."""
         request = self._packer.pack(snapshot)
         report = self._packer.report(request)
         if not request.delta and request.overflow_chunk_ids:
@@ -545,6 +668,7 @@ class ReflectOrchestrator:
         last_error = ""
         provider_usage: Usage | None = None
         unavailable = False
+        model_id = str(getattr(llm, "model", "") or "")
         for attempt in range(self._max_retries + 1):
             try:
                 response = llm.chat(system=request.cache_prefix, user=request.delta)
@@ -558,6 +682,7 @@ class ReflectOrchestrator:
                     payload,
                     overflow_chunk_ids=request.overflow_chunk_ids,
                     consumed_chunk_ids=request.packed_chunk_ids,
+                    model_id=model_id,
                 )
                 break
             except LLMUnavailable as exc:  # FR-2.6: typed provider outage, flagged + retried
@@ -582,32 +707,51 @@ class ReflectOrchestrator:
                     llm_unavailable=unavailable,
                 )
             self._sleep(self._backoff(attempt))
-
         assert result is not None
-        if self._verifier is not None:
-            # B1: verify rides the SAME reflect run — the journaled payload
-            # below is whatever the verifier returned (verified result, or A's
-            # original on fallback), so merge / crash-resume see exactly one
-            # consistent outcome and REFLECT_DONE marker semantics never change.
-            result = self._verifier.verify(snapshot, result)
-        tracked_report = _with_provider_usage(report, provider_usage)
+        return ReflectOutcome(
+            ok=True,
+            result=result,
+            report=_with_provider_usage(report, provider_usage),
+            llm_unavailable=unavailable,
+        )
+
+    def _record_and_finalize(
+        self,
+        snapshot: Snapshot,
+        result: ReflectionResult,
+        report: DeltaReport | None,
+        unavailable: bool,
+        *,
+        phase: SnapshotPhase,
+        seat: str | None,
+    ) -> ReflectOutcome:
+        """Meter the run's tokens and persist the phase marker + payload as one
+        atomic journal write (marker-before-progress, NFR-2.3)."""
+        tracked_report = report
         if self._ledger is not None:
             # Token metering (T5b / T3b): the dream consumed the packed delta
             # plus the provider-reported output tokens; record them into the
             # current UTC month before the marker persist (the call happened,
             # the usage is attributable even if the marker write fails).
-            completion = provider_usage.completion_tokens if provider_usage is not None else None
+            completion = (
+                tracked_report.provider_usage.completion_tokens
+                if tracked_report is not None and tracked_report.provider_usage is not None
+                else None
+            )
             self._ledger.record(
                 snapshot.profile_id,
-                delta_tokens=tracked_report.delta_tokens,
-                prefix_tokens=tracked_report.prefix_tokens,
+                delta_tokens=tracked_report.delta_tokens if tracked_report is not None else 0,
+                prefix_tokens=tracked_report.prefix_tokens if tracked_report is not None else 0,
                 output_tokens=completion or 0,
             )
         try:
-            self._finalize(snapshot, result)
+            self._finalize(snapshot, result, phase=phase, seat=seat)
         except Exception as exc:  # noqa: BLE001 - marker before progress
             logger.warning(
-                "reflect done but REFLECT_DONE persist failed for %s: %s", snapshot.profile_id, exc
+                "reflect done but %s persist failed for %s: %s",
+                phase.value,
+                snapshot.profile_id,
+                exc,
             )
             return ReflectOutcome(
                 ok=False,
@@ -616,19 +760,44 @@ class ReflectOrchestrator:
                 report=tracked_report,
                 llm_unavailable=unavailable,
             )
-        return ReflectOutcome(ok=True, result=result, report=tracked_report)
+        return ReflectOutcome(ok=True, result=result, report=tracked_report, llm_unavailable=unavailable)
 
     def _backoff(self, attempt: int) -> float:
         """Exponential schedule: base, 2*base, 4*base across retries 1..3."""
         return self._backoff_base * (1 << attempt)
 
-    def _finalize(self, snapshot: Snapshot, result: ReflectionResult) -> None:
-        """Persist the REFLECT_DONE marker AND the reflection payload as one
-        atomic journal file write (marker-before-progress, NFR-2.3): a crash
-        after this point resumes at the merge boundary with the result intact,
-        never re-runs reflect."""
-        carried = snapshot.with_reflect(_result_to_payload(result))
-        marked = carried.with_phase(SnapshotPhase.REFLECT_DONE.value)
+    def _finalize(
+        self,
+        snapshot: Snapshot,
+        result: ReflectionResult,
+        *,
+        phase: SnapshotPhase = SnapshotPhase.REFLECT_DONE,
+        seat: str | None = None,
+    ) -> None:
+        """Persist the phase marker AND the reflection payload as one atomic
+        journal file write (marker-before-progress, NFR-2.3): a crash after this
+        point resumes at the merge boundary with the result intact, never
+        re-runs reflect. A ``seat`` carries a vote phase's payload into the
+        per-seat carrier instead of the single ``reflect_result``. Each phase
+        builds on the on-disk journal (the authoritative copy) so a vote seat's
+        write never clobbers a previously-finalized seat."""
+        base = load_snapshot_file(self._directory / f"{snapshot.snapshot_id}.json") or snapshot
+        if seat is None:
+            carried = base.with_reflect(_result_to_payload(result))
+        else:
+            carried = base.with_vote_seat(seat, _result_to_payload(result))
+        marked = carried.with_phase(phase.value)
+        write_snapshot_file(self._directory, marked)
+        if self._on_done is not None:
+            self._on_done(snapshot.profile_id)
+
+    def _finalize_combined(self, snapshot: Snapshot, result: ReflectionResult) -> None:
+        """Persist the COMBINE_DONE marker with the combined result written into
+        the single ``reflect_result`` carrier, so the merge boundary reads it
+        exactly like a single-model dream (one consistent seam)."""
+        base = load_snapshot_file(self._directory / f"{snapshot.snapshot_id}.json") or snapshot
+        carried = base.with_reflect(_result_to_payload(result))
+        marked = carried.with_phase(SnapshotPhase.COMBINE_DONE.value)
         write_snapshot_file(self._directory, marked)
         if self._on_done is not None:
             self._on_done(snapshot.profile_id)
@@ -643,11 +812,12 @@ class ReflectOrchestrator:
         *,
         overflow_chunk_ids: tuple[str, ...],
         consumed_chunk_ids: tuple[str, ...],
+        model_id: str | None = None,
     ) -> ReflectionResult:
         origin_by_chunk = {c.chunk_id: origin_of(c) for c in snapshot.chunks}
         mentions: list[ReflectedTriple] = []
         for item in payload:
-            triple = _parse_triple(snapshot, item, origin_by_chunk)
+            triple = _parse_triple(snapshot, item, origin_by_chunk, model_id=model_id)
             if triple is not None:
                 mentions.append(triple)
         return _fold_triples(
@@ -656,6 +826,7 @@ class ReflectOrchestrator:
             mentions,
             overflow_chunk_ids=overflow_chunk_ids,
             consumed_chunk_ids=consumed_chunk_ids,
+            model_id=model_id,
         )
 
 
@@ -663,6 +834,7 @@ def _parse_triple(
     snapshot: Snapshot,
     item: dict[str, Any],
     origin_by_chunk: dict[str, str],
+    model_id: str | None = None,
 ) -> ReflectedTriple | None:
     try:
         subject = str(item["subject"]).strip()
@@ -697,6 +869,7 @@ def _parse_triple(
         route=route,
         preference=preference,
         polarity=polarity,
+        model_id=model_id,
     )
 
 
@@ -707,6 +880,7 @@ def _fold_triples(
     *,
     overflow_chunk_ids: tuple[str, ...] = (),
     consumed_chunk_ids: tuple[str, ...] = (),
+    model_id: str | None = None,
 ) -> ReflectionResult:
     """AC-3 dedup fold: repeated mentions of the same canonical triple collapse
     into one entry with reinforced confidence, merged provenance, and the most
@@ -761,6 +935,7 @@ def _fold_triples(
                 route=route,
                 preference=any(m.preference for m in group),
                 polarity=str(next(iter(by_polarity))),
+                model_id=model_id or next((m.model_id for m in group if m.model_id), None),
             )
         )
 
@@ -812,6 +987,8 @@ def _result_to_payload(result: ReflectionResult) -> dict[str, Any]:
                 "route": t.route.value,
                 "preference": t.preference,
                 "polarity": t.polarity,
+                "model_id": t.model_id,
+                "vote_disagreement": t.vote_disagreement,
             }
             for t in result.triples
         ],
@@ -864,4 +1041,6 @@ def _triple_from_payload(item: dict[str, Any]) -> ReflectedTriple:
         route=Route(str(item["route"])),
         preference=bool(item.get("preference", False)),
         polarity=polarity if polarity in ("positive", "negative") else "positive",
+        model_id=str(item["model_id"]) if item.get("model_id") else None,
+        vote_disagreement=bool(item.get("vote_disagreement", False)),
     )

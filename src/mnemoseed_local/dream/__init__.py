@@ -16,6 +16,11 @@ an audit record on any verifier failure.
 
 from __future__ import annotations
 
+from mnemoseed_local.dream.combine import (
+    COMBINE_PROMPT_VERSION,
+    SINGLE_SIDE_SALVAGE_FLOOR,
+    combine_results,
+)
 from mnemoseed_local.dream.delta import (
     DEFAULT_DELTA_BUDGET_TOKENS,
     DELTA_BUDGET_CEILING_TOKENS,
@@ -88,6 +93,7 @@ from mnemoseed_local.dream.verify import (
 )
 
 __all__ = [
+    "COMBINE_PROMPT_VERSION",
     "DELTA_BUDGET_CEILING_TOKENS",
     "DELTA_BUDGET_FLOOR_TOKENS",
     "DEFAULT_DELTA_BUDGET_TOKENS",
@@ -96,6 +102,7 @@ __all__ = [
     "DREAM_RETRY_MAX",
     "DREAM_RETRY_MULT",
     "PROMPT_VERSION",
+    "SINGLE_SIDE_SALVAGE_FLOOR",
     "ChunkBlock",
     "DeltaPacker",
     "DeltaReport",
@@ -135,6 +142,7 @@ __all__ = [
     "VERIFY_PROMPT_VERSION",
     "build_cache_prefix",
     "build_reflect_prompt",
+    "combine_results",
     "estimate_tokens",
     "load_snapshot_file",
     "ordered_chunks",

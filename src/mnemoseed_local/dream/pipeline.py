@@ -89,15 +89,24 @@ class DreamPipeline:
         merger: Merger,
         on_outcome: Callable[[str, TurnRange, bool, str | None], None] | None = None,
         on_run_committed: Callable[[RunCompletion], None] | None = None,
+        mode: Callable[[], str] | None = None,
     ) -> None:
         self._trigger = trigger
         self._snapshotter = snapshotter
         self._reflector = reflector
         self._merger = merger
         self._on_run_committed = on_run_committed
+        # B5 vote: the live ensemble mode ("off" | "verify" | "vote"). When
+        # wired, the pipeline dispatches the fresh-snapshot boundary to the
+        # vote dual-seat chain instead of the single-model reflect.
+        self._mode = mode if mode is not None else (lambda: "off")
         # Wired after construction: the scheduler is built after the pipeline in
         # the daemon lifespan, exactly like ``FileSnapshotter.on_ready``.
         self.on_outcome = on_outcome
+
+    def _is_vote(self) -> bool:
+        """Whether the live ensemble mode is the vote dual-seat path."""
+        return self._mode() == "vote"
 
     def on_snapshot_ready(self, profile_id: str) -> None:
         """Trigger seam: a fresh snapshot completed capture, the state machine
@@ -115,8 +124,15 @@ class DreamPipeline:
             return  # merge already committed; the journal terminated this dream
         if boundary == "merge":
             self._run_merge_boundary(snapshot)
-        else:
-            self._run_reflect_boundary(snapshot)
+        elif boundary == "reflect":
+            if self._is_vote():
+                self._run_vote_a_boundary(snapshot)
+            else:
+                self._run_reflect_boundary(snapshot)
+        elif boundary == "reflect_b":
+            self._run_vote_b_boundary(snapshot)
+        elif boundary == "combine":
+            self._run_combine_boundary(snapshot)
 
     # ------------------------------------------------------------ boundaries
 
@@ -133,15 +149,57 @@ class DreamPipeline:
             return
         self._merge(snapshot, outcome.result, outcome.report)
 
+    def _run_vote_a_boundary(self, snapshot: Snapshot) -> None:
+        """B5 vote: run seat A, then chain B -> combine -> merge on success."""
+        outcome = self._reflector.reflect_vote_a(snapshot)
+        if not outcome.ok or outcome.result is None:
+            logger.warning(
+                "vote seat A degraded for %s (ok=%s); snapshot stays journaled",
+                snapshot.profile_id,
+                outcome.ok,
+            )
+            self._fail(snapshot, outcome.error)
+            return
+        self._run_vote_b_boundary(snapshot)
+
+    def _run_vote_b_boundary(self, snapshot: Snapshot) -> None:
+        """B5 vote: run seat B, then chain combine -> merge on success."""
+        outcome = self._reflector.reflect_vote_b(snapshot)
+        if not outcome.ok or outcome.result is None:
+            logger.warning(
+                "vote seat B degraded for %s (ok=%s); snapshot stays journaled",
+                snapshot.profile_id,
+                outcome.ok,
+            )
+            self._fail(snapshot, outcome.error)
+            return
+        self._run_combine_boundary(snapshot)
+
+    def _run_combine_boundary(self, snapshot: Snapshot) -> None:
+        """B5 vote: fold the two seat results, then merge the combined result."""
+        outcome = self._reflector.combine(snapshot)
+        if not outcome.ok or outcome.result is None:
+            logger.warning(
+                "vote combine degraded for %s (ok=%s); snapshot stays journaled",
+                snapshot.profile_id,
+                outcome.ok,
+            )
+            self._fail(snapshot, outcome.error)
+            return
+        self._merge(snapshot, outcome.result, None)
+
     def _run_merge_boundary(self, snapshot: Snapshot) -> None:
         """Recovered at the merge boundary: merge ONLY, re-loading the persisted
         result from the journal — reflect must never re-run."""
-        if SnapshotPhase.REFLECT_DONE.value not in snapshot.phases:
+        if (
+            SnapshotPhase.REFLECT_DONE.value not in snapshot.phases
+            and SnapshotPhase.COMBINE_DONE.value not in snapshot.phases
+        ):
             logger.warning(
-                "merge-boundary snapshot %s lacks REFLECT_DONE; staying journaled",
+                "merge-boundary snapshot %s lacks a reflect/combine marker; staying journaled",
                 snapshot.snapshot_id,
             )
-            self._fail(snapshot, "merge-boundary snapshot lacks REFLECT_DONE")
+            self._fail(snapshot, "merge-boundary snapshot lacks REFLECT_DONE/COMBINE_DONE")
             return
         result = result_from_payload(snapshot.reflect_result)
         if result is None:
