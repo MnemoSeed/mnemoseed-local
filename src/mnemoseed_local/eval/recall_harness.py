@@ -13,10 +13,11 @@ a pull here is equivalent to one non-empty pull. No LLM anywhere: replies are
 the material's templates, the budget/tie-break are the daemon's deterministic
 keys.
 
-Isolation (B4b contract, mirrored 1:1): construction wipes the root
-(idempotent), and callers scope each rig under ``root / "runs" / <run-id> /
-<point_id>`` for per-call namespaces. The whole daemon world lives under the
-root — config, stores, journal, daemon.log.
+Isolation: materialization is FAIL-LOUD — construction refuses a root that
+already carries state (fresh = absent or an empty directory; kept forensics
+are never wiped), and callers scope each rig under
+``root / "runs" / <run-id> / <point_id>`` for per-point namespaces. The whole
+daemon world lives under the root — config, stores, journal, daemon.log.
 
 The needle oracle reproduces the shipped TS hook byte-for-byte
 (plugin.ts:58-60,221-253): JS string semantics are UTF-16 CODE UNITS, so the
@@ -26,8 +27,8 @@ code point in Python, pinned by tests/test_needle_oracle.py.
 
 from __future__ import annotations
 
+import logging
 import re
-import shutil
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -201,15 +202,20 @@ def _config_toml(root: Path, focal_floor: float, budget_chars: int) -> str:
 # ---------------------------------------------------------------- the rig
 
 
+class RigRootNotFresh(RuntimeError):
+    """A rig root carried prior state when a point tried to materialize."""
+
+
 class RecallRig:
     """One T2-pipeline rig over a disposable daemon app, driven over HTTP.
 
-    Construction wipes the root and writes the rig's own config there; the
-    daemon boots with ``capture.auto_recall=True`` and the given
-    (focal_floor, budget_chars). ``run_material`` walks the full pipeline
-    and returns the RecallRunResult the metrics consume. The root wipe makes
-    the rig idempotent (B4b); per-call run-id namespaces come from the caller
-    rooting each rig under ``root / "runs" / <run-id> / <point_id>``.
+    Materialization is fail-loud: construction refuses a root that already
+    carries state (fresh = absent or an empty directory — kept forensics are
+    never wiped) and writes the rig's own config there; the daemon boots with
+    ``capture.auto_recall=True`` and the given (focal_floor, budget_chars).
+    ``run_material`` walks the full pipeline and returns the RecallRunResult
+    the metrics consume. Per-point isolation comes from the caller rooting
+    each rig under ``root / "runs" / <run-id> / <point_id>``.
     """
 
     def __init__(
@@ -222,8 +228,10 @@ class RecallRig:
         budget_chars: int = 1200,
         profile_id: str = "t4a",
     ) -> None:
-        if root.exists():
-            shutil.rmtree(root)
+        if root.exists() and any(root.iterdir()):
+            raise RigRootNotFresh(
+                f"rig root {root} is not fresh: prior state present, refusing to materialize"
+            )
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.focal_floor = focal_floor
@@ -246,8 +254,17 @@ class RecallRig:
 
     def __enter__(self) -> RecallRig:
         stack = ExitStack()
-        stack.enter_context(_point_config(self.root, self.root / "config.toml"))
-        self._client = stack.enter_context(TestClient(create_app()))
+        try:
+            stack.enter_context(_point_config(self.root, self.root / "config.toml"))
+            self._client = stack.enter_context(TestClient(create_app()))
+        except BaseException:
+            # Startup can fail after the lifespan attached the global daemon.log
+            # handler: unwind the seam and release the pin before propagating,
+            # or the dead rig's root stays undeletable and later boots bleed
+            # into its file (the normal __exit__ never runs on a failed enter).
+            stack.close()
+            self._release_daemon_log_handler()
+            raise
         self._stack = stack
         return self
 
@@ -256,6 +273,20 @@ class RecallRig:
         self._stack.__exit__(exc_type, exc, tb)
         self._stack = None
         self._client = None
+        self._release_daemon_log_handler()
+
+    def _release_daemon_log_handler(self) -> None:
+        """Hand the process-global daemon logger back. The lifespan attaches
+        ONE named FileHandler per process (idempotent by name), so a rig's
+        handler would otherwise outlive the rig — holding its daemon.log open
+        past teardown (blocking artifact deletion) and making later boots log
+        into this root's file."""
+        target = logging.getLogger("mnemoseed_local")
+        for handler in list(target.handlers):
+            filename = getattr(handler, "baseFilename", None)
+            if filename is not None and Path(filename).is_relative_to(self.root):
+                target.removeHandler(handler)
+                handler.close()
 
     # ------------------------------------------------------------ pipeline
 
@@ -264,23 +295,22 @@ class RecallRig:
         session-A ingest -> session-B cue -> pull -> replies -> reinforce ->
         read-back."""
         ts = 1_700_000_000.0
-        label_to_sid: dict[str, str] = {}
-        for index, (label, text) in enumerate(material.stored_turns):
+        for index, (_label, text) in enumerate(material.stored_turns):
             session_id = f"{material.point_id}-a{index:02d}"
-            label_to_sid[label] = session_id
             self._ingest(session_id, text, ts + index)
             self._settle(session_id)
-        by_sid = self._chunk_ids_by_session(set(label_to_sid.values()))
-        label_to_id = {label: by_sid[sid] for label, sid in label_to_sid.items() if sid in by_sid}
+        label_to_id = self._label_chunk_ids(material)
         # The materials declare per-turn decay weights; ingest stamps 1.0, so
         # only the deviations need a write BEFORE the cue scan runs (the
-        # layering is what makes the focal-floor axis discriminative).
+        # layering is what makes the focal-floor axis discriminative). Every
+        # declared write lands — deduped twins included, both labels resolving
+        # onto the one carrier chunk (later declaration wins).
         updates = [
             WeightUpdate(chunk_id=label_to_id[label], decay_weight=decay)
             for label, decay in zip(
                 (label for label, _ in material.stored_turns), material.turn_decays, strict=True
             )
-            if decay < 1.0 and label in label_to_id
+            if decay < 1.0
         ]
         if updates:
             self._state.stores.vector.update_weights(updates)
@@ -328,14 +358,9 @@ class RecallRig:
         )
 
     def chunk_ids_by_label(self, material: RecallMaterial) -> dict[str, str]:
-        """label -> chunk id for the material's stored turns (read from the
-        store; call after run_material has drained them)."""
-        label_to_sid = {
-            label: f"{material.point_id}-a{index:02d}"
-            for index, (label, _text) in enumerate(material.stored_turns)
-        }
-        by_sid = self._chunk_ids_by_session(set(label_to_sid.values()))
-        return {label: by_sid[sid] for label, sid in label_to_sid.items()}
+        """label -> carrier chunk id for the material's stored turns (read
+        from the store; call after run_material has drained them)."""
+        return self._label_chunk_ids(material)
 
     def consumption_evidence(self) -> tuple[str, ...]:
         """Chunks the run actually reinforced — the consumption evidence read
@@ -394,13 +419,27 @@ class RecallRig:
         )
         assert response.status_code == 200, response.text
 
-    def _chunk_ids_by_session(self, session_ids: set[str]) -> dict[str, str]:
+    def _label_chunk_ids(self, material: RecallMaterial) -> dict[str, str]:
+        """label -> carrier chunk id for every stored turn. A turn whose text
+        the daemon deduped onto an earlier twin has no chunk of its own (the
+        profile-scoped near-duplicate branch reinforces the carrier instead),
+        so resolution falls back to exact text and fails loud when a label
+        stays unresolvable — a declared write is never silently dropped.
+        Stored turns arrive as user_prompt events, whose canonical chunk text
+        is the writer's single ``user:``-prefixed line."""
         page = self._state.stores.vector.list_chunks(ChunkFilter(profile_id=self.profile_id), Page(0, 100))
-        return {
-            chunk.provenance.session_id: chunk.chunk_id
-            for chunk in page.items
-            if chunk.provenance.session_id in session_ids
-        }
+        by_sid = {chunk.provenance.session_id: chunk.chunk_id for chunk in page.items}
+        by_text = {chunk.text: chunk.chunk_id for chunk in page.items}
+        resolved: dict[str, str] = {}
+        for index, (label, text) in enumerate(material.stored_turns):
+            chunk_id = by_sid.get(f"{material.point_id}-a{index:02d}") or by_text.get(f"user: {text}")
+            if chunk_id is None:
+                raise KeyError(
+                    f"material {material.point_id}: stored turn {index} ({label}) resolved to no "
+                    "chunk — neither its session nor its text matches a stored carrier"
+                )
+            resolved[label] = chunk_id
+        return resolved
 
     def _candidate_ids(self, material: RecallMaterial, bsid: str) -> set[str]:
         """The focal candidate pool the scan could have served: chunks whose

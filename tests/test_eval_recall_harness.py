@@ -25,7 +25,10 @@ from mnemoseed_local.eval.recall_harness import (
     normalize_recall_text,
 )
 from mnemoseed_local.eval.recall_materials import (
+    RecallMaterial,
+    RecallNoise,
     RecallNoiseKind,
+    RecallReplyTemplate,
     recall_materials,
 )
 from mnemoseed_local.eval.recall_metrics import score_recall
@@ -285,29 +288,100 @@ def test_rig_pipeline_metrics_are_hand_computable(tmp_path: Path) -> None:
         assert metrics.fn_rate == pytest.approx(1 / 7)
 
 
-def test_rig_same_root_twice_is_idempotent(tmp_path: Path) -> None:
-    """B4b contract: a reused rig root must not accumulate store state — the
-    second construction wipes and serves the identical picture."""
+def test_rig_reused_root_fails_loud_and_preserves_evidence(tmp_path: Path) -> None:
+    """Materialization guard: a rig root carrying prior state must be refused
+    loudly instead of being silently wiped — a rerun over a failed point's
+    forensics must destroy nothing. Fresh = absent or an empty directory."""
+    from mnemoseed_local.eval.recall_harness import RigRootNotFresh
     from mnemoseed_local.storage.ports import ChunkFilter, Page
 
     material = next(m for m in recall_materials() if m.language == "en" and m.length_band == "short")
     root = tmp_path / "rig"
     with RecallRig(root) as rig:
-        first = rig.run_material(material)
+        rig.run_material(material)
         first_total = rig.client.app.state.stores.vector.list_chunks(
             ChunkFilter(profile_id="t4a"), Page(0, 100)
         ).total
+    assert first_total == 6
+    assert (root / "config.toml").exists()
+    with pytest.raises(RigRootNotFresh, match="not fresh"):
+        RecallRig(root)
+    # the refused construction must not have touched the prior run's evidence
+    assert (root / "config.toml").exists()
+
+
+def test_rig_empty_existing_root_dir_is_accepted(tmp_path: Path) -> None:
+    """An existing but empty directory is still a fresh root (the guard fires
+    on materialization, not on the directory entry itself)."""
+    root = tmp_path / "rig"
+    root.mkdir()
     with RecallRig(root) as rig:
-        second = rig.run_material(material)
-        second_total = rig.client.app.state.stores.vector.list_chunks(
-            ChunkFilter(profile_id="t4a"), Page(0, 100)
-        ).total
-    assert first.candidate_pool == second.candidate_pool == 3
-    assert first.served_noise == second.served_noise == 1
-    assert first.non_focal_above_floor == second.non_focal_above_floor == 0
-    # no store may carry more than one run's worth of chunks (fresh wipe):
-    # the 2 fact turns + 3 noises (session A) and the cue/reply turn (B)
-    assert first_total == second_total == 6
+        assert rig.root == root
+
+
+def test_rig_exit_releases_its_daemon_log_handler(tmp_path: Path) -> None:
+    """First-boot-in-process shape: the lifespan pins the rig's daemon.log
+    with a process-global FileHandler, so the rig must release its own handler
+    at exit — otherwise artifact deletion can never remove the root and later
+    boots bleed their lines into this root's file. Precedent for the cleanup
+    shape: the daemon test fixtures' removeHandler+close discipline."""
+    import logging
+    import shutil
+
+    material = next(m for m in recall_materials() if m.language == "en" and m.length_band == "short")
+    target = logging.getLogger("mnemoseed_local")
+    for handler in [h for h in target.handlers if getattr(h, "name", None) == "daemon.log"]:
+        target.removeHandler(handler)
+        handler.close()
+    root = tmp_path / "rig"
+    with RecallRig(root) as rig:
+        rig.run_material(material)
+        assert any(
+            Path(getattr(h, "baseFilename", "")).is_relative_to(root)
+            for h in target.handlers
+            if getattr(h, "name", None) == "daemon.log"
+        )
+    assert all(
+        not Path(getattr(h, "baseFilename", "")).is_relative_to(root)
+        for h in target.handlers
+        if getattr(h, "name", None) == "daemon.log"
+    )
+    shutil.rmtree(root)  # nothing pins the root: hygiene deletion just works
+    assert not root.exists()
+
+
+def test_rig_startup_failure_still_releases_the_daemon_log_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot steps run AFTER the lifespan attached the global daemon.log
+    handler, so a startup failure must not strand that handler on the dead
+    rig: the release must run before the exception escapes, leaving the root
+    deletable and the logger clean for later boots."""
+    import logging
+    import shutil
+
+    import mnemoseed_local.daemon.app as daemon_app
+
+    target = logging.getLogger("mnemoseed_local")
+    for handler in [h for h in target.handlers if getattr(h, "name", None) == "daemon.log"]:
+        target.removeHandler(handler)
+        handler.close()
+
+    def _boom(config: object) -> object:
+        raise RuntimeError("startup boom")
+
+    monkeypatch.setattr(daemon_app, "build_stores", _boom)
+    root = tmp_path / "rig"
+    with pytest.raises(RuntimeError, match="startup boom"):
+        with RecallRig(root):
+            pass
+    assert all(
+        not Path(getattr(h, "baseFilename", "")).is_relative_to(root)
+        for h in target.handlers
+        if getattr(h, "name", None) == "daemon.log"
+    )
+    shutil.rmtree(root)
+    assert not root.exists()
 
 
 def test_rig_run_id_namespace_isolates_concurrent_runs(tmp_path: Path) -> None:
@@ -336,3 +410,104 @@ def test_rig_sequential_materials_do_not_leak(tmp_path: Path) -> None:
     assert run_zh.candidate_pool == 3
     # the entity names never cross over
     assert set(run_en.served) & set(run_zh.served) == set()
+
+
+# ---------------------------------------------------------------- synthetic fidelity points
+# Synthetic mini-materials keep the isolation oracle independent of the seeded
+# 24-point catalog: seed 20260821 stays calibration-comparable and never
+# becomes load-bearing for a second oracle.
+
+
+def _mini_material(
+    point_id: str,
+    entity: str,
+    *,
+    miss_text: str = "ZenithDb focuses on nightly backups and archival",
+    miss_decays: tuple[float, ...] = (0.35,),
+) -> RecallMaterial:
+    """One tiny well-formed point: fact + support above the floor sweep, and
+    ``len(miss_decays)`` copies of the same miss text with the declared
+    decays (duplicate texts exercise the daemon's dedupe path)."""
+    fact = f"{entity} prefers compact tooling for daily work"
+    support = f"{entity} moved to this setup at the start of the quarter"
+    return RecallMaterial(
+        point_id=point_id,
+        language="en",
+        fact_class="prefers",
+        length_band="short",
+        entity=entity,
+        fact_text=fact,
+        support_text=support,
+        noise=tuple(
+            RecallNoise(RecallNoiseKind.ENTITY_MISS, f"miss_{index}", miss_text, decay)
+            for index, decay in enumerate(miss_decays)
+        ),
+        cue_turn=f"What is the current status of {entity}?",
+        reply_templates=(
+            RecallReplyTemplate(
+                "cite", f"Noted - '{fact}'. Also noted: '{support}'.", ("fact", "fact_support")
+            ),
+        ),
+    )
+
+
+def _store_weights(rig: RecallRig, material: RecallMaterial) -> dict[str, float]:
+    from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+    page = rig.client.app.state.stores.vector.list_chunks(ChunkFilter(profile_id="t4a"), Page(0, 100))
+    weight_by_id = {chunk.chunk_id: chunk.decay_weight for chunk in page.items}
+    return {label: weight_by_id[chunk_id] for label, chunk_id in rig.chunk_ids_by_label(material).items()}
+
+
+def test_synthetic_point_duplicate_miss_texts_weight_writes_land(tmp_path: Path) -> None:
+    """Channel 2 inside a single point: two identical miss texts dedupe onto
+    one carrier chunk (REINFORCED outcome) — the declared decay writes must
+    still land for BOTH labels, the later declaration winning; nothing may be
+    silently skipped."""
+    material = _mini_material("syn-dup", "AtlasDb", miss_decays=(0.35, 0.55))
+    with RecallRig(tmp_path / "rig") as rig:
+        run = rig.run_material(material)
+        label_ids = rig.chunk_ids_by_label(material)
+        weights = _store_weights(rig, material)
+    # both duplicate labels resolve to ONE carrier chunk (direct id equality,
+    # not merely equal weights)...
+    assert label_ids["miss_0"] == label_ids["miss_1"]
+    carrier = weights["miss_0"]
+    assert weights["miss_1"] == carrier
+    # ...and every declared write landed, last declaration winning (0.55 keeps
+    # the carrier serveable; a skipped write would leave the first 0.35)
+    assert weights["miss_1"] == pytest.approx(0.55)
+    assert weights["fact"] == pytest.approx(1.0)
+    assert weights["fact_support"] == pytest.approx(1.0)
+    assert run.candidate_pool == 2  # facts only: the miss entity is never focal
+
+
+def test_synthetic_points_shared_miss_text_stay_isolated(tmp_path: Path) -> None:
+    """Per-point rigs over points that share a miss text must show zero
+    cross-material provenance: each pull serves only its own chunks, pools
+    match the isolated expectation exactly, and no foreign accumulation shows
+    up in the weak-association probe."""
+    shared_miss = "FalconDb focuses on nightly backups and archival"
+    materials = [
+        _mini_material("syn-a", "AtlasDb", miss_text=shared_miss),
+        _mini_material("syn-b", "NimbusDb", miss_text=shared_miss),
+    ]
+    own_ids: list[set[str]] = [set(), set()]
+    runs = []
+    for index, material in enumerate(materials):
+        root = tmp_path / "runs" / "run1" / material.point_id
+        with RecallRig(root) as rig:
+            runs.append(rig.run_material(material))
+            own_ids[index] = set(rig.chunk_ids_by_label(material).values())
+    for index, material in enumerate(materials):
+        run = runs[index]
+        assert run.candidate_pool == 2, material.point_id
+        assert run.noise_pool == 0, material.point_id
+        assert run.non_focal_above_floor == 0, material.point_id
+        others: set[str] = set()
+        for peer, ids in enumerate(own_ids):
+            if peer != index:
+                others |= ids
+        # zero cross-material candidate provenance hits
+        assert set(run.served) & others == set(), material.point_id
+        assert set(run.reinforced) & others == set(), material.point_id
