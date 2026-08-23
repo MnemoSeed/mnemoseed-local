@@ -300,15 +300,15 @@ def test_auto_trigger_false_records_pending_manual_only() -> None:
     assert trigger.status("p").pending_manual == 2
 
 
-def test_pending_manual_default_is_false() -> None:
-    """The FR-2.8 safety default is pinned: a default-constructed trigger
-    records pool events as pending_manual and never launches a snapshot."""
+def test_auto_trigger_constructor_default_is_true() -> None:
+    """The shipped product default is pinned: a trigger constructed without the
+    kwarg launches on the first pool event — manual-first is an explicit
+    opt-out (``auto_trigger=False``), never a silent fallback."""
     snap = _RecordingSnapshotter()
     trigger = DreamTrigger(snapshotter=snap)
     trigger.handle_event(_event())
-    assert snap.requests == []
-    assert trigger.status("p").state is DreamState.IDLE
-    assert trigger.status("p").pending_manual == 1
+    assert snap.requests == [("p", TurnRange(0, 3))]
+    assert trigger.status("p").state is DreamState.SNAPSHOTTING
 
 
 def test_dream_once_runs_exactly_one_manual_cycle() -> None:

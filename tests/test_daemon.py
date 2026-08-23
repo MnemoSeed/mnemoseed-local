@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -229,7 +230,7 @@ def test_capture_recall_dream_config_audit_loop(config_path: Path) -> None:
 
         # ---- config read + write (loopback-only, hot-apply)
         config = client.get("/api/v1/config").json()["config"]
-        assert config["dream"]["auto_trigger"] is False
+        assert config["dream"]["auto_trigger"] is True
         result = client.post(
             "/api/v1/config/set",
             json={"key_path": "dream.floor_pool_points", "value": 4.0},
@@ -547,11 +548,12 @@ def _wait_dream_idle(client: TestClient, timeout: float = 10.0) -> dict:
 
 
 def _enable_ensemble_verify(config_path: Path, *, verifier_table: str) -> None:
-    # one [dream] table only (TOML); the near-zero floor + idle makes the
-    # single captured turn fire the pool event dream_once consumes
+    # one [dream] table only (TOML); auto_trigger stays off because this is a
+    # MANUAL dream_once scenario (the near-zero floor + idle makes the single
+    # captured turn fire the pool event dream_once consumes)
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + '[dream]\nensemble = "verify"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream]\nauto_trigger = false\nensemble = "verify"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
         + verifier_table,
         encoding="utf-8",
     )
@@ -616,9 +618,10 @@ def test_ensemble_verify_broken_judge_route_falls_back_and_audits(config_path: P
 
 
 def _enable_ensemble_vote(config_path: Path) -> None:
+    # auto_trigger stays off because this is a MANUAL dream_once scenario
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream]\nauto_trigger = false\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
         + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
         encoding="utf-8",
     )
@@ -666,9 +669,11 @@ def test_healthz_and_ingest_stay_responsive_during_dream(
     chain synchronously on the event loop, blocking both endpoints for the
     entire dream.
     """
-    # lower the pool floor so the single captured turn fires a dream event
+    # lower the pool floor so the single captured turn fires a dream event;
+    # auto_trigger stays off because the launched dream must be the MANUAL one
     config_path.write_text(
-        config_path.read_text(encoding="utf-8") + "[dream]\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
+        config_path.read_text(encoding="utf-8")
+        + "[dream]\nauto_trigger = false\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
         encoding="utf-8",
     )
     # swap the reflect stub for a sleeping subclass (the daemon resolves the
@@ -770,6 +775,55 @@ def test_manual_dream_while_scheduled_trigger_in_flight_runs_reflect_once(
         # exactly one reflect per scheduled window, executed sequentially
         assert len(calls) == 2, f"expected one reflect per scheduled window, saw {len(calls)}"
         assert calls[1] - calls[0] >= 0.4, "dream chains overlapped; the worker did not serialize"
+
+
+def test_config_set_auto_trigger_off_stops_launches_without_restart(config_path: Path) -> None:
+    """Hot-apply contract (FR-2.8): with the daemon live under the shipped
+    auto-trigger ON default, flipping ``dream.auto_trigger`` to False through
+    the configwrite surface must stop automatic launches on the very next pool
+    event — the running daemon never needs a restart for the switch."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "[dream]\nauto_trigger = true\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # baseline: while auto_trigger is true, a settled turn auto-launches
+        _ingest_turn(client, SESSION, 1.0, DURABLE_TEXT)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        _wait_dream_idle(client)
+        committed_before = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()["total"]
+        assert committed_before >= 1
+
+        # the runtime off-switch: every reporting surface agrees it is off
+        result = client.post(
+            "/api/v1/config/set",
+            json={"key_path": "dream.auto_trigger", "value": False},
+            headers={"X-MnemoSeed-Actor": "cli"},
+        ).json()
+        assert result["ok"] is True
+        assert result["restart_required"] is False
+        assert client.get("/api/v1/config").json()["config"]["dream"]["auto_trigger"] is False
+
+        # drive another pool event: held as pending_manual, never launched
+        # (distinct text: an identical sentence scores as repetition and never
+        # reaches the pool)
+        _ingest_turn(client, "sess-b", 2.0, "我决定把 CI 从 GitHub Actions 迁移到自建服务器")
+        settled_b = client.post("/session/end", json={"session_id": "sess-b", "profile_id": PROFILE})
+        assert settled_b.status_code == 200, settled_b.text
+
+        status: dict[str, Any] = {}
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status = client.post("/memory/dream_status", json={"profile_id": PROFILE}).json()
+            if status.get("pending_manual", 0) >= 1 or status.get("state") != "idle":
+                break
+            time.sleep(0.05)
+        assert status.get("pending_manual", 0) >= 1, f"the event was never delivered: {status}"
+        assert status.get("state") == "idle", f"a dream launched after the switch-off: {status}"
+        committed_after = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()["total"]
+        assert committed_after == committed_before, "a dream launched after the switch-off"
 
 
 class _SlowSnapshotter:

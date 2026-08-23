@@ -4,9 +4,13 @@
 
 MnemoSeed Local is the local-first edition of MnemoSeed: one profile
 (`default`), one machine, CLI-first. No accounts, no console, no cloud
-defaults. The core loop is capture -> dream --once -> decay -> retrieve, with
-dream inference running against a local model (ollama by default, with an
-OpenAI-compatible fallback driver).
+defaults. The core loop is capture -> dream -> decay -> retrieve, with dream
+inference running against a local model (ollama by default, with an
+OpenAI-compatible fallback driver). Both automations ship ON by default:
+dream consolidation fires on its own under its schedule triggers (`--once`
+is the manual fallback), and the focal recall scan runs on every prompt —
+each rolls back with a single config switch
+(`dream.auto_trigger = false` / `capture.auto_recall = false`).
 
 Everything is local-first: chunks are stored verbatim, history is
 append-only, and memory plaintext never leaves the machine.

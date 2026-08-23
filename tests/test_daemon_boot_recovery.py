@@ -375,7 +375,7 @@ def test_vote_combine_boundary_resume_consolidates_chunks(
     never marked consolidated (double-representation + stale search surface)."""
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream]\nauto_trigger = false\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
         + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
         encoding="utf-8",
     )
@@ -435,7 +435,7 @@ def test_vote_reflect_b_boundary_resume_runs_b_and_consolidates(
     merged chunks were never marked consolidated."""
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + '[dream]\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
+        + '[dream]\nauto_trigger = false\nensemble = "vote"\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n'
         + '[dream.llm.dream_vote]\ndriver = "stub"\nmodel = "stub"\n',
         encoding="utf-8",
     )

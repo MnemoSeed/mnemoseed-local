@@ -181,10 +181,10 @@ def test_unknown_layer_resolution_names_key():
         Config().layer_instances("unknown")
 
 
-def test_dream_auto_trigger_defaults_to_false(tmp_path, monkeypatch):
+def test_dream_auto_trigger_defaults_to_true(tmp_path, monkeypatch):
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     cfg = load_config(tmp_path / "missing.toml")
-    assert cfg.dream.auto_trigger is False
+    assert cfg.dream.auto_trigger is True
 
 
 def test_dream_auto_trigger_parses(tmp_path, monkeypatch):
