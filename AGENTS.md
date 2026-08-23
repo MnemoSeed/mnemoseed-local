@@ -44,7 +44,7 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
   inside one task. Every parallel task plan is checked by solution-architect
   for conflicts (file-surface overlap, test-oracle collisions, ordering)
   BEFORE execution starts.
-- Public code and comments are English-only; Chinese docs live in `docs/zh`.
+- Public code and comments are English-only; Chinese docs live in `docs/zh`; GitHub issues, PRs, and comments are English-only; conversation with the owner is in Chinese.
 - **Code style (user directive 2026-08-20)**: DRY — extract shared logic,
   never copy-paste. Keep features modular and decoupled so problems are easy
   to isolate and features easy to move later. Comments stay minimal: names
@@ -65,6 +65,27 @@ turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
   of the system's core design.
 - Never commit secrets; `opencode.json` lives outside this repo (global user
   config) and must not leak into git.
+
+## Work queue & capture discipline
+
+- All work starts as a `queue`-labeled GitHub issue; capture-over-execute: any
+  emergent todo gets `/capture`d immediately, then resume prior work.
+- Lifecycle: `queue` (intent) → `doing` (in flight) → closed by the landing PR
+  (`Closes #N`). Never create a second issue for the same work.
+- Session orientation: run `/next` at start of work sessions to see the frontier.
+- Issues follow the lean template in `/capture`: short plain-English bullets, no jargon.
+- Landing: `/closeout` (gate script → adversarial QA → explicit-path staging →
+  branch → PR).
+- Local gates: run `pwsh -File scripts/gate.ps1` from the repo root (the
+  script resolves its own root; wraps pytest/ruff/format/mypy; CI backstops
+  on PR).
+- **Parallel-batch & cleanup rule (user directive 2026-08-23)**: large batches,
+  long-running eval jobs, or any pair of tasks that both touch tests must use
+  isolated git worktrees (`git worktree add ..<name> -b batch/<name>`) with
+  gates run per-tree; same-tree parallelism is allowed only for small batches
+  with verified disjoint file surfaces. After merge, clean up leftovers via
+  `git worktree list` (remove stale task worktrees) and `git branch --merged main`
+  (delete merged batch branches).
 
 ## Useful entry points
 
