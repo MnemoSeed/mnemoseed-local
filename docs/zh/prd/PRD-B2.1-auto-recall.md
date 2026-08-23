@@ -243,3 +243,5 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 - 新增/更新：材料 decay 分层钉、时序倒置钉、`fact_support` 可引用性钉（实体可抽取 + needle 非空）、rig 权重写入行为钉（老化 chunk 数值 0.35 + floor 0.5 出池行为证明——消费 rebound 会使强化 chunk 的存储权重回弹，行为证明不受其扰）、`write_calibration_defaults` 四用例（含部分匹配拒写）、meets_bars 报告层语义、损失手算重钉、bars/loss 字典钉。
 - **1536 passed / 5 skipped**；ruff check / ruff format --check / mypy src 全净。
 
+**修订（2026-08-23，默认值翻转）**：上文"`capture.auto_recall` 默认 off 不变（翻转仍待 live 遥测）"已被同日决策取代——出厂默认已翻转 **ON**（依据 = 阈值 0.5/2400 全量确认 + 用户拍板核心功能默认开启；本机同日手动启用）；原文保留作历史记录，不删。
+
