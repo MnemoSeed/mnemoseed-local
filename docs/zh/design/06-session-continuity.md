@@ -26,7 +26,7 @@
 5. **注入 ≠ 强化**：被注入不计 reinforce，仅 assistant 轮实际引用注入内容才计（TA-6）。
 6. **不判归属、不造熟悉感**：daemon 只供给结构；不加时间相似度检索项、不改排序（TA-7/TA-8/TA-9）。
 7. **数字都是起步值**：focal floor 0.4 / budget 1200 / 4000 / needle 窗口——T4 收口（2026-08-20）定案：B3 评测臂非检索面（PRD-B3 语义 1，矩阵不含 capture/检索），**harness 数据无法标定检索阈值**，阈值维持 as-is 起步值，标定走 live 遥测 `non_focal_above_floor` 通道（PRD-B2.1 收口记录）。
-8. **默认 off**：`capture.auto_recall` 默认关闭（观望 + 安全验证留门，翻转待 live 遥测数据）。
+8. **默认 off → 已翻转 ON**：`capture.auto_recall` 原默认关闭（观望 + 安全验证留门，翻转待 live 遥测数据）；**勘误（2026-08-23）**：出厂默认已翻转 ON——阈值全量确认 + 用户拍板核心功能默认开启，本机同日启用；回滚仅需该单键配置。
 
 ---
 
@@ -295,7 +295,7 @@ sequenceDiagram
 - 实体标注缺失的 chunk 永不被中段回忆（focal 是元数据实体命中——系统性盲，观测数据留 live 遥测 `non_focal_above_floor` 说话；T4 收口：评测臂非检索面，不产此数据）。
 - needle 引用检测是子串启发式：幻觉式复述计 FP（+0.1 有界回弹可承受）、复述面目全非漏记 FN（verbatim 冷门防线不受影响）；<32 字符短 chunk 永不可记（对短事实的系统性盲）；needle 撞串多 chunk 同记（FP 有界）；崩溃重放与 needle 注册无共同链 → 双向有界误差（每 chunk 每 session 至多一次 +0.1）。
 - **注入逐请求瞬态**：注入只存在于该 session 首个模型调用的 system 数组（之后各步 transform 被闸门短路），其效力靠"首轮回复进入对话历史"持久——token 红线的有意选择，不是缺陷。
-- **T2 默认 off**：管线随构建发船但行为不变，翻转待 live 遥测数据（T4 收口定案，见 §0 边界 7/8）。
+- **T2 默认 off**：管线随构建发船但行为不变，翻转待 live 遥测数据（T4 收口定案，见 §0 边界 7/8）；**勘误（2026-08-23）**：默认已翻转 ON（见 §0 边界 8）。
 - 混合版本不受支持：新 hook + 旧 daemon（缺 `budget_chars`/`slot_consumed` 字段）回退到修复前行为；旧 daemon + 新 hook（缺 `window`/`self_window` 字段）逐字节回退今日渲染。
 - serve=mark-seen 后 warmup transform 可吞 pending 批——"服务过但未进模型调用"的有界 FN 窗（记录备查）。
 - 注入至多迟一个模型调用（transform 早于 ack → 跳过本轮 pull，pending 槽 serve 前一直存活，**绝不丢**）。

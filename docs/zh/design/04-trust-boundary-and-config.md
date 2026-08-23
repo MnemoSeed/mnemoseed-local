@@ -212,7 +212,7 @@ flowchart TB
 
 | 键 | 类型 | 默认 | 消费端 |
 |---|---|---|---|
-| `dream.auto_trigger` | bool | `false` | DreamScheduler 手动优先门（MVP §4.5） |
+| `dream.auto_trigger` | bool | `true` | DreamScheduler 自动触发总门（2026-08-23 起出厂默认 ON；原 `false` 手动优先门，回滚仅需此单键） |
 | `dream.floor_pool_points` | 正数 | `10.0` | ScorePool 池底（同调度器同源） |
 | `dream.idle_min_sec` | 非负 | `900.0` | ScorePool / 调度器空闲窗 |
 | `dream.hard_deadline_sec` | 非负 | `86400.0` | 调度器硬期限（24h） |
@@ -240,7 +240,7 @@ flowchart TB
 
 | 键 | 类型 | 默认 | 消费端 |
 |---|---|---|---|
-| `capture.auto_recall` | bool | `false` | 整管开关（opt-in，默认 off） |
+| `capture.auto_recall` | bool | `true` | 整管开关（2026-08-23 起出厂默认 ON；原 opt-in 默认 off，回滚仅需此单键） |
 | `capture.auto_recall_focal_floor` | `(0,1]` | `0.4` | focal 扫描 floor（0 会被拒：全 decayed chunk 皆 focal） |
 | `capture.auto_recall_budget_chars` | 正整数 | `1200` | pending 选择预算 |
 
