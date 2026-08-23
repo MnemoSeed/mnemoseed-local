@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -40,7 +41,7 @@ from mnemoseed_local.eval.matrix import (
     summary_lines,
 )
 from mnemoseed_local.eval.recall_harness import RecallRig
-from mnemoseed_local.eval.recall_materials import recall_materials
+from mnemoseed_local.eval.recall_materials import RecallMaterial, recall_materials
 from mnemoseed_local.eval.recall_matrix import (
     PARAM_BUDGETS,
     PARAM_FLOORS,
@@ -155,23 +156,44 @@ def write_calibration_defaults(config_path: Path, focal_floor: float, budget_cha
     return True
 
 
+def run_calibration_point(
+    material: RecallMaterial,
+    *,
+    runs_root: Path,
+    focal_floor: float,
+    budget_chars: int,
+) -> RecallMetrics:
+    """One evaluation point on its own rig, per the harness contract.
+
+    The rig root is the deterministic ``<runs_root>/<point_id>``, lifecycle is
+    strict serial context-managed, and there are no retries: any failure
+    propagates and KEEPS the root as forensics, while success deletes it so
+    deterministic names stay re-claimable by a later group.
+    """
+    root = runs_root / material.point_id
+    with RecallRig(root, focal_floor=focal_floor, budget_chars=budget_chars) as rig:
+        result = rig.run_material(material)
+    metrics = score_recall(result)
+    shutil.rmtree(root)
+    return metrics
+
+
 def _recall_command(args: argparse.Namespace) -> int:
     """T4b live calibration: run coordinate descent over the T2 pipeline rig
     and emit recommended (focal_floor, budget_chars). Optionally writes to
     config.py default values."""
 
-    # Build a metric_fn that runs the rig for each (floor, budget) and returns
-    # the 24 RecallMetrics for the coordinate descent.
+    # Build a metric_fn that gives every material point its own freshly
+    # materialized rig (per-point isolation) and returns the 24 RecallMetrics
+    # for the coordinate descent.
     materials = recall_materials()
 
     def metric_fn(floor: float, budget: int) -> list[RecallMetrics]:
-        root = Path(args.workdir) / f"rig-f{floor}-b{budget}"
-        with RecallRig(root, focal_floor=floor, budget_chars=budget) as rig:
-            results: list[RecallMetrics] = []
-            for mat in materials:
-                run_result = rig.run_material(mat)
-                results.append(score_recall(run_result))
-            return results
+        runs_root = Path(args.workdir) / "runs" / f"f{floor}-b{budget}"
+        return [
+            run_calibration_point(mat, runs_root=runs_root, focal_floor=floor, budget_chars=budget)
+            for mat in materials
+        ]
 
     outcome: CoordinateDescentOutcome = coordinate_descent(
         metric_fn,
