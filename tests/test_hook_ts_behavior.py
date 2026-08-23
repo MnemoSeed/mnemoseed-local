@@ -11,6 +11,7 @@ unavailable (CI has both).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from importlib import resources
@@ -19,6 +20,15 @@ from pathlib import Path
 import pytest
 
 DRIVER = Path(__file__).parent / "ts_hook" / "hook_driver.mjs"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_plugin_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bundled plugin reads its opt-in seams from the AMBIENT environment
+    at module load; scenarios must decide their own env, never inherit one a
+    developer shell happens to carry."""
+    for var in ("MNEMOSEED_LOCAL_DEBUG", "MNEMOSEED_LOCAL_PROFILE_ID", "MNEMOSEED_LOCAL_BASEURL"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def _bundle(tmp_path: Path) -> Path:
@@ -39,12 +49,16 @@ def _bundle(tmp_path: Path) -> Path:
 
 
 def _run(bundle: Path, scenario: str) -> dict:
+    # Scenarios that pin the debug sink need the opt-in lane ARMED — it is
+    # read from the env at plugin load, so pass it explicitly instead of
+    # inheriting whatever the invoking shell carries.
     result = subprocess.run(
         ["node", str(DRIVER), str(bundle), scenario],
         shell=False,
         capture_output=True,
         encoding="utf-8",
         timeout=60,
+        env={**os.environ, "MNEMOSEED_LOCAL_DEBUG": "1"},
     )
     assert result.returncode == 0, f"driver failed: {result.stderr}"
     return json.loads(result.stdout.strip().splitlines()[-1])
