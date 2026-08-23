@@ -1,0 +1,63 @@
+name: Queue item
+description: Capture pending work so nothing gets lost
+title: "[queue] "
+labels: ["queue"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What this work is, in plain sentences.
+      placeholder: |
+        - One plain sentence per bullet
+        - Max 3 bullets — need more? Split into several smaller issues
+    validations:
+      required: true
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: How we know the work is finished.
+      placeholder: |
+        - Each bullet states an observable behavior or a directly checkable fact
+        - Prefer the shape "when <something happens>, the system does <something>"
+        - Someone reading only this section must be able to judge pass or fail without asking questions
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Things this work must NOT try to do.
+      placeholder: |
+        - One bullet per exclusion
+        - Write "nothing special" if none
+    validations:
+      required: false
+  - type: textarea
+    id: why-waiting
+    attributes:
+      label: Why it is waiting (optional)
+      description: The reason nothing is happening yet.
+      placeholder: |
+        - One short sentence, or leave empty
+    validations:
+      required: false
+  - type: textarea
+    id: what-would-start-it
+    attributes:
+      label: What would start it
+      description: The event or decision that moves this forward.
+      placeholder: |
+        - "A person decides" is a valid answer
+    validations:
+      required: false
+  - type: textarea
+    id: where-from
+    attributes:
+      label: Where this came from
+      description: A file path, link, or a short note.
+      placeholder: |
+        - docs/some/file.md or "chat with owner on 2026-08-23"
+    validations:
+      required: false
