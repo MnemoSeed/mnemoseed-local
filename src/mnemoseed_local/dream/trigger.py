@@ -23,10 +23,11 @@ Invariants, enforced by construction:
 - The pool event's turn_range is carried through to the snapshot request
   unchanged, and is re-used as the current_range observability field.
 
-Manual-first discipline (FR-2.8): with ``auto_trigger=False`` (the default)
-every pool event is recorded as ``pending_manual`` and drives nothing; the
-console's ``dream --once`` (later task) calls ``dream_once`` to run exactly one
-cycle. ``notify_activity`` is the interruption seam, wired to a new turn for a
+Manual-first discipline (FR-2.8): with ``auto_trigger=False`` every pool event
+is recorded as ``pending_manual`` and drives nothing; the console's ``dream
+--once`` calls ``dream_once`` to run exactly one cycle. Auto-launch is the
+shipped default; the live value follows the shared config on every worker
+delivery. ``notify_activity`` is the interruption seam, wired to a new turn for a
 profile; the /ingest hook-up is a later task.
 """
 
@@ -121,7 +122,7 @@ class DreamTrigger:
         self,
         snapshotter: Snapshotter,
         *,
-        auto_trigger: bool = False,
+        auto_trigger: bool = True,
         purger: Callable[[str, TurnRange], int] | None = None,
     ) -> None:
         self._snapshotter = snapshotter
@@ -459,11 +460,11 @@ class DreamScheduler:
 
     ``due_profiles`` returns every profile that is currently eligible (either
     rule), ``tick`` dedup-emits newly eligible profiles to the trigger as
-    synthetic pool events: with ``auto_trigger=False`` (the default) they are
-    recorded as pending_manual for ``dream --once``; with True the trigger
-    launches a dream immediately. The fingerprint dedup keeps the pending queue
-    at one event per (profile, window) — the same window is never re-emitted
-    while a dream is pending or in flight.
+    synthetic pool events: with ``auto_trigger=False`` they are recorded as
+    pending_manual for ``dream --once``; with True (the shipped default) the
+    trigger launches a dream immediately. The fingerprint dedup keeps the
+    pending queue at one event per (profile, window) — the same window is never
+    re-emitted while a dream is pending or in flight.
     """
 
     def __init__(

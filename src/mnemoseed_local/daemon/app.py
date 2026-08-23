@@ -318,12 +318,16 @@ class _DreamJob:
     pipeline: DreamPipeline | None = None
     snapshot: Snapshot | None = None
 
-    def run(self, trigger: DreamTrigger) -> bool | None:
+    def run(self, trigger: DreamTrigger, config: Config | None = None) -> bool | None:
         """Execute on the worker thread; returns the manual launch decision."""
         if self.pipeline is not None and self.snapshot is not None:
             self.pipeline.run(self.snapshot)
             return None
         if self.event is not None:
+            if config is not None:
+                # hot-apply seam: re-read the shared Config per delivery so a
+                # configwrite auto_trigger flip reaches this event live
+                trigger.set_auto_trigger(config.dream.auto_trigger)
             trigger.handle_event(self.event)
             return None
         if self.profile_id is not None:
@@ -350,9 +354,11 @@ class DreamWorker:
         self,
         trigger: DreamTrigger,
         *,
+        config: Config | None = None,
         stop_timeout: float = DREAM_STOP_TIMEOUT_S,
     ) -> None:
         self._trigger = trigger
+        self._config = config
         self._stop_timeout = stop_timeout
         self._executor = DaemonExecutor(max_workers=1, thread_name_prefix="mnemoseed-dream")
         self._queue: asyncio.Queue[_DreamJob] = asyncio.Queue()
@@ -407,7 +413,7 @@ class DreamWorker:
             job = await self._queue.get()
             self._inflight = job
             try:
-                cf = self._executor.submit(job.run, self._trigger)
+                cf = self._executor.submit(job.run, self._trigger, self._config)
                 self._inflight_cf = cf
                 result = await asyncio.wrap_future(cf)
             except Exception:
@@ -753,7 +759,7 @@ def _build_capture(
         # chain when the user opted in (configwrite changes hot-apply).
         mode=lambda: config.dream.ensemble,
     )
-    worker = DreamWorker(trigger)
+    worker = DreamWorker(trigger, config=config)
     relay = _DreamRelay(worker)
     snapshotter.on_ready = pipeline.on_snapshot_ready
     deferred_resumes: list[tuple[DreamPipeline, Snapshot]] = []

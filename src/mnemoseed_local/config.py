@@ -121,8 +121,8 @@ class DreamConfig:
     """Dream-engine runtime flags (PRD-02 FR-2.8 manual-first discipline).
 
     ``auto_trigger`` decides whether the schedule triggers drive dreams directly
-    (True) or are held as pending manual runs for ``mnemoseed dream --once``
-    (False, the M1 default until reflection quality passes review).
+    (True, the shipped default) or are held as pending manual runs for
+    ``mnemoseed dream --once`` (False; one config switch turns automation off).
     ``floor_pool_points`` / ``idle_min_sec`` / ``hard_deadline_sec`` are the
     A2 schedule trigger rules (hot-applied through the configwrite registry):
     score-pool floor+idle eligibility and the 24h hard deadline from the first
@@ -142,7 +142,7 @@ class DreamConfig:
     is the ScorePool forced-consolidation cap, always >= the floor.
     """
 
-    auto_trigger: bool = False
+    auto_trigger: bool = True
     floor_pool_points: float = DEFAULT_DREAM_FLOOR_POOL_POINTS
     idle_min_sec: float = DEFAULT_DREAM_IDLE_MIN_SEC
     hard_deadline_sec: float = DEFAULT_DREAM_HARD_DEADLINE_SEC
@@ -210,15 +210,15 @@ class DecayConfig:
 class CaptureConfig:
     """B2.1 T2 mid-session auto-recall flags (PRD-B2.1, design/01 §4.6).
 
-    ``auto_recall`` gates the whole pipeline (default OFF — the mid-session
-    focal scan is opt-in). ``auto_recall_focal_floor`` is the focal decay
-    floor of the embedding-free entity-anchored scan (positive, at most 1 — a
-    zero floor would make every decayed chunk focal).
+    ``auto_recall`` gates the whole pipeline (default ON — one config switch,
+    ``auto_recall = false``, turns it off). ``auto_recall_focal_floor`` is the
+    focal decay floor of the embedding-free entity-anchored scan (positive, at
+    most 1 — a zero floor would make every decayed chunk focal).
     ``auto_recall_budget_chars`` caps the pending-recall selection served to
     the hook (T1 budget semantics: greedy admission, boundary tail-slice).
     """
 
-    auto_recall: bool = False
+    auto_recall: bool = True
     auto_recall_focal_floor: float = DEFAULT_AUTO_RECALL_FOCAL_FLOOR
     auto_recall_budget_chars: int = DEFAULT_AUTO_RECALL_BUDGET_CHARS
 
@@ -481,7 +481,7 @@ def load_config(path: Path | None = None) -> Config:
                 "was deprecated and removed; the ledger records tokens only, "
                 "never a USD budget (delete the key)",
             )
-        auto_raw = dream_table.get("auto_trigger", False)
+        auto_raw = dream_table.get("auto_trigger", True)
         if not isinstance(auto_raw, bool):
             raise ConfigError("dream.auto_trigger", "must be a boolean")
         floor_raw = dream_table.get("floor_pool_points", DEFAULT_DREAM_FLOOR_POOL_POINTS)
@@ -641,14 +641,16 @@ def load_config(path: Path | None = None) -> Config:
         )
 
     # [capture] table (B2.1 T2, design/01 §4.6): the mid-session auto-recall
-    # pipeline. Default OFF — the focal scan is opt-in; the focal floor is
-    # positive (a zero floor would make every decayed chunk focal) and at most
-    # 1; the selection budget is a positive int.
+    # pipeline — the focal scan runs inside the ingest of every user prompt.
+    # ON by default; one config switch (auto_recall = false) turns the whole
+    # pipeline off. The focal floor is positive (a zero floor would make every
+    # decayed chunk focal) and at most 1; the selection budget is a positive
+    # int.
     capture = CaptureConfig()
     capture_raw = raw.get("capture")
     if capture_raw is not None:
         capture_table = _require_table(capture_raw, "capture")
-        auto_raw = capture_table.get("auto_recall", False)
+        auto_raw = capture_table.get("auto_recall", True)
         if not isinstance(auto_raw, bool):
             raise ConfigError("capture.auto_recall", "must be a boolean")
         floor_raw = capture_table.get("auto_recall_focal_floor", DEFAULT_AUTO_RECALL_FOCAL_FLOOR)
@@ -683,8 +685,10 @@ def default_config_toml() -> str:
 preset = "embedded"          # embedded | custom
 baseurl = "http://localhost:7788"
 
-# Dream-engine manual-first discipline (PRD-02 FR-2.8): keep dreams manual
-# until reflection quality passes review, then flip to automatic. The A2
+# Dream engine (PRD-02 FR-2.8): automatic consolidation is ON by default —
+# dreams fire on their own under the A2 schedule triggers below, and one
+# config switch (auto_trigger = false) holds every trigger as a pending
+# manual run for `mnemoseed-local dream --once`. The A2
 # schedule triggers (hot-applied via `mnemoseed-local config set`) are
 # score-pool based (design/01 + PRD-02): every capture turn credits its S
 # importance (arousal / novelty / causal components, 0..10 scale) into the
@@ -708,7 +712,7 @@ baseurl = "http://localhost:7788"
 #   pool_forced_cap     — >= core_confidence_floor (default 50.0): the capture
 #                        pool's forced-consolidation cap
 # [dream]
-# auto_trigger = false
+# auto_trigger = true
 # floor_pool_points = 10.0
 # idle_min_sec = 900.0
 # hard_deadline_sec = 86400.0
@@ -769,7 +773,9 @@ path = "~/.mnemoseed-local/isolated.db"
 
 # B2.1 T2 mid-session auto-recall (PRD-B2.1, design/01 §4.6): the focal scan
 # runs inside the ingest of every user prompt and parks a budgeted selection
-# that the hook pulls on the next transform (ack-implies-ready). Default OFF:
+# that the hook pulls on the next transform (ack-implies-ready). ON by
+# default; one config switch (auto_recall = false) turns the whole pipeline
+# off:
 #   auto_recall              — enable the whole pipeline
 #   auto_recall_focal_floor  — focal decay floor (0, 1]: below it a chunk is
 #                              never focal (a zero floor would make everything
@@ -779,7 +785,7 @@ path = "~/.mnemoseed-local/isolated.db"
 #                              boundary tail-slice follow the T1 semantics.
 #                              2400 = T4b calibrated value (ACCEPTED)
 # [capture]
-# auto_recall = false
+# auto_recall = true
 # auto_recall_focal_floor = 0.5
 # auto_recall_budget_chars = 2400
 """

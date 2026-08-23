@@ -235,7 +235,7 @@ def test_set_role_param_and_clear(tmp_path) -> None:
     assert "base_url" not in table
     assert "base_url" not in service._config.llm["dream"].params
     assert "base_url" not in service._config.raw["dream"]["llm"]["dream"]
-    assert load_config(path).dream.auto_trigger is False  # the file still parses
+    assert load_config(path).dream.auto_trigger is True  # the file still parses
 
 
 def test_set_api_key_env_persists_names_only(tmp_path) -> None:
@@ -503,7 +503,7 @@ def test_reconcile_first_boot_imports_registry_keys_once_and_audits(tmp_path) ->
     assert result["reason"] == "initial"
     assert "dream.auto_trigger" in result["keys_updated"]
     entry = meta.get_config("dream.auto_trigger")
-    assert entry is not None and entry.value["value"] is False
+    assert entry is not None and entry.value["value"] is True
     assert meta.get_config("dream.llm.dream.model").value["value"] == "stub"
     imports = _audit_entries(meta, "config_import")
     assert len(imports) == 1
@@ -611,7 +611,7 @@ def test_reconcile_completes_partial_import_without_overwriting(tmp_path) -> Non
     result = service.reconcile_boot()
     assert result["changed"] is True
     assert "dream.auto_trigger" in result["keys_updated"]
-    assert meta.get_config("dream.auto_trigger").value["value"] is False  # file value imported once
+    assert meta.get_config("dream.auto_trigger").value["value"] is True  # file value imported once
     assert meta.get_config("dream.llm.dream.model").value["value"] == "stub"  # untouched
     assert len(_audit_entries(meta, "config_import")) == 2  # completed import is audited too
 

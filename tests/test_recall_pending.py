@@ -10,7 +10,8 @@ most recent user prompt of a session:
   reports the T4 calibration count ``non_focal_above_floor``;
 - current-session chunks and daemon-seen ids are never served;
 - assistant_message ingests never scan; /session/end drops the slot;
-- the whole pipeline is gated on ``capture.auto_recall`` (default off) and
+- the whole pipeline is gated on ``capture.auto_recall`` (on by default;
+  off-state scenarios set the key explicitly) and
   hot-applies through the configwrite surface.
 """
 
@@ -80,9 +81,9 @@ def _config_toml(tmp_path: Path, capture: str = "") -> str:
 
 @pytest.fixture
 def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Default config: capture.auto_recall is off."""
+    """Config with capture.auto_recall explicitly off (off-state scenarios)."""
     cfg = tmp_path / "config.toml"
-    cfg.write_text(_config_toml(tmp_path), encoding="utf-8")
+    cfg.write_text(_config_toml(tmp_path, "[capture]\nauto_recall = false\n"), encoding="utf-8")
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
@@ -143,8 +144,8 @@ def _store_chunks(client: TestClient) -> dict[str, str]:
 # ---------------------------------------------------------------- gating (D5/D8)
 
 
-def test_recall_pending_is_disabled_by_default(config_path: Path) -> None:
-    """capture.auto_recall defaults off: the pull answers enabled:false with
+def test_recall_pending_gated_off_answers_disabled_and_consumes_nothing(config_path: Path) -> None:
+    """capture.auto_recall = false: the pull answers enabled:false with
     an empty selection, never scans, and never consumes anything."""
     with TestClient(create_app()) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")

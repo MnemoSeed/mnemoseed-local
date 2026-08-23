@@ -3,7 +3,7 @@ validation, hot-apply and config-file loading (design/01 §4.6, PRD-B2.1 T2
 D5).
 
 The three new registry keys:
-  capture.auto_recall               bool (default False — the pipeline is opt-in)
+  capture.auto_recall               bool (default True — one switch turns it off)
   capture.auto_recall_focal_floor   float in (0, 1]  (the focal decay floor)
   capture.auto_recall_budget_chars  positive int    (the injection budget)
 
@@ -59,7 +59,7 @@ def test_registry_has_three_capture_keys() -> None:
 def test_configwrite_get_resolves_three_capture_keys(tmp_path) -> None:
     service, _ = _service(tmp_path)
     capture = service.get()["config"]["capture"]
-    assert capture["auto_recall"] is False
+    assert capture["auto_recall"] is True
     assert capture["auto_recall_focal_floor"] == 0.5
     assert capture["auto_recall_budget_chars"] == 2400
     assert service.get()["restart_required"] == {}
@@ -136,7 +136,7 @@ def _write_capture(tmp_path: Path, body: str) -> Path:
 def test_load_defaults_for_three_capture_keys(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     cfg = load_config(tmp_path / "missing.toml")
-    assert cfg.capture.auto_recall is False
+    assert cfg.capture.auto_recall is True
     assert cfg.capture.auto_recall_focal_floor == 0.5
     assert cfg.capture.auto_recall_budget_chars == 2400
 
