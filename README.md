@@ -13,12 +13,22 @@ append-only, and memory plaintext never leaves the machine.
 
 ## Status
 
-Phase A (MVP core) shipped: config + secrets + storage ports + embedded
-drivers (sqlite_meta / sqlite_graph / lancedb_embedded / bge_m3_onnx /
-synthetic_embedder), schema, migrations, capture/retrieve/dream/decay
-pipelines with a config-driven dream scheduler (pool-score floor + idle window
-+ 24h hard deadline), no-accounts loopback daemon, and the `mnemoseed-local`
-CLI. Install script + MCP gateway + packaging polish land in Phase A3.
+Phase A (MVP core) including its A3 packaging batch is fully shipped: config +
+secrets + storage ports + embedded drivers (sqlite_meta / sqlite_graph /
+lancedb_embedded / bge_m3_onnx / synthetic_embedder), schema, migrations,
+capture/retrieve/dream/decay pipelines with a config-driven dream scheduler
+(pool-score floor + idle window + 24h hard deadline), no-accounts loopback
+daemon, the `mnemoseed-local` CLI, install orchestration, the OpenCode host
+hook adapter, and the MCP gateway.
+
+Phase B is well underway and landed through main: dream ensemble verification
+(B1); cross-session time awareness (`session_windows`), an OpenCode capture
+hook that ingests every turn with consumption-evidence reinforcement, crash
+durability, daemon reliability (TCP-probe watchdog, durable `daemon.log`),
+persistent daemon on/off, an agent recall redesign, and plugin bundling (B2.x);
+plus the eval harness and T4b live calibration with thresholds locked at
+focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23). Multi-session
+mutual awareness is in pre-PRD research; it is not a feature yet.
 
 ## Install
 
@@ -45,10 +55,12 @@ Linux/macOS (POSIX sh):
 curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
 ```
 
-Afterwards: `mnemoseed-local up` starts the daemon; `mnemoseed-local hook
-install` installs the OpenCode host adapter; `mnemoseed-local off` stops the
-daemon and disables the memory service; `mnemoseed-local on` re-enables it and
-starts the daemon again.
+Afterwards: `mnemoseed-local up` starts the daemon. The installer's final step
+is `mnemoseed-local hook install opencode`, so the OpenCode hook is installed
+automatically (restart OpenCode to load it). `mnemoseed-local off` stops the
+daemon and disables the memory service persistently; `mnemoseed-local on`
+re-enables it and starts the daemon again. Hook lifecycle:
+`mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
 
 ## MCP gateway
 
@@ -68,6 +80,17 @@ connectivity error.
 
 Test-driven, with an adversarial verifier on every task: failing tests first.
 Gates: `uv run pytest -q`, `ruff check`, `ruff format --check`, `mypy src`.
+
+## Evaluation (maintainers)
+
+The eval harness lives at `python -m mnemoseed_local.eval`, run from a source
+checkout:
+
+- `canary`: self-checks the harness with stub seats.
+- `matrix`: runs the material catalog.
+- `rescore`: re-judges a v1.1 report offline without GPU.
+- `recall`: T4b live calibration coordinate-descent (locked config: focal
+  floor 0.5, budget 2400 chars).
 
 ## License
 
