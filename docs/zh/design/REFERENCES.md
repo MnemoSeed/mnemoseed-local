@@ -17,11 +17,11 @@
 | R1 | McClelland, J. L., McNaughton, B. L., & O'Reilly, R. C. (1995). Why there are complementary learning systems in the hippocampus and neocortex. *Psychological Review*, 102(3), 419–457. DOI: 10.1037/0033-295X.102.3.419 | 互补学习系统（双存储架构：海马/皮层分工） | 00、02 | ✅ 同主仓 R1 |
 | R2 | Wilson, M. A., & McNaughton, B. L. (1994). Reactivation of hippocampal ensemble memories during sleep. *Science*, 265(5172), 676–679. | 睡眠期海马重放巩固（梦境引擎） | 00、02 | ✅ 同主仓 R2 |
 | R3 | Frey, U., & Morris, R. G. M. (1997). Synaptic tagging and long-term potentiation. *Nature*, 385, 533–536. | 捕获选择性编码门 | 00 | ✅ 同主仓 R3 |
-| R4 | Tulving, E., & Thomson, D. M. (1973). Encoding specificity and retrieval processes in episodic memory. *Psychological Review*, 80(5), 352–373. | 编码特异性；cue 元数据面 | 00、01、03、05、06 | ✅ 同主仓 R4 |
+| R4 | Tulving, E., & Thomson, D. M. (1973). Encoding specificity and retrieval processes in episodic memory. *Psychological Review*, 80(5), 352–373. | 编码特异性；cue 元数据面；09 救援准入主锚 | 00、01、03、05、06、09 | ✅ 同主仓 R4 |
 | R5 | Nader, K., Schafe, G. E., & LeDoux, J. E. (2000). Fear memories require protein synthesis in the amygdala for reconsolidation after retrieval. *Nature*, 406, 722–726. | 再巩固改写协议 | 00 | ✅ 同主仓 R5 |
 | R6 | Tononi, G., & Cirelli, C. (2003). Sleep and synaptic homeostasis: A hypothesis. *Brain Research Bulletin*, 62(2), 143–150.（extended 2014, *Neuron*） | 突触稳态（SHY）；衰减引擎/深睡清扫 | 00、03 | ✅ 同主仓 R6 |
 | R7 | Johnson, M. K., Hashtroudi, S., & Lindsay, D. S. (1993). Source monitoring. *Psychological Bulletin*, 114(1), 3–28. | 来源监控（写入侧 provenance/审计永不衰减，不依赖事后归因） | 00、04、05、06 | ✅ 同主仓 R7 |
-| R8 | Ebbinghaus, H. (1885/1913). *Memory: A Contribution to Experimental Psychology*. | 艾宾浩斯遗忘曲线 | 00、03 | 📕 同主仓 R8 |
+| R8 | Ebbinghaus, H. (1885/1913). *Memory: A Contribution to Experimental Psychology*. | 艾宾浩斯遗忘曲线（只锚曲线形状） | 00、03、09 | 📕 同主仓 R8 |
 | R9 | Cepeda, N. J., Pashler, H., Vul, E., Wixted, J. T., & Rohrer, D. (2006). Distributed practice in verbal recall tasks: A review and quantitative synthesis. *Psychological Bulletin*, 132(3), 354–380. | 间隔效应（强化回弹） | 00、03 | ✅ 同主仓 R9 |
 | R10 | Hebb, D. O. (1949). *The Organization of Behavior*. Wiley. | 赫布定律（近重复命中即回弹，编码时强化） | 00、01、03 | 📕 同主仓 R10 |
 | R11 | Godden, D. R., & Baddeley, A. D. (1975). Context-dependent memory in two natural environments: On land and underwater. *British Journal of Psychology*, 66(3), 325–331. | 上下文依赖记忆 | 00 | ✅ 同主仓 R12 |
@@ -74,7 +74,7 @@
 |---|---|---|---|---|
 | R34 | Bartlett, F. C. (1932). *Remembering: A Study in Experimental and Social Psychology*. Cambridge. | 重建性记忆：巩固引入失真，写入前须验证 | 00、02 | ✅ 同主仓 R51（1995 重印版 DOI 10.1017/cbo9780511759185） |
 | R35 | Loftus, E. F. (2005). Planting misinformation in the human mind. *Learning & Memory*, 12(4), 361–366. DOI: 10.1101/lm.94705 | 误导信息效应：重建=失真风险，verify-before-commit | 00、02 | ✅ 同主仓 R52 |
-| R36 | Nelson, T. O., & Narens, L. (1990). Metamemory: A theoretical framework and new findings. *Psychology of Learning and Motivation*, 26, 125–173. DOI: 10.1016/s0079-7421(08)60053-5 | 元记忆：用户 pin/correction = 最高权威信号 | 00 | ✅ 同主仓 R53 |
+| R36 | Nelson, T. O., & Narens, L. (1990). Metamemory: A theoretical framework and new findings. *Psychology of Learning and Motivation*, 26, 125–173. DOI: 10.1016/s0079-7421(08)60053-5 | 元记忆：用户 pin/correction = 最高权威信号（钉住的显著性信号来源） | 00、09 | ✅ 同主仓 R53 |
 | R37 | Stickgold, R., & Walker, M. P. (2013). Sleep-dependent memory triage. *Nature Neuroscience*, 16(2), 139–145. DOI: 10.1038/nn.3303 | 睡眠依赖记忆 triage（选择性巩固，非全量回放） | 00、02 | ✅ 同主仓 R54 |
 
 ## 多主体协调与任务切换（B2.8 互认知）
@@ -87,6 +87,19 @@
 | R41 | Clark, H. H., & Brennan, S. E. (1991). Grounding in communication. In L. B. Resnick, J. M. Levine, & S. D. Teasley (Eds.), *Perspectives on Socially Shared Cognition*. APA. | grounding 成本及其介质依赖（TA-11） | B2.8 | 📕 经典专著章节（教科书级常识引用） |
 | R42 | Monsell, S. (2003). Task switching. *Trends in Cognitive Sciences*, 7(3), 134–140. DOI: 10.1016/S1364-6613(03)00028-7 | 任务切换代价综述（TA-12；pull 优于 push 的理论根据之一） | B2.8 | ✅ Crossref 核验命中（DOI 直接解析） |
 | R43 | Altmann, E. M., & Trafton, J. G. (2002). Memory for goals: An activation-based model. *Cognitive Science*, 26(1), 39–83. DOI: 10.1207/s15516709cog2601_2 | 目标激活模型：中断恢复代价随挂起时长增长（TA-12） | B2.8 | ✅ Crossref 核验命中（DOI 直接解析） |
+
+
+## 保留动力学重设计（钉住条目去永久化）
+
+| # | Citation | Used for | 对应本篇 | Status |
+|---|---|---|---|---|
+| R44 | Roozendaal, B., & McGaugh, J. L. (2011). Memory modulation. *Behavioral Neuroscience*, 125(6), 797–824. DOI: 10.1037/a0026187 | 显著性调制巩固：显著事件巩固得更持久（慢衰减档的实证主锚） | 09 | ✅ Crossref 核验命中（DOI 直接解析，author/year/venue 全对） |
+| R45 | McGaugh, J. L. (2018). Emotional arousal regulation of memory consolidation. *Current Opinion in Behavioral Sciences*, 19, 55–60. DOI: 10.1016/j.cobeha.2017.10.003 | 同上补强：调制作用于编码后时间窗、决定持久性（不改变内容与真实性） | 09 | ✅ Crossref 核验命中。注：任务书原引"McGaugh 2018 Annual Review of Psychology"经查为混淆——McGaugh 的 ARP 综述实为 2015《Consolidating memories》；本条是同年可核验的署名综述 |
+| R46 | Roediger, H. L., III, & Karpicke, J. D. (2006). Test-enhanced learning: Taking memory tests improves long-term retention. *Psychological Science*, 17(3), 249–255. DOI: 10.1111/j.1467-9280.2006.01693.x | 提取练习/测试效应：提取行为本身巩固记忆（召回即强化的主锚） | 09 | ✅ Crossref 核验命中（摘要含规律原文级表述） |
+| R47 | Tulving, E., & Pearlstone, C. (1966). Availability versus accessibility of information in memory for words. *Journal of Verbal Learning and Verbal Behavior*, 5(4), 381–391. DOI: 10.1016/S0022-5371(66)80048-8 | 可用 ≠ 可及：在册但暂时取不回；给合适线索可达性恢复（索引残迹 + 线索救援的存在论依据） | 09 | ✅ Crossref 核验命中 |
+| R48 | Koriat, A. (1993). How do we know that we know? The accessibility model of the feeling of knowing. *Psychological Review*, 100(4), 609–639. DOI: 10.1037/0033-295X.100.4.609 | 知道感："认得出但想不起"可触发翻找行为（残迹一行钩子的元认知依据） | 09 | ✅ Crossref 核验命中 |
+
+> 本节未入册说明：McGaugh (2004) "The memory consolidation hypothesis"（*Learning & Memory* 11(6), 668–673）为本轮**未能核验**的经典——试探 DOI 10.1101/lm.75404 实际解析到同刊他文（Quirk, G. J., 11(2), 125–126），标题检索亦未命中该文。按诚实规则不入册；其假说陈述已由 R44/R45 覆盖。
 
 ## 工程与行业文献（I 类）
 
