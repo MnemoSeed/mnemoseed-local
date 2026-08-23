@@ -55,8 +55,8 @@ Linux/macOS (POSIX sh):
 curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
 ```
 
-Afterwards: `mnemoseed-local up` starts the daemon. The installer's final step
-is `mnemoseed-local hook install opencode`, so the OpenCode hook is installed
+Afterwards: `mnemoseed-local up` starts the daemon. The installer's final setup
+step is `mnemoseed-local hook install opencode`, so the OpenCode hook is installed
 automatically (restart OpenCode to load it). `mnemoseed-local off` stops the
 daemon and disables the memory service persistently; `mnemoseed-local on`
 re-enables it and starts the daemon again. Hook lifecycle:
@@ -71,7 +71,7 @@ daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
 {"mcp": {"mnemoseed": {"type": "local", "command": ["mnemoseed-local", "mcp"]}}}
 ```
 
-Tools: `recall(query, top_k?)`, `remember(text)`, `dream_once()`,
+Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `dream_once()`,
 `recent_sessions(n_sessions?, n_per_session?)`, `session_windows(n_sessions?)`. The
 handshake works even when the daemon is down; only tool calls report the
 connectivity error.
