@@ -50,6 +50,7 @@ from mnemoseed_local.daemon.ingest import router as ingest_router
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
 from mnemoseed_local.decay import DecaySweeper
+from mnemoseed_local.decay.rebuild import rebuild_pin_weights
 from mnemoseed_local.dream import (
     DeltaPacker,
     DreamPipeline,
@@ -892,6 +893,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Memory surface (T4): one retrieval engine whose track executor is shut
     # down in teardown, before the stores close.
     app.state.memory = MemoryService(stores, config)
+    # Retention redesign one-time migration (design/09 §4.1): existing pin
+    # chunks recompute their effective weight under the flashbulb λ from their
+    # own reinforcement baseline — deterministic, idempotent, marker-gated.
+    rebuild_pin_weights(stores, config)
     # Decay sweep (PRD-04 FR-4.1 / FR-4.4): the daemon-owned background loop
     # over the live config (λ / interval / enabled re-read each tick).
     app.state.decay = DecaySweeper(stores, config)

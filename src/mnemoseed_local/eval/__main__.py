@@ -52,6 +52,12 @@ from mnemoseed_local.eval.recall_matrix import (
 )
 from mnemoseed_local.eval.recall_metrics import RecallMetrics, score_recall
 from mnemoseed_local.eval.report import default_out_dir, write_report
+from mnemoseed_local.eval.rescue_harness import run_rescue_point
+from mnemoseed_local.eval.rescue_materials import rescue_materials
+from mnemoseed_local.eval.rescue_matrix import (
+    RescuePointMetrics,
+    rescue_grid_descent,
+)
 
 
 def _matrix_command(args: argparse.Namespace) -> int:
@@ -247,6 +253,79 @@ def _recall_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def write_rescue_defaults(config_path: Path, rescue_floor: float, rescue_cue_min: float) -> bool:
+    """Land an ACCEPTED rescue-band outcome into config.py (T4b rules)."""
+    content = config_path.read_text(encoding="utf-8")
+    replacements = (
+        (r"(DEFAULT_RECALL_RESCUE_FLOOR:\s*float\s*=\s*)[\d.]+", repr(rescue_floor)),
+        (r"(DEFAULT_RECALL_RESCUE_CUE_MIN:\s*float\s*=\s*)[\d.]+", repr(rescue_cue_min)),
+    )
+    updated = content
+    for pattern, value in replacements:
+        updated, count = re.subn(pattern, rf"\g<1>{value}", updated)
+        if count == 0:
+            return False
+    config_path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def _rescue_command(args: argparse.Namespace) -> int:
+    """Rescue-band calibration (design/09 §3.5): exhaust the small
+    (rescue_floor × cue_min) grid over the MCP-recall rig and emit the
+    recommended pair under the gate bars. Synthetic embedder — no live models."""
+
+    materials = rescue_materials()
+
+    def metric_fn(floor: float, cue_min: float) -> list[RescuePointMetrics]:
+        runs_root = Path(args.workdir) / "runs" / f"f{floor}-c{cue_min}"
+        points = (
+            run_rescue_point(mat, root=runs_root / mat.point_id, rescue_floor=floor, rescue_cue_min=cue_min)
+            for mat in materials
+        )
+        return [point.metrics for point in points]
+
+    outcome = rescue_grid_descent(metric_fn)
+
+    def fmt(value: float | None) -> str:
+        return "None" if value is None else f"{value:.3f}"
+
+    for res in outcome.results:
+        if res.aggregate is None:
+            print(f"  floor={res.group.rescue_floor:.2f} cue_min={res.group.cue_min:.2f}: NO DATA")
+            continue
+        agg = res.aggregate
+        print(
+            f"  floor={res.group.rescue_floor:.2f} cue_min={res.group.cue_min:.2f}: "
+            f"recovery={fmt(agg.band_recovery_rate)} rescue={fmt(agg.rescue_rate)} "
+            f"noise={fmt(agg.noise_admission_rate)} rebound={fmt(agg.rebound_rate)} "
+            f"leak={fmt(agg.dead_leak_rate)} residue={fmt(agg.residue_coverage)} "
+            f"rank={fmt(agg.rank_discipline)} points={agg.points}"
+        )
+
+    if outcome.recommended is None:
+        print("No runnable groups — demotion path empty")
+        return 1
+
+    floor, cue_min = outcome.recommended
+    status = "DEMOTED" if outcome.demoted else "ACCEPTED"
+    print(f"Recommended: rescue_floor={floor}, rescue_cue_min={cue_min} ({status})")
+    if outcome.demoted:
+        print(f"Missed bars: {', '.join(outcome.demotion_path)}")
+
+    if args.write_config:
+        if outcome.demoted:
+            print("DEMOTED outcomes are never written to product config")
+            return 1
+        config_path = Path("src/mnemoseed_local/config.py")
+        if write_rescue_defaults(config_path, floor, cue_min):
+            print(f"Updated {config_path} with rescue_floor={floor}, rescue_cue_min={cue_min}")
+        else:
+            print(f"FAILED to update {config_path}: rescue constants not found")
+            return 1
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mnemoseed_local.eval", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -296,6 +375,17 @@ def main(argv: list[str] | None = None) -> int:
     recall.add_argument("--write-config", action="store_true", help="write recommended values to config.py")
     recall.add_argument("--seed", type=int, default=20260821, help="material catalog seed")
 
+    rescue = sub.add_parser(
+        "rescue",
+        help="rescue-band calibration (design/09): (rescue_floor, cue_min) grid on the MCP-recall rig",
+    )
+    rescue.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
+    rescue.add_argument(
+        "--write-config",
+        action="store_true",
+        help="write ACCEPTED values to config.py (never a DEMOTED outcome)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "matrix":
         return _matrix_command(args)
@@ -303,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
         return _rescore_command(args)
     if args.command == "recall":
         return _recall_command(args)
+    if args.command == "rescue":
+        return _rescue_command(args)
     return _canary_command(args)
 
 

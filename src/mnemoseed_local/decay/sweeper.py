@@ -32,7 +32,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from mnemoseed_local.config import Config
-from mnemoseed_local.decay.model import SECONDS_PER_DAY, decay_weight, lambda_for
+from mnemoseed_local.decay.model import (
+    SECONDS_PER_DAY,
+    chunk_lambda_type,
+    decay_weight,
+    lambda_for,
+)
 from mnemoseed_local.schema.graph import GraphNode
 from mnemoseed_local.schema.stamp import ChunkStamp
 from mnemoseed_local.storage.factory import Stores
@@ -264,18 +269,20 @@ class DecaySweeper:
         cut: float,
         lam_map: dict[str, float],
     ) -> float | None:
-        """The recomputed weight for one chunk (verbatim channel, chunk λ).
+        """The recomputed weight for one chunk (verbatim channel).
 
         The baseline is ``last_reinforced`` when the store carries one (the
         event's timestamp wins over the original ingestion time); freshly
-        captured shards fall back to ``ingested_at``. A consolidated chunk
-        (post-dream merge marker, design/03 §4) resolves its λ at 3× the chunk
-        rate — the evidence scene fades once the gist is in the graph.
+        captured shards fall back to ``ingested_at``. The λ tier resolves from
+        the provenance source (design/09 §3.1): an explicit-pin chunk fades at
+        the flashbulb rate, everything else at the chunk rate. A consolidated
+        chunk (post-dream merge marker, design/03 §4) resolves its λ at 3× the
+        resolved rate — the evidence scene fades once the gist is in the graph.
         """
         baseline = chunk.last_reinforced if chunk.last_reinforced is not None else chunk.ingested_at
         if baseline >= cut:
             return None
-        lam = lambda_for("chunk", lam_map, consolidated=chunk.consolidated)
+        lam = lambda_for(chunk_lambda_type(chunk.provenance.source), lam_map, consolidated=chunk.consolidated)
         days = max(0.0, (now - baseline) / SECONDS_PER_DAY)
         candidate = decay_weight(chunk.provenance.confidence, lam, days)
         return min(chunk.decay_weight, candidate)

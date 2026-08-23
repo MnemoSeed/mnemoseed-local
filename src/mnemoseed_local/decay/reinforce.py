@@ -16,6 +16,9 @@ the baseline is the only way the ordering contract holds for the graph side.
 Guardrail (FR-4.3 ladder): a hit on an item whose decay_weight sits below the
 candidate floor still counts the usage but never rebounds — sunk memories are
 only resurrected by the explicit revival path, never by incidental recall hits.
+One deliberate contract revision (design/09 §3.2): a chunk that entered the
+pool through the cue-driven rescue band IS a real consumption event, so its
+hit rebounds like any above-floor hit.
 
 The rebound step is ``min(1.0, decay_weight + reinforcement_bonus)`` with a
 small constant bonus (see ``ReinforceConfig.bonus``). The spacing-effect
@@ -84,25 +87,34 @@ class Reinforcer:
     def config(self) -> ReinforceConfig:
         return self._config
 
-    def record_hits(self, chunk_ids: Sequence[str], node_ids: Sequence[str]) -> None:
+    def record_hits(
+        self,
+        chunk_ids: Sequence[str],
+        node_ids: Sequence[str],
+        *,
+        rescued_chunk_ids: Sequence[str] = (),
+    ) -> None:
         """Consume one batch of retrieval usage events.
 
         ``chunk_ids`` are the chunk entries that made the context package
         (vector track), ``node_ids`` the graph entries (graph track). Each live
         item above the floor gets its baseline refreshed and its weight
-        rebounded; below-floor items only count their usage.
+        rebounded; below-floor items only count their usage — except chunks
+        named in ``rescued_chunk_ids`` (design/09 §3.2): a cue-rescued hit is a
+        real consumption event, so the below-floor pin gets the same rebound.
         """
         now = self._clock()
-        self._record_chunk_hits(chunk_ids, now)
+        rescued = frozenset(rescued_chunk_ids)
+        self._record_chunk_hits(chunk_ids, now, rescued)
         self._record_node_hits(node_ids, now)
 
-    def _record_chunk_hits(self, chunk_ids: Sequence[str], now: float) -> None:
+    def _record_chunk_hits(self, chunk_ids: Sequence[str], now: float, rescued: frozenset[str]) -> None:
         updates: list[WeightUpdate] = []
         for chunk_id in chunk_ids:
             chunk = self._stores.vector.get_chunk(chunk_id)
             if chunk is None:
                 continue
-            if chunk.decay_weight >= self._config.min_decay:
+            if chunk.decay_weight >= self._config.min_decay or chunk_id in rescued:
                 updates.append(self._chunk_update(chunk, now))
         if updates:
             self._stores.vector.update_weights(updates)

@@ -110,6 +110,18 @@ DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
 DEFAULT_AUTO_RECALL_FOCAL_FLOOR: float = 0.5
 DEFAULT_AUTO_RECALL_BUDGET_CHARS: int = 2400
 
+#: Cue-driven rescue band (design/09 §3.5): below the main candidate floor a
+#: flashbulb pin enters the recall pool only when its cue overlap clears
+#: ``rescue_cue_min``, down to ``rescue_floor``. Values landed by the
+#: rescue-band calibration sweep (ACCEPTED: 20-point (floor × cue_min) grid ×
+#: 8 materials on the MCP-recall rig; every gate bar green on every group —
+#: noise 0 / rebound 1 / dead-zone leak 0 / rank discipline 1 — and the
+#: recovery scalar picks the deepest band that holds the bars: floor 0.15
+#: keeps 0.22-weight pins reachable, cue_min 0.2 still rescues half-overlap
+#: entity cues while gating everything weaker).
+DEFAULT_RECALL_RESCUE_FLOOR: float = 0.15
+DEFAULT_RECALL_RESCUE_CUE_MIN: float = 0.2
+
 #: The T3a enum sets, shared by the config loader and the configwrite registry
 #: (a drift between the two is a validation split — one source, both consumers).
 DREAM_HARDWARE_TIERS: frozenset[str] = frozenset({"standard", "lite", "advanced"})
@@ -180,10 +192,14 @@ DEFAULT_LAMBDA_PER_TYPE: dict[str, float] = {
     "INTENTION": 0.03,
     # the verbatim channel has no node_type; chunks decay like episodes
     "chunk": 0.03,
+    # the flashbulb class (design/09 §3.1): explicit-pin chunks decay at
+    # preference pace (≈139-day half-life) instead of the chunk rate
+    "pin": 0.005,
 }
 
-#: The writable λ-map keys: every frozen node type plus the chunk pseudo-type.
-LAMBDA_TARGETS: frozenset[str] = frozenset(NodeType.frozen_set()) | {"chunk"}
+#: The writable λ-map keys: every frozen node type plus the verbatim-channel
+#: pseudo-types ("chunk" ordinary, "pin" the explicit-pin class).
+LAMBDA_TARGETS: frozenset[str] = frozenset(NodeType.frozen_set()) | {"chunk", "pin"}
 
 
 @dataclass(frozen=True)
@@ -221,6 +237,20 @@ class CaptureConfig:
     auto_recall: bool = True
     auto_recall_focal_floor: float = DEFAULT_AUTO_RECALL_FOCAL_FLOOR
     auto_recall_budget_chars: int = DEFAULT_AUTO_RECALL_BUDGET_CHARS
+
+
+@dataclass(frozen=True)
+class RecallConfig:
+    """MCP explicit-recall rescue band (design/09 §3.5, open question 3).
+
+    ``rescue_floor`` is the lower bound of the two-band admission (the upper
+    bound is the hybrid retriever's main candidate floor); ``rescue_cue_min``
+    is the cue-overlap minimum a below-main-floor flashbulb pin must clear to
+    enter the pool. Both are calibration items owned by the eval harness.
+    """
+
+    rescue_floor: float = DEFAULT_RECALL_RESCUE_FLOOR
+    rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
 
 
 # A2 MVP + B1 + B5: the dream LLM roles. The cloud deep_reflection /
@@ -321,6 +351,7 @@ class Config:
     dream: DreamConfig = field(default_factory=DreamConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
+    recall: RecallConfig = field(default_factory=RecallConfig)
     llm: dict[str, RoleLLMConfig] = field(default_factory=lambda: dict(DEFAULT_LLM_ROUTES))
     source: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -665,6 +696,20 @@ def load_config(path: Path | None = None) -> Config:
             auto_recall_budget_chars=int(budget_raw),
         )
 
+    # [recall] table (design/09 §3.5): the MCP explicit-recall rescue band.
+    # Both thresholds are unit-range numbers owned by the eval calibration.
+    recall = RecallConfig()
+    recall_raw = raw.get("recall")
+    if recall_raw is not None:
+        recall_table = _require_table(recall_raw, "recall")
+        floor_raw = recall_table.get("rescue_floor", DEFAULT_RECALL_RESCUE_FLOOR)
+        if not _is_positive_number(floor_raw) or float(floor_raw) > 1.0:
+            raise ConfigError("recall.rescue_floor", "must be a number in (0, 1]")
+        cue_raw = recall_table.get("rescue_cue_min", DEFAULT_RECALL_RESCUE_CUE_MIN)
+        if not _is_positive_number(cue_raw) or float(cue_raw) > 1.0:
+            raise ConfigError("recall.rescue_cue_min", "must be a number in (0, 1]")
+        recall = RecallConfig(rescue_floor=float(floor_raw), rescue_cue_min=float(cue_raw))
+
     return Config(
         preset=preset_raw,
         baseurl=baseurl_raw,
@@ -672,6 +717,7 @@ def load_config(path: Path | None = None) -> Config:
         dream=dream,
         decay=decay,
         capture=capture,
+        recall=recall,
         llm=llm_routes,
         source=path,
         raw=raw,

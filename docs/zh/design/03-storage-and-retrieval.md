@@ -206,7 +206,8 @@ flowchart LR
 ### 3.7 provenance 横切与读面时间结构
 
 - **provenance 只追加**：chunk 的 `provenance.history` 与图节点的版本链都是 append-only；审计（`AuditEntry.actor/action/detail/at`）由 daemon 各任务显式写，actor 归因不缺席。
-- **衰减的例外**：provenance 永不衰减；`never_decay` 钉（FR-4.4，硬约束类节点）由 sweep 显式过滤；显式 pin / user 写入的 remembered 条目不在衰减面内。已 tombstone/已取代的版本因 sweep 只读当前版本而天然豁免。
+- **衰减的例外**：provenance 永不衰减；`never_decay` 钉（FR-4.4，硬约束类节点）由 sweep 显式过滤；显式 pin / user 写入的 remembered 条目不在衰减面内。
+  > **更正（2026-08-24，随实现批补注）**：上句后半对 chunk 不成立——`ChunkStamp` 根本没有 `never_decay` 字段，sweeper 的 chunk 路径也从无钉住豁免，显式钉住的条目实际一直按普通 chunk 速率（λ=0.03）衰减，构成静默信任缺陷。已由保留机制重设计修正：显式钉住条目现在读侧派生为 flashbulb 类，走慢衰减档 λ_pin=0.005（约 139 天半衰期），并配套同主题替换、线索救援与索引残迹；完整设计与缺陷取证见 `09-retention-redesign.md` §1–§3。原句按诚实规则保留不删，以此注为准。已 tombstone/已取代的版本因 sweep 只读当前版本而天然豁免。
 - **read-surface 时间结构**（PRD-B2.4 M1）：recall 条目携带 `session_id` + `ingested_at`（chunk 为真实值，ISO 格式；graph 条目诚实 null/null——整合节点无单一会话，借 `updated_at` 会制造来源混淆，违 TA-8），详情归 06。
 
 ## 4. 红线与诚实边界

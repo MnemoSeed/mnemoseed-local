@@ -27,7 +27,13 @@ from mnemoseed_local.retrieve.assemble import (
     EntryFlag,
 )
 from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
-from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRecall, HybridRetriever
+from mnemoseed_local.retrieve.hybrid import (
+    Candidate,
+    HybridConfig,
+    HybridRecall,
+    HybridRetriever,
+    ScoreBreakdown,
+)
 from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
@@ -539,6 +545,58 @@ def test_pre_existing_pending_flag_surfaces_without_probe(stack) -> None:
     result = _assemble(stack, _recall(stack, "lancedb loader", _query_cues(("LanceDb",))))
     entry = next(entry for entry in result.entries if entry.id == "g_busy")
     assert EntryFlag.PENDING_CONSOLIDATION in entry.flags
+
+
+# ------------------------------------------------------------ rank discipline
+
+
+def _pool_candidate(chunk_id: str, text: str, *, score: float, rescued: bool = False) -> Candidate:
+    breakdown = ScoreBreakdown(
+        semantic=score,
+        cue_overlap=0.0,
+        decay_weight=0.0,
+        graph_centrality=0.0,
+        cooccurrence=0.0,
+        total=score,
+    )
+    return Candidate(
+        kind="chunk",
+        id=chunk_id,
+        source="vector",
+        item=_chunk(chunk_id, text),
+        score=score,
+        breakdown=breakdown,
+        rescued=rescued,
+    )
+
+
+def test_rank_discipline_surfaces_in_served_order(stack) -> None:
+    """design/09 §3.5 at the serving surface: the assembler re-applies the
+    retriever's rank discipline, so a rescued candidate with the highest fused
+    score still renders after lower-scored normal candidates."""
+    strong_rescued = _pool_candidate("c_rescued", "rescued pin text", score=2.0, rescued=True)
+    modest_normal = _pool_candidate("c_normal", "normal memory text", score=1.0)
+    recall = HybridRecall(candidates=[strong_rescued, modest_normal], vector_hits=2, graph_hits=0)
+
+    result = _assemble(stack, recall)
+
+    ids = [entry.id for entry in result.entries]
+    assert ids == ["c_normal", "c_rescued"]
+    assert EntryFlag.RESCUED in result.entries[1].flags
+    assert result.entries[1].score == pytest.approx(2.0)
+
+
+def test_top_k_truncation_never_drops_normal_for_rescued(stack) -> None:
+    """Truncation inherits discipline: with a single slot the normal candidate
+    keeps it and the higher-scoring rescued one is the honest drop."""
+    strong_rescued = _pool_candidate("c_rescued", "rescued pin text", score=2.0, rescued=True)
+    modest_normal = _pool_candidate("c_normal", "normal memory text", score=1.0)
+    recall = HybridRecall(candidates=[strong_rescued, modest_normal], vector_hits=2, graph_hits=0)
+
+    result = _assemble(stack, recall, AssembleConfig(top_k=1))
+
+    assert [entry.id for entry in result.entries] == ["c_normal"]
+    assert result.dropped_count == 1
 
 
 # ------------------------------------------------------------ honest empty

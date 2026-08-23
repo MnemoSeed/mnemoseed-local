@@ -57,6 +57,18 @@ class ProvenanceEvent(BaseModel):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
+#: Provenance source marker of an explicit user pin (FR-3.1). The flashbulb
+#: memory class (design/09) derives from this value at read time — no schema
+#: field, no migration; a write is a pin exactly when its source says so.
+EXPLICIT_PIN_SOURCE = "memory.remember"
+
+
+def is_explicit_pin(source: str) -> bool:
+    """The flashbulb-class predicate: ONE comparison, used by the λ classifier,
+    the metadata view and every denormalized driver flag."""
+    return source == EXPLICIT_PIN_SOURCE
+
+
 class Provenance(BaseModel):
     """Provenance backbone (source monitoring: a memory without a source is a
     confabulation risk)."""
@@ -115,6 +127,9 @@ class ChunkStamp(BaseModel):
             "ingested_at": self.ingested_at,
             "turn_start": self.turn_start,
             "turn_end": self.turn_end,
+            # design/09 §3.5 route (b): additive pin-class flag so a storage
+            # prefilter can express 'relax pins only' without provenance.
+            "explicit_pin": is_explicit_pin(self.provenance.source),
         }
 
     @classmethod

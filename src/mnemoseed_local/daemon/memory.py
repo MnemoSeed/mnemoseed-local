@@ -58,10 +58,17 @@ from mnemoseed_local.retrieve.assemble import (
     AssembledContext,
     AssembledEntry,
     Assembler,
+    EntryFlag,
 )
 from mnemoseed_local.retrieve.cues import CueExtractor
-from mnemoseed_local.retrieve.hybrid import HybridRetriever
-from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance, ProvenanceEvent
+from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRetriever
+from mnemoseed_local.schema.stamp import (
+    EXPLICIT_PIN_SOURCE,
+    ChunkStamp,
+    CognitiveTier,
+    Provenance,
+    ProvenanceEvent,
+)
 from mnemoseed_local.schema.turn import ProfileRef
 from mnemoseed_local.storage.drivers._time import iso8601_utc
 from mnemoseed_local.storage.factory import Stores
@@ -78,9 +85,14 @@ from mnemoseed_local.storage.ports import (
 
 logger = logging.getLogger("mnemoseed_local.daemon.memory")
 
-# Explicit-pin provenance source marker (FR-3.1). A /memory/remember write is
-# asserted by the user and never merges into the capture provenance channel.
-EXPLICIT_PIN_SOURCE = "memory.remember"
+# Bounded index-residue rendering (design/09 §3.6): one line per dead-zone pin
+# (weight below the rescue floor) — date + verbatim head slice of the stored
+# text (never paraphrased: verbatim-channel red line), newest first, rows
+# capped. Deterministic bounded scan, zero model calls; rendered on the MCP
+# explicit recall response only, never on the T2 auto-injection surface.
+RESIDUE_HEAD_CHARS = 80
+_RESIDUE_ROW_CAP = 8
+_RESIDUE_SCAN_LIMIT = 2000
 
 # B2.1 T2 (design/01 §4.6, PRD-B2.1): the mid-session auto-recall focal scan.
 # NON_FOCAL_FLOOR mirrors the default focal floor: decay-healthy chunks the
@@ -358,7 +370,14 @@ class MemoryService:
         self._stores = stores
         self._config = config
         self._cues = CueExtractor()
-        self._retriever = HybridRetriever()
+        # design/09 §3.5: the rescue band thresholds ride the live config so a
+        # calibration update reaches the retriever without code edits.
+        self._retriever = HybridRetriever(
+            HybridConfig(
+                rescue_min_decay=config.recall.rescue_floor,
+                rescue_cue_min=config.recall.rescue_cue_min,
+            )
+        )
         self._assembler = Assembler()
         # FR-4.2 event side: retrieval usage becomes a reinforcement event
         # (baseline refresh + bounded rebound), the counterpart of the sweep.
@@ -442,7 +461,11 @@ class MemoryService:
             graph_store=self._stores.graph,
         )
         self._record_hits(context)
-        return {"memory": self._memory_payload(context)}
+        payload = self._memory_payload(context)
+        # design/09 §3.6: dead-zone pins stay reachable as one-line residues on
+        # the MCP explicit recall response (never on the T2 injection surface).
+        payload["index_residue"] = self._index_residue(profile_id)
+        return {"memory": payload}
 
     def _record_hits(self, context: AssembledContext) -> None:
         """FR-3.7 usage events + FR-4.2 reinforcement: fire-and-forget, never
@@ -451,14 +474,21 @@ class MemoryService:
         Only items that made the context package are counted and reinforced (a
         hit means the recalled memory). The raw store write is best-effort by
         design; the Reinforcer additionally refreshes ``last_reinforced`` and
-        rebounds ``decay_weight`` (bounded at 1.0) for every above-floor hit.
+        rebounds ``decay_weight`` (bounded at 1.0) for every above-floor hit —
+        and for rescue-admitted pins (design/09 §3.2), whose hits are real
+        consumption events despite sitting below the main floor.
         """
         chunk_ids = [entry.id for entry in context.entries if entry.kind == "chunk"]
         node_ids = [entry.id for entry in context.entries if entry.kind == "graph"]
+        rescued = [
+            entry.id
+            for entry in context.entries
+            if entry.kind == "chunk" and EntryFlag.RESCUED in entry.flags
+        ]
         if not chunk_ids and not node_ids:
             return
         try:
-            self._reinforcer.record_hits(chunk_ids, node_ids)
+            self._reinforcer.record_hits(chunk_ids, node_ids, rescued_chunk_ids=rescued)
         except Exception:  # pragma: no cover - usage accounting must not fail recall
             logger.warning("usage-event write failed; recall proceeds", exc_info=True)
 
@@ -499,6 +529,41 @@ class MemoryService:
             "ingested_at": iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
         }
 
+    def _index_residue(self, profile_id: str) -> dict[str, Any]:
+        """The residue BLOCK for dead-zone flashbulb pins (design/09 §3.6):
+        ``rows`` of date + verbatim head slice — a truncation, never a
+        paraphrase or summary (verbatim-channel red line) — plus the honesty
+        flag ``window_truncated`` (session-window precedent): True when the
+        profile holds more chunks than the bounded newest-first scan covered,
+        so silently invisible older residues stay detectable. Deterministic,
+        zero model calls: the point is a Koriat-style feeling-of-knowing hook,
+        not a served memory."""
+        rescue_floor = self._retriever.config.rescue_min_decay
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RESIDUE_SCAN_LIMIT)
+        )
+        dead_pins = [
+            chunk
+            for chunk in page.items
+            if chunk.provenance.source == EXPLICIT_PIN_SOURCE and chunk.decay_weight < rescue_floor
+        ]
+        dead_pins.sort(key=lambda chunk: (-chunk.ingested_at, chunk.chunk_id))
+        return {
+            "rows": [self._residue_row(chunk) for chunk in dead_pins[:_RESIDUE_ROW_CAP]],
+            "window_truncated": page.total > _RESIDUE_SCAN_LIMIT,
+        }
+
+    @staticmethod
+    def _residue_row(chunk: ChunkStamp) -> dict[str, Any]:
+        date = iso8601_utc(chunk.ingested_at)
+        head = chunk.text[:RESIDUE_HEAD_CHARS]
+        return {
+            "chunk_id": chunk.chunk_id,
+            "date": date,
+            "head": head,
+            "line": f"[pin residue {date}] {head}",
+        }
+
     # ------------------------------------------------------------ remember
 
     def remember(
@@ -510,9 +575,12 @@ class MemoryService:
         rules: Sequence[RecallRule] | None = None,
     ) -> dict[str, Any]:
         """Write an explicit user pin, mirroring the StampWriter's dual-branch
-        near-duplicate flow: a strong consistent hit reinforces in place, a
-        conflict flags needs_reconcile, anything else becomes a new chunk.
-        Provenance is append-only; the explicit-pin source is never rewritten.
+        near-duplicate flow with the supersede-in-place revision branch
+        (design/09 §3.3): a conflicting verdict flags needs_reconcile, an
+        identical re-pin reinforces in place, and a same-topic re-pin with
+        revised wording supersedes the stored text on the SAME chunk — never a
+        second entry within the bands. Provenance is append-only; the
+        explicit-pin source is never rewritten.
         B2.7: every branch persists the standing ``rules`` on the chunk
         (``rules_json``) — the driver merges them by identity on a re-upsert, so
         a near-duplicate re-pin never drops rules."""
@@ -542,7 +610,6 @@ class MemoryService:
             ingested_at=now,
             rules=rules_dicts,
         )
-        strong = vector.near_duplicate(embedded.dense, config.reinforce_threshold, profile_id=profile_id)
         band = vector.near_duplicate(embedded.dense, config.conflict_threshold, profile_id=profile_id)
         if not band:
             vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
@@ -551,9 +618,27 @@ class MemoryService:
             )
             return {"outcome": "new_chunk", "chunk_id": stamp.chunk_id}
         hit = band[0]
-        strong_ids = {chunk.chunk_id for chunk in strong}
         verdict = NearDuplicateChecker().check(stamp.text, hit.text)
-        if hit.chunk_id in strong_ids and verdict is ConsistencyVerdict.CONSISTENT:
+        if verdict is ConsistencyVerdict.CONFLICT:
+            # A real statement contradiction is never silently overwritten: the
+            # stored text stands and the explicit adjudication flag goes up.
+            hit_emb = self._stores.embed.embed(hit.text)
+            vector.upsert_chunk(
+                hit.model_copy(update={"rules": rules_dicts}),
+                hit_emb.dense,
+                hit_emb.sparse,
+            )
+            vector.update_chunk_state([hit.chunk_id], needs_reconcile=True)
+            self._audit(
+                profile_id,
+                "remember",
+                {"chunk_id": hit.chunk_id, "profile_id": profile_id, "outcome": "needs_reconcile"},
+                actor=actor,
+            )
+            return {"outcome": "needs_reconcile", "chunk_id": hit.chunk_id}
+        if hit.text == text:
+            # Identical wording is the strongest consistency evidence there is:
+            # the pre-existing pure reinforcement applies at any band strength.
             rebound = min(1.0, hit.decay_weight + config.reinforce_bonus)
             hit_emb = self._stores.embed.embed(hit.text)
             vector.upsert_chunk(
@@ -570,26 +655,53 @@ class MemoryService:
                 actor=actor,
             )
             return {"outcome": "reinforced", "chunk_id": hit.chunk_id}
-        if verdict is ConsistencyVerdict.CONFLICT:
-            hit_emb = self._stores.embed.embed(hit.text)
-            vector.upsert_chunk(
-                hit.model_copy(update={"rules": rules_dicts}),
-                hit_emb.dense,
-                hit_emb.sparse,
-            )
-            vector.update_chunk_state([hit.chunk_id], needs_reconcile=True)
+        if hit.provenance.source != EXPLICIT_PIN_SOURCE:
+            # Supersede is flashbulb-class only: a re-worded pin landing near an
+            # ordinary capture chunk must never rewrite captured verbatim text —
+            # it becomes its own fresh pin chunk instead.
+            vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
             self._audit(
-                profile_id,
-                "remember",
-                {"chunk_id": hit.chunk_id, "profile_id": profile_id, "outcome": "needs_reconcile"},
-                actor=actor,
+                profile_id, "remember", {"chunk_id": stamp.chunk_id, "profile_id": profile_id}, actor=actor
             )
-            return {"outcome": "needs_reconcile", "chunk_id": hit.chunk_id}
-        vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
-        self._audit(
-            profile_id, "remember", {"chunk_id": stamp.chunk_id, "profile_id": profile_id}, actor=actor
+            return {"outcome": "new_chunk", "chunk_id": stamp.chunk_id}
+        # Supersede-in-place (design/09 §3.3): a same-topic re-pin with revised
+        # wording replaces the stored verbatim text on the SAME chunk — never a
+        # second entry for the topic. The replaced text survives verbatim in
+        # the append-only provenance history (revision event), so the old
+        # authority stays auditable while only the latest wording is searchable.
+        history = [
+            *hit.provenance.history,
+            ProvenanceEvent(
+                action="superseded",
+                actor=actor,
+                at=now,
+                detail={"superseded_text": hit.text, "superseded_at": now},
+            ),
+        ]
+        rebound = min(1.0, hit.decay_weight + config.reinforce_bonus)
+        updated = hit.model_copy(
+            update={
+                "text": text,
+                "cues": extracted.cues,
+                "provenance": hit.provenance.model_copy(update={"history": history}),
+                "decay_weight": rebound,
+                "last_reinforced": now,
+                "rules": rules_dicts,
+            }
         )
-        return {"outcome": "new_chunk", "chunk_id": stamp.chunk_id}
+        vector.upsert_chunk(updated, embedded.dense, embedded.sparse)
+        self._audit(
+            profile_id,
+            "remember",
+            {
+                "chunk_id": hit.chunk_id,
+                "profile_id": profile_id,
+                "outcome": "superseded",
+                "superseded_text": hit.text,
+            },
+            actor=actor,
+        )
+        return {"outcome": "superseded", "chunk_id": hit.chunk_id}
 
     # ------------------------------------------------------------ audit
 
