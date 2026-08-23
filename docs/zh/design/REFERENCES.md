@@ -77,6 +77,17 @@
 | R36 | Nelson, T. O., & Narens, L. (1990). Metamemory: A theoretical framework and new findings. *Psychology of Learning and Motivation*, 26, 125–173. DOI: 10.1016/s0079-7421(08)60053-5 | 元记忆：用户 pin/correction = 最高权威信号 | 00 | ✅ 同主仓 R53 |
 | R37 | Stickgold, R., & Walker, M. P. (2013). Sleep-dependent memory triage. *Nature Neuroscience*, 16(2), 139–145. DOI: 10.1038/nn.3303 | 睡眠依赖记忆 triage（选择性巩固，非全量回放） | 00、02 | ✅ 同主仓 R54 |
 
+## 多主体协调与任务切换（B2.8 互认知）
+
+| # | Citation | Used for | 对应本篇 | Status |
+|---|---|---|---|---|
+| R38 | Wegner, D. M. (1987). Transactive memory: A contemporary analysis of the group mind. In B. Mullen & G. R. Goethals (Eds.), *Theories of Group Behavior* (pp. 185–208). Springer. DOI: 10.1007/978-1-4612-4634-3_9 | 交互记忆系统：目录是索引不是副本（TA-10） | B2.8 | ✅ Crossref 核验命中（book-chapter，pp. 185–208） |
+| R39 | DeChurch, L. A., & Mesmer-Magnus, J. R. (2010). The cognitive and motivational mechanisms underlying the relation between transactive memory systems and team performance. *Journal of Applied Psychology*, 95(2), 352–373. | TMS 结构质量与团队绩效正相关的团队层元分析（TA-10 实证补强） | B2.8 | ⚠️ 高置信经典但本轮未直接核验（两次 DOI 试探均未命中）——待抽查晋级或替换 |
+| R40 | Clark, H. H., & Marshall, C. R. (1981). Definite reference and mutual knowledge. In A. K. Joshi, B. L. Webber, & I. A. Sag (Eds.), *Elements of Discourse Understanding*. Cambridge University Press. | 相互知识/共同基础：协调所需的最小相互知识（TA-11） | B2.8 | 📕 经典专著章节（教科书级常识引用） |
+| R41 | Clark, H. H., & Brennan, S. E. (1991). Grounding in communication. In L. B. Resnick, J. M. Levine, & S. D. Teasley (Eds.), *Perspectives on Socially Shared Cognition*. APA. | grounding 成本及其介质依赖（TA-11） | B2.8 | 📕 经典专著章节（教科书级常识引用） |
+| R42 | Monsell, S. (2003). Task switching. *Trends in Cognitive Sciences*, 7(3), 134–140. DOI: 10.1016/S1364-6613(03)00028-7 | 任务切换代价综述（TA-12；pull 优于 push 的理论根据之一） | B2.8 | ✅ Crossref 核验命中（DOI 直接解析） |
+| R43 | Altmann, E. M., & Trafton, J. G. (2002). Memory for goals: An activation-based model. *Cognitive Science*, 26(1), 39–83. DOI: 10.1207/s15516709cog2601_2 | 目标激活模型：中断恢复代价随挂起时长增长（TA-12） | B2.8 | ✅ Crossref 核验命中（DOI 直接解析） |
+
 ## 工程与行业文献（I 类）
 
 | # | Citation | Used for | 对应本篇 | Status |
