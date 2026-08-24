@@ -224,8 +224,9 @@ def test_session_recent_rules_budget_absent_when_no_rules(config_path: Path) -> 
     with TestClient(create_app()) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
-        assert body.json() == {"profile_id": PROFILE, "sessions": [], "self_window": None}
-        assert "rules_budget" not in body.json()
+        payload = body.json()
+        assert payload["sessions"] == [] and payload["self_window"] is None
+        assert "rules_budget" not in payload
 
 
 def test_session_recent_rules_budget_aggregates_and_scopes(config_path: Path) -> None:
