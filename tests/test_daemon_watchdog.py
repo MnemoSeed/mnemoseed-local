@@ -720,7 +720,8 @@ def log_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
     """The durable daemon.log: exists under CONFIG_DIR, holds the boot line
     (with pid) while the process is alive, gains the teardown stage lines after
-    shutdown, and is attached exactly once across repeated in-process boots."""
+    shutdown, is attached exactly once across repeated in-process boots, and
+    is released again by each shutdown."""
     log_file = log_home / "daemon.log"
     app = create_app()
     with TestClient(app) as client:
@@ -739,9 +740,13 @@ def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
     # a second in-process boot must not double-attach the handler
     with TestClient(app) as client:
         assert client.get("/healthz").json()["status"] == "ok"
+        target = logging.getLogger("mnemoseed_local")
+        attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
+        assert len(attached) == 1
+    # each shutdown releases the process-global handler again
     target = logging.getLogger("mnemoseed_local")
     attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
-    assert len(attached) == 1
+    assert len(attached) == 0
     # the boot line carries the full identity payload, not just the pid
     boot_line = next(line for line in live_text.splitlines() if "daemon boot:" in line)
     assert f"pid={os.getpid()}" in boot_line
@@ -770,13 +775,14 @@ def test_daemon_log_handler_follows_patched_config_dir(
     try:
         with TestClient(app) as client:
             assert client.get("/healthz").json()["status"] == "ok"
+        # a boot after a released shutdown re-attaches against the same root
         with TestClient(app) as client:
             assert client.get("/healthz").json()["status"] == "ok"
-        target = logging.getLogger("mnemoseed_local")
-        attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
-        assert len(attached) == 1
-        base = str(attached[0].baseFilename)
-        assert base.startswith(str(tmp_path)), f"handler writes to {base!r}, not the tmp home"
+            target = logging.getLogger("mnemoseed_local")
+            attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
+            assert len(attached) == 1
+            base = str(attached[0].baseFilename)
+            assert base.startswith(str(tmp_path)), f"handler writes to {base!r}, not the tmp home"
     finally:
         _detach_daemon_log_handler()
 

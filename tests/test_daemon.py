@@ -9,6 +9,7 @@ and the daemon refuses a non-loopback baseurl at boot.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import threading
 import time
@@ -65,6 +66,22 @@ def test_healthz_after_real_boot(config_path: Path) -> None:
         assert body["gate"]["ok"] is True
         health = client.get("/health").json()
         assert health["drivers"]["embed"] == "synthetic"
+
+
+def test_shutdown_releases_the_global_daemon_log_handler(config_path: Path) -> None:
+    """Lifespan teardown must release the process-global named daemon.log
+    handler it attached: a released handler keeps daemon.log deletable and
+    stops a torn-down boot from bleeding into a later boot's logs."""
+    target = logging.getLogger("mnemoseed_local")
+
+    def named_handlers() -> list[logging.Handler]:
+        return [h for h in target.handlers if getattr(h, "name", None) == "daemon.log"]
+
+    for handler in named_handlers():  # isolate from handlers earlier boots left attached
+        target.removeHandler(handler)
+    with _boot(config_path):
+        assert named_handlers(), "the lifespan never attached the daemon.log handler"
+    assert not named_handlers(), "shutdown kept the global daemon.log handler attached"
 
 
 def test_ingest_scan_runs_on_daemon_pool(config_path: Path) -> None:
