@@ -583,6 +583,7 @@ class ReflectOrchestrator:
             outcome.llm_unavailable,
             phase=SnapshotPhase.REFLECT_DONE,
             seat=None,
+            batched=outcome.batched,
         )
 
     def reflect_vote_a(self, snapshot: Snapshot) -> ReflectOutcome:
@@ -887,9 +888,12 @@ class ReflectOrchestrator:
         *,
         phase: SnapshotPhase,
         seat: str | None,
+        batched: bool = False,
     ) -> ReflectOutcome:
         """Meter the run's tokens and persist the phase marker + payload as one
-        atomic journal write (marker-before-progress, NFR-2.3)."""
+        atomic journal write (marker-before-progress, NFR-2.3). ``batched``
+        must survive the finalize rebuild: the merge boundary reads it to
+        distinguish a genuine empty verdict (#99) from truncation evidence."""
         tracked_report = report
         if self._ledger is not None:
             # Token metering (T5b / T3b): the dream consumed the packed delta
@@ -922,8 +926,11 @@ class ReflectOrchestrator:
                 error=f"persist failed: {exc}",
                 report=tracked_report,
                 llm_unavailable=unavailable,
+                batched=batched,
             )
-        return ReflectOutcome(ok=True, result=result, report=tracked_report, llm_unavailable=unavailable)
+        return ReflectOutcome(
+            ok=True, result=result, report=tracked_report, llm_unavailable=unavailable, batched=batched
+        )
 
     def _backoff(self, attempt: int) -> float:
         """Exponential schedule: base, 2*base, 4*base across retries 1..3."""

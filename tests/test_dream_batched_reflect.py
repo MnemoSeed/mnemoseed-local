@@ -254,3 +254,26 @@ def test_batched_reflect_all_empty_batches_still_commits_all_noise(tmp_path: Pat
     assert outcome.ok and outcome.result is not None
     assert outcome.result.triples == ()
     assert outcome.result.overflow_chunk_ids == (), "fully covered noise commits like the legacy path"
+
+
+def test_batched_flag_survives_the_finalize_seam(tmp_path: Path) -> None:
+    """Regression: _record_and_finalize rebuilds the outcome and used to drop
+    the batched flag, so the merge boundary saw every empty batched verdict as
+    truncation evidence and deferred forever (live finding 22:27)."""
+    from mnemoseed_local.dream.snapshot import load_snapshot_file
+
+    snapshot = _snap(*[_extractable(f"c{i}", i) for i in range(3)])
+    llm = _CountingLLM()
+    outcome = _orchestrate(snapshot, tmp_path, llm, batch_max_tokens=_one_batch_cap(snapshot))
+    assert outcome.ok
+    assert outcome.batched is True, "the flag must survive _record_and_finalize"
+    on_disk = load_snapshot_file(tmp_path / "snap-batch.json")
+    assert on_disk is not None and "reflect_done" in on_disk.phases
+
+
+def test_legacy_path_reports_batched_false_through_finalize(tmp_path: Path) -> None:
+    snapshot = _snap(_extractable("c0", 0))
+    llm = _CountingLLM()
+    outcome = _orchestrate(snapshot, tmp_path, llm, batch_max_tokens=None)
+    assert outcome.ok
+    assert outcome.batched is False, "legacy single-pack keeps the conservative defer semantics"
