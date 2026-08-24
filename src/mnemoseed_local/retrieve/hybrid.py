@@ -45,9 +45,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from mnemoseed_local.config import DEFAULT_RECALL_RESCUE_CUE_MIN, DEFAULT_RECALL_RESCUE_FLOOR
 from mnemoseed_local.retrieve.cues import ExtractedCues
 from mnemoseed_local.schema.graph import GraphNode
-from mnemoseed_local.schema.stamp import ChunkStamp, Cues
+from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, Cues
 from mnemoseed_local.storage.ports import (
     Capability,
     ChunkFilter,
@@ -82,7 +83,8 @@ class HybridConfig:
     Defaults: alpha=1.0, beta=1.0, gamma=0.8, delta=0.5; candidate-pool decay
     floor 0.4 (design item 2: decay_weight < 0.4 never enters the pool);
     per-track pools capped at 20; graph 1-hop degree centrality saturates at 8
-    neighbors.
+    neighbors. The rescue band (design/09 §3.5) admits flashbulb pins below
+    the main floor when the cue match is strong enough.
     """
 
     weight_semantic: float = 1.0
@@ -90,6 +92,8 @@ class HybridConfig:
     weight_decay: float = 0.8
     weight_centrality: float = 0.5
     min_decay: float = 0.4
+    rescue_min_decay: float = DEFAULT_RECALL_RESCUE_FLOOR
+    rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
     vector_top_k: int = 20
     graph_top_k: int = 20
     centrality_saturation: int = 8
@@ -113,7 +117,9 @@ class ScoreBreakdown:
 
 @dataclass(frozen=True)
 class Candidate:
-    """One fused candidate: a chunk hit (kind="chunk") or graph node (kind="graph")."""
+    """One fused candidate: a chunk hit (kind="chunk") or graph node
+    (kind="graph"). ``rescued`` marks a below-main-floor flashbulb pin that
+    entered the pool through the cue-driven rescue band (design/09 §3.5)."""
 
     kind: str
     id: str
@@ -121,6 +127,7 @@ class Candidate:
     item: ChunkStamp | GraphNode
     score: float
     breakdown: ScoreBreakdown
+    rescued: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,7 +247,13 @@ class HybridRetriever:
             embedding.sparse,
             ChunkFilter(
                 profile_id=profile_id,
+                # Route (b) of design/09 §3.5: the two-band admission lives IN
+                # the storage prefilter via the additive pin-class flag —
+                # sub-floor rows must be explicit pins, so faded non-pin chunks
+                # never consume vector top-K slots. The joint pin-class +
+                # cue-match condition below stays as defense-in-depth.
                 min_decay=config.min_decay,
+                pin_min_decay=config.rescue_min_decay,
                 entities=filter_entities,
                 # Recall-surface entity tolerance mirrors the post-filter below:
                 # missing stored cues are absence of evidence, never excluded.
@@ -255,8 +268,21 @@ class HybridRetriever:
         candidates: list[Candidate] = []
         for hit in hits:
             chunk = hit.chunk
+            rescued = False
             if chunk.decay_weight < config.min_decay:
-                continue
+                # Two-band admission (design/09 §3.5): below the main floor
+                # only a flashbulb pin whose cue match clears the rescue
+                # minimum enters the pool — encoding specificity (R4): strong
+                # cues retrieve weak traces. Rank discipline is ENFORCED, not
+                # emergent: _merge sorts every rescued candidate after all
+                # normal candidates regardless of fused score, and the
+                # assembler re-applies that discipline when it admits and
+                # orders the serving surface.
+                if chunk.provenance.source != EXPLICIT_PIN_SOURCE:
+                    continue
+                if _chunk_cue_overlap(query, chunk) < config.rescue_cue_min:
+                    continue
+                rescued = True
             # Empty stored entity cues mean "no entity evidence" (e.g. written
             # before the daemon filled them), never a contradiction: the gate
             # only excludes positive mismatches (D2).
@@ -278,6 +304,7 @@ class HybridRetriever:
                     item=chunk,
                     score=breakdown.total,
                     breakdown=breakdown,
+                    rescued=rescued,
                 )
             )
         return candidates
@@ -344,9 +371,11 @@ class HybridRetriever:
 # ---------------------------------------------------------------- helpers
 
 
-def _sort_key(candidate: Candidate) -> tuple[float, str, str]:
-    """Rank order: score descending, then a stable (kind, id) tie-break."""
-    return (-candidate.score, candidate.kind, candidate.id)
+def _sort_key(candidate: Candidate) -> tuple[bool, float, str, str]:
+    """Rank order: rescued candidates ALWAYS trail normal ones (design/09 §3.5
+    enforced discipline — a cue-fished weak trace never displaces a healthy
+    memory), then score descending, then a stable (kind, id) tie-break."""
+    return (candidate.rescued, -candidate.score, candidate.kind, candidate.id)
 
 
 def _merge(

@@ -13,27 +13,36 @@ sweep interval.
 from __future__ import annotations
 
 from mnemoseed_local.decay.model import (
+    CHUNK_LAMBDA_TYPE,
     CONSOLIDATED_LAMBDA_MULTIPLIER,
     DEFAULT_LAMBDA_PER_TYPE,
     LAMBDA_TARGETS,
+    PIN_LAMBDA_TYPE,
     SECONDS_PER_DAY,
+    chunk_lambda_type,
     decay_weight,
     half_life_days,
     lambda_for,
 )
+from mnemoseed_local.decay.rebuild import PinRebuildStats, rebuild_pin_weights
 from mnemoseed_local.decay.reinforce import ReinforceConfig, Reinforcer
 from mnemoseed_local.decay.sweeper import DecaySweeper, SweepStats
 
 __all__ = [
+    "CHUNK_LAMBDA_TYPE",
     "CONSOLIDATED_LAMBDA_MULTIPLIER",
     "DEFAULT_LAMBDA_PER_TYPE",
     "LAMBDA_TARGETS",
+    "PIN_LAMBDA_TYPE",
     "SECONDS_PER_DAY",
     "DecaySweeper",
+    "PinRebuildStats",
     "ReinforceConfig",
     "Reinforcer",
     "SweepStats",
+    "chunk_lambda_type",
     "decay_weight",
     "half_life_days",
     "lambda_for",
+    "rebuild_pin_weights",
 ]

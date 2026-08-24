@@ -199,6 +199,23 @@ def _config_toml(root: Path, focal_floor: float, budget_chars: int) -> str:
     )
 
 
+def release_daemon_log_handler(root: Path) -> None:
+    """Hand the process-global daemon logger back to rigs rooted at ``root``.
+
+    The lifespan attaches ONE named FileHandler per process (idempotent by
+    name), so a rig's handler would otherwise outlive the rig — holding its
+    daemon.log open past teardown (blocking artifact deletion) and making
+    later boots log into this root's file. Shared by every rig that boots the
+    daemon app under its own root.
+    """
+    target = logging.getLogger("mnemoseed_local")
+    for handler in list(target.handlers):
+        filename = getattr(handler, "baseFilename", None)
+        if filename is not None and Path(filename).is_relative_to(root):
+            target.removeHandler(handler)
+            handler.close()
+
+
 # ---------------------------------------------------------------- the rig
 
 
@@ -276,17 +293,7 @@ class RecallRig:
         self._release_daemon_log_handler()
 
     def _release_daemon_log_handler(self) -> None:
-        """Hand the process-global daemon logger back. The lifespan attaches
-        ONE named FileHandler per process (idempotent by name), so a rig's
-        handler would otherwise outlive the rig — holding its daemon.log open
-        past teardown (blocking artifact deletion) and making later boots log
-        into this root's file."""
-        target = logging.getLogger("mnemoseed_local")
-        for handler in list(target.handlers):
-            filename = getattr(handler, "baseFilename", None)
-            if filename is not None and Path(filename).is_relative_to(self.root):
-                target.removeHandler(handler)
-                handler.close()
+        release_daemon_log_handler(self.root)
 
     # ------------------------------------------------------------ pipeline
 

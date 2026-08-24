@@ -123,6 +123,7 @@ def _chunk(
     confidence: float = 1.0,
     decay_weight: float = 1.0,
     consolidated: bool = False,
+    source: str = "manual",
 ) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
@@ -131,7 +132,7 @@ def _chunk(
         cognitive_tier=CognitiveTier.TIER_1,
         model_id="test-model",
         cues=Cues(entities=["ui"]),
-        provenance=Provenance(asserted_by="user", source="manual", confidence=confidence),
+        provenance=Provenance(asserted_by="user", source=source, confidence=confidence),
         decay_weight=decay_weight,
         ingested_at=ingested_at,
         last_reinforced=last_reinforced,
@@ -254,6 +255,45 @@ def test_sweep_never_decays_pinned_nodes(tmp_path: Path, monkeypatch: pytest.Mon
     assert stores.graph.get_node("plain").decay_weight < 1.0
     assert stats[0].nodes_scanned == 2
     assert stats[0].nodes_updated == 1
+
+
+def test_sweep_pin_chunks_decay_at_the_flashbulb_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """design/09 §3.1 (flashbulb class): a chunk whose provenance.source is the
+    explicit-pin marker resolves its λ from the "pin" tier — preference pace
+    (0.005, ~139-day half-life) instead of the verbatim-chunk rate; an
+    ordinary sibling keeps fading at the chunk rate."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    clock = [now]
+    sweeper = DecaySweeper(stores, config, clock=lambda: clock[0])
+    _seed_chunk(stores, _chunk("pin-c", ingested_at=now - 60 * _DAY, source="memory.remember"))
+    _seed_chunk(stores, _chunk("plain-c", ingested_at=now - 60 * _DAY))
+
+    sweeper.run_once()
+
+    assert stores.vector.get_chunk("pin-c").decay_weight == pytest.approx(math.exp(-0.005 * 60.0), abs=1e-6)
+    assert stores.vector.get_chunk("plain-c").decay_weight == pytest.approx(math.exp(-0.03 * 60.0), abs=1e-6)
+
+
+def test_sweep_pin_lambda_honors_the_explicit_map_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pin tier is a first-class λ key: an explicit ``lambda_per_type["pin"]``
+    entry wins over the design default, exactly like the other tiers."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    clock = [now]
+    config.decay = DecayConfig(lambda_per_type={"pin": 0.02})
+    sweeper = DecaySweeper(stores, config, clock=lambda: clock[0])
+    _seed_chunk(stores, _chunk("pin-c", ingested_at=now - 60 * _DAY, source="memory.remember"))
+
+    sweeper.run_once()
+
+    assert stores.vector.get_chunk("pin-c").decay_weight == pytest.approx(math.exp(-0.02 * 60.0), abs=1e-6)
 
 
 def test_sweep_excludes_tombstoned_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

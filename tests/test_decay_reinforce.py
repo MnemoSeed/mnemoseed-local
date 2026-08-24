@@ -212,6 +212,45 @@ def test_below_floor_chunk_hit_counts_but_never_rebounds(
     assert _raw_chunk(stores, "c3")["hit_count"] == 1
 
 
+def test_rescued_below_floor_hit_gets_the_normal_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """design/09 §3.2 (cue-driven rescue): a rescue-admitted hit is a real
+    consumption event, so a below-floor chunk named as rescued gets exactly the
+    same baseline refresh + bounded rebound as any above-floor hit — being
+    fished back up by a strong cue must let the trace rebound."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    _seed_chunk(
+        stores,
+        _chunk(
+            "rescued",
+            ingested_at=_NOW - 10 * _DAY,
+            last_reinforced=_NOW - 10 * _DAY,
+            decay_weight=0.2,
+        ),
+    )
+    _seed_chunk(
+        stores,
+        _chunk(
+            "sunk",
+            ingested_at=_NOW - 10 * _DAY,
+            last_reinforced=_NOW - 10 * _DAY,
+            decay_weight=0.2,
+        ),
+    )
+
+    _reinforcer(stores).record_hits(["rescued", "sunk"], [], rescued_chunk_ids=["rescued"])
+
+    rebounded = stores.vector.get_chunk("rescued")
+    assert rebounded.decay_weight == pytest.approx(0.3)
+    assert rebounded.last_reinforced == pytest.approx(_NOW)
+    # the un-rescued sibling keeps the FR-4.3 guard semantics untouched
+    sunk = stores.vector.get_chunk("sunk")
+    assert sunk.decay_weight == pytest.approx(0.2)
+    assert sunk.last_reinforced == pytest.approx(_NOW - 10 * _DAY)
+
+
 # ---------------------------------------------------------------- node hits
 
 

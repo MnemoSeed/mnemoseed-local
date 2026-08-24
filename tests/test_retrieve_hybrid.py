@@ -24,10 +24,11 @@ from mnemoseed_local.retrieve.hybrid import (
     ScoreBreakdown,
 )
 from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
-from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
+from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
 from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import ChunkFilter
 from mnemoseed_local.storage.registry import GRAPH_DRIVERS, VECTOR_DRIVERS, register
 
 _DIM = 64
@@ -78,6 +79,7 @@ def _chunk(
     tools: tuple[str, ...] = (),
     consolidated: bool = False,
     profile: str = _PROFILE,
+    source: str = "manual",
 ) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
@@ -94,9 +96,9 @@ def _chunk(
             entities=list(entities),
         ),
         provenance=Provenance(
-            asserted_by="test-model",
-            session_id="s1",
-            source="manual",
+            asserted_by="user" if source == EXPLICIT_PIN_SOURCE else "test-model",
+            session_id=None if source == EXPLICIT_PIN_SOURCE else "s1",
+            source=source,
             confidence=0.8,
             asserted_at=100.0,
         ),
@@ -245,6 +247,152 @@ def test_vector_track_excludes_decay_below_floor(stack) -> None:
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_high" in ids
     assert "c_low" not in ids
+
+
+# ---------------------------------------------------- cue-driven rescue band
+
+
+def test_rescue_band_admits_pin_with_strong_cue_below_main_floor(stack) -> None:
+    """design/09 §3.5 (cue-driven rescue): a flashbulb pin whose weight faded
+    into the rescue band [rescue_floor, 0.4) still enters the pool when the
+    query's cue match is strong — encoding specificity: strong cues retrieve
+    weak traces. The candidate carries the rescued marker."""
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    _write(
+        stack,
+        _chunk("pin", "LanceDb loader", decay=0.3, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE),
+    )
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)), config=config)
+    rescued = [c for c in _chunk_candidates(result) if c.id == "pin"]
+    assert len(rescued) == 1
+    assert rescued[0].rescued is True
+
+
+def test_rescue_band_never_admits_plain_chunks_below_main_floor(stack) -> None:
+    """The relaxation is pin-class only: an ordinary chunk below the main floor
+    stays excluded no matter how well the cue matches (status quo preserved)."""
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    _write(stack, _chunk("plain", "LanceDb loader", decay=0.3, entities=("LanceDb",)))
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)), config=config)
+    assert _chunk_candidates(result) == []
+
+
+def test_prefilter_expresses_relax_pins_only_in_storage(stack) -> None:
+    """Route (b) prefilter (design/09 §3.5): the retriever hands the store a
+    TWO-BAND window — main floor for everyone, relaxed floor for explicit pins
+    only — so faded non-pin chunks are excluded at the storage layer and never
+    consume vector top-K slots; the joint post-filter stays defense-in-depth."""
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    captured: list[ChunkFilter] = []
+
+    class _SpyStore:
+        def __init__(self, inner: LanceDbEmbeddedStore) -> None:
+            self._inner = inner
+
+        def search(self, dense, sparse, filter, top_k):  # noqa: A002 - port signature
+            captured.append(filter)
+            return self._inner.search(dense, sparse, filter, top_k)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    _write(stack, _chunk("faded", "LanceDb loader", decay=0.3, entities=("LanceDb",)))
+    _write(
+        stack,
+        _chunk("aged", "LanceDb loader", decay=0.3, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE),
+    )
+    _write(stack, _chunk("healthy", "LanceDb loader", decay=0.9, entities=("LanceDb",)))
+
+    result = HybridRetriever(config).recall(
+        "lancedb loader",
+        _query_cues(("LanceDb",)),
+        profile_id=_PROFILE,
+        vector_store=_SpyStore(stack.vector),
+        graph_store=stack.graph,
+        embedder=stack.embed,
+    )
+
+    assert len(captured) == 1
+    assert captured[0].min_decay == config.min_decay
+    assert captured[0].pin_min_decay == config.rescue_min_decay
+    # behavioral: the faded non-pin is gone while both legitimate rows survive
+    by_id = {c.id: c for c in _chunk_candidates(result)}
+    assert set(by_id) == {"aged", "healthy"}
+    assert by_id["aged"].rescued is True
+    assert by_id["healthy"].rescued is False
+
+
+def test_rescue_band_requires_the_cue_minimum(stack) -> None:
+    """Below the main floor a pin must clear the cue-match threshold: a partial
+    entity overlap (one of two query entities stored) scores β_entity = 0.3 and
+    is gated by a 0.4 minimum, admitted at 0.2."""
+    partial_overlap = 0.6 * (1 / 2)  # beta-internal entity component, 1-of-2 query entities
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.4)
+    _write(
+        stack,
+        _chunk("pin", "LanceDb loader", decay=0.3, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE),
+    )
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb", "Cache")), config=config)
+    assert [c.id for c in _chunk_candidates(result) if c.rescued] == []
+
+    permissive = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=partial_overlap)
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb", "Cache")), config=permissive)
+    assert [c.id for c in _chunk_candidates(result) if c.rescued] == ["pin"]
+
+
+def test_below_rescue_floor_pin_stays_dead(stack) -> None:
+    """The dead zone holds: below the rescue floor even a perfect-cue pin never
+    enters the pool (it remains reachable only as index residue)."""
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    _write(
+        stack,
+        _chunk("deep", "LanceDb loader", decay=0.1, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE),
+    )
+    result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)), config=config)
+    assert _chunk_candidates(result) == []
+
+
+def test_rescued_candidate_never_ranks_above_a_normal_one(stack) -> None:
+    """Enforced rank discipline (design/09 §3.5): a rescued candidate sorts
+    after ALL normal candidates regardless of its fused score — being fished
+    back must not let a weak trace displace decay-healthy memories."""
+    from mnemoseed_local.retrieve.hybrid import _merge
+
+    strong_rescued = Candidate(
+        kind="chunk",
+        id="rescued-high",
+        source="vector",
+        item=None,
+        score=10.0,
+        breakdown=ScoreBreakdown(
+            semantic=1.0,
+            cue_overlap=0.6,
+            decay_weight=0.2,
+            graph_centrality=0.0,
+            cooccurrence=0.0,
+            total=10.0,
+        ),
+        rescued=True,
+    )
+    modest_normal = Candidate(
+        kind="chunk",
+        id="normal-low",
+        source="vector",
+        item=None,
+        score=1.0,
+        breakdown=ScoreBreakdown(
+            semantic=0.5,
+            cue_overlap=0.6,
+            decay_weight=0.9,
+            graph_centrality=0.0,
+            cooccurrence=0.0,
+            total=1.0,
+        ),
+        rescued=False,
+    )
+    merged = _merge([strong_rescued], [modest_normal])
+
+    assert [candidate.id for candidate in merged.candidates] == ["normal-low", "rescued-high"]
 
 
 def test_vector_track_excludes_consolidated_chunks(stack) -> None:

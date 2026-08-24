@@ -30,12 +30,16 @@ import math
 from collections.abc import Mapping
 
 from mnemoseed_local.config import DEFAULT_LAMBDA_PER_TYPE, LAMBDA_TARGETS
+from mnemoseed_local.schema.stamp import is_explicit_pin
 
 __all__ = [
+    "CHUNK_LAMBDA_TYPE",
     "CONSOLIDATED_LAMBDA_MULTIPLIER",
     "DEFAULT_LAMBDA_PER_TYPE",
     "LAMBDA_TARGETS",
+    "PIN_LAMBDA_TYPE",
     "SECONDS_PER_DAY",
+    "chunk_lambda_type",
     "decay_weight",
     "half_life_days",
     "lambda_for",
@@ -47,7 +51,19 @@ SECONDS_PER_DAY = 86400.0
 #: scene fades once the dream folded the gist into the graph).
 CONSOLIDATED_LAMBDA_MULTIPLIER = 3.0
 
+#: The verbatim channel's ordinary λ key and the flashbulb class's key
+#: (design/09 §3.1): the class derives from provenance.source at read time.
+CHUNK_LAMBDA_TYPE = "chunk"
+PIN_LAMBDA_TYPE = "pin"
+
 _FALLBACK_LAMBDA = 0.01
+
+
+def chunk_lambda_type(source: str) -> str:
+    """The λ tier of one verbatim chunk, derived from its provenance source:
+    an explicit user pin resolves through the slow ``pin`` tier, everything
+    else through the ordinary ``chunk`` rate."""
+    return PIN_LAMBDA_TYPE if is_explicit_pin(source) else CHUNK_LAMBDA_TYPE
 
 
 def decay_weight(confidence: float, lam: float, days: float) -> float:

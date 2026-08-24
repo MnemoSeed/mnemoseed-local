@@ -106,6 +106,16 @@ def test_lambda_targets_cover_node_types_plus_chunk() -> None:
     pseudo-type (the vector store carries no node_type)."""
     assert NodeType.frozen_set() <= LAMBDA_TARGETS
     assert "chunk" in LAMBDA_TARGETS
+    assert "pin" in LAMBDA_TARGETS
+
+
+def test_pin_tier_resolves_the_flashbulb_default() -> None:
+    """design/09 §3.1: the explicit-pin chunk class decays at preference pace —
+    λ_pin defaults to 0.005 (~139-day half-life), overridable via the map."""
+    assert DEFAULT_LAMBDA_PER_TYPE["pin"] == pytest.approx(0.005)
+    assert lambda_for("pin", {}) == pytest.approx(0.005)
+    assert lambda_for("pin", {"pin": 0.02}) == pytest.approx(0.02)
+    assert half_life_days(lambda_for("pin", {})) == pytest.approx(138.6, abs=0.5)
 
 
 def test_lambda_for_resolves_override_then_default_fallback() -> None:

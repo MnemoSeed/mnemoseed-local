@@ -114,6 +114,11 @@ class ChunkFilter:
 
     profile_id: str
     min_decay: float = 0.0
+    # design/09 §3.5 route (b): when set BELOW ``min_decay``, explicit-pin
+    # chunks floor at this value instead — the two-band rescue admission lives
+    # in the storage prefilter itself, so sub-floor non-pin chunks never enter
+    # the search window. Drivers without the pin flag treat it as absent.
+    pin_min_decay: float | None = None
     ingested_after: float | None = None
     ingested_before: float | None = None
     session_id: str | None = None

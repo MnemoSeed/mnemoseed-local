@@ -32,12 +32,14 @@ from lancedb.query import ColumnOrdering
 
 from mnemoseed_local.config import CONFIG_DIR
 from mnemoseed_local.schema.stamp import (
+    EXPLICIT_PIN_SOURCE,
     ChunkStamp,
     CognitiveTier,
     Cues,
     EmotionCue,
     Provenance,
     ProvenanceEvent,
+    is_explicit_pin,
 )
 from mnemoseed_local.storage.ports import (
     Capability,
@@ -481,6 +483,9 @@ class LanceDbEmbeddedStore:
                 pa.field("entities_filter", pa.string()),
                 # B2.7 Scheme 2-lite: verbatim standing-constraint JSON
                 pa.field("rules_json", pa.string()),
+                # design/09 §3.5 route (b): denormalized pin-class flag so the
+                # rescue-band prefilter can exclude sub-floor non-pin rows
+                pa.field("explicit_pin", pa.bool_()),
             ]
         )
 
@@ -506,6 +511,15 @@ class LanceDbEmbeddedStore:
                 except TypeError:
                     # lancedb >= 0.20 expects a field/schema for NULL columns
                     self._table.add_columns([pa.field("rules_json", pa.string())])
+                self._table = self._db.open_table(self.table_name)
+            if "explicit_pin" not in self._table.schema.names:
+                try:
+                    # legacy rows keep NULL until their next rewrite; the pin
+                    # filter clause falls back to the authoritative provenance
+                    # source so they never lose or gain class membership
+                    self._table.add_columns({"explicit_pin": pa.bool_()})
+                except TypeError:
+                    self._table.add_columns([pa.field("explicit_pin", pa.bool_())])
                 self._table = self._db.open_table(self.table_name)
         else:
             self._table = self._db.create_table(self.table_name, schema=self._schema())
@@ -579,6 +593,7 @@ class LanceDbEmbeddedStore:
             "rules_json": (
                 json.dumps(chunk.rules, separators=(",", ":"), ensure_ascii=False) if chunk.rules else None
             ),
+            "explicit_pin": is_explicit_pin(provenance.source),
         }
 
     def _to_stamp(self, row: dict[str, Any]) -> ChunkStamp:
@@ -678,7 +693,20 @@ class LanceDbEmbeddedStore:
 
     def _filter_extra_sql(self, filter: ChunkFilter) -> list[str]:
         parts: list[str] = []
-        if filter.min_decay > 0.0:
+        if filter.pin_min_decay is not None and filter.pin_min_decay < filter.min_decay:
+            # design/09 §3.5 route (b): two-band admission in the STORAGE
+            # prefilter — sub-floor rows must be explicit pins. The flag covers
+            # new rows; the provenance-source disjunct keeps pre-flag legacy
+            # rows authoritative (NULL flag never changes class membership).
+            pin_band = (
+                f"((explicit_pin = true OR provenance['source'] = {_escape(EXPLICIT_PIN_SOURCE)}) "
+                f"AND decay_weight >= {_escape(filter.pin_min_decay)})"
+            )
+            if filter.min_decay > 0.0:
+                parts.append(f"(decay_weight >= {_escape(filter.min_decay)} OR {pin_band})")
+            else:
+                parts.append(pin_band)
+        elif filter.min_decay > 0.0:
             parts.append(f"decay_weight >= {_escape(filter.min_decay)}")
         if filter.ingested_after is not None:
             parts.append(f"ingested_at >= {_escape(filter.ingested_after)}")

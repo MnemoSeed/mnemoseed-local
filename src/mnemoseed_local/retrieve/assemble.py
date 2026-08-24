@@ -106,6 +106,7 @@ class EntryFlag(StrEnum):
     CONFLICT_PAIR = "conflict_pair"
     CONFLICT_OMITTED = "conflict_omitted"
     FRESH_EVIDENCE = "fresh_evidence"
+    RESCUED = "rescued"  # design/09 §3.5: admitted through the cue-driven rescue band
 
 
 @dataclass(frozen=True)
@@ -268,9 +269,20 @@ class Assembler:
         config: AssembleConfig,
     ) -> tuple[list[_Admission], int]:
         """Walk the ranked pool, admitting under top-k/budget and pairing
-        conflict groups atomically. Returns the admissions and the count of
-        candidates rejected by the gate (never silent)."""
-        ordered = sorted(pool, key=lambda candidate: (-effective[candidate.id], candidate.kind, candidate.id))
+        conflict groups atomically. Admission re-applies the retriever's rank
+        discipline (design/09 §3.5: rescued candidates trail normal ones
+        regardless of fused score) so rendering order and top-k truncation
+        inherit it at the serving surface. Returns the admissions and the
+        count of candidates rejected by the gate (never silent)."""
+        ordered = sorted(
+            pool,
+            key=lambda candidate: (
+                candidate.rescued,
+                -effective[candidate.id],
+                candidate.kind,
+                candidate.id,
+            ),
+        )
         kept: list[_Admission] = []
         used = 0
         consumed: set[str] = set()
@@ -403,6 +415,8 @@ class Assembler:
     ) -> AssembledEntry:
         candidate = admission.candidate
         flags: list[EntryFlag] = []
+        if candidate.rescued:
+            flags.append(EntryFlag.RESCUED)
         if candidate.kind == "graph":
             node = candidate.item
             if isinstance(node, GraphNode) and node.pending_consolidation:
