@@ -64,7 +64,7 @@ from mnemoseed_local.dream import (
     TripleVerifier,
     resume_boundary,
 )
-from mnemoseed_local.dream.pipeline import RunCompletion
+from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -630,6 +630,29 @@ class _WorkerTriggerForwarder:
         self._worker.enqueue_event(event)
 
 
+def _audit_extract_failure(meta: Any, failure: ExtractFailure) -> None:
+    """Observation log for failed dream extractions: one classified audit row
+    per attempt, best-effort — an audit surface fault never breaks the dream
+    pipeline."""
+    try:
+        meta.audit_append(
+            AuditEntry(
+                actor="dream",
+                action="dream_extract_failed",
+                detail={
+                    "profile_id": failure.profile_id,
+                    "stage": failure.stage,
+                    "failure_class": failure.failure_class,
+                    "detail": failure.detail,
+                    "tokens": failure.tokens,
+                },
+                at=time.time(),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("extract-failure audit failed for %s: %s", failure.profile_id, exc)
+
+
 def _build_capture(
     stores: Stores, config: Config, configwrite: ConfigWriteService
 ) -> tuple[
@@ -755,6 +778,7 @@ def _build_capture(
         reflector=reflector,
         merger=merger,
         on_run_committed=_record_run_completion,
+        on_extract_failed=lambda failure: _audit_extract_failure(stores.meta, failure),
         # B5 vote: the live ensemble mode ("off" | "verify" | "vote") read off
         # the config each run, so the pipeline dispatches the vote dual-seat
         # chain when the user opted in (configwrite changes hot-apply).
