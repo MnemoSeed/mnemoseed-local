@@ -85,6 +85,34 @@ connectivity error.
 Test-driven, with an adversarial verifier on every task: failing tests first.
 Gates: `uv run pytest -q`, `ruff check`, `ruff format --check`, `mypy src`.
 
+## Sponsor MnemoSeed
+
+**One memory under all your coding agents.**  
+MnemoSeed Local is an MIT, single-machine MVP that proves the core pipeline: capture → dream → decay → retrieve. Every prompt and response is stored verbatim, scored for importance, distilled by an offline dream pass, and forgotten on an Ebbinghaus curve — so the next session starts with what matters, not a blank slate.
+
+Your sponsorship keeps the dream model running (Opus-class inference), covers domain/infra for cloud TEE validation, and funds the daily burn of building in public.
+
+### Tiers
+
+| Tier | Monthly | What you get |
+|------|---------|--------------|
+| **Supporter** | $5 | Name in README Contributors |
+| **Backer** | $25 | Priority issue response + monthly dream-cost/eval brief (real numbers) |
+| **Sponsor** | $100 | README logo + quarterly roadmap sync (no feature promises) |
+| **Enterprise** | $500 | Direct support channel + private deployment consult (pre-warms Cloud) |
+
+One-time tips also welcome via Polar (below) or Buy Me a Coffee.
+
+### Channels
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-%23EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/MnemoSeed)
+[![Polar](https://img.shields.io/badge/Donate-Polar-%230066FF?logo=polar&logoColor=white)](https://buy.polar.sh/polar_cl_KoNqAsMI8IQGy5RRE8MLbX7I5TBGUMh9Kn8CC35YfP7)
+[![Buy Me a Coffee](https://img.shields.io/badge/Tip-Buy%20Me%20a%20Coffee-%23FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/mnemoseed)
+
+> **透明度承诺**：月度梦境成本、评估数据、赞助人数/金额将在 Backer 简报与季度 sync 中公开。不锁功能、不卖 License、不透支 Roadmap。
+
+[![Thanks.dev](https://thanks.dev/badge.svg?package=github%3AMnemoSeed%2Fmnemoseed-local)](https://thanks.dev/github/MnemoSeed/mnemoseed-local)
+
 ## Evaluation (maintainers)
 
 The eval harness lives at `python -m mnemoseed_local.eval`, run from a source
