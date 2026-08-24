@@ -9,6 +9,7 @@ and the daemon refuses a non-loopback baseurl at boot.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import threading
 import time
@@ -65,6 +66,22 @@ def test_healthz_after_real_boot(config_path: Path) -> None:
         assert body["gate"]["ok"] is True
         health = client.get("/health").json()
         assert health["drivers"]["embed"] == "synthetic"
+
+
+def test_shutdown_releases_the_global_daemon_log_handler(config_path: Path) -> None:
+    """Lifespan teardown must release the process-global named daemon.log
+    handler it attached: a released handler keeps daemon.log deletable and
+    stops a torn-down boot from bleeding into a later boot's logs."""
+    target = logging.getLogger("mnemoseed_local")
+
+    def named_handlers() -> list[logging.Handler]:
+        return [h for h in target.handlers if getattr(h, "name", None) == "daemon.log"]
+
+    for handler in named_handlers():  # isolate from handlers earlier boots left attached
+        target.removeHandler(handler)
+    with _boot(config_path):
+        assert named_handlers(), "the lifespan never attached the daemon.log handler"
+    assert not named_handlers(), "shutdown kept the global daemon.log handler attached"
 
 
 def test_ingest_scan_runs_on_daemon_pool(config_path: Path) -> None:
@@ -544,6 +561,23 @@ def _wait_dream_idle(client: TestClient, timeout: float = 10.0) -> dict:
     raise AssertionError(f"dream never returned to idle; last status: {body}")
 
 
+def _wait_audit_total(client: TestClient, action: str, minimum: int, timeout: float = 3.0) -> int:
+    """Poll /api/v1/audit until ``action`` has at least ``minimum`` rows.
+
+    The dream worker flips the trigger to idle at merge-commit, while the
+    dream_committed audit row is appended afterwards on the completion path —
+    a single-shot query can observe committed-but-not-yet-audited.
+    """
+    deadline = time.monotonic() + timeout
+    total = 0
+    while time.monotonic() < deadline:
+        total = client.get("/api/v1/audit", params={"action": action}).json()["total"]
+        if total >= minimum:
+            return total
+        time.sleep(0.05)
+    raise AssertionError(f"audit {action!r} never reached {minimum}; last total: {total}")
+
+
 # ---------------------------------------------------------------- B1 T3: ensemble verify (daemon wiring)
 
 
@@ -793,8 +827,7 @@ def test_config_set_auto_trigger_off_stops_launches_without_restart(config_path:
         settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
         assert settled.status_code == 200, settled.text
         _wait_dream_idle(client)
-        committed_before = client.get("/api/v1/audit", params={"action": "dream_committed"}).json()["total"]
-        assert committed_before >= 1
+        committed_before = _wait_audit_total(client, "dream_committed", minimum=1)
 
         # the runtime off-switch: every reporting surface agrees it is off
         result = client.post(

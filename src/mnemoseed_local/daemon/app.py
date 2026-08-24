@@ -822,7 +822,9 @@ def _attach_daemon_log_handler() -> None:
     daemon is alive; the boot/teardown stage lines and the watchdog last-words
     all land here through the daemon logger's propagation. The logger's level
     is lifted to INFO so the info-graded stage lines are not dropped before the
-    handler sees them."""
+    handler sees them. The handler is a process-global: exactly one live boot
+    per process is the supported embedding shape, and its teardown releases
+    the handler again (``_release_daemon_log_handler``)."""
     target = logging.getLogger("mnemoseed_local")
     for handler in target.handlers:
         if getattr(handler, "name", None) == "daemon.log":
@@ -839,6 +841,18 @@ def _attach_daemon_log_handler() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     target.addHandler(handler)
     target.setLevel(logging.INFO)
+
+
+def _release_daemon_log_handler() -> None:
+    """Teardown counterpart of ``_attach_daemon_log_handler``: close and drop
+    the named handler so a torn-down boot never keeps its daemon.log open
+    (undeletable log) or bleeds into a later boot's file. Assumes one live
+    boot per process — the shape pinned at the attach site."""
+    target = logging.getLogger("mnemoseed_local")
+    for handler in list(target.handlers):
+        if getattr(handler, "name", None) == "daemon.log":
+            target.removeHandler(handler)
+            handler.close()
 
 
 @asynccontextmanager
@@ -978,8 +992,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 abandoned,
             )
     logger.info("teardown: close stores")
-    await stores.close()
-    logger.info("teardown: complete")
+    try:
+        await stores.close()
+    finally:
+        logger.info("teardown: complete")
+        _release_daemon_log_handler()
 
 
 def create_app() -> FastAPI:
