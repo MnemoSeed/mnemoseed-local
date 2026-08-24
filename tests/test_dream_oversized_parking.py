@@ -180,3 +180,22 @@ def test_parking_is_per_window_and_growth_gets_fresh_attempts() -> None:
     disjoint = TurnRange(start=100, end=120)
     _deliver(pipeline, 200, disjoint)
     assert reflector.calls == 5, "unrelated windows are never blocked by another window's park"
+
+
+def test_boot_replay_deferrals_never_arm_parking() -> None:
+    """Boot recovery replays journaled merge-boundary verdicts with NO new LLM
+    evidence; replaying an old verdict must not arm the parking guard, or every
+    boot would re-park the window before any fresh attempt could run."""
+    reflector = _SpyReflector(ReflectOutcome(ok=True, result=_empty_with_overflow()))
+    failures: list[ExtractFailure] = []
+    outcomes: list[tuple[str, bool]] = []
+    pipeline, _ = _pipeline(reflector, failures, [], outcomes)
+
+    for replay in range(6):
+        pipeline.on_snapshot_ready(_PROFILE)
+        pipeline.run(_snap(f"snap-replay-{replay}"), counts_toward_parking=False)
+
+    assert not [f for f in failures if f.failure_class == "oversized_parked"], "replay never parks"
+    assert reflector.calls == 6, "every replay still ran its boundary honestly"
+    deferred_rows = [f for f in failures if f.failure_class == "truncated_delta_deferred"]
+    assert len(deferred_rows) == 6, "each replay defers with its audit record"

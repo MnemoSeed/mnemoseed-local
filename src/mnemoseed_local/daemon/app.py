@@ -322,7 +322,9 @@ class _DreamJob:
     def run(self, trigger: DreamTrigger, config: Config | None = None) -> bool | None:
         """Execute on the worker thread; returns the manual launch decision."""
         if self.pipeline is not None and self.snapshot is not None:
-            self.pipeline.run(self.snapshot)
+            # Boot-recovery replay: no new LLM evidence, so the oversized-delta
+            # parking guard must not arm on replayed verdicts (#97/#99).
+            self.pipeline.run(self.snapshot, counts_toward_parking=False)
             return None
         if self.event is not None:
             if config is not None:
