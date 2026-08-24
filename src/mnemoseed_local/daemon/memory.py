@@ -298,6 +298,20 @@ def _scan_session_window(
     )
 
 
+# Cross-session contamination guard (served on /session/recent): agents
+# resuming from this surface must not mistake another conversation's open
+# work for their own todo list. Embedded IN the payload — not just tool docs —
+# because it must reach every consumer that reads the tails.
+_RECENT_SESSIONS_GUIDANCE = (
+    "These tails may belong to OTHER conversations, not yours. A session with "
+    "active=true is another conversation still in progress: do not adopt or "
+    "continue its work in this session unless the user explicitly asks. For a "
+    "dormant session (active=false), resume its work only when the user asks "
+    "this session to continue THAT specific work, and prefer finishing the "
+    "work already in flight here first."
+)
+
+
 def _window_iso(window: SessionWindow) -> dict[str, str] | None:
     """ISO-8601 UTC rendering of an exact window; null when it has no chunks
     or a non-positive (epoch-leak) bound."""
@@ -851,6 +865,15 @@ class MemoryService:
             )
             group["window"] = _window_iso(window)
             group["window_truncated"] = window.window_truncated
+            # Cross-session contamination guard: a session still capturing is
+            # ANOTHER conversation in progress. Surface the live-capture flag
+            # and staleness explicitly so a resuming agent can tell "someone
+            # else's open work" from "a conversation that ended".
+            group["active"] = group["session_id"] in active_sessions
+            latest = window.latest
+            group["seconds_since_last_activity"] = (
+                max(0.0, time.time() - latest) if latest is not None and latest > 0 else None
+            )
         self_window: dict[str, Any] | None = None
         if self_session_id:
             window = _scan_session_window(
@@ -867,6 +890,7 @@ class MemoryService:
             "profile_id": profile_id,
             "sessions": groups,
             "self_window": self_window,
+            "guidance": _RECENT_SESSIONS_GUIDANCE,
         }
         rules_budget = self._build_rules_budget(
             profile_id=profile_id, session_id=self_session_id, per_session=per_session

@@ -106,7 +106,11 @@ TOOLS: list[dict[str, Any]] = [
         "name": "recent_sessions",
         "description": "Fetch the most recent sessions' verbatim tails from mnemoseed-local — "
         "use it to re-anchor on where the previous conversation ended "
-        "(time-ordered resume, newest session group first).",
+        "(time-ordered resume, newest session group first). "
+        "CAUTION: groups may be OTHER conversations. active=true means that conversation is still "
+        "in progress — do not adopt or continue its work here unless the user explicitly asks; "
+        "for dormant sessions resume only what the user asks THIS session to continue. "
+        "The response's guidance field restates this.",
         "inputSchema": {
             "type": "object",
             "properties": {

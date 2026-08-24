@@ -232,7 +232,10 @@ def test_session_recent_empty_profile_returns_no_groups(config_path: Path) -> No
     with TestClient(create_app()) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
-        assert body.json() == {"profile_id": PROFILE, "sessions": [], "self_window": None}
+        payload = body.json()
+        assert payload["sessions"] == []
+        assert payload["self_window"] is None
+        assert "do not adopt" in payload["guidance"].lower(), "guidance ships even when empty"
 
 
 def test_session_recent_rejects_out_of_range_caps(config_path: Path) -> None:
@@ -399,3 +402,31 @@ def test_session_recent_question_group_window_is_null(config_path: Path) -> None
         assert "?" in groups
         assert groups["?"]["window"] is None
         assert groups["?"]["window_truncated"] is False
+
+
+def test_session_recent_flags_active_sessions_and_embeds_anti_adoption_guidance(config_path: Path) -> None:
+    """Cross-session contamination guard: a session still capturing is ANOTHER
+    conversation in progress. The payload must flag liveness per group (and
+    expose staleness in seconds) plus embed explicit do-not-adopt guidance, so
+    a resuming agent never mistakes another session's open work for its own
+    todo list."""
+    with TestClient(create_app()) as client:
+        _ingest(client, "sess-old", 1.0, "早已结束的旧会话")
+        client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
+        _ingest(client, "sess-live", 2.0, "另一条线还在进行中")
+        client.post("/session/end", json={"session_id": "sess-live", "profile_id": PROFILE})
+        # liveness comes from the live-capture registry, not the store: point
+        # it at sess-live directly to simulate that session capturing again
+        client.app.state.capture.sessions = lambda: ("sess-live",)
+
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        payload = body.json()
+        by_id = {s["session_id"]: s for s in payload["sessions"]}
+        assert by_id["sess-live"]["active"] is True, "a still-capturing session must be flagged active"
+        assert by_id["sess-old"]["active"] is False
+        stale = by_id["sess-old"]["seconds_since_last_activity"]
+        assert isinstance(stale, (int, float)) and stale > 0
+        guidance = payload["guidance"]
+        assert "in progress" in guidance
+        assert "do not adopt" in guidance.lower()
