@@ -41,7 +41,11 @@ from mnemoseed_local.eval.matrix import (
     summary_lines,
 )
 from mnemoseed_local.eval.recall_harness import RecallRig
-from mnemoseed_local.eval.recall_materials import RecallMaterial, recall_materials
+from mnemoseed_local.eval.recall_materials import (
+    RECALL_MATERIALS_SEED,
+    RecallMaterial,
+    recall_materials,
+)
 from mnemoseed_local.eval.recall_matrix import (
     PARAM_BUDGETS,
     PARAM_FLOORS,
@@ -373,7 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     recall = sub.add_parser("recall", help="T4b live calibration: coordinate descent over T2 pipeline rig")
     recall.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
     recall.add_argument("--write-config", action="store_true", help="write recommended values to config.py")
-    recall.add_argument("--seed", type=int, default=20260821, help="material catalog seed")
+    recall.add_argument(
+        "--seed",
+        type=int,
+        default=RECALL_MATERIALS_SEED,
+        help="material catalog seed (pinned; overrides are rejected)",
+    )
 
     rescue = sub.add_parser(
         "rescue",
@@ -387,6 +396,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.command == "recall" and args.seed != RECALL_MATERIALS_SEED:
+        # Material identity is part of the calibration bar: the descent's bars
+        # hold only for the pinned catalog seed, so another catalog would yield
+        # outcomes incomparable with every calibrated constant — a seed override
+        # is rejected instead of silently running the default catalog.
+        parser.error(
+            f"--seed {args.seed}: seed override not supported for calibration "
+            f"comparability (bars assume the pinned catalog seed {RECALL_MATERIALS_SEED})"
+        )
     if args.command == "matrix":
         return _matrix_command(args)
     if args.command == "rescore":
