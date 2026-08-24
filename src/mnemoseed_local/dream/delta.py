@@ -244,3 +244,36 @@ class DeltaPacker:
             overflow_count=len(request.overflow_chunk_ids),
             budget_tokens=request.budget_tokens,
         )
+
+    def plan_batches(self, snapshot: Snapshot, *, batch_max_tokens: int) -> list[DeltaRequest]:
+        """Slice the snapshot into whole-chunk batches for batched reflection (#99).
+
+        Greedy fill in ``ordered_chunks`` order: a chunk joins the current
+        batch while the running token estimate fits ``batch_max_tokens``,
+        otherwise a new batch starts. A single chunk larger than the cap still
+        gets its own batch (never split mid-text — same contract as ``pack``).
+        Every chunk lands in exactly one batch and every returned request
+        carries empty overflow by construction; concatenating the packed ids
+        covers the snapshot. Deterministic and pure.
+
+        Raises ValueError for a non-positive cap (0/None means "batching
+        disabled" at the caller and must be checked there).
+        """
+        if batch_max_tokens <= 0:
+            raise ValueError("batch_max_tokens must be positive; disable batching with None instead")
+        batches: list[list[SnapshotChunk]] = []
+        current: list[SnapshotChunk] = []
+        acc_text = ""
+        for chunk in ordered_chunks(snapshot.chunks):
+            block = render_chunk_block(chunk)
+            candidate = acc_text + block
+            if current and estimate_tokens(candidate) > batch_max_tokens:
+                batches.append(current)
+                current = []
+                acc_text = ""
+                candidate = block
+            current.append(chunk)
+            acc_text = candidate
+        if current:
+            batches.append(current)
+        return [self.pack(replace(snapshot, chunks=tuple(batch))) for batch in batches]

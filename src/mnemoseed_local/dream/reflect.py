@@ -51,10 +51,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from mnemoseed_local.config import CONFIG_DIR
-from mnemoseed_local.dream.delta import DeltaPacker, DeltaReport
+from mnemoseed_local.dream.delta import DeltaPacker, DeltaReport, DeltaRequest
 from mnemoseed_local.dream.ledger import TokenLedger
 from mnemoseed_local.dream.prompts import (
     ChunkBlock,
+    ordered_chunks,
     origin_of,
     parse_chunk_blocks,
 )
@@ -69,6 +70,12 @@ from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.storage.ports import TurnRange
 
 logger = logging.getLogger("mnemoseed_local.dream.reflect")
+
+#: Batched reflection (#99): the per-dream bound on LLM calls when batching is
+#: enabled. The total packed delta across the batches stays within the same
+#: delta-budget ceiling a single legacy call respected, so the dream's cost
+#: envelope is unchanged — it is only split into model-sized pieces.
+_MAX_REFLECT_BATCHES_PER_DREAM = 4
 
 
 # ---------------------------------------------------------------- output contract
@@ -199,6 +206,34 @@ def _with_provider_usage(report: DeltaReport, usage: Usage | None) -> DeltaRepor
     if usage is None:
         return report
     return report.with_provider_usage(usage)
+
+
+def _aggregate_reports(
+    reports: list[DeltaReport],
+    usages: list[Usage | None],
+    *,
+    overflow_count: int,
+) -> DeltaReport:
+    """Fold per-batch telemetry into one honest per-dream report (#99).
+
+    ``delta_tokens`` sums (every batch's call happened); ``prefix_tokens``
+    takes the max (the cache-resident prefix is the same stable text every
+    batch, not a per-batch cost); provider usage sums the reported legs.
+    """
+    completion = sum(u.completion_tokens or 0 for u in usages if u is not None)
+    prompt = sum(u.prompt_tokens or 0 for u in usages if u is not None)
+    usage = (
+        Usage(prompt_tokens=prompt or None, completion_tokens=completion or None)
+        if prompt or completion
+        else None
+    )
+    return DeltaReport(
+        delta_tokens=sum(r.delta_tokens for r in reports),
+        prefix_tokens=max((r.prefix_tokens for r in reports), default=0),
+        overflow_count=overflow_count,
+        budget_tokens=reports[-1].budget_tokens if reports else 0,
+        provider_usage=usage,
+    )
 
 
 # ---------------------------------------------------------------- field-level coercion (D4)
@@ -484,6 +519,7 @@ class ReflectOrchestrator:
         verifier: Verifier | None = None,
         vote_llm: ChatLLM | None = None,
         resolve_vote_llm: Callable[[], ChatLLM] | None = None,
+        batch_max_tokens: int | None = None,
     ) -> None:
         self._llm = llm
         # F2 hot-apply seam: when wired, every reflect pass materializes the
@@ -513,6 +549,10 @@ class ReflectOrchestrator:
         # when not wired, so vote degrades to a same-seat pass rather than crash.
         self._vote_llm = vote_llm if vote_llm is not None else llm
         self._resolve_vote_llm = resolve_vote_llm
+        # Batched reflection (#99): None (the default) keeps the legacy
+        # single-pack path byte-identical; a positive cap slices oversized
+        # backlogs into model-sized batches drained over successive dreams.
+        self._batch_max_tokens = batch_max_tokens
 
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
         """Run the single-model reflect pass (off / verify ensemble modes).
@@ -644,6 +684,10 @@ class ReflectOrchestrator:
         """Run one full generation pass against a seat LLM (pack -> retry ->
         assemble). Returns a typed outcome: ok=True with ``result`` set on
         success, a degraded outcome (defer / retries exhausted) otherwise."""
+        if self._batch_max_tokens is not None:
+            batches = self._packer.plan_batches(snapshot, batch_max_tokens=self._batch_max_tokens)
+            if len(batches) > 1:
+                return self._run_batched_seat(snapshot, llm, batches)
         request = self._packer.pack(snapshot)
         report = self._packer.report(request)
         if not request.delta and request.overflow_chunk_ids:
@@ -714,6 +758,104 @@ class ReflectOrchestrator:
             report=_with_provider_usage(report, provider_usage),
             llm_unavailable=unavailable,
         )
+
+    def _run_batched_seat(
+        self,
+        snapshot: Snapshot,
+        llm: ChatLLM,
+        batches: list[DeltaRequest],
+    ) -> ReflectOutcome:
+        """Batched generation pass (#99): run up to
+        ``_MAX_REFLECT_BATCHES_PER_DREAM`` model-sized LLM calls per dream,
+        collect raw mentions across batches, then fold ONCE globally so dedup
+        sees the whole picture. Chunks whose batch never ran (the tail beyond
+        the per-dream cap) stay honest overflow — merge commits exactly the
+        covered ids via the allow-list safe-clear while the rest stays
+        journaled for later dreams. Any batch failure degrades the whole seat:
+        the snapshot stays journaled at the reflect boundary (existing
+        retry-lane semantics), bounded re-burn next attempt by the batch cap.
+        """
+        model_id = str(getattr(llm, "model", "") or "")
+        origin_by_chunk = {c.chunk_id: origin_of(c) for c in snapshot.chunks}
+        mentions: list[ReflectedTriple] = []
+        covered: list[str] = []
+        reports: list[DeltaReport] = []
+        usages: list[Usage | None] = []
+        unavailable = False
+        for request in batches[:_MAX_REFLECT_BATCHES_PER_DREAM]:
+            payload, usage, batch_unavailable, error = self._chat_batch_with_retries(llm, request)
+            reports.append(self._packer.report(request))
+            usages.append(usage)
+            unavailable = unavailable or batch_unavailable
+            if payload is None:
+                logger.warning(
+                    "batched reflect degraded for %s at batch %d/%d: %s",
+                    snapshot.profile_id,
+                    len(reports),
+                    min(len(batches), _MAX_REFLECT_BATCHES_PER_DREAM),
+                    error,
+                )
+                return ReflectOutcome(
+                    ok=False,
+                    result=None,
+                    error=error,
+                    report=_aggregate_reports(reports, usages, overflow_count=len(batches) - len(covered)),
+                    llm_unavailable=unavailable,
+                )
+            for item in payload:
+                triple = _parse_triple(snapshot, item, origin_by_chunk, model_id=model_id or None)
+                if triple is not None:
+                    mentions.append(triple)
+            covered.extend(request.packed_chunk_ids)
+        covered_set = set(covered)
+        uncovered = tuple(
+            c.chunk_id for c in ordered_chunks(snapshot.chunks) if c.chunk_id not in covered_set
+        )
+        result = _fold_triples(
+            snapshot,
+            batches[0].version,
+            mentions,
+            overflow_chunk_ids=uncovered,
+            consumed_chunk_ids=tuple(covered),
+            model_id=model_id or None,
+        )
+        return ReflectOutcome(
+            ok=True,
+            result=result,
+            report=_aggregate_reports(reports, usages, overflow_count=len(uncovered)),
+            llm_unavailable=unavailable,
+        )
+
+    def _chat_batch_with_retries(
+        self,
+        llm: ChatLLM,
+        request: DeltaRequest,
+    ) -> tuple[list[Any] | None, Usage | None, bool, str]:
+        """One batch's LLM call under the same retry/backoff contract as the
+        legacy single-pack path. Returns (payload, usage, llm_unavailable,
+        error); payload is None iff every retry was exhausted."""
+        provider_usage: Usage | None = None
+        last_error = ""
+        unavailable = False
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = llm.chat(system=request.cache_prefix, user=request.delta)
+                text, provider_usage = _split_response(response)
+                payload = _loads_json_array(text)
+                if not isinstance(payload, list):
+                    raise ValueError("reflect output is not a JSON array")
+                return payload, provider_usage, unavailable, ""
+            except LLMUnavailable as exc:  # FR-2.6: typed provider outage, flagged + retried
+                unavailable = True
+                if self._on_unavailable is not None:
+                    self._on_unavailable(str(exc))
+                last_error = str(exc)
+            except Exception as exc:  # noqa: BLE001 - degrade, never raise into the caller
+                last_error = str(exc)
+            if attempt >= self._max_retries:
+                return None, provider_usage, unavailable, last_error
+            self._sleep(self._backoff(attempt))
+        raise AssertionError("unreachable: retry loop must return")
 
     def _record_and_finalize(
         self,

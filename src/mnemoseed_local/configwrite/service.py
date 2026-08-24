@@ -153,6 +153,14 @@ def _validate_delta_ceiling(value: Any) -> int:
     return value
 
 
+def _validate_reflect_batch_cap(value: Any) -> int:
+    """dream.reflect_batch_max_tokens: a non-negative integer; 0 disables
+    batched reflection and keeps the legacy single-pack reflect (#99)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("must be a non-negative integer (0 disables batching)")
+    return value
+
+
 def _validate_forced_cap(value: Any) -> float:
     """dream.pool_forced_cap: a positive number (its >= floor ordering is the
     cross-validation's job)."""
@@ -550,6 +558,14 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         apply=lambda config, value: _dream_apply(config, "pool_forced_cap", value),
         live_apply=True,
         cross_validate=_cross_validate_floor_vs_cap,
+    ),
+    "dream.reflect_batch_max_tokens": ConfigKey(
+        key_path="dream.reflect_batch_max_tokens",
+        value_type="non-negative integer (0 disables batching)",
+        validate=_validate_reflect_batch_cap,
+        read=lambda config: config.dream.reflect_batch_max_tokens,
+        apply=lambda config, value: _dream_apply(config, "reflect_batch_max_tokens", value),
+        live_apply=False,
     ),
     # Decay engine (PRD-04 FR-4.1 / design/01 stage ⑤): the sweep's tunables
     # are live-applied — a λ edit reaches the NEXT sweep without a restart.
