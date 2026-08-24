@@ -233,7 +233,13 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error, stage="reflect", outcome=outcome)
             return
-        self._merge(snapshot, outcome.result, outcome.report, counts_toward_parking=counts_toward_parking)
+        self._merge(
+            snapshot,
+            outcome.result,
+            outcome.report,
+            counts_toward_parking=counts_toward_parking,
+            empty_verdict_commitable=outcome.batched,
+        )
 
     def _run_vote_a_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """B5 vote: run seat A, then chain B -> combine -> merge on success."""
@@ -314,8 +320,9 @@ class DreamPipeline:
         report: DeltaReport | None = None,
         *,
         counts_toward_parking: bool = True,
+        empty_verdict_commitable: bool = False,
     ) -> None:
-        if not result.triples and result.overflow_chunk_ids:
+        if not result.triples and result.overflow_chunk_ids and not empty_verdict_commitable:
             # Engine-side insurance (D1, FR-2.5 never-drop invariant): the
             # result is empty BECAUSE the delta was truncated, so committing it
             # would fire the safe-clear and purge source chunks the model never
@@ -323,6 +330,14 @@ class DreamPipeline:
             # (larger budget / manual run) can pick the overflow up. A genuinely
             # empty result with NO overflow (all-noise session) still merges and
             # purges normally.
+            #
+            # Batched exception (#99): when the batched seat ran, every COVERED
+            # chunk was fully handed to the model under budget — an empty
+            # verdict there is a genuine "nothing durable in this range", so
+            # merge commits it and the allow-list safe-clear clears exactly the
+            # covered ids while the unseen overflow tail stays journaled. This
+            # is what lets an unextractable head-of-queue advance instead of
+            # wedging the whole backlog forever.
             if counts_toward_parking:
                 attempts = self._deferred_attempts.get(_window_key(snapshot), 0) + 1
                 self._deferred_attempts[_window_key(snapshot)] = attempts
@@ -374,6 +389,14 @@ class DreamPipeline:
                 report=report,
             )
             return
+        if not result.triples and empty_verdict_commitable:
+            logger.warning(
+                "batched dream for %s commits an EMPTY extraction verdict over %d covered "
+                "chunk(s); %d unseen overflow chunk(s) stay journaled for a later dream",
+                snapshot.profile_id,
+                len(result.consumed_chunk_ids),
+                len(result.overflow_chunk_ids),
+            )
         outcome = self._merger.merge(snapshot, result)
         if outcome.ok:
             self._deferred_attempts.pop(_window_key(snapshot), None)
