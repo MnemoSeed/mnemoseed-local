@@ -221,6 +221,20 @@ def test_load_defaults_for_five_t3a_keys(monkeypatch, tmp_path) -> None:
     assert cfg.dream.pool_forced_cap == 50.0
 
 
+def test_batched_reflect_is_on_by_default_and_clamps_to_ceiling(monkeypatch, tmp_path) -> None:
+    """The shipped default batches at 8000 tokens (#99) so oversized backlogs
+    drain on every install; the effective cap binds at the ceiling, and a
+    legitimately lowered ceiling must NOT hard-error the default (the packer
+    clamps — explicit configwrite writes above the ceiling are what get refused)."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(tmp_path / "missing.toml")
+    assert cfg.dream.reflect_batch_max_tokens == 8000
+
+    lowered = _write_dream(tmp_path, "delta_budget_ceiling_tokens = 5000\n")
+    clamped = load_config(lowered)
+    assert clamped.dream.reflect_batch_max_tokens == 5000, "effective cap = min(default, ceiling)"
+
+
 def test_load_parses_five_t3a_keys(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     path = _write_dream(

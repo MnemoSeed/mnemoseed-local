@@ -441,6 +441,11 @@ class EvalRig:
             config.dream,
             ensemble=cell.ensemble,
             core_confidence_floor=cell.core_confidence_floor,
+            # Calibration comparability: the dream matrix's baselines were
+            # measured under the legacy single-pack reflect. The shipped
+            # default is now batched (#99); pin the legacy semantics here so
+            # new runs stay comparable to frozen baselines.
+            reflect_batch_max_tokens=0,
         )
         self._config = config
 
