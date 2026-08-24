@@ -101,10 +101,11 @@ DEFAULT_DREAM_ENSEMBLE: str = "off"
 DEFAULT_DREAM_CORE_CONFIDENCE_FLOOR: float = 0.0
 DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS: int = 32000
 
-#: Batched reflection (#99): default per-batch cap is OFF (0) — eval runs and
-#: existing installs keep the byte-identical legacy single-pack reflect until
-#: the key is set explicitly.
-DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS: int = 0
+#: Batched reflection (#99): ON by default at 8000 tokens per batch — an
+#: oversized backlog otherwise wedges forever (empty extraction -> defer ->
+#: park) on every user's machine, not just oversized corpora. The dream eval
+#: rigs pin 0 explicitly so calibration baselines stay comparable.
+DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS: int = 8000
 DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
 
 #: B2.1 T2 mid-session auto-recall (PRD-B2.1): the focal decay floor and the
@@ -562,11 +563,13 @@ def load_config(path: Path | None = None) -> Config:
         batch_raw = dream_table.get("reflect_batch_max_tokens", DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS)
         if not isinstance(batch_raw, int) or isinstance(batch_raw, bool) or batch_raw < 0:
             raise ConfigError("dream.reflect_batch_max_tokens", "must be a non-negative integer (0 disables)")
-        if batch_raw > ceiling_raw:
-            raise ConfigError(
-                "dream.reflect_batch_max_tokens",
-                "must be <= dream.delta_budget_ceiling_tokens (the packer binds at the ceiling)",
-            )
+        # The effective per-batch cap is min(configured, ceiling): the packer
+        # binds at the ceiling either way (plan_batches clamps), so a cap above
+        # the ceiling is clamped here rather than rejected — the shipped 8000
+        # default must not hard-error configs that legitimately lower the
+        # ceiling. Explicit configwrite writes above the ceiling are still
+        # refused at write time so user intent is corrected immediately.
+        batch_raw = min(int(batch_raw), int(ceiling_raw))
         forced_raw = dream_table.get("pool_forced_cap", DEFAULT_DREAM_POOL_FORCED_CAP)
         if not _is_positive_number(forced_raw):
             raise ConfigError("dream.pool_forced_cap", "must be a positive number")
@@ -775,9 +778,10 @@ baseurl = "http://localhost:7788"
 #                        clamp's ceiling, read by the doctor's ctx-window check
 #   pool_forced_cap     — >= core_confidence_floor (default 50.0): the capture
 #                        pool's forced-consolidation cap
-#   reflect_batch_max_tokens — >= 0 (default 0 = off): batched reflection (#99);
+#   reflect_batch_max_tokens — >= 0 (default 8000): batched reflection (#99);
 #                        a positive cap slices oversized backlogs into
-#                        model-sized batches drained over successive dreams
+#                        model-sized batches drained over successive dreams;
+#                        0 restores the legacy single-pack reflect
 # [dream]
 # auto_trigger = true
 # floor_pool_points = 10.0
@@ -788,7 +792,7 @@ baseurl = "http://localhost:7788"
 # core_confidence_floor = 0.0
 # delta_budget_ceiling_tokens = 32000
 # pool_forced_cap = 50.0
-# reflect_batch_max_tokens = 0
+# reflect_batch_max_tokens = 8000
 
 # Per-layer overrides (required under the custom preset):
 # [storage.vector]
