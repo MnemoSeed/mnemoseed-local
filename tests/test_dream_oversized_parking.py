@@ -1,11 +1,13 @@
 """Oversized-delta hot-loop guard: identical no-progress deferrals of the same
-snapshot park after a bounded number of attempts (one loud audit record via
-the seam, then cheap no-op retries with zero LLM cost). Progress resets the
-counter; parking is per-snapshot and clears on daemon restart."""
+pending window park after a bounded number of attempts (one loud audit record
+via the seam, then cheap no-op retries with zero LLM cost). The strike counter
+is keyed by the (profile, turn-range) window — NOT by snapshot id — because
+every production retry recaptures a fresh snapshot id. Progress (window growth
+or committed merge) resets the counter; parking is in-process and clears on
+daemon restart."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from mnemoseed_local.dream.pipeline import DreamPipeline, ExtractFailure, RunCompletion
@@ -18,7 +20,7 @@ _PROFILE = "default"
 _RANGE = TurnRange(start=0, end=1)
 
 
-def _snap(snapshot_id: str) -> Snapshot:
+def _snap(snapshot_id: str, turn_range: TurnRange = _RANGE) -> Snapshot:
     stamp = ChunkStamp(
         chunk_id="c1",
         profile_id=_PROFILE,
@@ -27,13 +29,13 @@ def _snap(snapshot_id: str) -> Snapshot:
         model_id="test-model",
         cues=Cues(entities=[]),
         provenance=Provenance(asserted_by="user", session_id="s1", source="manual"),
-        turn_start=0,
-        turn_end=1,
+        turn_start=turn_range.start,
+        turn_end=turn_range.end,
     )
     return Snapshot(
         snapshot_id=snapshot_id,
         profile_id=_PROFILE,
-        turn_range=_RANGE,
+        turn_range=turn_range,
         chunks=(SnapshotChunk.from_stamp(stamp),),
         created_at=1000.0,
         phases=frozenset({"snapshot_done"}),
@@ -67,28 +69,44 @@ class _SpyReflector(ReflectOrchestrator):
         )
 
 
+class _RecordingTrigger:
+    """Minimal trigger double that tracks in-flight bookkeeping like the real
+    state machine does: on_snapshot_ready advances to DREAMING (in flight),
+    on_dream_failed releases it."""
+
+    def __init__(self) -> None:
+        self.in_flight = False
+        self.failed_releases = 0
+
+    def on_snapshot_ready(self, profile_id: str) -> None:
+        self.in_flight = True
+
+    def on_dream_failed(self, profile_id: str) -> None:
+        if not self.in_flight:
+            return
+        self.in_flight = False
+        self.failed_releases += 1
+
+    def on_merge_committed(self, profile_id: str) -> None:
+        self.in_flight = False
+
+
 def _pipeline(
     reflector: _SpyReflector,
     failures: list[ExtractFailure],
     committed: list[RunCompletion],
     outcomes: list[tuple[str, bool]],
-) -> DreamPipeline:
-    trigger = type(
-        "_T",
-        (),
-        {
-            "on_snapshot_ready": staticmethod(lambda pid: None),
-            "on_dream_failed": staticmethod(lambda pid: None),
-            "on_merge_committed": staticmethod(lambda pid: None),
-        },
-    )()
+) -> tuple[DreamPipeline, _RecordingTrigger]:
+    trigger = _RecordingTrigger()
 
     class _Merger:
         def merge(self, snapshot: Snapshot, result: ReflectionResult) -> Any:
-            return type("_MO", (), {"ok": True, "committed": True, "error": None})()
+            outcome = type("_MO", (), {"ok": True, "committed": True, "error": None})()
+            trigger.on_merge_committed(snapshot.profile_id)
+            return outcome
 
-    return DreamPipeline(
-        trigger=trigger,
+    pipeline = DreamPipeline(
+        trigger=trigger,  # type: ignore[arg-type]
         snapshotter=type("_NS", (), {"active": staticmethod(lambda pid: None)})(),  # type: ignore[arg-type]
         reflector=reflector,  # type: ignore[arg-type]
         merger=_Merger(),  # type: ignore[arg-type]
@@ -96,35 +114,69 @@ def _pipeline(
         on_run_committed=committed.append,
         on_outcome=lambda profile, rng, ok, err: outcomes.append((profile, ok)),
     )
+    return pipeline, trigger
 
 
-def test_identical_no_progress_deferrals_park_after_limit(tmp_path: Path) -> None:
-    del tmp_path
+def _deliver(pipeline: DreamPipeline, delivery: int, turn_range: TurnRange = _RANGE) -> None:
+    """One production-shaped delivery: launch advances the state machine, then
+    a brand-new snapshot id reaches the pipeline (fresh capture per retry)."""
+    pipeline.on_snapshot_ready(_PROFILE)
+    pipeline.run(_snap(f"snap-{_PROFILE}-{delivery}", turn_range))
+
+
+def test_identical_no_progress_deferrals_park_after_limit() -> None:
     reflector = _SpyReflector(ReflectOutcome(ok=True, result=_empty_with_overflow()))
     failures: list[ExtractFailure] = []
     committed: list[RunCompletion] = []
     outcomes: list[tuple[str, bool]] = []
-    pipeline = _pipeline(reflector, failures, committed, outcomes)
+    pipeline, trigger = _pipeline(reflector, failures, committed, outcomes)
 
-    for _ in range(10):
-        pipeline.run(_snap("snap-big"))
+    for delivery in range(10):  # production retries never reuse a snapshot id
+        _deliver(pipeline, delivery)
 
     parked_rows = [f for f in failures if f.failure_class == "oversized_parked"]
     deferred_rows = [f for f in failures if f.failure_class == "truncated_delta_deferred"]
     assert len(deferred_rows) == 2, "the first two strikes are honest deferrals"
     assert len(parked_rows) == 1, "one loud oversized_parked record"
-    assert reflector.calls == 3, "PARK_LIMIT real attempts, then parked snapshots never reach the LLM again"
+    assert reflector.calls == 3, "PARK_LIMIT real attempts, then parked windows never reach the LLM again"
     assert committed == []
     assert outcomes[-1] == (_PROFILE, False)
+    assert trigger.in_flight is False, "every attempt releases in-flight bookkeeping"
 
 
-def test_parking_is_per_snapshot(tmp_path: Path) -> None:
-    del tmp_path
+def test_parked_noop_releases_bookkeeping_and_reports_outcome() -> None:
     reflector = _SpyReflector(ReflectOutcome(ok=True, result=_empty_with_overflow()))
     failures: list[ExtractFailure] = []
-    pipeline = _pipeline(reflector, failures, [], [])
+    outcomes: list[tuple[str, bool]] = []
+    pipeline, trigger = _pipeline(reflector, failures, [], outcomes)
+    for delivery in range(3):
+        _deliver(pipeline, delivery)
 
-    for _ in range(5):
-        pipeline.run(_snap("snap-a"))
-    pipeline.run(_snap("snap-b"))
-    assert reflector.calls == 4, "3 attempts for snap-a (then parked) + 1 fresh attempt for snap-b"
+    noop_failures_before = len(failures)
+    for delivery in range(3, 6):
+        trigger.in_flight = True  # simulate the real launch path re-advancing
+        _deliver(pipeline, delivery)
+
+    assert reflector.calls == 3, "post-park deliveries are cheap no-ops before any LLM call"
+    assert len(failures) == noop_failures_before, "no extra audit spam after parking"
+    assert trigger.in_flight is False, "parked runs release DREAMING bookkeeping instead of wedging"
+    post_park = [ok for _, ok in outcomes[2:]]
+    assert all(ok is False for ok in post_park), "post-park outcomes report failure so backoff counts them"
+
+
+def test_parking_is_per_window_and_growth_gets_fresh_attempts() -> None:
+    reflector = _SpyReflector(ReflectOutcome(ok=True, result=_empty_with_overflow()))
+    failures: list[ExtractFailure] = []
+    pipeline, _ = _pipeline(reflector, failures, [], [])
+
+    for delivery in range(5):
+        _deliver(pipeline, delivery)
+    assert reflector.calls == 3, "same window: parked after 3 strikes"
+
+    grown = TurnRange(start=0, end=20)
+    _deliver(pipeline, 100, grown)
+    assert reflector.calls == 4, "a genuinely grown window is a different key with fresh attempts"
+
+    disjoint = TurnRange(start=100, end=120)
+    _deliver(pipeline, 200, disjoint)
+    assert reflector.calls == 5, "unrelated windows are never blocked by another window's park"
