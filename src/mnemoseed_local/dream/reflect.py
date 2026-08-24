@@ -779,7 +779,6 @@ class ReflectOrchestrator:
         origin_by_chunk = {c.chunk_id: origin_of(c) for c in snapshot.chunks}
         mentions: list[ReflectedTriple] = []
         covered: list[str] = []
-        skipped_oversized: list[str] = []
         reports: list[DeltaReport] = []
         usages: list[Usage | None] = []
         unavailable = False
@@ -797,7 +796,6 @@ class ReflectOrchestrator:
                     len(request.overflow_chunk_ids),
                     snapshot.profile_id,
                 )
-                skipped_oversized.extend(request.overflow_chunk_ids)
                 continue
             ran += 1
             payload, usage, batch_unavailable, error = self._chat_batch_with_retries(llm, request)
