@@ -24,7 +24,12 @@ from typing import Protocol
 
 from mnemoseed_local.dream.delta import DeltaReport
 from mnemoseed_local.dream.merge import Merger
-from mnemoseed_local.dream.reflect import ReflectionResult, ReflectOrchestrator, result_from_payload
+from mnemoseed_local.dream.reflect import (
+    ReflectionResult,
+    ReflectOrchestrator,
+    ReflectOutcome,
+    result_from_payload,
+)
 from mnemoseed_local.dream.snapshot import (
     Snapshot,
     SnapshotPhase,
@@ -51,6 +56,35 @@ class RunCompletion:
     started_at: float
     finished_at: float
     tokens: int
+
+
+@dataclass(frozen=True)
+class ExtractFailure:
+    """One failed dream attempt, classified for the observation log.
+
+    ``failure_class`` is coarse and honest: llm_unreachable / persist_failed /
+    over_budget / truncated_delta_deferred / merge_degraded /
+    journal_unrecoverable / reflect_error. ``tokens`` is the wasted attempt's
+    known cost (0 when unknowable).
+    """
+
+    profile_id: str
+    turn_range: TurnRange
+    stage: str
+    failure_class: str
+    detail: str | None
+    tokens: int
+
+
+def _classify_failure(outcome: ReflectOutcome) -> str:
+    if outcome.llm_unavailable:
+        return "llm_unreachable"
+    error = outcome.error or ""
+    if error.startswith("persist failed"):
+        return "persist_failed"
+    if "exceed the delta budget" in error:
+        return "over_budget"
+    return "reflect_error"
 
 
 def _completion_tokens(report: DeltaReport | None) -> int:
@@ -89,6 +123,7 @@ class DreamPipeline:
         merger: Merger,
         on_outcome: Callable[[str, TurnRange, bool, str | None], None] | None = None,
         on_run_committed: Callable[[RunCompletion], None] | None = None,
+        on_extract_failed: Callable[[ExtractFailure], None] | None = None,
         mode: Callable[[], str] | None = None,
     ) -> None:
         self._trigger = trigger
@@ -96,6 +131,7 @@ class DreamPipeline:
         self._reflector = reflector
         self._merger = merger
         self._on_run_committed = on_run_committed
+        self.on_extract_failed = on_extract_failed
         # B5 vote: the live ensemble mode ("off" | "verify" | "vote"). When
         # wired, the pipeline dispatches the fresh-snapshot boundary to the
         # vote dual-seat chain instead of the single-model reflect.
@@ -145,7 +181,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.ok,
             )
-            self._fail(snapshot, outcome.error)
+            self._fail(snapshot, outcome.error, stage="reflect", outcome=outcome)
             return
         self._merge(snapshot, outcome.result, outcome.report)
 
@@ -158,7 +194,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.ok,
             )
-            self._fail(snapshot, outcome.error)
+            self._fail(snapshot, outcome.error, stage="vote_seat_a", outcome=outcome)
             return
         self._run_vote_b_boundary(snapshot)
 
@@ -171,7 +207,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.ok,
             )
-            self._fail(snapshot, outcome.error)
+            self._fail(snapshot, outcome.error, stage="vote_seat_b", outcome=outcome)
             return
         self._run_combine_boundary(snapshot)
 
@@ -184,7 +220,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.ok,
             )
-            self._fail(snapshot, outcome.error)
+            self._fail(snapshot, outcome.error, stage="vote_combine", outcome=outcome)
             return
         self._merge(snapshot, outcome.result, None)
 
@@ -199,7 +235,12 @@ class DreamPipeline:
                 "merge-boundary snapshot %s lacks a reflect/combine marker; staying journaled",
                 snapshot.snapshot_id,
             )
-            self._fail(snapshot, "merge-boundary snapshot lacks REFLECT_DONE/COMBINE_DONE")
+            self._fail(
+                snapshot,
+                "merge-boundary snapshot lacks REFLECT_DONE/COMBINE_DONE",
+                stage="merge_boundary",
+                failure_class="journal_unrecoverable",
+            )
             return
         result = result_from_payload(snapshot.reflect_result)
         if result is None:
@@ -207,7 +248,12 @@ class DreamPipeline:
                 "merge-boundary snapshot %s has no recoverable result; staying journaled",
                 snapshot.snapshot_id,
             )
-            self._fail(snapshot, "merge-boundary snapshot has no recoverable result")
+            self._fail(
+                snapshot,
+                "merge-boundary snapshot has no recoverable result",
+                stage="merge_boundary",
+                failure_class="journal_unrecoverable",
+            )
             return
         self._merge(snapshot, result, None)
 
@@ -232,7 +278,13 @@ class DreamPipeline:
                 snapshot.profile_id,
                 len(result.overflow_chunk_ids),
             )
-            self._fail(snapshot, "reflect covered a truncated delta with overflow; merge deferred")
+            self._fail(
+                snapshot,
+                "reflect covered a truncated delta with overflow; merge deferred",
+                stage="merge",
+                failure_class="truncated_delta_deferred",
+                report=report,
+            )
             return
         outcome = self._merger.merge(snapshot, result)
         if not outcome.ok:
@@ -241,7 +293,7 @@ class DreamPipeline:
                 snapshot.profile_id,
                 outcome.error,
             )
-            self._fail(snapshot, outcome.error)
+            self._fail(snapshot, outcome.error, stage="merge", failure_class="merge_degraded", report=report)
             return
         if outcome.committed and self._on_run_committed is not None:
             now = time.time()
@@ -263,11 +315,40 @@ class DreamPipeline:
         if self.on_outcome is not None:
             self.on_outcome(snapshot.profile_id, snapshot.turn_range, True, None)
 
-    def _fail(self, snapshot: Snapshot, error: str | None) -> None:
+    def _fail(
+        self,
+        snapshot: Snapshot,
+        error: str | None,
+        *,
+        stage: str = "reflect",
+        outcome: ReflectOutcome | None = None,
+        failure_class: str | None = None,
+        report: DeltaReport | None = None,
+    ) -> None:
         """One dream attempt ended without committing: the trigger drops its
         in-flight bookkeeping (so a retried event can launch again) and the
         outcome seam reports the failure to the scheduler's retry backoff.
-        Never a raise; the journal stays the source of truth."""
+        Never a raise; the journal stays the source of truth. The observation
+        seam receives one classified record; a faulty sink is isolated."""
         self._trigger.on_dream_failed(snapshot.profile_id)
+        if self.on_extract_failed is not None:
+            classified = failure_class or (
+                _classify_failure(outcome) if outcome is not None else "reflect_error"
+            )
+            try:
+                self.on_extract_failed(
+                    ExtractFailure(
+                        profile_id=snapshot.profile_id,
+                        turn_range=snapshot.turn_range,
+                        stage=stage,
+                        failure_class=classified,
+                        detail=error,
+                        tokens=_completion_tokens(
+                            report if report is not None else (outcome.report if outcome else None)
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - observation must never break the dream
+                logger.warning("extract-failure observer raised for %s: %s", snapshot.profile_id, exc)
         if self.on_outcome is not None:
             self.on_outcome(snapshot.profile_id, snapshot.turn_range, False, error)
