@@ -76,6 +76,7 @@ from mnemoseed_local.storage.ports import (
     AuditEntry,
     AuditFilter,
     ChunkFilter,
+    DreamRunFilter,
     NodeFilter,
     Page,
     RecallRule,
@@ -1485,4 +1486,61 @@ async def memory_dream_once(req: DreamRequest, request: Request) -> dict[str, An
 @router.post("/memory/dream_status")
 async def memory_dream_status(req: DreamRequest, request: Request) -> dict[str, Any]:
     trigger: DreamTrigger = request.app.state.dream
-    return _trigger_payload(trigger.status(req.profile_id))
+    payload = _trigger_payload(trigger.status(req.profile_id))
+    payload.update(_dream_data_status(request, req.profile_id))
+    return payload
+
+
+def _dream_data_status(request: Request, profile_id: str) -> dict[str, Any]:
+    """The owner's data-status block: pending pool vs threshold, the digested
+    watermark, and dream history (committed runs + failed extractions by
+    class). Read-only over existing store surfaces; missing data renders
+    honest zeros/nulls."""
+    stores: Any = request.app.state.stores
+    config: Any = request.app.state.config
+    pool_state = stores.meta.pool_state(profile_id)
+    watermark = (
+        {"start": pool_state.watermark.start, "end": pool_state.watermark.end}
+        if pool_state.watermark is not None
+        else None
+    )
+
+    failed_counts: dict[str, int] = {}
+    audit_offset = 0
+    while True:
+        page = stores.meta.audit_query(
+            AuditFilter(action="dream_extract_failed"),
+            Page(offset=audit_offset, limit=200),
+        )
+        for entry in page.items:
+            detail = entry.detail if isinstance(entry.detail, dict) else {}
+            failure_class = str(detail.get("failure_class") or "unknown")
+            failed_counts[failure_class] = failed_counts.get(failure_class, 0) + 1
+        audit_offset += len(page.items)
+        if not page.items or audit_offset >= page.total:
+            break
+
+    runs_committed = 0
+    last_commit_at: str | None = None
+    runs_offset = 0
+    while True:
+        page = stores.meta.list_dream_runs(DreamRunFilter(), Page(offset=runs_offset, limit=200))
+        for run in page.items:
+            if run.finished_at is not None:
+                runs_committed += 1
+                stamp = iso8601_utc(run.finished_at)
+                if last_commit_at is None or stamp > last_commit_at:
+                    last_commit_at = stamp
+        runs_offset += len(page.items)
+        if not page.items or runs_offset >= page.total:
+            break
+
+    return {
+        "pool": {"balance": pool_state.balance, "threshold": config.dream.floor_pool_points},
+        "watermark": watermark,
+        "history": {
+            "committed_runs": runs_committed,
+            "last_commit_at": last_commit_at,
+            "extract_failures": dict(sorted(failed_counts.items())),
+        },
+    }

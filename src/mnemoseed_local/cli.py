@@ -694,6 +694,22 @@ def cmd_dream(args: argparse.Namespace) -> int:
         print(f"state: {body.get('state')}")
         print(f"pending_queue: {body.get('pending_queue')}")
         print(f"pending_manual: {body.get('pending_manual')}")
+        pool = body.get("pool") or {}
+        if pool:
+            print(f"pool: {pool.get('balance')} / {pool.get('threshold')} pts")
+        watermark = body.get("watermark")
+        if watermark:
+            print(f"digested turns: {watermark.get('start')}..{watermark.get('end')}")
+        elif "watermark" in body:
+            print("digested turns: none yet")
+        history = body.get("history") or {}
+        if history:
+            failures = history.get("extract_failures") or {}
+            failure_text = ", ".join(f"{k}={v}" for k, v in sorted(failures.items())) or "none"
+            print(f"dreams committed: {history.get('committed_runs', 0)}")
+            last = history.get("last_commit_at")
+            print(f"last dream: {last if last else 'never'}")
+            print(f"extraction failures: {failure_text}")
     else:
         print(f"launched: {body.get('launched')}")
         print(f"state: {body.get('state')}")
