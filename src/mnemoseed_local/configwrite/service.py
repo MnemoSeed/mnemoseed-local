@@ -161,6 +161,14 @@ def _validate_reflect_batch_cap(value: Any) -> int:
     return value
 
 
+def _cross_validate_batch_cap_vs_ceiling(config: Config, value: int) -> None:
+    """The batch cap binds above the packer's ceiling would be silently
+    clipped by pack(); refuse the misleading write instead (#99)."""
+    ceiling = config.dream.delta_budget_ceiling_tokens
+    if value > ceiling:
+        raise ValueError(f"must be <= dream.delta_budget_ceiling_tokens ({ceiling})")
+
+
 def _validate_forced_cap(value: Any) -> float:
     """dream.pool_forced_cap: a positive number (its >= floor ordering is the
     cross-validation's job)."""
@@ -566,6 +574,7 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         read=lambda config: config.dream.reflect_batch_max_tokens,
         apply=lambda config, value: _dream_apply(config, "reflect_batch_max_tokens", value),
         live_apply=False,
+        cross_validate=_cross_validate_batch_cap_vs_ceiling,
     ),
     # Decay engine (PRD-04 FR-4.1 / design/01 stage ⑤): the sweep's tunables
     # are live-applied — a λ edit reaches the NEXT sweep without a restart.

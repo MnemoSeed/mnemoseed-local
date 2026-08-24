@@ -684,7 +684,7 @@ class ReflectOrchestrator:
         """Run one full generation pass against a seat LLM (pack -> retry ->
         assemble). Returns a typed outcome: ok=True with ``result`` set on
         success, a degraded outcome (defer / retries exhausted) otherwise."""
-        if self._batch_max_tokens is not None:
+        if self._batch_max_tokens is not None and self._batch_max_tokens > 0:
             batches = self._packer.plan_batches(snapshot, batch_max_tokens=self._batch_max_tokens)
             if len(batches) > 1:
                 return self._run_batched_seat(snapshot, llm, batches)
@@ -779,10 +779,27 @@ class ReflectOrchestrator:
         origin_by_chunk = {c.chunk_id: origin_of(c) for c in snapshot.chunks}
         mentions: list[ReflectedTriple] = []
         covered: list[str] = []
+        skipped_oversized: list[str] = []
         reports: list[DeltaReport] = []
         usages: list[Usage | None] = []
         unavailable = False
+        ran = 0
         for request in batches[:_MAX_REFLECT_BATCHES_PER_DREAM]:
+            if not request.delta and not request.packed_chunk_ids:
+                # D1 parity: a solo chunk whose block alone exceeds the packer
+                # budget clips inside pack() to an empty delta. Calling the
+                # LLM with an empty user turn would burn retries and degrade
+                # the seat forever OUTSIDE the merge-boundary parking guard.
+                # Defer instead: the chunk stays uncovered (honest overflow).
+                logger.warning(
+                    "batched reflect deferred %d oversized chunk(s) for %s: "
+                    "block alone exceeds the delta budget; staying journaled",
+                    len(request.overflow_chunk_ids),
+                    snapshot.profile_id,
+                )
+                skipped_oversized.extend(request.overflow_chunk_ids)
+                continue
+            ran += 1
             payload, usage, batch_unavailable, error = self._chat_batch_with_retries(llm, request)
             reports.append(self._packer.report(request))
             usages.append(usage)
@@ -791,15 +808,17 @@ class ReflectOrchestrator:
                 logger.warning(
                     "batched reflect degraded for %s at batch %d/%d: %s",
                     snapshot.profile_id,
-                    len(reports),
+                    ran,
                     min(len(batches), _MAX_REFLECT_BATCHES_PER_DREAM),
                     error,
                 )
+                degraded_covered = set(covered)
+                uncovered_count = sum(1 for c in snapshot.chunks if c.chunk_id not in degraded_covered)
                 return ReflectOutcome(
                     ok=False,
                     result=None,
                     error=error,
-                    report=_aggregate_reports(reports, usages, overflow_count=len(batches) - len(covered)),
+                    report=_aggregate_reports(reports, usages, overflow_count=uncovered_count),
                     llm_unavailable=unavailable,
                 )
             for item in payload:

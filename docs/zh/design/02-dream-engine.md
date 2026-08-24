@@ -161,6 +161,7 @@ flowchart TB
 | `dream.ensemble` | `"off"`（`off\|verify\|vote`） | 枚举成员（:500-502）；`lite` 档强制 `off`（:503） |
 | `dream.core_confidence_floor` | `0.0` | `[0,1]`（:509-510）；`>0` 时要求 `storage.graph.instances.isolated` 存在（:528） |
 | `dream.delta_budget_ceiling_tokens` | `32000` | 整数且 `>= 5000`（:514-515） |
+| `dream.reflect_batch_max_tokens` | `>= 0` | `0` | 批量反射每批 token 上限（#99），`config.py` 校验 `<= ceiling` |
 | `dream.pool_forced_cap` | `50.0` | 正数（:517-518）且 `>= core_confidence_floor`（:519） |
 
 - **移除键**：`dream.token_budget_usd` 写入即 `ConfigError`（deprecation 报错，永不静默忽略，`config.py:470`）。

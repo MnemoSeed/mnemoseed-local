@@ -126,6 +126,16 @@ def test_plan_batches_rejects_non_positive_cap() -> None:
         DeltaPacker().plan_batches(_snap(_extractable("c0", 0)), batch_max_tokens=0)
 
 
+def test_plan_batches_clamps_cap_to_the_packers_ceiling() -> None:
+    stamps = [_extractable(f"c{i}", i) for i in range(4)]
+    requests = DeltaPacker().plan_batches(_snap(*stamps), batch_max_tokens=500_000)
+    assert all(req.budget_tokens <= 32_000 for req in requests), (
+        "pack binds at the ceiling; the plan must not promise more"
+    )
+    packed = [cid for req in requests for cid in req.packed_chunk_ids]
+    assert sorted(packed) == ["c0", "c1", "c2", "c3"], "clamping never drops chunks"
+
+
 # ---------------------------------------------------------------- batched _run_seat
 
 
@@ -196,6 +206,42 @@ def test_batching_disabled_keeps_legacy_single_call_path(tmp_path: Path) -> None
     outcome = _orchestrate(snapshot, tmp_path, llm, batch_max_tokens=None)
     assert outcome.ok
     assert llm.calls == 1, "opt-in off: byte-identical legacy single-pack path"
+
+
+def test_zero_batch_cap_through_the_seat_is_treated_as_disabled(tmp_path: Path) -> None:
+    """Direct construction with 0 must not raise out of reflect() (the module
+    contract is never-a-raise); it degrades to the legacy single-call path."""
+    snapshot = _snap(*[_extractable(f"c{i}", i) for i in range(3)])
+    llm = _CountingLLM()
+    outcome = _orchestrate(snapshot, tmp_path, llm, batch_max_tokens=0)
+    assert outcome.ok
+    assert llm.calls == 1
+
+
+def test_oversized_solo_chunk_defers_without_an_empty_user_call(tmp_path: Path) -> None:
+    """D1 parity: a chunk whose block alone exceeds the packer budget clips to
+    an empty delta inside pack(). The seat must NOT call the LLM with an empty
+    user turn (that wedge sits outside merge-boundary parking); the chunk
+    stays honest uncovered overflow while the rest still drains."""
+
+    class _NoEmptyUserLLM(_CountingLLM):
+        def chat(self, *, system: str, user: str) -> str:
+            assert user, "empty delta must never reach the LLM"
+            return super().chat(system=system, user=user)
+
+    huge = _stamp("huge", "我特别喜欢" * 14000)  # block alone far over the 32k ceiling
+    small = _extractable("c0", 0)
+    snapshot = _snap(huge, small)
+    # cap above the ceiling so both chunks land in one planned batch each and
+    # the huge one clips inside pack() exactly like production would
+    llm = _NoEmptyUserLLM()
+    outcome = _orchestrate(snapshot, tmp_path, llm, batch_max_tokens=500_000)
+    assert outcome.ok and outcome.result is not None
+    assert llm.calls >= 1
+    assert outcome.result.overflow_chunk_ids == ("huge",), "oversized solo chunk stays journaled"
+    assert outcome.result.consumed_chunk_ids == ("c0",)
+    objects = {t.object for t in outcome.result.triples}
+    assert "dark mode c0" in objects
 
 
 def test_batched_reflect_all_empty_batches_still_commits_all_noise(tmp_path: Path) -> None:

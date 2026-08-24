@@ -249,25 +249,30 @@ class DeltaPacker:
         """Slice the snapshot into whole-chunk batches for batched reflection (#99).
 
         Greedy fill in ``ordered_chunks`` order: a chunk joins the current
-        batch while the running token estimate fits ``batch_max_tokens``,
-        otherwise a new batch starts. A single chunk larger than the cap still
-        gets its own batch (never split mid-text — same contract as ``pack``).
-        Every chunk lands in exactly one batch and every returned request
-        carries empty overflow by construction; concatenating the packed ids
-        covers the snapshot. Deterministic and pure.
+        batch while the running token estimate fits the EFFECTIVE cap
+        (``min(batch_max_tokens, the packer's ceiling)`` — ``pack`` binds at
+        the ceiling, so a larger configured cap would be silently disrespected),
+        otherwise a new batch starts. A single chunk larger than the effective
+        cap still gets its own batch (never split mid-text — same contract as
+        ``pack``). Every chunk lands in exactly one batch; NOTE that a chunk
+        whose block alone exceeds the packer's BUDGET still clips inside
+        ``pack`` (empty delta, empty packed ids) exactly like the legacy path —
+        the seat owes such batches the same D1 defer treatment. Deterministic
+        and pure.
 
         Raises ValueError for a non-positive cap (0/None means "batching
         disabled" at the caller and must be checked there).
         """
         if batch_max_tokens <= 0:
             raise ValueError("batch_max_tokens must be positive; disable batching with None instead")
+        effective_cap = min(batch_max_tokens, self._ceiling())
         batches: list[list[SnapshotChunk]] = []
         current: list[SnapshotChunk] = []
         acc_text = ""
         for chunk in ordered_chunks(snapshot.chunks):
             block = render_chunk_block(chunk)
             candidate = acc_text + block
-            if current and estimate_tokens(candidate) > batch_max_tokens:
+            if current and estimate_tokens(candidate) > effective_cap:
                 batches.append(current)
                 current = []
                 acc_text = ""

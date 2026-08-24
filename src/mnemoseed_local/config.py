@@ -562,6 +562,11 @@ def load_config(path: Path | None = None) -> Config:
         batch_raw = dream_table.get("reflect_batch_max_tokens", DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS)
         if not isinstance(batch_raw, int) or isinstance(batch_raw, bool) or batch_raw < 0:
             raise ConfigError("dream.reflect_batch_max_tokens", "must be a non-negative integer (0 disables)")
+        if batch_raw > ceiling_raw:
+            raise ConfigError(
+                "dream.reflect_batch_max_tokens",
+                "must be <= dream.delta_budget_ceiling_tokens (the packer binds at the ceiling)",
+            )
         forced_raw = dream_table.get("pool_forced_cap", DEFAULT_DREAM_POOL_FORCED_CAP)
         if not _is_positive_number(forced_raw):
             raise ConfigError("dream.pool_forced_cap", "must be a positive number")
