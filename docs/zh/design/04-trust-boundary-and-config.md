@@ -225,6 +225,7 @@ flowchart TB
 | `dream.ensemble` | `off\|verify\|vote` | `off` | TripleVerifier；`lite` 档锁 off（双向互锁，`service.py:173-185`） |
 | `dream.core_confidence_floor` | `[0,1]` | `0.0` | Merger 活读（§3.5）；≤ `pool_forced_cap`；>0 ⇒ isolated 必须存在 |
 | `dream.delta_budget_ceiling_tokens` | int ≥ 5000 | `32000` | DeltaPacker 动态预算上限（`dream/delta.py` 模块常量同源 + 镜像钉） |
+| `dream.reflect_batch_max_tokens` | int >= 0（0=off） | `0` | 批量消化上限（#99）；> ceiling 拒绝 |
 | `dream.pool_forced_cap` | 正数 ≥ floor | `50.0` | ScorePool 强制合并上限 |
 
 **decay（4）**

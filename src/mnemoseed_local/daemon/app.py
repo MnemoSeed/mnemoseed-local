@@ -735,6 +735,9 @@ def _build_capture(
         # never degenerates into a same-model duplicate or a crash.
         vote_llm=_build_vote_llm(router),
         resolve_vote_llm=_resolve_vote_llm,
+        # Batched reflection (#99): 0 keeps the legacy single-pack reflect;
+        # a positive cap slices oversized backlogs into model-sized batches.
+        batch_max_tokens=config.dream.reflect_batch_max_tokens or None,
     )
     merger = Merger(
         graph_main=stores.graph,
