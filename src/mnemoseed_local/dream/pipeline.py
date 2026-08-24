@@ -175,9 +175,16 @@ class DreamPipeline:
         if snapshot is not None:
             self.run(snapshot)
 
-    def run(self, snapshot: Snapshot) -> None:
+    def run(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """Run whichever boundary the snapshot resumes at. Never raises; the
-        journal is the source of truth and every failure stays tracked there."""
+        journal is the source of truth and every failure stays tracked there.
+
+        ``counts_toward_parking``: boot-recovery replay of a journaled
+        merge-boundary snapshot re-defers with NO new LLM evidence — replaying
+        an old verdict must not arm the oversized-delta parking guard, or every
+        boot would re-park the window before any batched reflect could run.
+        Only fresh attempts (launch seam / eval harness) count.
+        """
         window = _window_key(snapshot)
         if window in self._parked_windows:
             logger.warning(
@@ -202,20 +209,20 @@ class DreamPipeline:
         if boundary is None:
             return  # merge already committed; the journal terminated this dream
         if boundary == "merge":
-            self._run_merge_boundary(snapshot)
+            self._run_merge_boundary(snapshot, counts_toward_parking=counts_toward_parking)
         elif boundary == "reflect":
             if self._is_vote():
-                self._run_vote_a_boundary(snapshot)
+                self._run_vote_a_boundary(snapshot, counts_toward_parking=counts_toward_parking)
             else:
-                self._run_reflect_boundary(snapshot)
+                self._run_reflect_boundary(snapshot, counts_toward_parking=counts_toward_parking)
         elif boundary == "reflect_b":
-            self._run_vote_b_boundary(snapshot)
+            self._run_vote_b_boundary(snapshot, counts_toward_parking=counts_toward_parking)
         elif boundary == "combine":
-            self._run_combine_boundary(snapshot)
+            self._run_combine_boundary(snapshot, counts_toward_parking=counts_toward_parking)
 
     # ------------------------------------------------------------ boundaries
 
-    def _run_reflect_boundary(self, snapshot: Snapshot) -> None:
+    def _run_reflect_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """Fresh/interrupted-at-reflect snapshot: reflect, then merge on success."""
         outcome = self._reflector.reflect(snapshot)
         if not outcome.ok or outcome.result is None:
@@ -226,9 +233,9 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error, stage="reflect", outcome=outcome)
             return
-        self._merge(snapshot, outcome.result, outcome.report)
+        self._merge(snapshot, outcome.result, outcome.report, counts_toward_parking=counts_toward_parking)
 
-    def _run_vote_a_boundary(self, snapshot: Snapshot) -> None:
+    def _run_vote_a_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """B5 vote: run seat A, then chain B -> combine -> merge on success."""
         outcome = self._reflector.reflect_vote_a(snapshot)
         if not outcome.ok or outcome.result is None:
@@ -239,9 +246,9 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error, stage="vote_seat_a", outcome=outcome)
             return
-        self._run_vote_b_boundary(snapshot)
+        self._run_vote_b_boundary(snapshot, counts_toward_parking=counts_toward_parking)
 
-    def _run_vote_b_boundary(self, snapshot: Snapshot) -> None:
+    def _run_vote_b_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """B5 vote: run seat B, then chain combine -> merge on success."""
         outcome = self._reflector.reflect_vote_b(snapshot)
         if not outcome.ok or outcome.result is None:
@@ -254,7 +261,7 @@ class DreamPipeline:
             return
         self._run_combine_boundary(snapshot)
 
-    def _run_combine_boundary(self, snapshot: Snapshot) -> None:
+    def _run_combine_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """B5 vote: fold the two seat results, then merge the combined result."""
         outcome = self._reflector.combine(snapshot)
         if not outcome.ok or outcome.result is None:
@@ -267,7 +274,7 @@ class DreamPipeline:
             return
         self._merge(snapshot, outcome.result, None)
 
-    def _run_merge_boundary(self, snapshot: Snapshot) -> None:
+    def _run_merge_boundary(self, snapshot: Snapshot, *, counts_toward_parking: bool = True) -> None:
         """Recovered at the merge boundary: merge ONLY, re-loading the persisted
         result from the journal — reflect must never re-run."""
         if (
@@ -298,13 +305,15 @@ class DreamPipeline:
                 failure_class="journal_unrecoverable",
             )
             return
-        self._merge(snapshot, result, None)
+        self._merge(snapshot, result, None, counts_toward_parking=counts_toward_parking)
 
     def _merge(
         self,
         snapshot: Snapshot,
         result: ReflectionResult,
         report: DeltaReport | None = None,
+        *,
+        counts_toward_parking: bool = True,
     ) -> None:
         if not result.triples and result.overflow_chunk_ids:
             # Engine-side insurance (D1, FR-2.5 never-drop invariant): the
@@ -314,37 +323,49 @@ class DreamPipeline:
             # (larger budget / manual run) can pick the overflow up. A genuinely
             # empty result with NO overflow (all-noise session) still merges and
             # purges normally.
-            attempts = self._deferred_attempts.get(_window_key(snapshot), 0) + 1
-            self._deferred_attempts[_window_key(snapshot)] = attempts
-            if attempts >= _PARK_AFTER_IDENTICAL_DEFERRALS:
-                self._parked_windows.add(_window_key(snapshot))
-                logger.error(
-                    "dream window %s (%s..%s) parked after %d identical oversized-delta "
-                    "deferrals (%d overflow chunks, no progress); stopping "
-                    "automatic retries to stop the token burn",
+            if counts_toward_parking:
+                attempts = self._deferred_attempts.get(_window_key(snapshot), 0) + 1
+                self._deferred_attempts[_window_key(snapshot)] = attempts
+                if attempts >= _PARK_AFTER_IDENTICAL_DEFERRALS:
+                    self._parked_windows.add(_window_key(snapshot))
+                    logger.error(
+                        "dream window %s (%s..%s) parked after %d identical oversized-delta "
+                        "deferrals (%d overflow chunks, no progress); stopping "
+                        "automatic retries to stop the token burn",
+                        snapshot.profile_id,
+                        snapshot.turn_range.start,
+                        snapshot.turn_range.end,
+                        attempts,
+                        len(result.overflow_chunk_ids),
+                    )
+                    self._fail(
+                        snapshot,
+                        f"oversized delta parked after {attempts} identical deferrals",
+                        stage="merge",
+                        failure_class="oversized_parked",
+                        report=report,
+                    )
+                    return
+                logger.warning(
+                    "merge deferred for %s (attempt %d/%d): reflect covered a truncated "
+                    "delta with %d overflow chunks and produced no triples; snapshot "
+                    "stays journaled so a later dream can pick the overflow up",
                     snapshot.profile_id,
-                    snapshot.turn_range.start,
-                    snapshot.turn_range.end,
                     attempts,
+                    _PARK_AFTER_IDENTICAL_DEFERRALS,
                     len(result.overflow_chunk_ids),
                 )
-                self._fail(
-                    snapshot,
-                    f"oversized delta parked after {attempts} identical deferrals",
-                    stage="merge",
-                    failure_class="oversized_parked",
-                    report=report,
+            else:
+                # Boot-recovery replay of a journaled merge-boundary verdict:
+                # no new LLM evidence, so no strike — otherwise every boot
+                # would re-park the window before any fresh batched reflect
+                # could ever run.
+                logger.warning(
+                    "merge deferred for %s (boot replay, not counted): journaled "
+                    "truncated delta with %d overflow chunks stays journaled",
+                    snapshot.profile_id,
+                    len(result.overflow_chunk_ids),
                 )
-                return
-            logger.warning(
-                "merge deferred for %s (attempt %d/%d): reflect covered a truncated "
-                "delta with %d overflow chunks and produced no triples; snapshot "
-                "stays journaled so a later dream can pick the overflow up",
-                snapshot.profile_id,
-                attempts,
-                _PARK_AFTER_IDENTICAL_DEFERRALS,
-                len(result.overflow_chunk_ids),
-            )
             self._fail(
                 snapshot,
                 "reflect covered a truncated delta with overflow; merge deferred",
