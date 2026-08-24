@@ -40,6 +40,23 @@ from mnemoseed_local.storage.ports import TurnRange
 
 logger = logging.getLogger("mnemoseed_local.dream.pipeline")
 
+#: Identical no-progress deferrals tolerated before a window parks. Parking
+#: stops the LLM cost of hopeless retries; the journal keeps the data and a
+#: daemon restart grants fresh attempts.
+_PARK_AFTER_IDENTICAL_DEFERRALS = 3
+
+
+def _window_key(snapshot: Snapshot) -> tuple[str, int, int]:
+    """Stable identity for one pending dream window.
+
+    Every retry recaptures a brand-new snapshot id (``FileSnapshotter`` mints
+    a fresh uuid per capture), so snapshot ids can never key a strike counter
+    in production. The (profile, turn-range) window is what survives
+    recapture: identical re-emissions accumulate strikes; genuine growth is a
+    different window with fresh attempts.
+    """
+    return (snapshot.profile_id, snapshot.turn_range.start, snapshot.turn_range.end)
+
 
 @dataclass(frozen=True)
 class RunCompletion:
@@ -63,7 +80,7 @@ class ExtractFailure:
     """One failed dream attempt, classified for the observation log.
 
     ``failure_class`` is coarse and honest: llm_unreachable / persist_failed /
-    over_budget / truncated_delta_deferred / merge_degraded /
+    over_budget / truncated_delta_deferred / oversized_parked / merge_degraded /
     journal_unrecoverable / reflect_error. ``tokens`` is the wasted attempt's
     known cost (0 when unknowable).
     """
@@ -139,6 +156,12 @@ class DreamPipeline:
         # Wired after construction: the scheduler is built after the pipeline in
         # the daemon lifespan, exactly like ``FileSnapshotter.on_ready``.
         self.on_outcome = on_outcome
+        # Oversized-delta hot-loop guard: consecutive identical deferrals per
+        # pending window. A window that keeps deferring with no progress parks
+        # after the limit and stops consuming LLM calls until a daemon restart
+        # grants fresh attempts.
+        self._deferred_attempts: dict[tuple[str, int, int], int] = {}
+        self._parked_windows: set[tuple[str, int, int]] = set()
 
     def _is_vote(self) -> bool:
         """Whether the live ensemble mode is the vote dual-seat path."""
@@ -155,6 +178,26 @@ class DreamPipeline:
     def run(self, snapshot: Snapshot) -> None:
         """Run whichever boundary the snapshot resumes at. Never raises; the
         journal is the source of truth and every failure stays tracked there."""
+        window = _window_key(snapshot)
+        if window in self._parked_windows:
+            logger.warning(
+                "dream window %s (%s..%s) is parked after repeated oversized-delta "
+                "deferrals; skipping without any LLM call. A daemon restart grants "
+                "fresh attempts.",
+                snapshot.profile_id,
+                snapshot.turn_range.start,
+                snapshot.turn_range.end,
+            )
+            # Release the trigger's in-flight bookkeeping (the state machine
+            # already advanced to DREAMING on the launch path) and report the
+            # failed outcome so scheduler retries count toward give-up instead
+            # of wedging the profile forever.
+            self._trigger.on_dream_failed(snapshot.profile_id)
+            if self.on_outcome is not None:
+                self.on_outcome(
+                    snapshot.profile_id, snapshot.turn_range, False, "oversized-delta window parked"
+                )
+            return
         boundary = resume_boundary(snapshot)
         if boundary is None:
             return  # merge already committed; the journal terminated this dream
@@ -271,11 +314,35 @@ class DreamPipeline:
             # (larger budget / manual run) can pick the overflow up. A genuinely
             # empty result with NO overflow (all-noise session) still merges and
             # purges normally.
+            attempts = self._deferred_attempts.get(_window_key(snapshot), 0) + 1
+            self._deferred_attempts[_window_key(snapshot)] = attempts
+            if attempts >= _PARK_AFTER_IDENTICAL_DEFERRALS:
+                self._parked_windows.add(_window_key(snapshot))
+                logger.error(
+                    "dream window %s (%s..%s) parked after %d identical oversized-delta "
+                    "deferrals (%d overflow chunks, no progress); stopping "
+                    "automatic retries to stop the token burn",
+                    snapshot.profile_id,
+                    snapshot.turn_range.start,
+                    snapshot.turn_range.end,
+                    attempts,
+                    len(result.overflow_chunk_ids),
+                )
+                self._fail(
+                    snapshot,
+                    f"oversized delta parked after {attempts} identical deferrals",
+                    stage="merge",
+                    failure_class="oversized_parked",
+                    report=report,
+                )
+                return
             logger.warning(
-                "merge deferred for %s: reflect covered a truncated delta with %d "
-                "overflow chunks and produced no triples; snapshot stays journaled "
-                "so a later dream can pick the overflow up",
+                "merge deferred for %s (attempt %d/%d): reflect covered a truncated "
+                "delta with %d overflow chunks and produced no triples; snapshot "
+                "stays journaled so a later dream can pick the overflow up",
                 snapshot.profile_id,
+                attempts,
+                _PARK_AFTER_IDENTICAL_DEFERRALS,
                 len(result.overflow_chunk_ids),
             )
             self._fail(
@@ -287,6 +354,8 @@ class DreamPipeline:
             )
             return
         outcome = self._merger.merge(snapshot, result)
+        if outcome.ok:
+            self._deferred_attempts.pop(_window_key(snapshot), None)
         if not outcome.ok:
             logger.warning(
                 "merge degraded for %s: %s; snapshot stays journaled for resume_merge",
