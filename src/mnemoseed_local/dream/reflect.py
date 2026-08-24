@@ -132,6 +132,9 @@ class ReflectOutcome:
     report: DeltaReport | None = None  # T5 cost telemetry (NFR-2.2 substrate)
     llm_unavailable: bool = False  # T6: sticky — set once any attempt raised LLMUnavailable, even if
     # the final failure was a non-provider error; False when a retry eventually succeeded
+    batched: bool = False  # #99: the batched seat ran, so every covered chunk was fully handed to the
+    # model under budget — an empty extraction verdict on the covered range is a genuine "nothing
+    # durable here", not truncation evidence, and merge may commit it (clearing exactly the covered ids)
 
 
 # ---------------------------------------------------------------- the LLM seam
@@ -841,6 +844,7 @@ class ReflectOrchestrator:
             result=result,
             report=_aggregate_reports(reports, usages, overflow_count=len(uncovered)),
             llm_unavailable=unavailable,
+            batched=True,
         )
 
     def _chat_batch_with_retries(

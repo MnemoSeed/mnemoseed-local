@@ -66,6 +66,7 @@ class _SpyReflector(ReflectOrchestrator):
             error=self.outcome.error,
             report=self.outcome.report,
             llm_unavailable=self.outcome.llm_unavailable,
+            batched=self.outcome.batched,
         )
 
 
@@ -199,3 +200,24 @@ def test_boot_replay_deferrals_never_arm_parking() -> None:
     assert reflector.calls == 6, "every replay still ran its boundary honestly"
     deferred_rows = [f for f in failures if f.failure_class == "truncated_delta_deferred"]
     assert len(deferred_rows) == 6, "each replay defers with its audit record"
+
+
+def test_batched_empty_verdict_commits_covered_range() -> None:
+    """Batched seat: every covered chunk was fully handed to the model under
+    budget, so an empty verdict is a genuine 'nothing durable here' — merge
+    commits and the allow-list safe-clear advances past an unextractable head
+    of queue instead of wedging the backlog forever (legacy path still defers)."""
+    reflector = _SpyReflector(ReflectOutcome(ok=True, result=_empty_with_overflow(), batched=True))
+    failures: list[ExtractFailure] = []
+    committed: list[RunCompletion] = []
+    outcomes: list[tuple[str, bool]] = []
+    pipeline, _ = _pipeline(reflector, failures, committed, outcomes)
+
+    pipeline.on_snapshot_ready(_PROFILE)
+    pipeline.run(_snap("snap-batched-empty"))
+
+    assert not [f for f in failures if f.failure_class == "truncated_delta_deferred"], (
+        "a batched empty verdict is honest, not truncation evidence"
+    )
+    assert len(committed) == 1, "merge committed the covered range"
+    assert outcomes[-1] == (_PROFILE, True)
