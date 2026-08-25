@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-#: Audit-attribution header the daemon trusts (actor cli|console|mcp).
+#: Audit-attribution header the daemon trusts (actor cli|console|mcp|hook).
 ACTOR_HEADER = "X-MnemoSeed-Actor"
 DEFAULT_ACTOR = "cli"
 
@@ -52,7 +52,9 @@ class DaemonClient:
     base_url: str
     profile_id: str = DEFAULT_PROFILE_ID
     actor: str = DEFAULT_ACTOR
-    timeout: float = REQUEST_TIMEOUT_SECONDS
+    # httpx.Timeout allowed so per-phase budgets (hook SessionEnd lane) ride
+    # the same client without a second request path.
+    timeout: float | httpx.Timeout = REQUEST_TIMEOUT_SECONDS
 
     def _headers(self) -> dict[str, str]:
         return {ACTOR_HEADER: self.actor}

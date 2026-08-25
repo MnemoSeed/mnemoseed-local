@@ -877,14 +877,19 @@ def cmd_config_rollback(args: argparse.Namespace) -> int:
 def cmd_hook(args: argparse.Namespace) -> int:
     """Host hook management (design/01 §4.5).
 
-    ``args.host`` selects the adapter (only "opencode" ships today — the
-    parser's choices enforce it). Local filesystem operations only — the
+    ``args.host`` selects the adapter (opencode file-copy lifecycle or
+    claude_code settings.json merge). Local filesystem operations only — the
     daemon REST write path is never touched. ``status`` adds a read-only
     /healthz reachability probe.
     """
+    if args.host == "claude_code":
+        return _cmd_hook_claude_code(args)
+    return _cmd_hook_opencode(args)
+
+
+def _cmd_hook_opencode(args: argparse.Namespace) -> int:
     from mnemoseed_local.hosts import install as hook
 
-    assert args.host == "opencode"  # parser choices pin this
     if args.hook_command == "install":
         path, changed = hook.install_plugin()
         if changed:
@@ -930,6 +935,96 @@ def cmd_hook(args: argparse.Namespace) -> int:
     print(f"path: {info.path}")
     reach = "reachable" if info.daemon_reachable else "unreachable"
     print(f"daemon: {reach} ({info.base_url})")
+    return 0
+
+
+def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
+    from mnemoseed_local.hosts.claude_code import install as hook
+
+    command = args.hook_command
+    try:
+        if command == "install":
+            path, changed = hook.install()
+            print(f"{'installed hook' if changed else 'hook already up to date'}: {path}")
+        elif command == "uninstall":
+            path, existed = hook.uninstall()
+            print(f"{'uninstalled hook' if existed else 'hook not installed'}: {path}")
+        elif command == "disable":
+            path, changed = hook.disable()
+            print(f"{'disabled hook' if changed else 'hook not installed or already disabled'}: {path}")
+        elif command == "enable":
+            path, changed = hook.enable()
+            print(f"{'enabled hook' if changed else 'hook not disabled or not installed'}: {path}")
+        else:
+            info = hook.status()
+            state_label = {
+                "not-installed": "not installed",
+                "installed": "installed",
+                "disabled": "installed (disabled)",
+                "partial": "partially installed",
+                "differs": "present (settings not strict JSON — fix manually)",
+            }[info.state]
+            print(f"hook: {state_label}")
+            print(f"path: {info.path}")
+            reach = "reachable" if info.daemon_reachable else "unreachable"
+            print(f"daemon: {reach} ({info.base_url})")
+    except hook.SettingsParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _read_stdin_text() -> str:
+    """UTF-8 decode of the raw stdin bytes.
+
+    The host pipes UTF-8 regardless of the process locale, so the stdin TEXT
+    layer (locale-decoded, e.g. GBK on zh-CN Windows) must be bypassed: read
+    ``stdin.buffer`` and decode as UTF-8 ourselves.
+    """
+    raw = getattr(sys.stdin, "buffer", None)
+    if raw is not None:
+        data: bytes = raw.read()
+        return data.decode("utf-8", errors="replace")
+    return sys.stdin.read()
+
+
+def cmd_hook_event(args: argparse.Namespace) -> int:
+    """Hidden transformer: host hook stdin JSON -> normalized daemon POST.
+
+    Zero stdout on EVERY path (UserPromptSubmit stdout leaks into model
+    context); fire-and-forget with a ~2s timeout, failures swallowed into the
+    opt-in stderr debug lane.
+    """
+    from mnemoseed_local.hosts import install as shared
+    from mnemoseed_local.hosts.claude_code import events
+
+    try:
+        payload = json.loads(_read_stdin_text())
+    except ValueError:
+        events.debug("dropped malformed stdin payload")
+        return 0
+    if not isinstance(payload, dict):
+        events.debug("dropped non-object stdin payload")
+        return 0
+    try:
+        action = events.normalize_event(payload, now=time.time())
+    except Exception as exc:  # noqa: BLE001 - tolerant-by-contract lane
+        events.debug(f"normalization failed: {exc}")
+        return 0
+    if action is None:
+        events.debug(f"dropped unmapped or identity-less event {payload.get('hook_event_name')!r}")
+        return 0
+    kind, body = action
+    client = DaemonClient(
+        base_url=shared.resolve_base_url(),
+        profile_id=events.profile_id(),
+        actor="hook",
+        timeout=events.endpoint_budget(kind),
+    )
+    try:
+        client.post(events.ENDPOINTS[kind], body.model_dump(mode="json"))
+    except Exception as exc:  # noqa: BLE001 - fire-and-forget contract
+        events.debug(f"{kind} post failed: {exc}")
     return 0
 
 
@@ -1054,11 +1149,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hook.add_argument(
         "host",
-        choices=("opencode",),
+        choices=("opencode", "claude_code"),
         help="the host whose hook to manage (no default — installing a hook "
-        "writes into that host's config directory, so the choice is always "
-        "explicit; only opencode ships today, claude_code/codex planned)",
+        "writes into that host's config directory/files, so the choice is "
+        "always explicit)",
     )
+
+    p_hook_event = sub.add_parser("_hook-event", help=argparse.SUPPRESS)
+    p_hook_event.add_argument("--host", required=True, choices=("claude_code",))
 
     p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")
     p_mcp.add_argument("--baseurl", default=None, help="daemon base URL override")
@@ -1094,6 +1192,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_uninstall(args)
     if args.command == "hook":
         return cmd_hook(args)
+    if args.command == "_hook-event":
+        return cmd_hook_event(args)
     if args.command == "mcp":
         return cmd_mcp(args)
     parser.print_help(file=sys.stderr)
