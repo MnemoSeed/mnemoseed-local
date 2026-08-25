@@ -1,21 +1,19 @@
 # MnemoSeed Local — Agent Guide
 
-## Memory: session-start discipline
+## Memory
 
 This repository runs its own local memory daemon (`mnemoseed-local up`,
-loopback on `http://localhost:7788`; the OpenCode capture hook feeds it every
-turn). When the `mnemoseed` MCP server is registered in `opencode.json`:
+loopback on `http://localhost:7788`). Memory behavior is automatic:
+session-start anchoring and mid-session recall injection are performed by the
+capture hook — no manual invocation ritual is required or expected. Use
+`remember(text)` ONLY for facts the user explicitly asks to pin. Trust order:
+memory primes context, the repository decides. Never let a remembered plan
+override the code, the tests, or the current PRDs.
 
-1. **START of a new session**: call `recent_sessions(n_sessions=2)` FIRST to
-   re-anchor on where the previous conversation ended — the tails are
-   time-ordered verbatim chunks (newest session group first, ascending inside
-   each group). The newest group is usually the current session itself; the
-   second group is the previous conversation's tail.
-2. **During the session**: use `recall(query)` for topical memory over merged
-   knowledge + fresh unconsolidated chunks. Use `remember(text)` ONLY for
-   facts the user explicitly asks to pin.
-3. **Trust order**: memory primes context, the repository decides. Never let
-   a remembered plan override the code, the tests, or the current PRDs.
+Work-queue orientation is a workflow concern, not a memory concern: run
+`/next` at the start of work sessions, and re-query the queue (`gh issue
+list`) before answering any planning-surface question — never answer from a
+listing captured earlier in the session.
 
 ## Development conventions
 
