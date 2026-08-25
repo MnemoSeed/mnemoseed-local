@@ -66,6 +66,20 @@ daemon and disables the memory service persistently; `mnemoseed-local on`
 re-enables it and starts the daemon again. Hook lifecycle:
 `mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
 
+### Claude Code
+
+`mnemoseed-local hook install claude_code` merges marked MnemoSeed hook entries
+into `~/.claude/settings.json` for `UserPromptSubmit`, `Stop`, `PostToolUse`,
+`PreCompact` and `SessionEnd` — your own hook entries are never touched, and
+`uninstall` removes only the marked ones (`disable`/`enable` flip a flag on our
+entries). The hooks pipe Claude Code's stdin payloads through the hidden
+`mnemoseed-local _hook-event --host claude_code` transformer into the daemon
+(fire-and-forget with a ~2s timeout; zero stdout, so prompts stay clean).
+Settings files must stay plain JSON (Claude Code documents plain JSON) —
+commented (JSONC) files are refused untouched with manual-edit guidance.
+Lifecycle: `mnemoseed-local hook {install|uninstall|status|disable|enable}
+claude_code`.
+
 ## MCP gateway
 
 The CLI ships a zero-config MCP stdio gateway (newline-delimited JSON-RPC,

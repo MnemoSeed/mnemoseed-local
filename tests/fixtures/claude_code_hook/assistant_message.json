@@ -1,0 +1,1 @@
+{"host":"claude_code","event":"assistant_message","session_id":"cc-sess-01","profile_id":"default","ts":1755500001.25,"content":{"text":"失败原因是测试里的时钟断言没有冻结；我给你改成注入时钟。","model_id":"claude-sonnet-4-5"},"raw":{"hook_event_name":"Stop","stop_hook_active":false}}
