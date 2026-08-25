@@ -363,20 +363,21 @@ class DreamTrigger:
 # ---------------------------------------------------------------- A2 schedule (FR-2.1 / FR-2.4)
 #
 # The A2 schedule is score-pool based (design/01 + PRD-02): every durable
-# capture turn credits its S importance into the profile's ScorePool, which
-# mirrors the balance into the per-profile MetaStore row; the scheduler reads
-# that balance on every tick:
+# capture turn credits its S importance into the profile's ScorePool, whose
+# pending gauge mirrors into the per-profile MetaStore row; the scheduler reads
+# that gauge on every tick:
 #
-#   floor+idle  - a profile is eligible when its pool balance >=
+#   floor+idle  - a profile is eligible when its pool gauge >=
 #                 floor_pool_points AND the profile has been idle (no capture
 #                 activity) for >= idle_min_sec (defaults 10.0 points / 900s);
 #   hard-deadline - a profile is forced once the OLDEST pending verbatim chunk
 #                 has waited >= hard_deadline_sec (default 24h); skipped when
 #                 nothing is pending.
 #
-# A fired dream consumes the pool (drain): the persisted balance resets to 0,
-# so the same credits never trigger twice — re-firing requires the pool to
-# earn toward the floor again. The hard deadline is the post-drain backstop.
+# A fired dream (either fire path) drains the gauge atomically: the persisted
+# balance moves into the lifetime filed-points ledger and resets to 0, so the
+# same credits never trigger twice — re-firing requires the pool to earn toward
+# the floor again. The hard deadline is the post-drain backstop.
 #
 # Both rules are CONFIG keys ([dream] table, configwrite registry) and are
 # re-read on every tick, so a ``config set`` hot-applies to the next tick
@@ -394,15 +395,16 @@ _SCHED_PAGE_LIMIT = 10_000
 
 # ---------------------------------------------------------------- A2.5 failure backoff (T1)
 #
-# A fired dream drains the pool AT TRIGGER TIME, and the tick fingerprint marks
-# its window as emitted. If that dream then fails (reflect degraded /
-# LLMUnavailable / merge degraded), the drained pool cannot re-earn the floor
-# and the unchanged fingerprint blocks every later tick — the pending chunks
-# would sit forever (design/02 §4.3). The constants below are the retry layer:
-# a failed window re-fires on an exponential schedule (BASE * MULT^(n-1),
-# capped), and after MAX consecutive failures the scheduler stops and records a
-# give-up audit event. A success resets the streak. Re-sends never re-score the
-# pool: the balance stays drained and the re-emitted event carries 0.
+# A fired dream drains the pool AT EMISSION TIME (the atomic gauge->ledger
+# drain above), and the tick fingerprint marks its window as emitted. If that
+# dream then fails (reflect degraded / LLMUnavailable / merge degraded), the
+# drained pool cannot re-earn the floor and the unchanged fingerprint blocks
+# every later tick — the pending chunks would sit forever (design/02 §4.3).
+# The constants below are the retry layer: a failed window re-fires on an
+# exponential schedule (BASE * MULT^(n-1), capped), and after MAX consecutive
+# failures the scheduler stops and records a give-up audit event. A success
+# resets the streak. Re-sends never re-score the pool: the balance stays
+# drained and the re-emitted event carries 0.
 
 #: Base backoff interval (seconds) after the first failed dream.
 DREAM_RETRY_BASE_S: float = 60.0
@@ -472,6 +474,7 @@ class DreamScheduler:
         stores: object,
         config: Config,
         *,
+        drain: Callable[[str, TurnRange], float],
         trigger: DreamTrigger | None = None,
         clock: Callable[[], float] = time.time,
         resume_drain: asyncio.Event | None = None,
@@ -484,6 +487,11 @@ class DreamScheduler:
         self._clock = clock
         self._resume_drain = resume_drain
         self._resume_drain_timeout_s = resume_drain_timeout_s
+        # required fire-time gauge->ledger drain; the daemon wires the live
+        # capture ScorePool here so both ledgers reset together — draining the
+        # bare meta row instead would let a mirroring ScorePool resurrect the
+        # consumed points on its next credit
+        self._drain_fire = drain
         self._last: dict[str, tuple[str, int, int]] = {}
         self._retry: dict[str, _RetryState] = {}
         self._outcomes: queue.Queue[tuple[str, TurnRange, bool, str | None, float]] = queue.Queue()
@@ -494,14 +502,14 @@ class DreamScheduler:
         """Evaluate both trigger rules for one profile; None when not due.
 
         The floor rule is score-pool based: ``MetaStore.pool_state`` returns
-        the profile's persisted pool balance — the per-profile row the capture
-        ScorePool mirrors after every credit and drains after every fired
-        event. A drained pool (balance <= 0, consumed by a previous dream) is
-        never floor-eligible: the same points never trigger twice, and
-        re-firing requires the pool to earn toward the floor again. Idle is
-        measured from the profile's latest capture activity (any chunk). The
-        hard deadline counts from the OLDEST pending chunk and is skipped when
-        nothing is pending.
+        the profile's persisted pool row — the pending gauge the capture
+        ScorePool mirrors after every credit, and which every fired dream
+        drains atomically into the lifetime ledger. A drained pool
+        (balance <= 0, consumed by a previous dream) is never floor-eligible:
+        the same points never trigger twice, and re-firing requires the pool to
+        earn toward the floor again. Idle is measured from the profile's latest
+        capture activity (any chunk). The hard deadline counts from the OLDEST
+        pending chunk and is skipped when nothing is pending.
         """
         config = self._config.dream
         now = self._clock()
@@ -556,7 +564,7 @@ class DreamScheduler:
         Returns the emitted eligibilities. A fingerprint of the pending window
         (reason + turn range) is stored per profile; an unchanged window is
         never re-emitted, so the manual pending queue does not accumulate
-        duplicate events for the same backlog — the pool drain after a dream is
+        duplicate events for the same backlog — the atomic drain at emission is
         what clears the balance, and only re-earned points over a fresh window
         re-emit. A dream that FAILED (reported through ``report_outcome``) is
         the one deliberate exception: its window re-fires on the exponential
@@ -569,10 +577,24 @@ class DreamScheduler:
             if self._last.get(eligible.profile_id) == fingerprint:
                 continue
             self._last[eligible.profile_id] = fingerprint
+            self._drain_fired_points(eligible)
             emitted.append(eligible)
             self._emit(eligible)
         emitted.extend(self._retry_due())
         return emitted
+
+    def _drain_fired_points(self, eligible: DreamEligibility) -> None:
+        """File the persisted gauge into the lifetime ledger at fire time.
+
+        The drain is the anti-double-trigger mechanism: the same points leave
+        the gauge exactly once, so the floor rule can never re-fire them. A
+        failed drain never blocks the emission — the balance stays pending and
+        a later window change re-arms.
+        """
+        try:
+            self._drain_fire(eligible.profile_id, eligible.turn_range)
+        except Exception:  # noqa: BLE001 - a drain failure never breaks the tick
+            logger.exception("score-pool drain failed for %s", eligible.profile_id)
 
     def _emit(self, eligible: DreamEligibility) -> None:
         """Deliver one eligibility to the trigger as a synthetic pool event."""
@@ -765,8 +787,9 @@ class DreamScheduler:
 
 class _MetaProbe(Protocol):
     """The minimal meta surface the scheduler probes: profile discovery, the
-    score-pool balance read (the canonical persisted pool row), and the
-    append-only audit seam for give-up records."""
+    persisted score-pool read (the canonical pending gauge), and the
+    append-only audit seam for give-up records. Fire-time draining is NOT part
+    of this probe — it goes through the required ``drain`` callable."""
 
     def list_profiles(self) -> list[Any]: ...
     def pool_state(self, profile_id: str) -> PoolState: ...

@@ -109,6 +109,68 @@ def test_pool_states_returns_all_rows(driver):
     assert states["u2"].watermark is None  # pool_add alone advances no watermark
 
 
+def test_pool_drain_files_the_lifetime_ledger_and_zeroes_the_gauge(driver):
+    driver.pool_credit("u1", 7.0, TurnRange(start=0, end=4))
+    filed = driver.pool_drain("u1", TurnRange(start=0, end=4))
+    assert filed == 7.0
+    state = driver.pool_state("u1")
+    assert state.balance == 0.0
+    assert state.filed_points_total == 7.0
+    assert state.watermark == TurnRange(start=0, end=4)  # the watermark is untouched
+    # the lifetime ledger accumulates across fires
+    driver.pool_credit("u1", 4.0, TurnRange(start=5, end=6))
+    filed = driver.pool_drain("u1", TurnRange(start=5, end=6))
+    assert filed == 4.0
+    state = driver.pool_state("u1")
+    assert state.balance == 0.0
+    assert state.filed_points_total == 11.0
+
+
+def test_pool_drain_unknown_profile_files_nothing(driver):
+    assert driver.pool_drain("ghost", TurnRange(start=0, end=0)) == 0.0
+    assert driver.pool_state("ghost") == PoolState(balance=0.0)
+
+
+def test_pool_drain_atomic_under_concurrent_writers(tmp_path):
+    """Six driver instances race one drain each over a seeded gauge: exactly
+    one drainer wins the balance, the ledger files it once, nothing is lost."""
+    path = tmp_path / "drain-race.db"
+    seed = SqliteMetaDriver(path=path)
+    seed.pool_add("race", 30.0, TurnRange(start=0, end=0))  # create the profile row
+    asyncio.run(seed.close())
+
+    writer_count = 6
+    barrier = threading.Barrier(writer_count)
+    filed: list[float] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        db = SqliteMetaDriver(path=path)
+        barrier.wait()
+        try:
+            amount = db.pool_drain("race", TurnRange(start=0, end=0))
+            with lock:
+                filed.append(amount)
+        finally:
+            asyncio.run(db.close())
+
+    threads = [threading.Thread(target=worker) for _ in range(writer_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    check = SqliteMetaDriver(path=path)
+    try:
+        assert max(filed) == 30.0  # a single drainer won the whole gauge
+        assert sum(filed) == 30.0  # nothing double-filed, nothing lost
+        state = check.pool_state("race")
+        assert state.balance == 0.0
+        assert state.filed_points_total == 30.0
+    finally:
+        asyncio.run(check.close())
+
+
 def test_advance_watermark_monotonic_merge(driver):
     driver.advance_watermark("u1", TurnRange(start=0, end=4))
     driver.advance_watermark("u1", TurnRange(start=5, end=8))
@@ -418,15 +480,16 @@ def test_meta_migration_preserves_data_and_is_forward_only(tmp_path):
     try:
         # graph-tagged v2 is not applied to a meta-only file; v3 adds the
         # per-profile score pool, v4 the dream token ledger, v6 the identity
-        # users table + hashed token column, v7 the profile archive flag and
-        # v8 the reserved config.scope column, so meta lands at 8 (the legacy
-        # singleton score_pool is neither dropped nor migrated).
-        assert driver.schema_version() == 8
+        # users table + hashed token column, v7 the profile archive flag,
+        # v8 the reserved config.scope column and v9 the lifetime filed-points
+        # ledger column, so meta lands at 9 (the legacy singleton score_pool
+        # is neither dropped nor migrated).
+        assert driver.schema_version() == 9
         got = driver.get_profile("u1")
         assert got is not None
         assert got.display_name == "survivor"
         driver.migrate()  # idempotent re-run
-        assert driver.schema_version() == 8
+        assert driver.schema_version() == 9
     finally:
         asyncio.run(driver.close())
 
@@ -435,10 +498,32 @@ def test_schema_version_equals_latest_new_install(tmp_path):
     db = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
         assert db.schema_version() == db.migrate()
-        assert db.schema_version() == 8
+        assert db.schema_version() == 9
         # a profile row written after init survives a migrate() no-op
         db.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
         db.migrate()
         assert db.get_profile("u1").display_name == "Uma"
     finally:
         asyncio.run(db.close())
+
+
+def test_v9_backfills_filed_points_born_empty(tmp_path):
+    """Legacy pool rows survive the v9 column add: the lifetime ledger starts
+    at 0 while the pending gauge keeps its value."""
+    path = tmp_path / "v8-meta.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    apply_migrations(conn, "meta", target=8)
+    conn.execute(
+        "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
+        "watermark_end, last_event_start, last_event_end) VALUES ('u1', 2.5, 0, 3, 0, 3)"
+    )
+    conn.close()
+
+    driver = SqliteMetaDriver(path=path)
+    try:
+        assert driver.schema_version() == 9
+        state = driver.pool_state("u1")
+        assert state.balance == 2.5
+        assert state.filed_points_total == 0.0
+    finally:
+        asyncio.run(driver.close())

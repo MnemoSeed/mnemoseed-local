@@ -85,6 +85,28 @@ def test_pool_credit_upserts_row(stack) -> None:
     assert state.watermark == TurnRange(start=3, end=5)
 
 
+def test_pool_drain_files_the_lifetime_ledger(stack) -> None:
+    """pool_drain moves the pending gauge into the lifetime filed total in one
+    transaction and returns the filed amount; the watermark is untouched."""
+    stack.meta.pool_credit("u1", 7.0, TurnRange(start=0, end=4))
+    assert stack.meta.pool_drain("u1", TurnRange(start=0, end=4)) == 7.0
+    state = stack.meta.pool_state("u1")
+    assert state.balance == 0.0
+    assert state.filed_points_total == 7.0
+    assert state.watermark == TurnRange(start=0, end=4)
+    # the ledger accumulates across fires
+    stack.meta.pool_credit("u1", 4.0, TurnRange(start=5, end=6))
+    assert stack.meta.pool_drain("u1", TurnRange(start=5, end=6)) == 4.0
+    state = stack.meta.pool_state("u1")
+    assert state.balance == 0.0
+    assert state.filed_points_total == 11.0
+
+
+def test_pool_drain_unknown_profile_is_empty(stack) -> None:
+    assert stack.meta.pool_drain("ghost", TurnRange(start=0, end=0)) == 0.0
+    assert stack.meta.pool_state("ghost") == PoolState(balance=0.0)
+
+
 def test_pool_states_returns_all_rows(stack) -> None:
     stack.meta.pool_credit("u1", 4.0, TurnRange(start=0, end=1))
     stack.meta.pool_add("u2", 7.0, TurnRange(start=2, end=3))
@@ -335,13 +357,14 @@ def test_dream_run_finish_completes_the_row(stack) -> None:
 
 
 def test_schema_version_and_migrate_forward_only(stack) -> None:
-    """meta's head is v8 (frozen v1 schema + v3 profile_score_pool + v4
+    """meta's head is v9 (frozen v1 schema + v3 profile_score_pool + v4
     dream_token_ledger + v6 identity users/token_hash + v7 profile archive
-    flag + v8 reserved config.scope); migrate is idempotent and forward-only."""
-    assert stack.meta.schema_version() == 8
-    assert stack.meta.migrate() == 8
-    assert stack.meta.migrate(target=1) == 8  # back-targeting is a no-op at head
-    assert stack.meta.schema_version() == 8
+    flag + v8 reserved config.scope + v9 pool filed_points_total ledger);
+    migrate is idempotent and forward-only."""
+    assert stack.meta.schema_version() == 9
+    assert stack.meta.migrate() == 9
+    assert stack.meta.migrate(target=1) == 9  # back-targeting is a no-op at head
+    assert stack.meta.schema_version() == 9
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:

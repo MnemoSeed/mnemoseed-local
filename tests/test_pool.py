@@ -8,6 +8,7 @@ wall-clock sleeps anywhere.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 import pytest
@@ -43,17 +44,30 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.credits: list[tuple[str, float, TurnRange]] = []  # pool_credit calls
-        self.fired: list[tuple[str, float, TurnRange]] = []  # pool_add calls
+        self.drains: list[tuple[str, float, TurnRange]] = []  # pool_drain calls
+        self.sequence: list[str] = []  # call order across both verbs
         self._rows: dict[str, PoolState] = {}
 
-    def pool_add(self, profile_id: str, points: float, turn_range: TurnRange) -> None:
-        self.fired.append((profile_id, points, turn_range))
-        state = self._rows.get(profile_id, PoolState(balance=0.0))
-        self._rows[profile_id] = PoolState(balance=state.balance + points, watermark=state.watermark)
-
     def pool_credit(self, profile_id: str, balance: float, turn_range: TurnRange) -> None:
+        self.sequence.append("credit")
         self.credits.append((profile_id, balance, turn_range))
-        self._rows[profile_id] = PoolState(balance=balance, watermark=turn_range)
+        state = self._rows.get(profile_id, PoolState(balance=0.0))
+        self._rows[profile_id] = PoolState(
+            balance=balance,
+            watermark=turn_range,
+            filed_points_total=state.filed_points_total,
+        )
+
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        self.sequence.append("drain")
+        state = self._rows.get(profile_id, PoolState(balance=0.0))
+        self._rows[profile_id] = PoolState(
+            balance=0.0,
+            watermark=state.watermark,
+            filed_points_total=state.filed_points_total + state.balance,
+        )
+        self.drains.append((profile_id, state.balance, turn_range))
+        return state.balance
 
     def pool_states(self) -> dict[str, PoolState]:
         return dict(self._rows)
@@ -77,7 +91,6 @@ def test_no_trigger_below_threshold_even_after_idle() -> None:
     pool.add_points("p", 4.0, TurnRange(0, 0))
     pool.add_points("p", 4.0, TurnRange(1, 1))  # balance 8.0, below threshold
     clock.advance(6.0)
-    assert pool.evaluate() == ()
     assert events == []
     assert pool.stats("p").balance == pytest.approx(8.0)
 
@@ -108,20 +121,6 @@ def test_trigger_after_idle_window_with_correct_turn_range() -> None:
     # the pool drained after the event
     assert pool.stats("p") is not None
     assert pool.stats("p").balance == pytest.approx(0.0)
-
-
-def test_evaluate_fires_quietly_accumulated_balance() -> None:
-    clock = _Clock()
-    events, sink = _sink()
-    pool = ScorePool(clock=clock, sink=sink)
-    pool.add_points("p", 4.0, TurnRange(0, 0))
-    pool.add_points("p", 4.0, TurnRange(1, 1))
-    pool.add_points("p", 4.0, TurnRange(2, 2))
-    clock.advance(6.0)
-    fired = pool.evaluate()
-    assert len(fired) == 1
-    assert fired[0].kind is PoolEventKind.DREAM_TRIGGER
-    assert fired[0].turn_range == TurnRange(0, 2)
 
 
 def test_forced_micro_consolidation_at_cap_ignores_idle() -> None:
@@ -189,9 +188,9 @@ def test_stats_observability() -> None:
     assert pool.stats("ghost") is None
 
 
-def test_meta_backend_persists_credits_and_fired_events() -> None:
-    """Every non-firing credit persists the live ledger; a fired event records
-    itself and resets the persisted balance to 0."""
+def test_meta_backend_persists_credits_and_filed_events() -> None:
+    """Every credit persists the live gauge first; a fired event then files its
+    whole gauge into the lifetime ledger and zeroes the balance."""
     clock = _Clock()
     backend = _FakeBackend()
     pool = ScorePool(clock=clock, backend=backend)
@@ -203,11 +202,129 @@ def test_meta_backend_persists_credits_and_fired_events() -> None:
         ("p", 4.0, TurnRange(0, 0)),
         ("p", 8.0, TurnRange(0, 1)),
         ("p", 12.0, TurnRange(0, 2)),
-        ("p", 0.0, TurnRange(0, 3)),  # the fire reset the persisted ledger
+        ("p", 13.0, TurnRange(0, 3)),  # the triggering credit is mirrored too
     ]
-    assert backend.fired == [("p", 13.0, TurnRange(0, 3))]
-    assert backend.pool_states()["p"].balance == pytest.approx(0.0)
-    assert backend.pool_states()["p"].watermark == TurnRange(0, 3)
+    assert backend.drains == [("p", 13.0, TurnRange(0, 3))]
+    state = backend.pool_states()["p"]
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(13.0)
+    assert state.watermark == TurnRange(0, 3)
+
+
+def test_fire_files_the_gauge_in_one_atomic_drain() -> None:
+    """The fired event's points move into the lifetime ledger and the persisted
+    gauge resets inside ONE transaction — the old add-then-reset pair had a
+    crash window between its two writes."""
+    clock = _Clock()
+    backend = _FakeBackend()
+    events, sink = _sink()
+    pool = ScorePool(clock=clock, sink=sink, backend=backend)
+    for index in range(3):
+        pool.add_points("p", 4.0, TurnRange(index, index))
+    clock.advance(5.0)
+    fired = pool.add_points("p", 1.0, TurnRange(3, 3))
+    assert len(fired) == 1
+    # exactly one drain carries the whole accumulated balance; no zeroing
+    # credit follows it
+    assert backend.drains == [("p", 13.0, TurnRange(0, 3))]
+    assert backend.credits[-1] == ("p", 13.0, TurnRange(0, 3))
+    assert len(events) == 1
+
+
+def test_fire_mirrors_the_credit_before_the_atomic_drain() -> None:
+    """Ordering pin: within a fire, the triggering credit lands on the backend
+    BEFORE the atomic drain — persistence completes before the ledger move, so
+    a crash between the two leaves points pending instead of consuming them."""
+    clock = _Clock()
+    backend = _FakeBackend()
+    pool = ScorePool(clock=clock, backend=backend)
+    for index in range(3):
+        pool.add_points("p", 4.0, TurnRange(index, index))
+    clock.advance(5.0)
+    pool.add_points("p", 1.0, TurnRange(3, 3))  # the fire under test
+    assert backend.sequence[-2:] == ["credit", "drain"]
+
+
+class _RaisingDrainBackend(_FakeBackend):
+    """A backend whose atomic drain fails (a storage hiccup)."""
+
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        raise RuntimeError("simulated drain failure")
+
+
+class _InterlockBackend(_FakeBackend):
+    """Coordinates one armed credit so a drain can land mid-credit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.credit_started = threading.Event()
+        self.release_credit = threading.Event()
+
+    def pool_credit(self, profile_id: str, balance: float, turn_range: TurnRange) -> None:
+        if self.armed:
+            self.credit_started.set()
+            self.release_credit.wait(timeout=10.0)
+        super().pool_credit(profile_id, balance, turn_range)
+
+
+def test_concurrent_add_and_drain_never_double_count() -> None:
+    """Interleaving oracle: a drain landing mid-credit from another thread
+    (hard-deadline fires need no idle) must leave every point either filed or
+    pending exactly once — never counted in both ledgers."""
+    clock = _Clock()
+    backend = _InterlockBackend()
+    pool = ScorePool(clock=clock, backend=backend)
+    for index in range(3):
+        pool.add_points("p", 4.0, TurnRange(index, index))  # gauge 12, persisted 12
+    backend.armed = True  # interlock only the racing credit below
+
+    def adder() -> None:
+        pool.add_points("p", 1.0, TurnRange(3, 3))
+
+    drained: dict[str, float] = {}
+
+    def drainer() -> None:
+        drained["filed"] = pool.drain("p", TurnRange(0, 3))
+
+    thread = threading.Thread(target=adder)
+    thread.start()
+    assert backend.credit_started.wait(timeout=10.0)
+    race = threading.Thread(target=drainer)
+    race.start()  # races the paused credit (or blocks on the pool lock)
+    backend.release_credit.set()
+    thread.join(timeout=10.0)
+    race.join(timeout=10.0)
+
+    assert "filed" in drained, "the racing drain never completed (deadlock?)"
+    state = backend.pool_states()["p"]
+    # every credited point is exactly once in the ledger or the gauge
+    assert state.filed_points_total + state.balance == pytest.approx(13.0)
+    assert drained["filed"] + state.balance == pytest.approx(13.0)
+
+
+def test_failed_backend_drain_keeps_both_gauges() -> None:
+    """If the atomic backend drain fails, the in-process gauge must NOT be
+    reset ahead of it: both ledgers keep their values and the next credit
+    re-persists the full balance — no point vanishes."""
+    clock = _Clock()
+    backend = _RaisingDrainBackend()
+    pool = ScorePool(clock=clock, backend=backend)
+    for index in range(3):
+        pool.add_points("p", 4.0, TurnRange(index, index))
+    with pytest.raises(RuntimeError, match="simulated drain failure"):
+        pool.drain("p", TurnRange(0, 3))
+    # neither ledger lost the points
+    assert pool.stats("p") is not None
+    assert pool.stats("p").balance == pytest.approx(12.0)
+    state = backend.pool_states()["p"]
+    assert state.balance == pytest.approx(12.0)
+    assert state.filed_points_total == pytest.approx(0.0)
+    # the next credit re-persists the untouched balance: nothing vanished
+    pool.add_points("p", 4.0, TurnRange(4, 4))
+    state = backend.pool_states()["p"]
+    assert state.balance == pytest.approx(16.0)
+    assert state.filed_points_total == pytest.approx(0.0)
 
 
 def test_backend_persists_per_profile_isolation() -> None:
@@ -234,7 +351,7 @@ def test_fire_resets_persisted_balance_and_records_event() -> None:
     clock.advance(5.0)
     pool.add_points("p", 1.0, TurnRange(3, 3))
     assert backend.pool_states()["p"].balance == pytest.approx(0.0)
-    assert backend.fired == [("p", 13.0, TurnRange(0, 3))]
+    assert backend.drains == [("p", 13.0, TurnRange(0, 3))]
     assert len(events) == 1
 
 
@@ -255,14 +372,10 @@ def test_restore_seeds_ledger_without_firing_or_persisting() -> None:
     assert ledger is not None
     assert ledger.balance == pytest.approx(12.0)
     assert ledger.turns_pooled == 0
-    # conservative boot: a restored backlog cannot instantly dream-trigger even
-    # once the idle window has elided, because last_add stays fresh
-    clock.advance(10.0)
-    assert pool.evaluate() == ()
     assert events == []
     # restore writes nothing through the backend, either direction
     assert backend.credits == []
-    assert backend.fired == []
+    assert backend.drains == []
     assert backend.pool_states() == {}
 
 
@@ -284,11 +397,11 @@ def test_restored_pool_accumulates_and_fires_like_a_live_one() -> None:
     assert pool.stats("p").balance == pytest.approx(12.0)
     assert backend.credits[-1] == ("p", 12.0, TurnRange(2, 6))
     clock.advance(6.0)
-    fired = pool.evaluate()
+    fired = pool.add_points("p", 1.0, TurnRange(7, 7))
     assert len(fired) == 1
     assert fired[0].kind is PoolEventKind.DREAM_TRIGGER
-    assert fired[0].turn_range == TurnRange(2, 6)
-    assert backend.fired[-1] == ("p", 12.0, TurnRange(2, 6))
+    assert fired[0].turn_range == TurnRange(2, 7)
+    assert backend.drains[-1] == ("p", 13.0, TurnRange(2, 7))
     assert backend.pool_states()["p"].balance == pytest.approx(0.0)
 
 
@@ -297,11 +410,13 @@ def test_restored_balance_at_forced_cap_fires_forced_consolidation() -> None:
     backend = _FakeBackend()
     events, sink = _sink()
     pool = ScorePool(clock=clock, sink=sink, backend=backend)
-    pool.restore("p", 50.0, TurnRange(0, 9))
-    fired = pool.evaluate()
+    pool.restore("p", 45.0, TurnRange(0, 9))
+    fired = pool.add_points("p", 6.0, TurnRange(10, 10))  # 45 + 6 crosses the cap
     assert len(fired) == 1
     assert fired[0].kind is PoolEventKind.FORCED_CONSOLIDATION
-    assert backend.pool_states()["p"].balance == pytest.approx(0.0)
+    state = backend.pool_states()["p"]
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(51.0)
 
 
 def test_balances_snapshot() -> None:

@@ -1564,7 +1564,12 @@ def _dream_data_status(request: Request, profile_id: str) -> dict[str, Any]:
             break
 
     return {
-        "pool": {"balance": pool_state.balance, "threshold": config.dream.floor_pool_points},
+        "pool": {
+            "balance": pool_state.balance,
+            "threshold": config.dream.floor_pool_points,
+            "pending": pool_state.balance,
+            "lifetime_filed": pool_state.filed_points_total,
+        },
         "watermark": watermark,
         "history": {
             "committed_runs": runs_committed,

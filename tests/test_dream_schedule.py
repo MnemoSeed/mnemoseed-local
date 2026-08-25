@@ -23,6 +23,7 @@ re-read on every tick, so a ``config set`` hot-applies to the next tick.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
 
@@ -96,7 +97,21 @@ class _FakeMeta:
         self._states[profile_id] = PoolState(balance=state.balance + points)
 
     def pool_credit(self, profile_id: str, balance: float, turn_range: TurnRange) -> None:
-        self._states[profile_id] = PoolState(balance=balance, watermark=turn_range)
+        self._states[profile_id] = PoolState(
+            balance=balance,
+            watermark=turn_range,
+            filed_points_total=self._states.get(profile_id, PoolState(balance=0.0)).filed_points_total,
+        )
+
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        del turn_range
+        state = self._states.get(profile_id, PoolState(balance=0.0))
+        self._states[profile_id] = PoolState(
+            balance=0.0,
+            watermark=state.watermark,
+            filed_points_total=state.filed_points_total + state.balance,
+        )
+        return state.balance
 
     # ---- MetaStore read seams
 
@@ -118,6 +133,14 @@ class _RecordingSeam:
 
     def handle_event(self, event: PoolEvent) -> None:
         self.sink.append(event)
+
+
+def _scheduler(stores: _FakeStores, config: Config, **kwargs: Any) -> DreamScheduler:
+    """A scheduler wired with the store seam's own fire-time drain — the
+    construction contract: a scheduler without a drain callable cannot be
+    built (draining only the bare meta row would let a mirroring ScorePool
+    resurrect consumed points)."""
+    return DreamScheduler(stores, config, drain=stores.meta.pool_drain, **kwargs)
 
 
 class _FakeStores:
@@ -184,7 +207,7 @@ def _eligible(scheduler: DreamScheduler, profile: str = "p") -> DreamEligibility
 
 def test_below_floor_is_not_eligible() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(9)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 9.0}),
         _config(hard_deadline_sec=1e9),  # deadline disabled: only the floor can fire
         clock=lambda: 100_000.0,  # idle huge, but the pool is below the floor
@@ -194,7 +217,7 @@ def test_below_floor_is_not_eligible() -> None:
 
 def test_floor_met_but_not_idle_is_not_eligible() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 12.0}),
         _config(),
         clock=lambda: 500.0,  # last activity at 9.0 -> idle 491s < 900
@@ -204,7 +227,7 @@ def test_floor_met_but_not_idle_is_not_eligible() -> None:
 
 def test_floor_and_idle_met_is_eligible() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 12.0}),
         _config(),
         clock=lambda: 10_000.0,
@@ -223,7 +246,7 @@ def test_floor_counts_pool_points_not_chunks() -> None:
         _chunk("p", turn=(0, 0), ingested_at=1.0),
         _chunk("p", turn=(1, 1), ingested_at=2.0),
     ]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 12.0}),
         _config(hard_deadline_sec=1e9),
         clock=lambda: 100_000.0,
@@ -238,7 +261,7 @@ def test_floor_counts_pool_points_not_chunks() -> None:
 def test_consolidated_chunks_do_not_count_as_pending() -> None:
     pending = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
     old = [_chunk("p", turn=(100 + i, 100 + i), ingested_at=float(i), consolidated=True) for i in range(50)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores([*pending, *old], profiles=["p"], balances={"p": 12.0}),
         _config(),
         clock=lambda: 10_000.0,
@@ -253,7 +276,7 @@ def test_idle_measures_from_latest_capture_activity() -> None:
     # latest activity is a CONSOLIDATED chunk at t=9500; pending chunks are old
     pending = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
     recent = [_chunk("p", turn=(50, 50), ingested_at=9_500.0, consolidated=True)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores([*pending, *recent], profiles=["p"], balances={"p": 12.0}),
         _config(),
         clock=lambda: 10_000.0,
@@ -262,7 +285,7 @@ def test_idle_measures_from_latest_capture_activity() -> None:
 
 
 def test_no_pending_chunks_is_never_eligible() -> None:
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores([], profiles=["p"], balances={"p": 12.0}),
         _config(),
         clock=lambda: 1e9,
@@ -274,7 +297,7 @@ def test_drained_pool_never_re_triggers_the_floor() -> None:
     """A dream consumed the pool: balance 0 means the same credits can never
     re-trigger the floor, regardless of idle or pending chunks."""
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 0.0}),
         _config(hard_deadline_sec=1e9),
         clock=lambda: 100_000.0,
@@ -287,7 +310,7 @@ def test_drained_pool_never_re_triggers_the_floor() -> None:
 
 def test_hard_deadline_forces_below_floor() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(3)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 3.0}),
         _config(),
         clock=lambda: 100_000.0,  # oldest chunk waited ~100k s > 24h
@@ -301,7 +324,7 @@ def test_hard_deadline_forces_below_floor() -> None:
 
 def test_hard_deadline_forces_even_when_idle_below_window() -> None:
     chunks = [_chunk("p", turn=(0, 0), ingested_at=0.0)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 3.0}),
         _config(),
         clock=lambda: 90_000.0,  # 25h since the only pending chunk
@@ -318,14 +341,14 @@ def test_hard_deadline_counts_from_oldest_pending_chunk() -> None:
         _chunk("p", turn=(0, 0), ingested_at=100.0),
         _chunk("p", turn=(1, 1), ingested_at=90_000.0),
     ]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 3.0}),
         _config(),
         clock=lambda: 100.0 + 86_399.0,  # oldest waited 86_399s < 86400
     )
     assert _eligible(scheduler) is None
     # one second later the deadline binds, regardless of the fresh chunk
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 3.0}),
         _config(),
         clock=lambda: 100.0 + 86_401.0,
@@ -337,7 +360,7 @@ def test_hard_deadline_counts_from_oldest_pending_chunk() -> None:
 
 def test_deadline_not_hit_within_window() -> None:
     chunks = [_chunk("p", turn=(0, 0), ingested_at=100.0)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 3.0}),
         _config(),
         clock=lambda: 100.0 + 86_399.0,  # just under 24h
@@ -348,7 +371,7 @@ def test_deadline_not_hit_within_window() -> None:
 def test_deadline_skip_when_zero_pending() -> None:
     # every chunk consolidated: zero pending, the deadline is skipped
     chunks = [_chunk("p", turn=(0, 0), ingested_at=0.0, consolidated=True)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 0.0}),
         _config(),
         clock=lambda: 1_000_000.0,
@@ -361,7 +384,7 @@ def test_drained_pool_still_allows_hard_deadline() -> None:
     still hit the 24h deadline: the floor respects the drain, the deadline is
     the backstop that does not."""
     chunks = [_chunk("p", turn=(0, 0), ingested_at=0.0)]
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 0.0}),
         _config(),
         clock=lambda: 90_000.0,
@@ -442,7 +465,7 @@ def test_scheduler_re_reads_config_each_tick() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(3)]
     stores = _FakeStores(chunks, profiles=["p"], balances={"p": 3.5})
     config = Config()  # defaults: floor 10.0 -> not eligible
-    scheduler = DreamScheduler(stores, config, clock=lambda: 100_000.0)
+    scheduler = _scheduler(stores, config, clock=lambda: 100_000.0)
     # deadline disabled by the hot-apply step below; first check the floor only
     config.dream = DreamConfig(hard_deadline_sec=1e9)
     assert _eligible(scheduler) is None
@@ -459,17 +482,44 @@ def test_scheduler_re_reads_config_each_tick() -> None:
 def test_tick_emits_pending_manual_events_and_dedups_window() -> None:
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
     stores = _FakeStores(chunks, profiles=["p"], balances={"p": 12.0})
-    scheduler = DreamScheduler(stores, Config(), clock=lambda: 10_000.0)
+    scheduler = _scheduler(stores, Config(), clock=lambda: 10_000.0)
     emitted = scheduler.tick()
     assert len(emitted) == 1
     assert emitted[0].reason == "floor_idle"
+    # the emission drained the persisted gauge into the lifetime ledger
+    state = stores.meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(12.0)
     # same window: no duplicate emission
     assert scheduler.tick() == []
-    # a new pending turn changes the window -> a fresh emission
+    # a new pending turn plus re-earned points change the window -> a fresh
+    # emission (drained points alone never re-arm the floor)
     stores.vector.chunks.append(_chunk("p", turn=(10, 10), ingested_at=9_000.0))
+    stores.meta.pool_credit("p", 12.0, TurnRange(0, 10))
     emitted_again = scheduler.tick()
     assert len(emitted_again) == 1
     assert emitted_again[0].turn_range == TurnRange(0, 10)
+
+
+def test_scheduler_fire_drains_the_persisted_gauge_into_the_ledger() -> None:
+    """The dominant fire path persists its drain: emission zeroes the gauge row
+    and files the points into the lifetime ledger, so consumed points can never
+    re-arm the floor."""
+    chunks = [_chunk("p", turn=(i, i), ingested_at=float(i)) for i in range(10)]
+    meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
+    scheduler = _scheduler(
+        _FakeStores(chunks, profiles=["p"], meta=meta),
+        _config(hard_deadline_sec=1e9),
+        clock=lambda: 100_000.0,
+    )
+    emitted = scheduler.tick()
+    assert len(emitted) == 1
+    state = meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(12.0)
+    # the same credits never trigger twice
+    assert scheduler.eligibility("p") is None
+    assert scheduler.tick() == []
 
 
 def test_tick_hands_events_to_trigger_when_bound() -> None:
@@ -477,7 +527,7 @@ def test_tick_hands_events_to_trigger_when_bound() -> None:
     from mnemoseed_local.dream import DreamTrigger, NullSnapshotter
 
     trigger = DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=False)
-    scheduler = DreamScheduler(
+    scheduler = _scheduler(
         _FakeStores(chunks, profiles=["p"], balances={"p": 12.0}),
         Config(),
         trigger=trigger,
@@ -516,18 +566,18 @@ def test_pool_self_fire_uses_config_idle_window_and_drain_stops_double_service()
         clock.advance(200.0)  # idle since the last credit: 200s < 900s
         pool.add_points("p", 4.0, TurnRange(index, index))
     assert sink_events == []  # balance 12 >= floor, but idle < idle_min_sec
-    clock.advance(600.0)  # idle 600s: a fixed 5s window would fire here
-    assert pool.evaluate() == ()
-    clock.advance(400.0)  # idle 1000s >= 900s: the pool fires and drains
-    fired = pool.evaluate()
+    clock.advance(1000.0)  # idle 1000s >= 900s: the next credit fires and drains
+    fired = pool.add_points("p", 1.0, TurnRange(3, 3))
     assert len(fired) == 1
     assert fired[0].kind is PoolEventKind.DREAM_TRIGGER
-    assert sink_events == [fired[0]]
-    assert meta.pool_state("p").balance == pytest.approx(0.0)
+    assert sink_events == list(fired)
+    state = meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(13.0)
     # the scheduler shares the same config and the drained balance: the same
     # window is never double-serviced
     chunks = [_chunk("p", turn=(i, i), ingested_at=float(1_000.0 + i * 200.0)) for i in range(3)]
-    scheduler = DreamScheduler(_FakeStores(chunks, profiles=["p"], meta=meta), config, clock=clock)
+    scheduler = _scheduler(_FakeStores(chunks, profiles=["p"], meta=meta), config, clock=clock)
     assert scheduler.eligibility("p") is None
     assert scheduler.tick() == []
 
@@ -546,7 +596,7 @@ def test_failed_dream_retries_with_backoff_then_stops_and_audits() -> None:
     meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
     stores = _FakeStores(chunks, profiles=["p"], meta=meta)
     emitted: list[PoolEvent] = []
-    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+    scheduler = _scheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
 
     # initial fire: floor + idle, balance 12.0
     first = scheduler.tick()
@@ -600,7 +650,7 @@ def test_success_after_failure_resets_the_backoff_streak() -> None:
     meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
     stores = _FakeStores(chunks, profiles=["p"], meta=meta)
     emitted: list[PoolEvent] = []
-    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+    scheduler = _scheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
 
     assert len(scheduler.tick()) == 1
     meta.pool_credit("p", 0.0, TurnRange(0, 9))
@@ -635,7 +685,7 @@ def test_retry_waits_for_outcome_while_worker_is_busy() -> None:
     meta = _FakeMeta(profiles=["p"], balances={"p": 12.0})
     stores = _FakeStores(chunks, profiles=["p"], meta=meta)
     emitted: list[PoolEvent] = []
-    scheduler = DreamScheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
+    scheduler = _scheduler(stores, _config(), trigger=_RecordingSeam(emitted), clock=clock)
 
     assert len(scheduler.tick()) == 1
     meta.pool_credit("p", 0.0, TurnRange(0, 9))

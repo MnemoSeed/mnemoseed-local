@@ -77,6 +77,25 @@ def test_dream_status_reports_pool_watermark_and_history(config_path: Path) -> N
         assert "state" in payload
 
 
+def test_dream_status_reports_pending_and_lifetime_filed(config_path: Path) -> None:
+    """The pool block splits the pending gauge from the lifetime filed total."""
+    with _client(config_path) as client:
+        stores = client.app.state.stores  # type: ignore[attr-defined]
+        stores.meta.pool_credit(PROFILE, 2.05, TurnRange(start=3, end=3))
+
+        body = client.post("/memory/dream_status", json={"profile_id": PROFILE})
+        payload = body.json()
+        assert payload["pool"]["balance"] == pytest.approx(2.05)
+        assert payload["pool"]["pending"] == pytest.approx(payload["pool"]["balance"])
+        assert payload["pool"]["lifetime_filed"] == 0.0
+
+        stores.meta.pool_drain(PROFILE, TurnRange(start=3, end=3))
+        body = client.post("/memory/dream_status", json={"profile_id": PROFILE})
+        payload = body.json()
+        assert payload["pool"]["pending"] == 0.0
+        assert payload["pool"]["lifetime_filed"] == pytest.approx(2.05)
+
+
 def test_dream_status_empty_profile_renders_honest_nulls(config_path: Path) -> None:
     with _client(config_path) as client:
         body = client.post("/memory/dream_status", json={"profile_id": "fresh-profile"})

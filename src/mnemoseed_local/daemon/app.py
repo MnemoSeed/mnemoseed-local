@@ -666,6 +666,7 @@ def _build_capture(
     _DreamRelay,
     RoleRouter,
     list[tuple[DreamPipeline, Snapshot]],
+    ScorePool,
 ]:
     """Serving capture funnel: strip -> score -> pool -> stamp/write over the
     resolved storage stack. /ingest stays submit-only; the funnel drains on
@@ -842,6 +843,7 @@ def _build_capture(
         relay,
         router,
         deferred_resumes,
+        pool,
     )
 
 
@@ -918,6 +920,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.dream_relay,
         app.state.role_router,
         deferred_resumes,
+        app.state.score_pool,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
     # B6 (W-C): the drain lane runs WritingPipeline.drain off the event loop on
@@ -956,6 +959,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config,
         trigger=scheduler_trigger,
         resume_drain=app.state.dream_worker.resume_drained,
+        # fire-time drain through the live pool: the persisted gauge files into
+        # the lifetime ledger and the in-process gauge resets together, so a
+        # later credit can never resurrect drained points
+        drain=app.state.score_pool.drain,
     )
     # A2.5 T1 backoff wiring: the dream pipeline reports every attempt's outcome
     # (reflect/merge ok or error) back to the scheduler, so a failed dream

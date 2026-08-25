@@ -52,7 +52,7 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (33 methods)
+## MetaStore (34 methods)
 
 | Method | Contract test |
 |---|---|
@@ -78,6 +78,7 @@ Driver family covered by the `stack` fixture:
 | migrate | `test_contract_meta.py::test_schema_version_and_migrate_forward_only` |
 | pool_add | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
 | pool_credit | `test_contract_meta.py::test_pool_credit_upserts_row` |
+| pool_drain | `test_contract_meta.py::test_pool_drain_files_the_lifetime_ledger` |
 | pool_state | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
 | pool_states | `test_contract_meta.py::test_pool_states_returns_all_rows` |
 | record_dream_run | `test_contract_meta.py::test_dream_runs_roundtrip` |

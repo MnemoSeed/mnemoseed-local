@@ -55,6 +55,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "pool_add": "test_contract_meta.py::test_pool_add_state_advance_watermark",
         "pool_state": "test_contract_meta.py::test_pool_add_state_advance_watermark",
         "pool_credit": "test_contract_meta.py::test_pool_credit_upserts_row",
+        "pool_drain": "test_contract_meta.py::test_pool_drain_files_the_lifetime_ledger",
         "pool_states": "test_contract_meta.py::test_pool_states_returns_all_rows",
         "advance_watermark": "test_contract_meta.py::test_pool_watermark_gap_raises",
         "upsert_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
@@ -100,12 +101,13 @@ COVERAGE: dict[str, dict[str, str]] = {
 # with archive_profile (PRD-07 FR-7.3 console profile archive), and to 32 with
 # update_dream_run_model (F2 per-run model pinning recorded on dream_runs), and
 # to 33 with finish_dream_run (the dream log surface: finish time + metered
-# tokens recorded at merge commit, 2026-08-17).
+# tokens recorded at merge commit, 2026-08-17), and to 34 with pool_drain (the
+# atomic fire-time gauge->ledger drain on the score pool).
 # GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
 # 2026-08-13, the console Graph View bulk edge listing).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 14,
     "GraphStore": 20,
-    "MetaStore": 33,
+    "MetaStore": 34,
     "Embedder": 3,
 }
