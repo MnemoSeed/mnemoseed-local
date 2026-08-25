@@ -101,6 +101,21 @@
 
 > 本节未入册说明：McGaugh (2004) "The memory consolidation hypothesis"（*Learning & Memory* 11(6), 668–673）为本轮**未能核验**的经典——试探 DOI 10.1101/lm.75404 实际解析到同刊他文（Quirk, G. J., 11(2), 125–126），标题检索亦未命中该文。按诚实规则不入册；其假说陈述已由 R44/R45 覆盖。
 
+## 经验学习与强化（B2.13 体验学习管线）
+
+| # | Citation | Used for | 对应本篇 | Status |
+|---|---|---|---|---|
+| R49 | Rescorla, R. A., & Wagner, A. R. (1972). A theory of Pavlovian conditioning: Variations in the effectiveness of reinforcement and nonreinforcement. In A. H. Black & W. F. Prokasy (Eds.), *Classical Conditioning II: Current Research and Theory* (pp. 64–99). New York: Appleton-Century-Crofts. | RW delta rule：错误事件→记忆晋升阈值的主锚；可证伪预测：负性结果剂量 vs serve-rate 下降呈单调剂量-反应关系 | B2.13 | ✅ 核验命中（书章无 DOI；多个独立书目来源一致，含合作者 Wagner 本人 Yale 出版列表 wagner.yale.edu/publications） |
+| R50 | Sutton, R. S., & Barto, A. G. (1998). *Reinforcement Learning: An Introduction*. MIT Press. ISBN 978-0-262-19398-6 | eligibility traces：outcome→memory 归因的有界回看窗口（工程规则：KISS 形式的 bounded attribution window，缺省值 mark-as-is + 遥测后校准） | B2.13 | 📕 经典专著（Open Library 命中：MIT Press, 1998, ISBN 0262193981；2018 二版另有 DOI，本轮按原引登记） |
+| R51 | Schank, R. C. (1982). *Dynamic Memory: A Theory of Reminding and Learning in Computers and People*. Cambridge University Press. ＋ Kolodner, J. L. (1993). *Case-Based Reasoning*. San Mateo, CA: Morgan Kaufmann.（组合条目，同 CBR 谱系） | 案例推理（CBR）：从具体案例泛化出可复用的教训结构 → lesson chunk artifact（EVIDENCED_BY 边回指原案例，教训永不替换原件） | B2.13 | 📕 经典专著（Open Library 双命中：Schank 1982 首版年确认 works/OL2645866W；Kolodner 1993 确认 works/OL3945936W） |
+| R52 | Gollwitzer, P. M. (1999). Implementation intentions: Strong effects of simple plans. *American Psychologist*, 54(7), 493–503. DOI: 10.1037/0003-066X.54.7.493 | 实现意图（if-then 计划效应）：触发条件+行动的配对显著提升执行率 → INTENTION 节点 `{trigger_condition, action, status}`（schema 已冻结于 `schema/graph.py:147`） | B2.13 | ✅ Crossref 核验命中（DOI 直接解析，author/year/venue 全对） |
+| R53 | Anderson, J. R. (1982). Acquisition of cognitive skill. *Psychological Review*, 89(4), 369–406. DOI: 10.1037/0033-295X.89.4.369 | 知识编译（declarative→procedural，练习使规则自动化）→ SKILL_SEQUENCE 编译规则（`{task_type, tool_chain, success_rate}` 已冻结于 `graph.py:150`） | B2.13 | ✅ Crossref 核验命中（DOI 直接解析，author/year/venue 全对） |
+
+> 本节未入册说明：
+> - **Fitts & Posner (1967)**《Motor Skill Acquisition》动作技能三阶段模型——纯描述性分期叙事，无可证伪预测，未达本仓入册门槛（诚实规则），其可用部分由 R53 的知识编译框架覆盖。
+> - **后悔/反事实思维**（regret / counterfactual thinking）——归因与失真语义已由在册条目覆盖（R7 来源监控、R34/R35 重建性与误导信息框架），不再重复入册。
+> - **Von Restorff 隔离效应**——**暂缓入册**。缓办备忘：①「隔离效应」一词已被竞品营销用作签名概念，直接引用将造成对外叙事混淆；②「越突出越记得住」若落为写入侧显著性加权即触碰捕获中立红线。重议条件：仅限读取面（呈现侧显著性标注）设计出现时，并先过中立执法扫描再入册。
+
 ## 工程与行业文献（I 类）
 
 | # | Citation | Used for | 对应本篇 | Status |
