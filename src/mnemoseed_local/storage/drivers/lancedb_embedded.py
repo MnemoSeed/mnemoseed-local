@@ -486,6 +486,8 @@ class LanceDbEmbeddedStore:
                 # design/09 §3.5 route (b): denormalized pin-class flag so the
                 # rescue-band prefilter can exclude sub-floor non-pin rows
                 pa.field("explicit_pin", pa.bool_()),
+                # inert origin-agent attribution label (write-time provenance)
+                pa.field("origin_agent", pa.string()),
             ]
         )
 
@@ -505,24 +507,28 @@ class LanceDbEmbeddedStore:
     def _ensure_table(self) -> None:
         if self.table_name in self._existing_tables():
             self._table = self._db.open_table(self.table_name)
-            if "rules_json" not in self._table.schema.names:
-                try:
-                    self._table.add_columns({"rules_json": pa.string()})
-                except TypeError:
-                    # lancedb >= 0.20 expects a field/schema for NULL columns
-                    self._table.add_columns([pa.field("rules_json", pa.string())])
-                self._table = self._db.open_table(self.table_name)
-            if "explicit_pin" not in self._table.schema.names:
-                try:
-                    # legacy rows keep NULL until their next rewrite; the pin
-                    # filter clause falls back to the authoritative provenance
-                    # source so they never lose or gain class membership
-                    self._table.add_columns({"explicit_pin": pa.bool_()})
-                except TypeError:
-                    self._table.add_columns([pa.field("explicit_pin", pa.bool_())])
-                self._table = self._db.open_table(self.table_name)
+            # rules_json: B2.7 standing constraints; explicit_pin: design/09
+            # §3.5 pin-class flag (legacy rows keep NULL until their next
+            # rewrite and the filter clause falls back to the authoritative
+            # provenance source); origin_agent: write-time attribution label.
+            for name, column_type in (
+                ("rules_json", pa.string()),
+                ("explicit_pin", pa.bool_()),
+                ("origin_agent", pa.string()),
+            ):
+                if name not in self._table.schema.names:
+                    self._add_nullable_column(name, column_type)
         else:
             self._table = self._db.create_table(self.table_name, schema=self._schema())
+
+    def _add_nullable_column(self, name: str, column_type: pa.DataType) -> None:
+        """Add one NULL-born column (existing rows stay NULL until rewritten)."""
+        try:
+            self._table.add_columns({name: column_type})
+        except TypeError:
+            # lancedb >= 0.20 expects a field/schema for NULL columns
+            self._table.add_columns([pa.field(name, column_type)])
+        self._table = self._db.open_table(self.table_name)
 
     # ------------------------------------------------------------- mapping
 
@@ -594,6 +600,7 @@ class LanceDbEmbeddedStore:
                 json.dumps(chunk.rules, separators=(",", ":"), ensure_ascii=False) if chunk.rules else None
             ),
             "explicit_pin": is_explicit_pin(provenance.source),
+            "origin_agent": chunk.origin_agent,
         }
 
     def _to_stamp(self, row: dict[str, Any]) -> ChunkStamp:
@@ -611,6 +618,7 @@ class LanceDbEmbeddedStore:
             cognitive_tier=CognitiveTier(int(row["cognitive_tier"])),
             model_id=str(row["model_id"]),
             persona_id=row.get("persona_id"),
+            origin_agent=row.get("origin_agent"),
             cues=Cues(
                 project=cues_row.get("project"),
                 host=cues_row.get("host"),

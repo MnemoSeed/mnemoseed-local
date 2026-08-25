@@ -63,7 +63,15 @@ def _ensure_registered():
 # ---------------------------------------------------------------- grouping (pure)
 
 
-def _stamp(chunk_id: str, session: str, ingested_at: float, text: str, turn: int = 0) -> ChunkStamp:
+def _stamp(
+    chunk_id: str,
+    session: str,
+    ingested_at: float,
+    text: str,
+    turn: int = 0,
+    host: str | None = None,
+    origin_agent: str | None = None,
+) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
         profile_id=PROFILE,
@@ -71,7 +79,8 @@ def _stamp(chunk_id: str, session: str, ingested_at: float, text: str, turn: int
         cognitive_tier=CognitiveTier.TIER_1,
         model_id="test-model",
         persona_id=None,
-        cues=Cues(entities=[]),
+        origin_agent=origin_agent,
+        cues=Cues(entities=[], host=host),
         provenance=Provenance(asserted_by="user", session_id=session, source="manual"),
         turn_start=turn,
         turn_end=turn,
@@ -143,6 +152,21 @@ def test_group_session_tails_cap_counts_survivor_groups_after_exclusion() -> Non
     assert [g["session_id"] for g in groups] == ["sess-old2", "sess-old1"]
 
 
+def test_group_session_tails_expose_origin_agent_and_host_per_chunk() -> None:
+    """B2.9 read-back: every tail item carries its origin agent label and its
+    encoding host; a pre-attribution chunk reports consistent nulls."""
+    chunks = [
+        _stamp("c2", "s1", 20.0, "attributed turn", host="opencode", origin_agent="build"),
+        _stamp("c1", "s1", 10.0, "legacy turn"),
+    ]
+    [group] = _group_session_tails(chunks, per_session=20, sessions=5)
+    legacy, attributed = group["chunks"]
+    assert attributed["origin_agent"] == "build"
+    assert attributed["host"] == "opencode"
+    assert legacy["origin_agent"] is None
+    assert legacy["host"] is None
+
+
 # ---------------------------------------------------------------- daemon integration
 
 
@@ -212,6 +236,64 @@ def test_session_recent_returns_both_session_tails_verbatim_in_order(config_path
             for chunk in group["chunks"]:
                 assert chunk["chunk_id"]
                 assert chunk["ingested_at"] > 0
+
+
+def test_session_recent_items_carry_origin_agent_and_host_end_to_end(config_path: Path) -> None:
+    """Full chain through ingest -> segmenter -> stamper -> store: the canonical
+    `agent` on the payload reaches the read-back item alongside the encoding
+    host; a session without one reports consistent nulls."""
+    with TestClient(create_app()) as client:
+        attributed = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-agent",
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "agent": "build",
+                "content": {"text": "带归属的一轮"},
+            },
+        )
+        assert attributed.status_code == 202, attributed.text
+        client.post("/session/end", json={"session_id": "sess-agent", "profile_id": PROFILE})
+        _ingest(client, "sess-plain", 2.0, "没有归属的一轮")
+        client.post("/session/end", json={"session_id": "sess-plain", "profile_id": PROFILE})
+
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        groups = {g["session_id"]: g for g in body.json()["sessions"]}
+        [attributed_item] = groups["sess-agent"]["chunks"]
+        assert attributed_item["origin_agent"] == "build"
+        assert attributed_item["host"] == "opencode"
+        [plain_item] = groups["sess-plain"]["chunks"]
+        assert plain_item["origin_agent"] is None
+        assert plain_item["host"] == HostId.CLAUDE_CODE.value
+
+
+def test_blank_agent_ingests_and_serves_as_null(config_path: Path) -> None:
+    """Capture success outranks attribution completeness: a whitespace-only
+    agent never fails ingest and serves as the honest null."""
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-blank-agent",
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "agent": "   ",
+                "content": {"text": "空白归属的一轮"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        client.post("/session/end", json={"session_id": "sess-blank-agent", "profile_id": PROFILE})
+
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        assert body.status_code == 200, body.text
+        [chunk] = body.json()["sessions"][0]["chunks"]
+        assert chunk["origin_agent"] is None
 
 
 def test_session_recent_honors_the_caps(config_path: Path) -> None:

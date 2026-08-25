@@ -95,6 +95,12 @@ def test_replayed_tail_arrives_before_the_live_turn(tmp_path: Path) -> None:
     assert replay_user_index < replay_assistant_index < live_index, (
         f"replay must fully precede the live turn: {order}"
     )
+    # B2.9 attribution: the crash-replay lane lifts the host history's
+    # per-message agent (UserMessage.agent) into the canonical body field; a
+    # live hookInput without one stays honestly unattributed.
+    agents = {post["text"]: post.get("agent") for post in transcript["order"]}
+    assert agents["历史用户消息"] == "build", f"replayed prompt lost its agent: {transcript['order']}"
+    assert agents["重启后的新消息"] is None
 
 
 def test_completed_assistant_posts_exactly_once_across_live_and_replay(tmp_path: Path) -> None:

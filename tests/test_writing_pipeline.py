@@ -115,7 +115,13 @@ def _existing(
 
 
 def _turn(
-    text: str, *, index: int = 0, hint: float | None = None, profile: str = PROFILE, session: str = SESSION
+    text: str,
+    *,
+    index: int = 0,
+    hint: float | None = None,
+    profile: str = PROFILE,
+    session: str = SESSION,
+    origin_agent: str | None = None,
 ) -> Turn:
     return Turn(
         turn_index=index,
@@ -125,6 +131,7 @@ def _turn(
         model_id="claude-sonnet-5",
         started_at=0.0,
         importance_hint=hint,
+        origin_agent=origin_agent,
         steps=[TurnStep(role=TurnRole.USER, content=text)],
     )
 
@@ -180,6 +187,18 @@ def test_default_clock_stamps_are_epoch_domain() -> None:
     assert abs(stamp.ingested_at - time.time()) < 300
     assert abs(stamp.provenance.asserted_at - time.time()) < 300
     assert abs(stamp.provenance.history[0].at - time.time()) < 300
+
+
+def test_default_context_propagates_the_turn_origin_agent() -> None:
+    """The bare pipeline write context carries the segmenter's turn-level
+    attribution into the written stamp (capture neutrality: a label ride, the
+    scorer never sees it)."""
+    store = _FakeVectorStore()
+    pipe = _writing_pipeline(store, _Clock())
+    pipe.submit_turn(_turn("我 review 喜欢简洁", origin_agent="build"))
+
+    assert [o.kind for o in pipe.drain(SESSION)] == [WriteOutcomeKind.NEW_CHUNK]
+    assert store.upserts[0].origin_agent == "build"
 
 
 def test_stats_track_outcome_kinds() -> None:

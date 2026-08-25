@@ -349,7 +349,7 @@ class WritingStats:
 
 def _default_write_context(turn: Turn) -> WriteContext:
     """Bare write context: only the identity the wire model always carries."""
-    return WriteContext(profile_id=turn.profile_id)
+    return WriteContext(profile_id=turn.profile_id, origin_agent=turn.origin_agent)
 
 
 class WritingPipeline:

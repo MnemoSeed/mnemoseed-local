@@ -155,3 +155,40 @@ def test_list_chunks_rules_not_null_on_pre_b27_table(tmp_path: Path) -> None:
     result = store.list_chunks(ChunkFilter(profile_id=PROFILE, rules_not_null=True), Page(limit=10))
     assert result.items == []
     assert result.total == 0
+
+
+def test_origin_agent_column_migrates_and_legacy_rows_stay_null(tmp_path: Path) -> None:
+    """Pre-attribution table gains origin_agent through the driver's add-columns
+    migration; legacy rows keep NULL (no backfill — provenance is immutable),
+    and only writes after the migration carry a label."""
+    from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+
+    uri = tmp_path / "old.lance"
+    db = connect(str(uri))
+    probe = LanceDbEmbeddedStore(uri=tmp_path / "probe.lance", dimensions=DIMENSION)
+    embedder = SyntheticEmbedder(dimension=DIMENSION)
+    old_schema = probe._schema().remove(probe._schema().get_field_index("origin_agent"))
+    db.create_table("chunks", schema=old_schema)
+    legacy = make_stamp("legacy-1", "pre-attribution turn")
+    emb = embedder.embed(legacy.text)
+    row = {
+        key: value
+        for key, value in probe._to_row(legacy, list(emb.dense), None).items()
+        if key != "origin_agent"
+    }
+    db.open_table("chunks").add([row])
+
+    store = LanceDbEmbeddedStore(uri=uri, dimensions=DIMENSION)
+    assert "origin_agent" in store._table.schema.names
+
+    got = store.get_chunk("legacy-1")
+    assert got is not None
+    assert got.origin_agent is None, "legacy rows stay NULL: no backfill"
+
+    labeled = make_stamp("labeled-1", "attributed turn")
+    labeled.origin_agent = "build"
+    result = embedder.embed(labeled.text)
+    store.upsert_chunk(labeled, result.dense, result.sparse)
+    stored = store.get_chunk("labeled-1")
+    assert stored is not None
+    assert stored.origin_agent == "build"

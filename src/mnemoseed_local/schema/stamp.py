@@ -91,6 +91,10 @@ class ChunkStamp(BaseModel):
     cognitive_tier: CognitiveTier
     model_id: str
     persona_id: str | None = None
+    # Inert origin-agent attribution label (write-time provenance); NULL for
+    # legacy rows and any capture without a host-reported agent. Never read by
+    # scoring/decay/retrieval ranking.
+    origin_agent: str | None = None
     cues: Cues = Field(default_factory=Cues)
     provenance: Provenance
     decay_weight: float = Field(default=1.0, ge=0.0, le=1.0)

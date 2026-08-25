@@ -38,7 +38,9 @@ PROFILE = "default"
 HOST = HostId.OPENCODE
 
 
-def _message(etype: IngestEventType, session: str, ts: float, text: str) -> IngestEvent:
+def _message(
+    etype: IngestEventType, session: str, ts: float, text: str, agent: str | None = None
+) -> IngestEvent:
     return IngestEvent(
         host=HOST,
         event=etype,
@@ -46,6 +48,7 @@ def _message(etype: IngestEventType, session: str, ts: float, text: str) -> Inge
         profile_id=PROFILE,
         ts=ts,
         content=MessageContent(text=text),
+        agent=agent,
     )
 
 
@@ -72,6 +75,54 @@ def _raw_turn(session: str, text: str, ts: float = 1.0) -> Turn:
         closed=True,
         steps=[TurnStep(role=TurnRole.USER, content=text)],
     )
+
+
+# ---------------------------------------------------------------- origin attribution
+
+
+def test_turn_attribution_follows_the_anchoring_user_prompt() -> None:
+    """First-party anchor defines turn attribution: the anchoring prompt's
+    agent label rides the turn; assistant/tool events never override it."""
+    pipeline = InMemoryCapturePipeline()
+    segmenter = TurnSegmenter(pipeline)
+    session = "sess-attrib"
+    segmenter.ingest(_message(IngestEventType.USER_PROMPT, session, 1.0, "第一问", agent="build"))
+    segmenter.ingest(_tool(session, 2.0))
+    segmenter.ingest(_message(IngestEventType.ASSISTANT_MESSAGE, session, 3.0, "答"))
+    assert segmenter.flush(session, PROFILE) == 1
+    turns = pipeline.turns(session)
+    assert len(turns) == 1
+    assert turns[0].origin_agent == "build"
+
+
+def test_mid_session_agent_switch_survives_at_turn_granularity() -> None:
+    """Build↔Plan switches mid-session keep per-turn labels: each turn carries
+    ITS anchoring prompt's agent, never the previous turn's."""
+    pipeline = InMemoryCapturePipeline()
+    segmenter = TurnSegmenter(pipeline)
+    session = "sess-switch"
+    segmenter.ingest(_message(IngestEventType.USER_PROMPT, session, 1.0, "build 轮", agent="build"))
+    segmenter.ingest(_message(IngestEventType.ASSISTANT_MESSAGE, session, 2.0, "build 答"))
+    segmenter.ingest(_message(IngestEventType.USER_PROMPT, session, 3.0, "plan 轮", agent="plan"))
+    segmenter.ingest(_message(IngestEventType.ASSISTANT_MESSAGE, session, 4.0, "plan 答"))
+    assert segmenter.flush(session, PROFILE) == 1  # only the still-open turn
+    turns = pipeline.turns(session)
+    assert len(turns) == 2
+    assert [turn.origin_agent for turn in turns] == ["build", "plan"]
+
+
+def test_anchorless_turns_stay_unattributed_even_when_events_carry_agent() -> None:
+    """No anchoring user prompt -> honest null: assistant/tool events never
+    attribute a turn (mislabeling beats not labeling)."""
+    pipeline = InMemoryCapturePipeline()
+    segmenter = TurnSegmenter(pipeline)
+    session = "sess-unattributed"
+    segmenter.ingest(_message(IngestEventType.ASSISTANT_MESSAGE, session, 1.0, "orphan reply", agent="build"))
+    segmenter.ingest(_message(IngestEventType.ASSISTANT_MESSAGE, session, 2.0, "second reply"))
+    assert segmenter.flush(session, PROFILE) == 1  # only the still-open turn
+    turns = pipeline.turns(session)
+    assert len(turns) == 2
+    assert [turn.origin_agent for turn in turns] == [None, None]
 
 
 # ---------------------------------------------------------------- QA-3

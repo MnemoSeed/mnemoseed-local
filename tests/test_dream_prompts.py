@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 from mnemoseed_local.dream import StubReflectLLM, build_reflect_prompt
+from mnemoseed_local.dream.prompts import origin_of
 from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.ports import TurnRange
@@ -27,6 +28,7 @@ def _stamp(
     tier: CognitiveTier = CognitiveTier.TIER_1,
     origin: str = "user",
     persona_id: str | None = None,
+    origin_agent: str | None = None,
     turn_start: int | None = 0,
     turn_end: int | None = 1,
 ) -> ChunkStamp:
@@ -38,6 +40,7 @@ def _stamp(
         cognitive_tier=tier,
         model_id="anima-model" if origin == "agent" else "test-model",
         persona_id=persona_id,
+        origin_agent=origin_agent,
         cues=Cues(entities=[]),
         provenance=Provenance(asserted_by=asserted_by, session_id="s1", source="manual"),
         turn_start=turn_start,
@@ -110,6 +113,17 @@ def test_prompt_is_frozen_value_and_renders_metadata() -> None:
 def test_prompt_marks_agent_rendered_origin() -> None:
     snap = _snap(_stamp("c1", "I love coffee", origin="agent", persona_id="anima-1"))
     assert "origin: agent" in build_reflect_prompt(snap).user
+
+
+def test_origin_agent_never_flips_the_dream_evidence_boundary() -> None:
+    """The reflect evidence boundary keys off persona_id/asserted_by only; the
+    inert origin_agent label never changes the user/agent classification and
+    never reaches the prompt (the FR-2.12 preference gate stays exact)."""
+    labeled = _stamp("c1", "I prefer warm light", origin="user", origin_agent="build")
+    plain = _stamp("c1", "I prefer warm light", origin="user")
+    assert labeled.origin_agent == "build"
+    assert origin_of(SnapshotChunk.from_stamp(labeled)) == "user"
+    assert build_reflect_prompt(_snap(labeled)) == build_reflect_prompt(_snap(plain))
 
 
 # ---------------------------------------------------------------- prompt feeds the stub

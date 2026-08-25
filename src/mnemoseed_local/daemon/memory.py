@@ -367,6 +367,8 @@ def _group_session_tails(
                         "ingested_at": chunk.ingested_at,
                         "turn_start": chunk.turn_start,
                         "turn_end": chunk.turn_end,
+                        "origin_agent": chunk.origin_agent,
+                        "host": chunk.cues.host,
                     }
                     for chunk in tail
                 ],
@@ -542,6 +544,8 @@ class MemoryService:
             "recent_evidence": list(entry.recent_evidence),
             "session_id": entry.session_id,
             "ingested_at": iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
+            "origin_agent": entry.origin_agent,
+            "host": entry.host,
         }
 
     def _index_residue(self, profile_id: str) -> dict[str, Any]:

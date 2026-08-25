@@ -81,6 +81,9 @@ class IngestEvent(BaseModel):
     ts: float
     content: MessageContent | ToolContent
     importance_hint: float | None = Field(default=None, ge=0.0, le=1.0)  # FR-1.9
+    # Origin-agent attribution reported by the host (additive, wire-compatible
+    # both directions); absent means unknown, never a guess.
+    agent: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -90,6 +93,14 @@ class IngestEvent(BaseModel):
                 raise ValueError("event 'tool_use' requires content as {tool_name, input, output}")
         elif not isinstance(self.content, MessageContent):
             raise ValueError(f"event '{self.event.value}' requires content as {{text, model_id}}")
+        return self
+
+    @model_validator(mode="after")
+    def _blank_agent_is_unknown(self) -> Self:
+        # A whitespace-only host label is the honest unknown (ProfileRef
+        # blank-identity precedent): capture success outranks attribution.
+        if self.agent is not None and not self.agent.strip():
+            self.agent = None
         return self
 
 
@@ -135,6 +146,9 @@ class Turn(BaseModel):
     profile_id: ProfileRef
     host: HostId
     model_id: str | None = None
+    # Inert provenance label from the turn's anchoring user_prompt event
+    # (source monitoring, write-time attribution); scoring/ranking never read it.
+    origin_agent: str | None = None
     started_at: float
     ended_at: float | None = None
     closed: bool = False

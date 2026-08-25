@@ -124,6 +124,10 @@ class AssembledEntry:
     recent_evidence: tuple[str, ...] = ()
     session_id: str | None = None
     ingested_at: float | None = None
+    # Inert provenance labels served read-only (origin attribution + encoding
+    # host); graph entries and unlabeled chunks carry None.
+    origin_agent: str | None = None
+    host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -435,6 +439,8 @@ class Assembler:
             provenance = {
                 "session_id": candidate.item.provenance.session_id,
                 "ingested_at": candidate.item.ingested_at,
+                "origin_agent": candidate.item.origin_agent,
+                "host": candidate.item.cues.host,
             }
         return AssembledEntry(
             kind=candidate.kind,

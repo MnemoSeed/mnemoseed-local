@@ -298,6 +298,7 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
         profile_id=turn.profile_id,
         host=turn.host.value,
         cognitive_tier=CognitiveTier.TIER_1,
+        origin_agent=turn.origin_agent,
         entities=entities,
         tools_used=_turn_tool_names(turn),
     )
