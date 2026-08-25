@@ -482,6 +482,15 @@ _V8_ADD_CONFIG_SCOPE = AddColumn(
     column=Column("scope", "TEXT"),
 )
 
+# v9 (B2.11 score-pool split): lifetime filed-points ledger column on the
+# per-profile score pool. NOT NULL DEFAULT 0 back-fills every existing row as
+# born-empty; incremental writes happen only inside the atomic pool_drain.
+_V9_ADD_POOL_FILED_TOTAL = AddColumn(
+    store="meta",
+    table="profile_score_pool",
+    column=Column("filed_points_total", "REAL", not_null=True, default=0),
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -562,6 +571,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             "(NULL today, system-wide until per-scope settings land)"
         ),
         ops=(_V8_ADD_CONFIG_SCOPE,),
+    ),
+    Migration(
+        version=9,
+        description=(
+            "score-pool split: lifetime filed_points_total ledger column on "
+            "profile_score_pool (born-empty backfill, written only by pool_drain)"
+        ),
+        ops=(_V9_ADD_POOL_FILED_TOTAL,),
     ),
 )
 

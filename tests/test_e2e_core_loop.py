@@ -137,10 +137,11 @@ def test_full_core_loop(stores: tuple[Stores, Config]) -> None:
     outcomes = writing.drain(SESSION)
     assert outcomes, "no durable turn survived the funnel"
 
-    # ---- score pool: advance the injected clock past the idle window and let
-    # the pool evaluate -> a DREAM_TRIGGER event fires (balance >= 10, idle >= 5)
+    # ---- score pool: advance the injected clock past the idle window, then a
+    # fresh credit re-evaluates the quiet balance -> a DREAM_TRIGGER event
+    # fires (balance >= 10, idle >= 5)
     wall[0] += 10.0
-    events = pool.evaluate()
+    events = pool.add_points(PROFILE, 0.0, turn_range)
     assert events, "score pool never reached the dream threshold"
     assert any(event.kind is PoolEventKind.DREAM_TRIGGER for event in events)
     # deliver the fired events to the trigger (the daemon's _DreamRelay.flush)

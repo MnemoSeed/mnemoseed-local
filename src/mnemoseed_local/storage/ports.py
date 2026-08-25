@@ -220,10 +220,16 @@ class TurnRange:
 
 @dataclass(frozen=True)
 class PoolState:
-    """Score-pool balance and the current watermark."""
+    """Score-pool split balances: the pending gauge and the lifetime ledger.
 
-    balance: float
+    ``balance`` is only the current pending gauge (points that can still
+    trigger a dream); ``filed_points_total`` accumulates every fired point and
+    never triggers again.
+    """
+
+    balance: float = 0.0
     watermark: TurnRange | None = None
+    filed_points_total: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -727,6 +733,16 @@ class MetaStore(Protocol):
         Used by the capture ScorePool after every state change, mirroring the
         in-process ledger into the per-profile table without touching the
         fired-event window.
+        """
+        raise NotImplementedError
+
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        """Atomically file a fired dream's points out of the pending gauge.
+
+        One transaction moves the whole persisted balance into the lifetime
+        ``filed_points_total`` ledger and resets the gauge to 0, so the same
+        points can never trigger twice. The watermark columns are untouched.
+        Returns the filed amount.
         """
         raise NotImplementedError
 

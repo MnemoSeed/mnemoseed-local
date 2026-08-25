@@ -590,9 +590,10 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
             "dream_runs",
             "dream_token_ledger",
         }
-        # v2/v5 are graph-only; v3/v4/v6/v7/v8 are meta (identity chain lands in
-        # v6, the profile archive flag in v7, the reserved config.scope in v8)
-        assert current_schema_version(conn, "meta") == 8
+        # v2/v5 are graph-only; v3/v4/v6/v7/v8/v9 are meta (identity chain lands
+        # in v6, the profile archive flag in v7, the reserved config.scope in
+        # v8, the pool filed-points ledger in v9)
+        assert current_schema_version(conn, "meta") == 9
     finally:
         conn.close()
 
@@ -600,7 +601,7 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
 def test_migration_sequence_is_shared_and_forward_only():
     versions = [m.version for m in MIGRATIONS]
     assert versions == sorted(versions)
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     stores = {op.store for m in MIGRATIONS for op in m.ops}
     assert stores == {"graph", "meta"}
     # every store-region can reach the tail of the shared sequence independently

@@ -1,9 +1,9 @@
 """SQLite meta driver: profiles, tokens, score pool, config, audit, dream runs.
 
-Every pool mutation (pool_add / advance_watermark) is a transaction: the WAL
-journal makes concurrent writer waits safe (busy_timeout). audit_log is
-append-only at the database level via BEFORE UPDATE/DELETE triggers, not just
-by driver convention.
+Every pool mutation (pool_add / pool_drain / advance_watermark) is a
+transaction: the WAL journal makes concurrent writer waits safe (busy_timeout).
+audit_log is append-only at the database level via BEFORE UPDATE/DELETE
+triggers, not just by driver convention.
 """
 
 from __future__ import annotations
@@ -115,29 +115,70 @@ class SqliteMetaDriver:
                 (profile_id, balance, turn_range.start, turn_range.end),
             )
 
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        """Move the whole pending gauge into the lifetime ledger atomically.
+
+        The read of the pending balance and its reset + filing happen inside one
+        BEGIN IMMEDIATE transaction, so concurrent drainers serialize: exactly
+        one of them wins the balance and files it.
+        """
+        with _transaction(self._conn):
+            row = self._conn.execute(
+                "SELECT balance FROM profile_score_pool WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            drained = float(row["balance"]) if row is not None else 0.0
+            self._conn.execute(
+                "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
+                "watermark_end, last_event_start, last_event_end, filed_points_total) "
+                "VALUES (?, 0, 0, 0, ?, ?, ?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET "
+                "balance = 0, last_event_start = excluded.last_event_start, "
+                "last_event_end = excluded.last_event_end, "
+                "filed_points_total = filed_points_total + excluded.filed_points_total",
+                (
+                    profile_id,
+                    turn_range.start,
+                    turn_range.end,
+                    drained,
+                ),
+            )
+            return drained
+
     def pool_state(self, profile_id: str) -> PoolState:
+        """The profile's pending gauge plus its lifetime filed total."""
         row = self._conn.execute(
-            "SELECT balance, watermark_start, watermark_end FROM profile_score_pool WHERE profile_id = ?",
+            "SELECT balance, watermark_start, watermark_end, filed_points_total "
+            "FROM profile_score_pool WHERE profile_id = ?",
             (profile_id,),
         ).fetchone()
-        if row is None or int(row["watermark_end"]) == 0:
-            # no watermark advanced yet: balance may still be un-filed points
-            balance = float(row["balance"]) if row is not None else 0.0
-            return PoolState(balance=balance)
-        watermark = TurnRange(start=int(row["watermark_start"]), end=int(row["watermark_end"]))
-        return PoolState(balance=float(row["balance"]), watermark=watermark)
+        if row is None:
+            return PoolState()
+        # a row whose watermark never advanced still carries an honest gauge
+        watermark = None
+        if int(row["watermark_end"]) != 0:
+            watermark = TurnRange(start=int(row["watermark_start"]), end=int(row["watermark_end"]))
+        return PoolState(
+            balance=float(row["balance"]),
+            watermark=watermark,
+            filed_points_total=float(row["filed_points_total"]),
+        )
 
     def pool_states(self) -> dict[str, PoolState]:
         rows = self._conn.execute(
-            "SELECT profile_id, balance, watermark_start, watermark_end FROM profile_score_pool"
+            "SELECT profile_id, balance, watermark_start, watermark_end, filed_points_total "
+            "FROM profile_score_pool"
         ).fetchall()
         states: dict[str, PoolState] = {}
         for row in rows:
-            balance = float(row["balance"])
             watermark: TurnRange | None = None
             if int(row["watermark_end"]) != 0:
                 watermark = TurnRange(start=int(row["watermark_start"]), end=int(row["watermark_end"]))
-            states[str(row["profile_id"])] = PoolState(balance=balance, watermark=watermark)
+            states[str(row["profile_id"])] = PoolState(
+                balance=float(row["balance"]),
+                watermark=watermark,
+                filed_points_total=float(row["filed_points_total"]),
+            )
         return states
 
     def advance_watermark(self, profile_id: str, turn_range: TurnRange) -> None:

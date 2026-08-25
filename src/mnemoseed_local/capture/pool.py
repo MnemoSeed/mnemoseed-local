@@ -10,12 +10,14 @@ dream engine:
 Idle is measured from the injected clock only: the pool never reads a wall
 clock and tests never sleep. The per-profile ledger is authoritative in-process
 state; the optional ``backend`` seam mirrors it into the MetaStore per-profile
-score pool after every state change (so a daemon restart can restore balances),
-and records each trigger event there.
+score pool after every state change, so a daemon restart can restore balances.
+The persisted row splits two roles: ``balance`` is only the pending gauge,
+``filed_points_total`` is the lifetime ledger of already-fired points.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -60,15 +62,16 @@ class PoolStats:
 class PoolBackend(Protocol):
     """MetaStore-shaped persistence seam (structural subset of MetaStore).
 
-    ``pool_credit`` mirrors a non-firing ledger state into the store; ``pool_add``
-    records a fired event's accumulated total; ``pool_states`` is the boot-time
+    ``pool_credit`` mirrors a non-firing ledger state into the store;
+    ``pool_drain`` files a fired event's whole gauge into the lifetime ledger
+    and zeroes the balance in one transaction; ``pool_states`` is the boot-time
     read back. The full MetaStore satisfies the seam, so ``stores.meta`` binds
     directly.
     """
 
-    def pool_add(self, profile_id: str, points: float, turn_range: TurnRange) -> None: ...
-
     def pool_credit(self, profile_id: str, balance: float, turn_range: TurnRange) -> None: ...
+
+    def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float: ...
 
     def pool_states(self) -> dict[str, PoolState]: ...
 
@@ -107,6 +110,10 @@ class ScorePool:
         self._idle_window_sec = idle_window_sec
         self._config = config
         self._ledgers: dict[str, _Ledger] = {}
+        # one lock for every ledger mutation: add_points runs on the capture
+        # drain-lane threads while the scheduler-fire drain runs on the tick
+        # thread, so their read-modify-write sections must never interleave
+        self._lock = threading.Lock()
 
     def _forced_cap_value(self) -> float:
         """The forced-consolidation cap (T3a): the live dream.pool_forced_cap
@@ -126,113 +133,87 @@ class ScorePool:
         """Pool points for a profile; returns any events fired by this credit.
 
         ``points`` are the S value of one scored turn; ``turn_range`` bounds that
-        turn. Every state change mirrors into the optional backend: a non-firing
-        credit persists the new balance and span, a fired event records the
-        accumulated total (``pool_add``) and then resets the persisted balance to
-        0 (``pool_credit``) before the sink is notified.
+        turn. Every state change mirrors into the optional backend: the new
+        balance persists first (ordinary credit), then a fired event moves the
+        whole gauge into the lifetime ledger with ONE atomic ``pool_drain``
+        before the sink is notified — persistence always completes before the
+        event is delivered, so a crash can leave points pending but never lets
+        a launched dream re-fire them.
         """
-        ledger = self._ledgers.setdefault(profile_id, _Ledger())
-        ledger.points_added += points
-        ledger.turns_pooled += 1
-        now = self._clock()
-        idle = now - ledger.last_add if ledger.last_add is not None else 0.0
-        accumulator = ledger.balance + points
-        if ledger.balance == 0:
-            start, end = turn_range.start, turn_range.end
-        else:
-            start = ledger.range_start if ledger.range_start is not None else turn_range.start
-            end = max(ledger.range_end, turn_range.end)
-        span = TurnRange(start, end)
-
-        event: PoolEvent | None = None
-        forced_cap = self._forced_cap_value()
-        if accumulator >= forced_cap:
-            event = PoolEvent(
-                kind=PoolEventKind.FORCED_CONSOLIDATION,
-                profile_id=profile_id,
-                turn_range=span,
-                balance=accumulator,
-                fired_at=now,
-            )
-            ledger.forced_triggers += 1
-        elif accumulator >= self._dream_threshold and idle >= self._idle_window_sec:
-            event = PoolEvent(
-                kind=PoolEventKind.DREAM_TRIGGER,
-                profile_id=profile_id,
-                turn_range=span,
-                balance=accumulator,
-                fired_at=now,
-            )
-            ledger.dream_triggers += 1
-        else:
+        with self._lock:
+            ledger = self._ledgers.setdefault(profile_id, _Ledger())
+            ledger.points_added += points
+            ledger.turns_pooled += 1
+            now = self._clock()
+            idle = now - ledger.last_add if ledger.last_add is not None else 0.0
+            accumulator = ledger.balance + points
+            if ledger.balance == 0:
+                start, end = turn_range.start, turn_range.end
+            else:
+                start = ledger.range_start if ledger.range_start is not None else turn_range.start
+                end = max(ledger.range_end, turn_range.end)
+            span = TurnRange(start, end)
             ledger.balance = accumulator
             ledger.range_start = start
             ledger.range_end = end
             ledger.last_add = now
-            if self._backend is not None:
-                self._backend.pool_credit(profile_id, accumulator, span)
 
-        if event is not None:
-            ledger.balance = 0.0
-            ledger.range_start = None
-            ledger.range_end = 0
-            ledger.last_add = None
-            if self._backend is not None:
-                self._backend.pool_add(profile_id, accumulator, span)
-                self._backend.pool_credit(profile_id, 0.0, span)
-            if self._sink is not None:
-                self._sink(event)
-            return (event,)
-        return ()
-
-    def evaluate(self) -> tuple[PoolEvent, ...]:
-        """Re-check every non-empty ledger against the same rules.
-
-        Used when the daemon polls between turns; returns every event fired and
-        delivers the same backend/sink notifications as ``add_points``.
-        """
-        now = self._clock()
-        fired: list[PoolEvent] = []
-        for profile_id, ledger in self._ledgers.items():
-            if ledger.balance <= 0:
-                continue
-            idle = now - ledger.last_add if ledger.last_add is not None else 0.0
-            if ledger.range_start is None:
-                continue
-            span = TurnRange(ledger.range_start, ledger.range_end)
+            event: PoolEvent | None = None
             forced_cap = self._forced_cap_value()
-            if ledger.balance >= forced_cap:
+            if accumulator >= forced_cap:
                 event = PoolEvent(
                     kind=PoolEventKind.FORCED_CONSOLIDATION,
                     profile_id=profile_id,
                     turn_range=span,
-                    balance=ledger.balance,
+                    balance=accumulator,
                     fired_at=now,
                 )
                 ledger.forced_triggers += 1
-            elif ledger.balance >= self._dream_threshold and idle >= self._idle_window_sec:
+            elif accumulator >= self._dream_threshold and idle >= self._idle_window_sec:
                 event = PoolEvent(
                     kind=PoolEventKind.DREAM_TRIGGER,
                     profile_id=profile_id,
                     turn_range=span,
-                    balance=ledger.balance,
+                    balance=accumulator,
                     fired_at=now,
                 )
                 ledger.dream_triggers += 1
-            else:
-                continue
-            fired.append(event)
-            accumulator = event.balance
-            ledger.balance = 0.0
-            ledger.range_start = None
-            ledger.range_end = 0
-            ledger.last_add = None
+
             if self._backend is not None:
-                self._backend.pool_add(profile_id, accumulator, span)
-                self._backend.pool_credit(profile_id, 0.0, span)
-            if self._sink is not None:
-                self._sink(event)
-        return tuple(fired)
+                self._backend.pool_credit(profile_id, accumulator, span)
+
+            if event is not None:
+                ledger.balance = 0.0
+                ledger.range_start = None
+                ledger.range_end = 0
+                ledger.last_add = None
+                if self._backend is not None:
+                    self._backend.pool_drain(profile_id, span)
+                if self._sink is not None:
+                    self._sink(event)
+                return (event,)
+            return ()
+
+    def drain(self, profile_id: str, turn_range: TurnRange) -> float:
+        """File one profile's fired points out of the gauge, both ledgers.
+
+        The scheduler-fire path lands here. Mirroring the credit-first
+        discipline of ``add_points``, the atomic backend drain runs FIRST and
+        the in-process gauge resets only once it succeeded — a failed drain
+        leaves both ledgers untouched instead of orphaning the persisted
+        balance under an emptied gauge. Returns the filed amount.
+        """
+        with self._lock:
+            filed = 0.0
+            if self._backend is not None:
+                filed = self._backend.pool_drain(profile_id, turn_range)
+            ledger = self._ledgers.get(profile_id)
+            if ledger is not None:
+                ledger.balance = 0.0
+                ledger.range_start = None
+                ledger.range_end = 0
+                ledger.last_add = None
+            return filed
 
     def stats(self, profile_id: str) -> PoolStats | None:
         """Snapshot a profile ledger, or None if nothing was ever pooled."""

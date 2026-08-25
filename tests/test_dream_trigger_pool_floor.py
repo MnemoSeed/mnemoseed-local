@@ -144,7 +144,7 @@ def test_low_arousal_events_trickle_the_pool_slowly(tmp_path: Path) -> None:
     excited_balance = meta.pool_state("excited").balance
     assert calm_balance < excited_balance  # low arousal: less S per event
     clock.advance(1000.0)  # idle window elapses for both profiles
-    scheduler = DreamScheduler(_Stores(vector, meta), _config(), clock=clock)
+    scheduler = DreamScheduler(_Stores(vector, meta), _config(), clock=clock, drain=meta.pool_drain)
     assert scheduler.eligibility("calm") is None  # trickled slowly: still below the floor
     eligible = scheduler.eligibility("excited")
     assert eligible is not None  # the same event count reached the floor
@@ -171,7 +171,7 @@ def test_emotion_modulated_arrivals_push_the_floor_faster(tmp_path: Path) -> Non
     assert vivid0.importance > flat0.importance
     assert meta.pool_state("vivid").balance > meta.pool_state("flat").balance
     clock.advance(1000.0)
-    scheduler = DreamScheduler(_Stores(vector, meta), _config(), clock=clock)
+    scheduler = DreamScheduler(_Stores(vector, meta), _config(), clock=clock, drain=meta.pool_drain)
     # two events: the emotion-bearing pool cleared the floor, the flat one not
     assert scheduler.eligibility("vivid") is not None
     assert scheduler.eligibility("flat") is None
@@ -195,20 +195,26 @@ def test_floor_fires_at_threshold_and_refires_only_after_reearning(tmp_path: Pat
     pool = ScorePool(clock=clock, backend=meta)
     vector = _FakeVector()
     scorer = TurnScorer(embedder=SyntheticEmbedder())
+    total = 0.0
     for index in range(2):
-        _capture_turn(scorer, pool, vector, clock, "我 review 喜欢简洁", "p", index)
+        scored = _capture_turn(scorer, pool, vector, clock, "我 review 喜欢简洁", "p", index)
+        total += scored.importance
+    assert total == pytest.approx(13.6)
     clock.advance(1000.0)
     trigger = DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=False)
-    scheduler = DreamScheduler(_Stores(vector, meta), _config(), trigger=trigger, clock=clock)
+    scheduler = DreamScheduler(
+        _Stores(vector, meta), _config(), trigger=trigger, clock=clock, drain=pool.drain
+    )
     emitted = scheduler.tick()
     assert len(emitted) == 1
     assert emitted[0].reason == "floor_idle"
     assert emitted[0].pool_points == pytest.approx(13.6)
-    # the dream commits: the pool fires and drains its balance to 0, and the
+    # the scheduler's emission drained the gauge into the lifetime ledger; the
     # merge marks the covered chunks consolidated (the watermark advance's
     # persisted effect on the vector side)
-    pool.evaluate()
-    assert meta.pool_state("p").balance == pytest.approx(0.0)
+    state = meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(total)
     for chunk in vector.chunks:
         if chunk.turn_start in (0, 1):
             chunk.consolidated = True
@@ -224,5 +230,62 @@ def test_floor_fires_at_threshold_and_refires_only_after_reearning(tmp_path: Pat
     assert len(re_emitted) == 1
     assert re_emitted[0].turn_range == TurnRange(2, 3)  # fresh window, never the old one
     assert trigger.status("p").pending_manual == 2
-    # the old window stays out of the pending read (consolidation watermark)
-    assert scheduler.eligibility("p").turn_range == TurnRange(2, 3)
+    # the second fire drained again: the lifetime ledger holds every point
+    # exactly once and the gauge is empty
+    state = meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total > total
+    # consumed again: the old window never re-arms the floor
+    assert scheduler.eligibility("p") is None
+    assert scheduler.tick() == []
+
+
+def test_double_scheduler_fires_file_every_point_exactly_once(tmp_path: Path) -> None:
+    """N scheduler-fired dreams leave the gauge empty and the lifetime ledger
+    at exactly the credited sum: the same points never trigger twice, and the
+    live capture pool cannot resurrect drained points on later credits."""
+    clock = _Clock()
+    meta = SqliteMetaDriver(path=str(tmp_path / "meta.db"))
+    pool = ScorePool(clock=clock, backend=meta, idle_window_sec=1e9)
+    vector = _FakeVector()
+    scorer = TurnScorer(embedder=SyntheticEmbedder())
+    trigger = DreamTrigger(snapshotter=NullSnapshotter(), auto_trigger=False)
+    scheduler = DreamScheduler(
+        _Stores(vector, meta), _config(), trigger=trigger, clock=clock, drain=pool.drain
+    )
+    total = 0.0
+    for window in range(2):
+        for index in range(2):
+            scored = _capture_turn(scorer, pool, vector, clock, "我 review 喜欢简洁", "p", window * 2 + index)
+            total += scored.importance
+        clock.advance(1000.0)
+        emitted = scheduler.tick()
+        assert len(emitted) == 1
+        # the dream commits: covered chunks leave the pending read
+        for chunk in vector.chunks:
+            chunk.consolidated = True
+
+    state = meta.pool_state("p")
+    assert state.balance == pytest.approx(0.0)
+    assert state.filed_points_total == pytest.approx(total)
+    # a third tick cannot re-fire the consumed points
+    clock.advance(1000.0)
+    assert scheduler.tick() == []
+
+
+def test_restart_seeds_the_gauge_from_pending_not_lifetime(tmp_path: Path) -> None:
+    """Restart oracle: boot seeds the trigger gauge from the persisted balance
+    (the true pending amount) — after fired dreams the gauge boots at 0, never
+    the lifetime total, and a mid-accrual pending amount survives."""
+    meta = SqliteMetaDriver(path=str(tmp_path / "meta.db"))
+    meta.pool_credit("p", 13.6, TurnRange(start=0, end=1))
+    meta.advance_watermark("p", TurnRange(start=0, end=1))
+    filed = meta.pool_drain("p", TurnRange(start=0, end=1))  # a dream fired
+    assert filed == pytest.approx(13.6)
+    meta.pool_credit("p", 4.2, TurnRange(start=2, end=3))  # mid-accrual pending
+
+    # the daemon boot loop reads exactly this surface (stores.meta.pool_states())
+    states = meta.pool_states()
+    state = states["p"]
+    assert state.balance == pytest.approx(4.2)  # the boot seed is pending-only
+    assert state.filed_points_total == pytest.approx(13.6)  # lifetime kept aside

@@ -617,6 +617,9 @@ def test_scheduler_ticks_after_resume_drain_timeout(
     scheduler = DreamScheduler(
         _EmptyStores(),
         Config(dream=DreamConfig()),
+        # no pool exists behind this bare scheduler and nothing ever emits:
+        # an explicit no-op fire-time drain keeps the required wiring honest
+        drain=lambda profile_id, turn_range: 0.0,
         resume_drain=never_drain,
         resume_drain_timeout_s=0.05,
     )
