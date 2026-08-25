@@ -1,0 +1,1 @@
+{"host":"claude_code","event":"tool_use","session_id":"cc-sess-01","profile_id":"default","ts":1755500002.5,"content":{"tool_name":"Bash","input":{"command":"uv run pytest -q"},"output":"938 passed, 5 skipped"},"raw":{"hook_event_name":"PostToolUse","tool_use_id":"toolu_01ABC123"}}

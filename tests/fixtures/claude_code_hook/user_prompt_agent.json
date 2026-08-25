@@ -1,0 +1,1 @@
+{"host":"claude_code","event":"user_prompt","session_id":"cc-sess-01","profile_id":"default","ts":1755500000.0,"agent":"Explore","content":{"text":"按模块梳理召回链路的测试盲区"},"raw":{"hook_event_name":"UserPromptSubmit","agent_type":"Explore","agent_id":"agent-77f"}}
