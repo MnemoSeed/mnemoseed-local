@@ -286,3 +286,27 @@ def test_default_config_toml_documents_the_verifier_role() -> None:
     source."""
     assert "[dream.llm.dream_verifier]" in default_config_toml()
     assert 'model = "gemma4:e4b"' in default_config_toml()
+
+
+# ---------------------------------------------------------------- [logging] (B2.12)
+
+
+def test_logging_requests_defaults_off(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(tmp_path / "missing.toml")
+    assert cfg.logging.requests is False
+
+
+def test_logging_requests_parses_true(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, "[logging]\nrequests = true\n")
+    assert load_config(p).logging.requests is True
+
+
+def test_logging_requests_rejects_non_bool(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, '[logging]\nrequests = "yes"\n')
+    with pytest.raises(ConfigError, match=r"config\[logging.requests\]"):
+        load_config(p)

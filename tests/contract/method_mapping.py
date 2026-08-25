@@ -27,6 +27,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "update_weights": "test_contract_vector.py::test_update_weights",
         "update_chunk_state": "test_contract_vector.py::test_update_chunk_state_usage_counts",
         "list_chunks": "test_contract_vector.py::test_list_chunks_filter_pagination",
+        "distinct_profile_ids": "test_contract_vector.py::test_distinct_profile_ids",
     },
     "GraphStore": {
         "capabilities": "test_contract_graph.py::test_capabilities",
@@ -102,11 +103,13 @@ COVERAGE: dict[str, dict[str, str]] = {
 # update_dream_run_model (F2 per-run model pinning recorded on dream_runs), and
 # to 33 with finish_dream_run (the dream log surface: finish time + metered
 # tokens recorded at merge commit, 2026-08-17), and to 34 with pool_drain (the
-# atomic fire-time gauge->ledger drain on the score pool).
+# atomic fire-time gauge->ledger drain on the score pool). VectorStore grew to
+# 15 with distinct_profile_ids (observational captured-namespace enumeration
+# behind the doctor's unknown-profile check).
 # GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
 # 2026-08-13, the console Graph View bulk edge listing).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
-    "VectorStore": 14,
+    "VectorStore": 15,
     "GraphStore": 20,
     "MetaStore": 34,
     "Embedder": 3,

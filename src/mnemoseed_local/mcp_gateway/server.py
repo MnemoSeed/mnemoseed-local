@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import sys
+import threading
 from dataclasses import replace
 from typing import Any, TextIO
 
@@ -305,6 +306,17 @@ def _force_utf8_lane(stream: TextIO, *, newline: bool) -> None:
         pass
 
 
+def send_handshake_beacon(client: DaemonClient) -> None:
+    """Announce this gateway process to the daemon (B2.12, fire-and-forget).
+
+    Purely observational: any failure (daemon down, timeout) is swallowed —
+    the beacon must never break MCP serving."""
+    try:
+        client.post("/mcp/handshake", {"profile_id": client.profile_id})
+    except Exception:  # noqa: BLE001 - observability never breaks serving
+        logger.debug("MCP handshake beacon failed", exc_info=True)
+
+
 def serve(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
@@ -319,11 +331,26 @@ def serve(
     out_stream = stdout if stdout is not None else sys.stdout
     _force_utf8_lane(in_stream, newline=False)
     _force_utf8_lane(out_stream, newline=True)
-    down_hint = DAEMON_DISABLED_HINT if daemon_state.is_disabled() else None
-    daemon: Any = GatewayClient.wrap(
-        client if client is not None else build_client(),
-        down_hint=down_hint,
-    )
+    client = client if client is not None else build_client()
+    disabled = daemon_state.is_disabled()
+    down_hint = DAEMON_DISABLED_HINT if disabled else None
+    daemon: Any = GatewayClient.wrap(client, down_hint=down_hint)
+
+    def _beacon_safely() -> None:
+        # absolute fire-and-forget: even a broken beacon callable never
+        # touches the serving loop
+        try:
+            send_handshake_beacon(client)
+        except Exception:  # noqa: BLE001 - observability never breaks serving
+            logger.debug("MCP handshake beacon crashed", exc_info=True)
+
+    # a user-disabled service gets no loopback traffic from the gateway
+    if not disabled:
+        threading.Thread(
+            target=_beacon_safely,
+            name="mnemoseed-mcp-handshake",
+            daemon=True,
+        ).start()
     try:
         for raw in in_stream:
             line = raw.strip()

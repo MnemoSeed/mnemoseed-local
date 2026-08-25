@@ -233,6 +233,15 @@ class DecayConfig:
 
 
 @dataclass(frozen=True)
+class LoggingConfig:
+    """Observability toggles ([logging], B2.12): ``requests`` turns on the
+    per-request method+path+status INFO line in daemon.log (default OFF —
+    zero-cost when off; request bodies are never logged)."""
+
+    requests: bool = False
+
+
+@dataclass(frozen=True)
 class CaptureConfig:
     """B2.1 T2 mid-session auto-recall flags (PRD-B2.1, design/01 §4.6).
 
@@ -362,6 +371,7 @@ class Config:
     decay: DecayConfig = field(default_factory=DecayConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     llm: dict[str, RoleLLMConfig] = field(default_factory=lambda: dict(DEFAULT_LLM_ROUTES))
     source: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -731,6 +741,16 @@ def load_config(path: Path | None = None) -> Config:
             raise ConfigError("recall.rescue_cue_min", "must be a number in (0, 1]")
         recall = RecallConfig(rescue_floor=float(floor_raw), rescue_cue_min=float(cue_raw))
 
+    # [logging] table (B2.12): observability toggles, all default OFF.
+    logging_config = LoggingConfig()
+    logging_raw = raw.get("logging")
+    if logging_raw is not None:
+        logging_table = _require_table(logging_raw, "logging")
+        requests_raw = logging_table.get("requests", False)
+        if not isinstance(requests_raw, bool):
+            raise ConfigError("logging.requests", "must be a boolean")
+        logging_config = LoggingConfig(requests=requests_raw)
+
     return Config(
         preset=preset_raw,
         baseurl=baseurl_raw,
@@ -739,6 +759,7 @@ def load_config(path: Path | None = None) -> Config:
         decay=decay,
         capture=capture,
         recall=recall,
+        logging=logging_config,
         llm=llm_routes,
         source=path,
         raw=raw,
@@ -860,4 +881,10 @@ path = "~/.mnemoseed-local/isolated.db"
 # auto_recall = true
 # auto_recall_focal_floor = 0.5
 # auto_recall_budget_chars = 2400
+
+# Request-level observability (B2.12): when ON, every HTTP request logs one
+# INFO line (method + path + status) to daemon.log; request bodies are never
+# logged.
+# [logging]
+# requests = false
 """

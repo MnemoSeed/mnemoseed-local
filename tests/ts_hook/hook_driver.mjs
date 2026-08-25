@@ -1197,6 +1197,34 @@ async function main() {
       break
     }
 
+    case "debug-lane-recall": {
+      // B2.12: one DEBUG line per session-start injection attempt and one per
+      // pending-recall poll — read back out of the hook-debug.jsonl sink.
+      recentPayload = RECENT_PAYLOAD
+      recallPayload = RECALL_PAYLOAD
+      const d1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, d1)
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_dbg" },
+        { parts: [{ type: "text", text: "调试轮" }] },
+      )
+      await delay(50)
+      const d2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, d2)
+      await delay(100)
+      const raw = await readFile(
+        join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"),
+        "utf8",
+      ).catch(() => "")
+      const events = raw
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      console.log(JSON.stringify({ events }))
+      break
+    }
+
     case "config-inject": {
       // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
       // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual

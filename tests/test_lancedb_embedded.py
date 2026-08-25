@@ -919,3 +919,13 @@ def test_concurrent_mixed_writes_exact_counts_no_errors(tmp_path):
         assert row["hit_count"] == 1
         assert row["decay_weight"] == pytest.approx(0.5)
     asyncio.run(store.close())
+
+
+def test_distinct_profile_ids_covers_every_namespace(store, embedder):
+    """Observational read for the doctor's unknown-profile check (#110):
+    every captured namespace is enumerated across profiles."""
+    assert store.distinct_profile_ids() == set()
+    _write(store, embedder, _make("c-a", "alpha beta gamma", profile_id="alice"))
+    _write(store, embedder, _make("c-b", "delta epsilon zeta", profile_id="bob"))
+    _write(store, embedder, _make("c-c", "eta theta iota", profile_id="alice"))
+    assert store.distinct_profile_ids() == {"alice", "bob"}

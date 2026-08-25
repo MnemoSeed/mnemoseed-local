@@ -49,6 +49,7 @@ from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.ingest import router as ingest_router
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
+from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.decay import DecaySweeper
 from mnemoseed_local.decay.rebuild import rebuild_pin_weights
 from mnemoseed_local.dream import (
@@ -907,6 +908,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     stores = build_stores(config)
     app.state.config = config
     app.state.stores = stores
+    # Since-boot observability counters (B2.12): a fresh instance per boot so
+    # the counts are honest since-boot signals for the doctor surface.
+    app.state.observability = Observability()
     # ConfigWriteService: the daemon's single config writer behind every
     # CLI settings change; boot reconciliation (E1-4 DB-primary) imports the
     # registry keys once and then lets the DB win over a hand-edited file.
@@ -1036,6 +1040,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _release_daemon_log_handler()
 
 
+def _request_logging_middleware(app: Any, get_state: Callable[[], Any]) -> Any:
+    """Pure-ASGI [logging] requests middleware (B2.12): one INFO line per
+    request (method + path + status), paths only — never bodies. A plain
+    ASGI wrapper, deliberately not BaseHTTPMiddleware: the extra task-group
+    scheduling hops would reorder respond-then-run seams (/daemon/shutdown).
+    Off by default; a single boolean read per request when off."""
+
+    async def _entry(scope: Any, receive: Any, send: Any) -> None:
+        config = getattr(get_state(), "config", None)
+        if scope["type"] != "http" or config is None or not config.logging.requests:
+            await app(scope, receive, send)
+            return
+        status = {"code": 0}
+
+        async def _send(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        await app(scope, receive, _send)
+        logger.info("%s %s -> %d", scope["method"], scope["path"], status["code"])
+
+    return _entry
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="MnemoSeed Local", version=__version__, lifespan=lifespan)
     # Capture intake lives per-app state; F1 (StrippingPipeline) drains the
@@ -1043,9 +1072,12 @@ def create_app() -> FastAPI:
     # consumer side of the seam so the HTTP path stays O(1).
     app.state.capture = StrippingPipeline()
     app.state.segmenter = TurnSegmenter(app.state.capture)
+    app.state.observability = Observability()
     app.include_router(ingest_router)
     app.include_router(memory_router)
     app.include_router(configwrite_router)
+    # B2.12 request-level observability ([logging] requests, default OFF).
+    app.add_middleware(_request_logging_middleware, get_state=lambda: app.state)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -1078,6 +1110,24 @@ def create_app() -> FastAPI:
                 "embed": stores.embed.info.name,
             },
         }
+
+    @app.post("/mcp/handshake")
+    async def mcp_handshake(request: Request) -> dict[str, Any]:
+        """MCP-gateway startup beacon (B2.12): the stdio server announces
+        itself when a client connects it. Loopback-trusted like every other
+        surface (no tokens in the local MVP); purely observational."""
+        observability: Observability | None = getattr(request.app.state, "observability", None)
+        if observability is not None:
+            observability.note_mcp_handshake()
+        return {"ok": True}
+
+    @app.get("/api/v1/observability")
+    async def observability_read() -> dict[str, Any]:
+        """Since-boot activity counters for the doctor surface (B2.12)."""
+        observability: Observability | None = getattr(app.state, "observability", None)
+        if observability is None:
+            return {"boot_started_at": 0.0, "capture_ingest_count": 0, "mcp_handshake_count": 0}
+        return observability.snapshot()
 
     @app.get("/api/v1/audit")
     async def audit_read(

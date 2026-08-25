@@ -48,17 +48,22 @@ def _bundle(tmp_path: Path) -> Path:
     return out
 
 
-def _run(bundle: Path, scenario: str) -> dict:
+def _run(bundle: Path, scenario: str, *, debug: str | None = "1") -> dict:
     # Scenarios that pin the debug sink need the opt-in lane ARMED — it is
     # read from the env at plugin load, so pass it explicitly instead of
-    # inheriting whatever the invoking shell carries.
+    # inheriting whatever the invoking shell carries. debug=None runs the
+    # driver with the lane OFF (the negative observability oracle).
+    env = dict(os.environ)
+    env.pop("MNEMOSEED_LOCAL_DEBUG", None)
+    if debug is not None:
+        env["MNEMOSEED_LOCAL_DEBUG"] = debug
     result = subprocess.run(
         ["node", str(DRIVER), str(bundle), scenario],
         shell=False,
         capture_output=True,
         encoding="utf-8",
         timeout=60,
-        env={**os.environ, "MNEMOSEED_LOCAL_DEBUG": "1"},
+        env=env,
     )
     assert result.returncode == 0, f"driver failed: {result.stderr}"
     return json.loads(result.stdout.strip().splitlines()[-1])
@@ -477,6 +482,46 @@ def test_recall_pull_clears_the_arm_once_the_slot_was_consumed(tmp_path: Path) -
     assert s1 == ["BASE"], "a consumed slot serves nothing"
     assert s2 == ["BASE2"], "the cleared arm must not pull again"
     assert transcript["pullCount"] == 1, transcript["pullCount"]
+
+
+# ---------------------------------------------------------------- B2.12 debug-lane observability
+
+
+def _debug_lane_events(transcript: dict) -> list[dict]:
+    return [
+        event
+        for event in transcript["events"]
+        if event["tag"] in ("session-start injection", "recall-pending poll")
+    ]
+
+
+def test_debug_lane_logs_injection_attempt_and_recall_poll(tmp_path: Path) -> None:
+    """B2.12: under MNEMOSEED_LOCAL_DEBUG=1 the hook records one line per T1
+    session-start injection attempt (groups fetched / injected chars) and one
+    per T2 pending-recall poll (candidates above floor, injected chars, slot),
+    through the existing debug() lane."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "debug-lane-recall")
+    events = _debug_lane_events(transcript)
+    tags = [event["tag"] for event in events]
+    assert tags.count("session-start injection") >= 1, events
+    injection = next(e["payload"] for e in events if e["tag"] == "session-start injection")
+    assert injection["sessionID"] == "sess-behavior"
+    assert injection["groups"] == 2, f"fetched groups count expected: {injection}"
+    assert injection["injectedChars"] > 0
+    poll = next(e["payload"] for e in events if e["tag"] == "recall-pending poll")
+    assert poll["sessionID"] == "sess-behavior"
+    assert poll["candidatesAboveFloor"] == 1, f"candidates above floor expected: {poll}"
+    assert poll["injectedChars"] > 0
+    assert poll["slotConsumed"] is False
+
+
+def test_debug_lane_stays_silent_without_the_env(tmp_path: Path) -> None:
+    """The observability lines are opt-in only — no MNEMOSEED_LOCAL_DEBUG, no
+    sink traffic for the recall lanes."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "debug-lane-recall", debug=None)
+    assert _debug_lane_events(transcript) == []
 
 
 # ---------------------------------------------------------------- B2.6 host-plugin bundling

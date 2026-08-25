@@ -630,6 +630,14 @@ class VectorStore(Protocol):
     def list_chunks(self, filter: ChunkFilter, page: Page) -> PageResult[ChunkStamp]:
         raise NotImplementedError
 
+    def distinct_profile_ids(self) -> set[str]:
+        """Every profile_id present in stored chunks (observational reads).
+
+        Feeds the doctor's unknown-profile hygiene check (#110); drivers
+        without a distinct scan leave the default (callers degrade quietly).
+        """
+        raise NotImplementedError
+
 
 class GraphStore(Protocol):
     """Cortex: consolidated structured long-term memory with version chains."""

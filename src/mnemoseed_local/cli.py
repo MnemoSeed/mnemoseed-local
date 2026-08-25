@@ -33,6 +33,10 @@ from mnemoseed_local.rest_client import DaemonClient
 #: Default profile at the application boundary (no identity in the local MVP).
 DEFAULT_PROFILE = "default"
 
+#: Host config the MCP-injection doctor check inspects (B2.12): an
+#: ``mcp.mnemoseed`` entry here means opencode was told about our MCP server.
+OPENCODE_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.json"
+
 #: Doctor ctx-window check (design/01 §4.8): the generation margin assumed when
 #: the dream route does not configure ``num_predict``.
 DREAM_MARGIN_TOKENS_DEFAULT = 2048
@@ -252,6 +256,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[tuple[str, bool, str]] = []
+    warnings: list[tuple[str, str]] = []
     try:
         config = load_config()
         checks.append(("config", True, f"loaded from {config.source}"))
@@ -292,9 +297,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from mnemoseed_local.storage.factory import build_stores
     from mnemoseed_local.storage.ports import StorageError
 
+    unregistered_profiles: list[str] = []
     try:
         stores = build_stores(config)
         checks.append(("storage", True, "all layers resolved; capability gate passed"))
+        unregistered_profiles = _unregistered_profile_ids(stores)
     except StorageError as exc:
         checks.append(("storage", False, str(exc)))
         return _doctor_report(checks)
@@ -324,21 +331,89 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # B1.1 (live finding Q7): the verify seat's context window must fit its
     # judging load — the check that would have caught the 16384-vs-18287 gap.
     checks.append(_verifier_ctx_window_check(config))
-    return _doctor_report(checks)
+
+    # B2.12 (#117): a registered MCP server that never connected while the
+    # capture hooks clearly work is the silent missing-tools state — surface
+    # it. The since-boot qualifier keeps a daemon restart from crying wolf
+    # over a healthy setup whose gateway simply has not re-announced yet.
+    if _opencode_mcp_registered(OPENCODE_CONFIG_PATH):
+        activity = _daemon_activity(config)
+        if activity is not None:
+            if activity.get("capture_ingest_count", 0) > 0 and activity.get("mcp_handshake_count", 0) == 0:
+                warnings.append(
+                    (
+                        "mcp injection",
+                        "MCP server registered but never connected since the daemon "
+                        "booted - tools likely not injected into sessions; restart "
+                        "opencode or re-register the 'mnemoseed' MCP server",
+                    )
+                )
+
+    # B2.12 (#110): captured namespaces with no profiles-table row are how a
+    # typo'd profile_id presents (an empty namespace, "fake amnesia").
+    if unregistered_profiles:
+        warnings.append(
+            (
+                "unknown profiles",
+                f"captured profile_ids with no profiles-table row: "
+                f"{', '.join(unregistered_profiles)} - typo'd ids present as empty "
+                "namespaces; re-ingest under the intended profile id",
+            )
+        )
+    return _doctor_report(checks, warnings)
 
 
-def _doctor_report(checks: list[tuple[str, bool, str]]) -> int:
+def _doctor_report(checks: list[tuple[str, bool, str]], warnings: list[tuple[str, str]] | None = None) -> int:
     failed = 0
     for name, ok, detail in checks:
         state_char = "ok" if ok else "FAIL"
         print(f"[{state_char:>4}] {name}: {detail}")
         if not ok:
             failed += 1
+    for name, detail in warnings or []:
+        print(f"[warn] {name}: {detail}")
     if failed:
         print(f"doctor: {failed} check(s) failed")
     else:
         print("doctor: all checks passed")
     return 1 if failed else 0
+
+
+def _opencode_mcp_registered(path: Path) -> bool:
+    """True when the host config registers an enabled ``mcp.mnemoseed`` entry.
+
+    A missing/corrupt file (or a malformed entry) means the check cannot say
+    anything — quiet False, never an error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    mcp = data.get("mcp") if isinstance(data, dict) else None
+    entry = mcp.get("mnemoseed") if isinstance(mcp, dict) else None
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("enabled") is not False
+
+
+def _daemon_activity(config: Config) -> dict[str, Any] | None:
+    """The daemon's since-boot observability counters; None when unreachable
+    (a down daemon says nothing about MCP injection)."""
+    try:
+        return DaemonClient(base_url=config.baseurl).get("/api/v1/observability")
+    except Exception:  # noqa: BLE001 - any transport failure means "unknown"
+        return None
+
+
+def _unregistered_profile_ids(stores: Any) -> list[str]:
+    """Captured profile_ids with no row in the profiles table (#110)."""
+    try:
+        distinct = getattr(stores.vector, "distinct_profile_ids", None)
+        if not callable(distinct):
+            return []
+        known = {profile.profile_id for profile in stores.meta.list_profiles()}
+        return sorted(set(distinct()) - known)
+    except Exception:  # noqa: BLE001 - purely observational check
+        return []
 
 
 def _delta_budget_ceiling_tokens(config: Config) -> int:
