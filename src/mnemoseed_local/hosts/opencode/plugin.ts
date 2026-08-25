@@ -464,6 +464,11 @@ function buildT2Injection(
   return { block, registry }
 }
 
+function pollCandidates(served: any): number {
+  // The daemon's above-floor candidate count from the recall-pending payload.
+  return typeof served?.non_focal_above_floor === "number" ? served.non_focal_above_floor : 0
+}
+
 async function fetchSessionTails(sessionID: string): Promise<any> {
   // The ONE awaited network call in the whole hook (invariant): the daemon
   // read that feeds the injection, bounded by AbortSignal and fail-open.
@@ -552,24 +557,34 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
     if (!injectedSessions.has(sessionID)) {
       injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
       const data = await fetchSessionTails(sessionID)
+      const built = data !== null ? buildRecallInjection(data.sessions, data.self_window) : null
+      // B2.12: one observability line per session-start injection attempt.
+      if (DEBUG) {
+        debugLog("session-start injection", {
+          sessionID,
+          groups: Array.isArray(data?.sessions) ? data.sessions.length : 0,
+          injectedChars: built !== null ? built.block.length : 0,
+          reason:
+            built === null
+              ? data === null
+                ? "session/recent unavailable"
+                : "no injectable recall content"
+              : undefined,
+        })
+      }
+      if (built !== null) {
+        hookOutput.system.push(built.block)
+        injectedRegistry.set(sessionID, built.registry)
+        // the T2 seen list = every chunk the T1 injection ADMITTED (needle
+        // or not): the daemon merges it so a focal hit never re-serves a T1
+        // replay. The daemon caps the list at 16 ids; the T1 budget
+        // (2 x 8 chunks) stays under it.
+        t1InjectedChunkIds.set(sessionID, built.includedIds)
+      }
+      // B2.7 Scheme 3 (Task C): the standing rules budget rides the same
+      // session-start read; append it (absent key -> no block). Independent
+      // of the memory-recall block's budget.
       if (data !== null) {
-        const built = buildRecallInjection(data.sessions, data.self_window)
-        if (built === null) {
-          // A reachable transform with nothing injectable gets one debug line —
-          // the attempt gate is already consumed, so no extra rate limiting.
-          debugLog("recall injection skipped: no injectable recall content", { sessionID })
-        } else {
-          hookOutput.system.push(built.block)
-          injectedRegistry.set(sessionID, built.registry)
-          // the T2 seen list = every chunk the T1 injection ADMITTED (needle
-          // or not): the daemon merges it so a focal hit never re-serves a T1
-          // replay. The daemon caps the list at 16 ids; the T1 budget
-          // (2 x 8 chunks) stays under it.
-          t1InjectedChunkIds.set(sessionID, built.includedIds)
-        }
-        // B2.7 Scheme 3 (Task C): the standing rules budget rides the same
-        // session-start read; append it (absent key -> no block). Independent
-        // of the memory-recall block's budget.
         const rulesBlock = buildRulesBudgetInjection(data.rules_budget)
         if (rulesBlock !== null) hookOutput.system.push(rulesBlock)
       }
@@ -580,7 +595,11 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       // 503 or an empty selection keeps the arm for the next transform —
       // the daemon's slot survives an empty serve (D6).
       const served = await pullPendingRecall(sessionID)
-      if (served === null) return
+      if (served === null) {
+        if (DEBUG) debugLog("recall-pending poll", { sessionID, reason: "pull failed" })
+        return
+      }
+      let injectedChars = 0
       if (served.enabled === true && served.items.length > 0) {
         // QA BLOCKER-1: the daemon's budget_chars IS the item budget — the
         // old fixed cap (RECALL_PULL_MAX_CHARS minus the fence+disclaimer
@@ -600,10 +619,20 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
             items: served.items.length,
             budget_chars: served.budget_chars,
           })
+          if (DEBUG) {
+            debugLog("recall-pending poll", {
+              sessionID,
+              candidatesAboveFloor: pollCandidates(served),
+              injectedChars: 0,
+              slotConsumed: served.slot_consumed === true,
+              reason: "selection exceeds the item budget",
+            })
+          }
           return
         }
         hookOutput.system.push(built.block)
         pendingPull.delete(sessionID) // a non-empty serve consumes the flags (D8)
+        injectedChars = built.block.length
         let registry = injectedRegistry.get(sessionID)
         if (registry === undefined) {
           registry = new Map<string, Set<string>>()
@@ -622,6 +651,16 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       }
       // items empty ∧ enabled ∧ not consumed: keep the arm — a fresh pull can
       // still consume the surviving slot (D8).
+      // B2.12: one observability line per pending-recall poll outcome.
+      if (DEBUG) {
+        debugLog("recall-pending poll", {
+          sessionID,
+          candidatesAboveFloor: pollCandidates(served),
+          injectedChars,
+          slotConsumed: served.slot_consumed === true,
+          armCleared: !pendingPull.has(sessionID),
+        })
+      }
     }
   } catch (err) {
     console.debug("mnemoseed-local: chat.system.transform failed:", err)

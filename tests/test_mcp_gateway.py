@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
 from typing import Any
 
 import pytest
@@ -19,16 +20,19 @@ from mnemoseed_local.rest_client import DaemonRestError, DaemonUnavailableError
 
 
 class StubClient:
-    """DaemonClient double: records posts, returns a canned payload or raises."""
+    """DaemonClient double: records posts, returns a canned payload or raises.
+    Handshake beacons are recorded separately so tool-call assertions stay
+    readable."""
 
     def __init__(self, payload: dict[str, Any] | None = None, error: Exception | None = None) -> None:
         self.profile_id = "default"
         self.payload = payload if payload is not None else {"ok": True}
         self.error = error
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.handshakes: list[tuple[str, dict[str, Any] | None]] = []
 
     def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.calls.append((path, body))
+        (self.handshakes if path == "/mcp/handshake" else self.calls).append((path, body))
         if self.error is not None:
             raise self.error
         return self.payload
@@ -395,6 +399,65 @@ def test_eof_exits_cleanly() -> None:
     code, responses = run_gateway([], StubClient())
     assert code == 0
     assert responses == []
+
+
+# ---------------------------------------------------------------- handshake beacon (B2.12)
+
+
+def test_serve_beacons_the_daemon_once_on_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway announces itself to the daemon exactly once when it starts
+    serving a client — the observability signal doctor needs to tell a
+    registered-but-never-connected MCP server from a working one."""
+    seen: list[StubClient] = []
+    beacons = threading.Event()
+
+    def fake_beacon(client: StubClient) -> None:
+        seen.append(client)
+        beacons.set()
+
+    monkeypatch.setattr(server.daemon_state, "is_disabled", lambda: False)
+    monkeypatch.setattr(server, "send_handshake_beacon", fake_beacon)
+    client = StubClient()
+    code, responses = run_gateway([_request(1, "ping")], client)
+    assert code == 0
+    assert responses[0]["id"] == 1
+    assert beacons.wait(5), "serve() never fired the handshake beacon"
+    assert seen == [client]
+
+
+def test_beacon_failure_never_breaks_serving(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fire-and-forget discipline: an exploding beacon must not disturb the
+    stdin loop — the MCP surface keeps answering."""
+
+    def exploding_beacon(client: StubClient) -> None:
+        raise RuntimeError("beacon channel down")
+
+    monkeypatch.setattr(server, "send_handshake_beacon", exploding_beacon)
+    code, responses = run_gateway([_request(7, "ping")], StubClient())
+    assert code == 0
+    assert responses == [{"jsonrpc": "2.0", "id": 7, "result": {}}]
+
+
+def test_beacon_skipped_when_daemon_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A user-disabled service gets no loopback traffic from the gateway."""
+    fired = threading.Event()
+
+    def fake_beacon(client: StubClient) -> None:
+        fired.set()
+
+    monkeypatch.setattr(server.daemon_state, "is_disabled", lambda: True)
+    monkeypatch.setattr(server, "send_handshake_beacon", fake_beacon)
+    code, responses = run_gateway([_request(3, "ping")], StubClient())
+    assert code == 0
+    assert responses[0]["id"] == 3
+    assert not fired.wait(0.5), "the beacon must not fire while the service is disabled"
+
+
+def test_send_handshake_beacon_swallows_an_unreachable_daemon() -> None:
+    """A dead daemon must be swallowed quietly — the beacon is best-effort."""
+    from mnemoseed_local.rest_client import DaemonClient
+
+    server.send_handshake_beacon(DaemonClient(base_url="http://127.0.0.1:1", timeout=1.0))
 
 
 # ---------------------------------------------------------------- client seam

@@ -750,6 +750,166 @@ def test_up_skips_model_preflight_for_non_ollama_route(cli_home: Path, monkeypat
     assert calls == {"build_stores": 1, "run_server": 1}
 
 
+# ------------------------------------------- B2.12: doctor observability checks
+
+
+def _write_opencode_registration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str = "") -> Path:
+    """Point the doctor's opencode-config seam at a hermetic file."""
+    path = tmp_path / "opencode.json"
+    path.write_text(body or '{"mcp": {"mnemoseed": {"type": "local"}}}', encoding="utf-8")
+    monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", path)
+    return path
+
+
+def _mock_daemon_activity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ingests: int = 0,
+    handshakes: int = 0,
+    unreachable: bool = False,
+) -> None:
+    from mnemoseed_local.rest_client import DaemonUnavailableError
+
+    class _ObservabilityClient:
+        def __init__(self, base_url: str, **kwargs: object) -> None:
+            self.base_url = base_url
+
+        def get(self, path: str) -> dict[str, int]:
+            del path
+            if unreachable:
+                raise DaemonUnavailableError("connection refused")
+            return {
+                "capture_ingest_count": ingests,
+                "mcp_handshake_count": handshakes,
+            }
+
+    monkeypatch.setattr("mnemoseed_local.cli.DaemonClient", _ObservabilityClient)
+
+
+class _ProfileProbeStores:
+    """Storage double exposing the captured-vs-registered profile seams."""
+
+    class vector:
+        @staticmethod
+        def distinct_profile_ids() -> set[str]:
+            return {"default", "typo-x"}
+
+    class meta:
+        @staticmethod
+        def list_profiles() -> list[object]:
+            return [type("P", (), {"profile_id": "default"})()]
+
+    async def close(self) -> None:
+        pass
+
+
+def _mock_profile_probe_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr("mnemoseed_local.storage.factory.build_stores", lambda config: _ProfileProbeStores())
+
+
+def test_doctor_warns_when_mcp_registered_but_never_connected(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """#117: capture hooks ingest but the MCP gateway never connected — the
+    exact silent-failure state that hid missing tools from sessions."""
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path)
+    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    assert main(["doctor"]) == 0, "warnings must not fail the doctor"
+    out = capsys.readouterr().out
+    assert "[warn] mcp injection:" in out
+    assert "MCP server registered but never connected since the daemon booted" in out
+    assert "tools likely not injected into sessions" in out
+
+
+@pytest.mark.parametrize("body", ['{"mcp": {}}', "{ not json", '{"other": 1}'])
+def test_doctor_stays_quiet_without_a_live_registration(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys, body: str
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path, body)
+    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
+def test_doctor_absent_opencode_config_skips_silently(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", tmp_path / "absent" / "opencode.json")
+    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
+def test_doctor_stays_quiet_when_gateway_connected(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path)
+    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=2)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
+def test_doctor_stays_quiet_without_capture_activity(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path)
+    _mock_daemon_activity(monkeypatch, ingests=0, handshakes=0)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
+def test_doctor_stays_quiet_when_daemon_unreachable(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path)
+    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0, unreachable=True)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
+def test_doctor_flags_captured_profiles_missing_from_the_profiles_table(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    """#110: a typo'd profile_id presents as an empty namespace — doctor lists
+    captured ids that have no profiles-table row."""
+    _write_doctor_config(cli_home)
+    _mock_profile_probe_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] unknown profiles:" in out
+    assert "typo-x" in out
+    assert "typo" in out.lower() or "empty namespace" in out
+
+
+def test_doctor_profile_check_quiet_when_every_id_is_registered(cli_home: Path, monkeypatch, capsys) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+
+    class _AllRegisteredVector:
+        @staticmethod
+        def distinct_profile_ids() -> set[str]:
+            return {"default"}
+
+    stores = _ProfileProbeStores()
+    stores.vector = _AllRegisteredVector
+    monkeypatch.setattr("mnemoseed_local.storage.factory.build_stores", lambda config: stores)
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
+
+
 # ------------------------------------------- A3 T5: init guidance
 
 

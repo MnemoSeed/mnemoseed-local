@@ -20,6 +20,8 @@ from mnemoseed_local.capture import (
     SessionUnknownError,
     TurnSegmenter,
 )
+from mnemoseed_local.daemon.actor import resolve_actor
+from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.schema.turn import (
     FlushRequest,
     IngestEvent,
@@ -40,9 +42,21 @@ logger = logging.getLogger("mnemoseed_local.daemon.ingest")
 scan_executor = DaemonExecutor(max_workers=2, thread_name_prefix="mnemoseed-scan")
 
 
+def _observability(request: Request) -> Observability | None:
+    return getattr(request.app.state, "observability", None)
+
+
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     segmenter: TurnSegmenter = request.app.state.segmenter
+    observability = _observability(request)
+    if observability is not None:
+        # B2.12: capture-hook activity (vs other actors) feeds the doctor's
+        # registered-but-never-connected check; every sighting feeds the
+        # first-sighting profile hygiene. Observational only.
+        if resolve_actor(request) == "hook":
+            observability.note_capture_ingest()
+        observability.note_profile_sighting(event.profile_id)
     try:
         segmenter.ingest(event)
     except ProfileMismatchError as exc:
@@ -83,6 +97,9 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
 
 @router.post("/session/end")
 async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any]:
+    observability = _observability(request)
+    if observability is not None:
+        observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
         turn_range = segmenter.end_session(req.session_id, req.profile_id)
@@ -149,6 +166,9 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
     drain-less pipeline working; the drain runs on the daemon drain lane thread
     and the response waits for it (ack = completed-applied, B6 W-C).
     """
+    observability = _observability(request)
+    if observability is not None:
+        observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
         closed = segmenter.flush(req.session_id, req.profile_id)

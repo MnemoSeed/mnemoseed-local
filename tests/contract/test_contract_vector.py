@@ -377,3 +377,12 @@ def test_list_chunks_needs_reconcile_filter(stack) -> None:
     clean = stack.vector.list_chunks(ChunkFilter(profile_id=PROFILE, needs_reconcile=False), Page(limit=10))
     assert {chunk.chunk_id for chunk in clean.items} == {"r2"}
     assert clean.total == 1
+
+
+def test_distinct_profile_ids(stack) -> None:
+    """distinct_profile_ids: every captured namespace, across profiles."""
+    assert stack.vector.distinct_profile_ids() == set()
+    a = stack.embed.embed("alpha beta gamma")
+    stack.vector.upsert_chunk(make_stamp("a1", "alpha beta gamma"), a.dense, a.sparse)
+    stack.vector.upsert_chunk(make_stamp("b1", "delta epsilon zeta", profile_id="bob"), a.dense, a.sparse)
+    assert stack.vector.distinct_profile_ids() == {PROFILE, "bob"}

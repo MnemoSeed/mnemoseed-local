@@ -23,15 +23,20 @@ from mnemoseed_local.rest_client import DaemonRestError, DaemonUnavailableError
 
 class ScriptedClient:
     """DaemonClient double: replays a script of ``("ok", payload)`` /
-    ``("raise", exception)`` steps and records every ``post``."""
+    ``("raise", exception)`` steps and records every ``post``. Handshake
+    beacons are free (no script step) so the tool-call scripts stay exact."""
 
     def __init__(self, script: list[tuple[str, Any]]) -> None:
         self.profile_id = "default"
         self.base_url = "http://localhost:7788"
         self.script = list(script)
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.handshakes: list[tuple[str, dict[str, Any] | None]] = []
 
     def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        if path == "/mcp/handshake":
+            self.handshakes.append((path, body))
+            return {"ok": True}
         self.calls.append((path, body))
         step = self.script.pop(0)
         kind, value = step

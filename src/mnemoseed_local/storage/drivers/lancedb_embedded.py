@@ -385,6 +385,19 @@ class LanceDbEmbeddedStore:
             rows.extend(batch)
         return [self._to_stamp(row) for row in rows]
 
+    def distinct_profile_ids(self) -> set[str]:
+        """Every captured namespace, paged as a projection-only scan."""
+        ids: set[str] = set()
+        step = 1000
+        offset = 0
+        while True:
+            batch = self._table.search().select(["profile_id"]).limit(step).offset(offset).to_list()
+            if not batch:
+                break
+            ids.update(str(row["profile_id"]) for row in batch)
+            offset += step
+        return ids
+
     def list_chunks(self, filter: ChunkFilter, page: Page) -> PageResult[ChunkStamp]:
         where = self._filter_sql(filter)
         total = self._table.count_rows(filter=where)
