@@ -70,6 +70,10 @@ class _SessionState:
             if not isinstance(content, MessageContent):
                 self._invalid(event)
             turn = self._start_turn(event, pipeline)
+            # The first-party anchor defines the turn's origin attribution;
+            # assistant/tool events never override it (mid-session agent
+            # switches survive at turn granularity).
+            turn.origin_agent = event.agent
             turn.steps.append(TurnStep(role=TurnRole.USER, content=content.text))
         elif event.event is IngestEventType.ASSISTANT_MESSAGE:
             content = event.content

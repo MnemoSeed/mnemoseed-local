@@ -1,0 +1,1 @@
+{"host":"opencode","event":"user_prompt","session_id":"oc-sess-01","profile_id":"default","ts":1755500000.0,"agent":"build","content":{"text":"帮我看一下这个 flaky 测试为什么偶发失败"},"raw":{"messageID":"msg-user-1","agent":"build"}}

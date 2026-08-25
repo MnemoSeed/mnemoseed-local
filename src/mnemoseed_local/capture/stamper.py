@@ -73,6 +73,9 @@ class WriteContext:
 
     profile_id: str
     agent_label: str | None = None
+    # Inert origin-agent attribution from the turn's anchoring user prompt;
+    # parallel to ``agent_label`` (the soul carrier) and never merged with it.
+    origin_agent: str | None = None
     cognitive_tier: CognitiveTier = CognitiveTier.TIER_1
     project: str | None = None
     host: str | None = None
@@ -414,4 +417,5 @@ class StampWriter:
             turn_end=turn.turn_index,
         )
         stamp.persona_id = ctx.agent_label
+        stamp.origin_agent = ctx.origin_agent
         return stamp

@@ -330,6 +330,35 @@ def test_importance_hint_reaches_score_on_written_chunk() -> None:
     assert store.chunks[outcome.chunk_id].score == pytest.approx(10.0)
 
 
+# --------------------------------------------------------- origin attribution
+
+
+def test_writer_stamps_origin_agent_without_touching_persona() -> None:
+    """origin_agent rides its own inert stamp column verbatim; persona_id
+    stays the soul carrier (agent_label only) — the two never merge."""
+    store = _FakeVectorStore()
+    ctx = WriteContext(profile_id=PROFILE, agent_label="soul-default", origin_agent="build")
+    outcome = _writer(store, _Clock()).write(_scored("以后都用 pnpm"), ctx)
+    stamp = store.chunks[outcome.chunk_id]
+    assert stamp.origin_agent == "build"
+    assert stamp.persona_id == "soul-default"
+
+
+def test_writer_leaves_origin_agent_null_when_context_has_none() -> None:
+    store = _FakeVectorStore()
+    outcome = _writer(store, _Clock()).write(_scored("以后都用 pnpm"), WriteContext(profile_id=PROFILE))
+    assert store.chunks[outcome.chunk_id].origin_agent is None
+
+
+def test_origin_agent_alone_never_fills_persona_id() -> None:
+    store = _FakeVectorStore()
+    ctx = WriteContext(profile_id=PROFILE, origin_agent="build")
+    outcome = _writer(store, _Clock()).write(_scored("以后都用 pnpm"), ctx)
+    stamp = store.chunks[outcome.chunk_id]
+    assert stamp.origin_agent == "build"
+    assert stamp.persona_id is None
+
+
 # ------------------------------------------------------- near-duplicate branch
 
 

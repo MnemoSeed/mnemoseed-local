@@ -25,7 +25,7 @@ from mnemoseed_local.schema.turn import FlushRequest, HostId, IngestEvent, Sessi
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "opencode_hook"
 
-INGEST_FIXTURES = ["user_prompt.json", "assistant_message.json", "tool_use.json"]
+INGEST_FIXTURES = ["user_prompt.json", "user_prompt_agent.json", "assistant_message.json", "tool_use.json"]
 
 #: The hook -> wire-event -> endpoint invariant table pinned inside plugin.ts
 #: (the static contract test parses the comment table and compares exactly).
@@ -67,6 +67,33 @@ def test_ingest_fixtures_validate(name: str) -> None:
 
 def test_session_end_fixture_validates() -> None:
     SessionEndRequest.model_validate(_fixture("session_end.json"))
+
+
+def test_agent_fixture_carries_the_canonical_field_and_legacy_fixtures_stay_valid() -> None:
+    """B2.9 wire compat: the canonical `agent` body field validates, and the
+    pre-attribution payloads (no canonical field) still validate with an
+    explicit null — old hooks and new daemons interoperate both ways."""
+    attributed = IngestEvent.model_validate(_fixture("user_prompt_agent.json"))
+    assert attributed.agent == "build"
+    for name in ("user_prompt.json", "assistant_message.json", "tool_use.json"):
+        assert IngestEvent.model_validate(_fixture(name)).agent is None
+
+
+def test_blank_agent_normalizes_to_unknown() -> None:
+    """A whitespace-only host label is the honest unknown, never a stored
+    blank (ProfileRef blank-identity precedent); a real label passes through."""
+    base = {
+        "host": "opencode",
+        "event": "user_prompt",
+        "session_id": "oc-sess-01",
+        "profile_id": "default",
+        "ts": 1755500000.0,
+        "content": {"text": "x"},
+    }
+    for blank in ("", "   ", "\t\n"):
+        event = IngestEvent.model_validate({**base, "agent": blank})
+        assert event.agent is None, repr(blank)
+    assert IngestEvent.model_validate({**base, "agent": "build"}).agent == "build"
 
 
 def test_flush_fixture_validates() -> None:
@@ -375,6 +402,26 @@ def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     assert len(re.findall(r'post\(\s*"/flush"', source)) == 2
     assert len(re.findall(r'post\(\s*"/ingest"', source)) == 3
     assert len(re.findall(r'post\(\s*"/memory/reinforce"', source)) == 1
+
+
+def test_plugin_lifts_host_agent_into_the_canonical_ingest_body() -> None:
+    """B2.9 hook slice: hookInput.agent rides the canonical user-prompt ingest
+    body as `agent` (the segmenter's turn-attribution anchor); raw.agent stays
+    for one transition generation so an older daemon still sees the label. The
+    crash-replay lane lifts the same attribution from the host history's
+    per-message agent (UserMessage.agent in the SDK types)."""
+    source = _plugin_source()
+    assert "if (agent) body.agent = agent" in source
+    assert "function agentOf(info: any)" in source, "one shared per-message agent extractor"
+    assert len(re.findall(r"if \(agent\) raw\.agent = agent", source)) == 2, (
+        "live AND crash-replay lanes both keep the raw.agent transition generation"
+    )
+    assert re.search(r"postUserIngest\(\s*sessionID,\s*text,\s*stamp,\s*raw,\s*agent\s*\)", source), (
+        "the chat.message lane must pass the canonical agent through"
+    )
+    assert re.search(r"postUserIngest\(sessionID, text, createdS, raw, agent\)", source), (
+        "the crash-replay lane must attribute replayed prompts from the host's per-message agent"
+    )
 
 
 def test_plugin_pins_the_t1_t3_recall_injection_and_consumption_guard() -> None:

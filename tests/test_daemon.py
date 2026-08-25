@@ -29,6 +29,7 @@ PROFILE = "default"
 SESSION = "sess-daemon"
 
 DURABLE_TEXT = "我决定以后都用 pnpm 管理依赖"
+PLAIN_TEXT = "我决定构建脚本一律用 uv 启动服务"
 
 
 @pytest.fixture
@@ -369,6 +370,27 @@ def test_daemon_write_context_caps_tool_cues_at_retrieval_budget() -> None:
     assert ctx.tools_used == tuple(f"tool-{i:02d}" for i in range(cap))
 
 
+def test_daemon_write_context_carries_turn_origin_agent() -> None:
+    """The serving write context propagates the segmenter's turn-level origin
+    attribution so the stamp writer can land it on its own inert column."""
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id=PROFILE,
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        origin_agent="build",
+        steps=[TurnStep(role=TurnRole.USER, content="以后都用 pnpm")],
+    )
+
+    ctx = _daemon_write_context(turn)
+
+    assert ctx.origin_agent == "build"
+
+
 def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
     """D2 end-to-end on the serving surface: a durable turn drained into the
     store must be reachable by a query whose cues extract entities (the
@@ -466,6 +488,75 @@ def test_recall_entries_carry_session_provenance_and_iso_ingested_at(config_path
         for entry in chunk_entries:
             assert entry["session_id"] == SESSION
             assert _ISO.fullmatch(entry["ingested_at"])
+
+
+def test_recall_entries_carry_origin_agent_and_host(config_path: Path) -> None:
+    """B2.9 recall read-back: chunk entries expose the inert origin agent label
+    and the encoding host; a session captured without an agent reports
+    consistent nulls (with the host still present) instead of a guessed label."""
+    with _boot(config_path) as client:
+        attributed = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "agent": "build",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert attributed.status_code == 202, attributed.text
+        settled = client.post(
+            "/session/end",
+            json={"session_id": SESSION, "profile_id": PROFILE},
+        )
+        assert settled.status_code == 200, settled.text
+
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "pnpm", "top_k": 5},
+        ).json()
+        chunk_entries = [e for e in recall["memory"]["entries"] if e["kind"] == "chunk"]
+        assert chunk_entries, recall
+        for entry in chunk_entries:
+            assert entry["origin_agent"] == "build"
+            assert entry["host"] == HostId.OPENCODE.value
+
+        # The unattributed twin: every recall entry of a plain session renders
+        # origin_agent null while the encoding host stays present.
+        plain = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": f"{SESSION}-plain",
+                "profile_id": PROFILE,
+                "ts": 2.0,
+                "content": {"text": PLAIN_TEXT},
+            },
+        )
+        assert plain.status_code == 202, plain.text
+        plain_settled = client.post(
+            "/session/end",
+            json={"session_id": f"{SESSION}-plain", "profile_id": PROFILE},
+        )
+        assert plain_settled.status_code == 200, plain_settled.text
+
+        plain_recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "uv", "top_k": 5},
+        ).json()
+        plain_entries = [
+            e
+            for e in plain_recall["memory"]["entries"]
+            if e["kind"] == "chunk" and e["session_id"] == f"{SESSION}-plain"
+        ]
+        assert plain_entries, plain_recall
+        for entry in plain_entries:
+            assert entry["origin_agent"] is None
+            assert entry["host"] == HostId.CLAUDE_CODE.value
 
 
 # ---------------------------------------------------------------- B6 (W-C): drain off the event loop

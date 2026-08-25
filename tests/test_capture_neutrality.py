@@ -9,15 +9,45 @@ way a linter gate would.
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
+import pytest
+
 CAPTURE_DIR = Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "capture"
+RETRIEVE_DIR = Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "retrieve"
+DECAY_DIR = Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "decay"
+DRIVERS_DIR = Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "storage" / "drivers"
 
 FORBIDDEN = ("anima", "preference", "persona")
 
 # FR-1.6: capture writes these stamp metadata labels (provenance labels, not
 # anima/preference state); assigning them is allowed, reading is not.
 _ALLOWED_STAMP_FIELD_WRITES = frozenset({"anima_id", "persona_id"})
+
+# origin_agent is inert provenance metadata (source monitoring, write-time
+# attribution): scoring, decay, and retrieval RANKING must never read it. The
+# capture write path (segmenter/stamper/pipeline) propagates the label; the
+# read-face serializers are sanctioned readers (per-function allowlist below).
+INERT_METADATA_FIELD = "origin_agent"
+_INERT_SCAN_PATHS = (
+    CAPTURE_DIR / "scorer.py",
+    CAPTURE_DIR / "pool.py",
+    RETRIEVE_DIR / "hybrid.py",
+    RETRIEVE_DIR / "cues.py",
+    RETRIEVE_DIR / "assemble.py",
+    DRIVERS_DIR / "lancedb_embedded.py",
+    *sorted(DECAY_DIR.glob("*.py")),
+)
+
+# Sanctioned readers per scanned file: the serializer functions whose contract
+# IS serving the label on the read face. Any other read inside these files
+# (a ranking/decision leak) fails the guard; files absent from the map flag
+# every read.
+_SANCTIONED_INERT_READERS: dict[str, frozenset[str]] = {
+    "assemble.py": frozenset({"_entry"}),
+    "lancedb_embedded.py": frozenset({"_to_row", "_to_stamp"}),
+}
 
 
 def _forbidden_part(ident: str) -> str:
@@ -86,6 +116,55 @@ def scan_capture_sources() -> list[str]:
     return violations
 
 
+def _enclosing_function_name(tree: ast.AST, node: ast.AST) -> str | None:
+    """Innermost function enclosing ``node`` (None at module level)."""
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    current: ast.AST | None = node
+    while current is not None and current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current.name
+    return None
+
+
+def scan_source_for_inert_reads(source: str, path: str) -> list[str]:
+    """Return unsanctioned reads of the inert metadata field (syntax-error
+    marker on unparseable fixtures). Serializer files allowlist their serving
+    functions; every other read in any scanned file is a violation."""
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as exc:
+        return [f"{path}: syntax error in scan fixture: {exc}"]
+    sanctioned = _SANCTIONED_INERT_READERS.get(Path(path).name, frozenset())
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == INERT_METADATA_FIELD
+            and isinstance(node.ctx, ast.Load)
+            and _enclosing_function_name(tree, node) not in sanctioned
+        ):
+            _record_violation(violations, path, node.lineno, INERT_METADATA_FIELD)
+    return violations
+
+
+def scan_inert_metadata_sources() -> list[str]:
+    # A target that drifted off disk must fail loud here, never scan silently.
+    missing = (
+        f"{path}: inert-scan target missing from the tree" for path in _INERT_SCAN_PATHS if not path.is_file()
+    )
+    violations = list(missing)
+    for source_path in _INERT_SCAN_PATHS:
+        if not source_path.is_file():
+            continue
+        text = source_path.read_text(encoding="utf-8")
+        violations.extend(scan_source_for_inert_reads(text, str(source_path)))
+    return violations
+
+
 # ---------------------------------------------------------------- the guard
 
 
@@ -145,3 +224,60 @@ def test_scanner_allows_anima_id_field_assignment_on_stamp() -> None:
 def test_scanner_allows_persona_id_field_assignment_on_stamp() -> None:
     good = "chunk.persona_id = 'prof-1'\n"
     assert scan_source(good, "f.py") == []
+
+
+# --------------------------------------------------- inert origin_agent guard
+
+
+def test_scoring_decay_and_retrieval_never_read_origin_agent() -> None:
+    """origin_agent is write-time provenance only: no scoring, decay, or
+    ranking surface may ever read it (capture neutrality extends to the new
+    column)."""
+    violations = scan_inert_metadata_sources()
+    assert violations == [], "inert metadata read by a ranking surface:\n" + "\n".join(violations)
+
+
+def test_inert_scanner_flags_field_reads_but_not_writes() -> None:
+    bad = "label = chunk.origin_agent\nscore += len(label)\n"
+    assert scan_source_for_inert_reads(bad, "f.py")
+    good = "chunk.origin_agent = 'build'\n"
+    assert scan_source_for_inert_reads(good, "f.py") == []
+
+
+def test_inert_scanner_allows_sanctioned_serializer_reads() -> None:
+    """The read-face serializers expose the label by contract: their serving
+    functions are the ONLY legal readers inside the scanned serializer files."""
+    assemble = (
+        "class Assembler:\n"
+        "    def _entry(self, candidate):\n"
+        "        return {'origin_agent': candidate.item.origin_agent}\n"
+    )
+    lance = (
+        "class Store:\n"
+        "    def _to_row(self, chunk):\n"
+        "        return {'origin_agent': chunk.origin_agent}\n"
+        "\n"
+        "    def _to_stamp(self, row):\n"
+        "        return row.get('origin_agent')\n"
+    )
+    assert scan_source_for_inert_reads(assemble, "assemble.py") == []
+    assert scan_source_for_inert_reads(lance, "lancedb_embedded.py") == []
+
+
+def test_inert_scanner_flags_ranking_read_inside_serializer_files() -> None:
+    """A ranking/decision read inside a serializer file is still a leak — the
+    allowlist covers only the sanctioned serving functions."""
+    bad = "def boost(candidates):\n    return [c for c in candidates if c.origin_agent]\n"
+    assert scan_source_for_inert_reads(bad, "assemble.py")
+    assert scan_source_for_inert_reads(bad, "lancedb_embedded.py")
+
+
+def test_inert_scan_fails_loud_when_a_target_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename that orphans a scan target must fail the guard, never shrink
+    the scanned surface silently."""
+    ghost = Path("does/not/exist/scorer.py")
+    monkeypatch.setattr(sys.modules[__name__], "_INERT_SCAN_PATHS", (ghost,))
+    violations = scan_inert_metadata_sources()
+    assert any("inert-scan target missing" in v for v in violations)

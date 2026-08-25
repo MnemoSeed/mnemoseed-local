@@ -737,6 +737,10 @@ async function fetchAssistantText(
   return { ok: true, text: textOf(found.parts) }
 }
 
+function agentOf(info: any): string | undefined {
+  return typeof info?.agent === "string" && info.agent ? info.agent : undefined
+}
+
 function modelIdOf(info: any): string | undefined {
   const provider = typeof info?.providerID === "string" ? info.providerID : ""
   const model = typeof info?.modelID === "string" ? info.modelID : ""
@@ -785,7 +789,13 @@ function scheduleRecovery(sessionID: string): () => void {
   }
 }
 
-function postUserIngest(sessionID: string, text: string, ts: number, raw: JsonRecord): void {
+function postUserIngest(
+  sessionID: string,
+  text: string,
+  ts: number,
+  raw: JsonRecord,
+  agent?: string,
+): void {
   // B2.1 T2: posting a user prompt ARMS the mid-session pending-recall pull;
   // the daemon's 2xx is the ACK (ack-implies-ready — the ingest handler parks
   // the focal slot before answering). A rejected/nacked prompt stays armed but
@@ -794,17 +804,19 @@ function postUserIngest(sessionID: string, text: string, ts: number, raw: JsonRe
   pull.armed = true
   pull.acked = false
   pendingPull.set(sessionID, pull)
+  const body: JsonRecord = {
+    host: HOST_ID,
+    event: "user_prompt",
+    session_id: sessionID,
+    profile_id: PROFILE_ID,
+    ts,
+    content: { text },
+    raw,
+  }
+  if (agent) body.agent = agent
   post(
     "/ingest",
-    {
-      host: HOST_ID,
-      event: "user_prompt",
-      session_id: sessionID,
-      profile_id: PROFILE_ID,
-      ts,
-      content: { text },
-      raw,
-    },
+    body,
     () => {
       noteWatermark(sessionID, ts)
       const armed = pendingPull.get(sessionID)
@@ -999,7 +1011,11 @@ async function reconcileSession(
         if (text) {
           const raw: JsonRecord = { replayed: true }
           if (typeof info?.id === "string") raw.messageID = info.id
-          postUserIngest(sessionID, text, createdS, raw)
+          // The host history carries a per-message agent, so crash-recovery
+          // tails keep turn-level attribution like the live lane.
+          const agent = agentOf(info)
+          if (agent) raw.agent = agent
+          postUserIngest(sessionID, text, createdS, raw, agent)
         }
       } else if (role === "assistant" && completedS !== undefined && completedS > sinceSeconds) {
         const text = textOf(entry?.parts)
@@ -1083,13 +1099,16 @@ export default async function MnemoSeedLocalPlugin(
       const raw: JsonRecord = {}
       const messageID = hookInput?.messageID ?? hookOutput?.message?.id
       if (typeof messageID === "string" && messageID) raw.messageID = messageID
-      if (typeof hookInput?.agent === "string" && hookInput.agent) raw.agent = hookInput.agent
+      // Origin attribution rides the canonical body `agent`; raw.agent stays
+      // one transition generation so an older daemon still sees the label.
+      const agent = agentOf(hookInput)
+      if (agent) raw.agent = agent
       const stamp = Date.now() / 1000
       // B2.2 lazy reconcile: enqueued FIRST so the replayed host-history tail
       // reaches the daemon strictly before this session's live posts; both
       // legs are fire-and-forget for the handler (T4 hot-path red line).
       enqueueForSession(sessionID, () => reconcileSession(client, sessionID))
-      enqueueForSession(sessionID, () => postUserIngest(sessionID, text, stamp, raw))
+      enqueueForSession(sessionID, () => postUserIngest(sessionID, text, stamp, raw, agent))
     } catch (error) {
       console.debug("mnemoseed-local: chat.message hook failed:", error)
     }

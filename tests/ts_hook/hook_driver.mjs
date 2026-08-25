@@ -147,7 +147,9 @@ let t2CiteTurnsVisible = false
 function historyEntries() {
   const entries = [
     {
-      info: { id: "m_old_user", role: "user", sessionID: SES, time: { created: 1_000 } },
+      // opencode's UserMessage carries a required per-message agent; the
+      // crash-replay lane must lift it into the canonical ingest field.
+      info: { id: "m_old_user", role: "user", sessionID: SES, agent: "build", time: { created: 1_000 } },
       parts: [{ type: "text", text: "历史用户消息" }],
     },
     {
@@ -373,6 +375,7 @@ async function main() {
             event: post.body.event,
             text: post.body.content?.text ?? "",
             ts: post.body.ts,
+            agent: post.body.agent ?? null,
           })),
         }),
       )
