@@ -53,3 +53,10 @@ settings.json 若含注释（JSONC）：容忍解析后合并；不可行则 std
 - 幂等合并 oracle：装两遍 settings 字节稳定；uninstall 后外来条目 bit-for-bit 保留。
 - Stop→flush 回归钉（防重演 idle≠ended 事故类）。
 - transcript 解析失败降级路径：assistant 事件仍到达（无 model id）。
+
+## 批次执行记录
+
+- **B2.10 Claude Code hook 适配器**：2026-08-25 立项并收口（squash `5847a6a`/PR #114 → issue #106）。落地：`hosts/claude_code/` 安装生命周期（settings.json marker 合并手术——精确匹配防外来命令误删、temp+fsync+os.replace 原子写、JSONC/畸形结构拒绝且字节不动、utf-8-sig 容忍）+ `_hook-event --host claude_code` 转换器（零 stdout 全路径纪律、stdin 字节级 UTF-8 解码免疫 locale、per-endpoint 预算——SessionEnd 收紧至 0.5s×4 对抗 CC ~1.5s 拆卸钟、失败吞并进 opt-in debug lane）；事件映射 UserPromptSubmit→user_prompt（agent 归因从第一天生效）/Stop→assistant_message（transcript 尾部解析模型 id，失败降级不丢事件）/PostToolUse→tool_use/PreCompact→flush/SessionEnd→session_end；子代理流量 v1 仅 raw 记录。
+- QA 三轮：首轮 NOT CLOSABLE 抓出 3 BLOCKER（GBK locale 乱码静默入库、非原子重写可毁用户配置、非字典 hooks 静默覆盖）+ 3 IMPORTANT → 全部红测试先行修复（含子进程级 UTF-8 往返 oracle 强制 PYTHONIOENCODING=gbk）→ 增量复核 CLOSABLE → 微修折入后合并。
+- 门禁 **1717 passed / 5 skipped**（ruff/format/mypy 干净）。
+- 已知边界：真实 Claude Code 会话全五 hook 的端到端手动验证待做（与 opencode 同姿态）；transcript 尾部的 sidechain 记录在 v1 可能错标 model/text（PRD 出界节已记）。
