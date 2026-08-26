@@ -1436,9 +1436,7 @@ def test_archived_but_bound_still_routes(config_path: Path) -> None:
             },
         )
         assert resp.status_code == 202, resp.text
-        settled = client.post(
-            "/session/end", json={"session_id": "sess-archived", "profile_id": "default"}
-        )
+        settled = client.post("/session/end", json={"session_id": "sess-archived", "profile_id": "default"})
         assert settled.status_code == 200, settled.text
         from mnemoseed_local.storage.ports import ChunkFilter, Page
 
@@ -1627,9 +1625,7 @@ def test_bound_agent_pool_balances_are_isolated(config_path: Path) -> None:
             },
         )
         assert resp.status_code == 202, resp.text
-        settled = client.post(
-            "/session/end", json={"session_id": "sess-pool-work", "profile_id": "default"}
-        )
+        settled = client.post("/session/end", json={"session_id": "sess-pool-work", "profile_id": "default"})
         assert settled.status_code == 200, settled.text
         pool = client.app.state.score_pool
         balances = pool.balances()
@@ -1736,7 +1732,9 @@ def test_bound_agent_focal_pending_isolation(config_path: Path) -> None:
             if work_key in memory._pending_slots:
                 break
             time.sleep(0.05)
-        assert work_key in memory._pending_slots, f"pending not parked under work: {list(memory._pending_slots.keys())}"
+        assert work_key in memory._pending_slots, (
+            f"pending not parked under work: {list(memory._pending_slots.keys())}"
+        )
         assert default_key not in memory._pending_slots
 
 
@@ -1746,61 +1744,112 @@ def test_orphan_binding_warns_and_audits(config_path: Path) -> None:
     with _boot(config_path) as client:
         resp = client.post(
             "/api/v1/config/set",
-            json={"key_path": "profiles.agent_bindings", "value": {"agentX": "ghost"}},
+            json={
+                "key_path": "profiles.agent_bindings",
+                "value": {"agentX": "ghost"},
+            },
         )
         assert resp.status_code == 200, resp.text
         result = resp.json()
         assert result["ok"] is True
         # the binding is still stored (typo not rejected)
-        assert client.get("/api/v1/config").json()["config"]["profiles"]["agent_bindings"] == {"agentX": "ghost"}
+        cfg = client.get("/api/v1/config").json()["config"]
+        assert cfg["profiles"]["agent_bindings"] == {"agentX": "ghost"}
         audit = client.get("/api/v1/audit", params={"action": "profile_binding_orphan"}).json()
         assert audit["total"] >= 1, audit
 
 
-def test_writing_pipeline_snapshot_reverse_is_atomic() -> None:
-    """BLOCKER-1 reverse: snapshot {} (unbound) must revert live work to
-    default — otherwise a mid-drain unbind splits one session across two
-    profiles (store vs pool)."""
-    from mnemoseed_local.capture.pipeline import ScoringPipeline, WritingPipeline
+def test_writing_pipeline_snapshot_is_pure_and_atomic() -> None:
+    """BLOCKER-1: WritingPipeline must derive effective purely from snapshot.
+
+    Reverse (snapshot {} / live work) must revert to default and forward
+    (snapshot work / live default) must stay work — half-patch fails reverse.
+    """
+    from unittest.mock import MagicMock
+
+    from mnemoseed_local.capture.pipeline import WritingPipeline
+    from mnemoseed_local.capture.scorer import Durability, DurabilityResult, ScoreComponents, ScoredTurn
     from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
     from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
-    from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
-    from mnemoseed_local.storage.ports import ChunkFilter, Page
-    from mnemoseed_local.storage.factory import build_stores
-    from pathlib import Path
-    import tempfile
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        cfg = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
-        # minimal stores
-        cfg.storage["vector"] = cfg.storage.get("vector")  # use defaults via build
-        # use synthetic stores for unit test - build via factory with temp paths
-        # Instead test the effective logic directly: simulate drain snapshot logic
-        turn = Turn(
-            turn_index=0,
-            session_id="s1",
-            profile_id="default",
-            host="opencode",
-            started_at=1.0,
-            origin_agent="agentX",
-            steps=[TurnStep(role=TurnRole.USER, content="hello")],
-        )
-        # live config is still bound to work, but snapshot is {} (unbound after mid-drain clear)
-        snapshot: dict[str, str] = {}
-        # replicate WritingPipeline drain's effective logic (should be snapshot pure)
-        from dataclasses import replace
-        from mnemoseed_local.daemon.app import _daemon_write_context
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host="opencode",
+        started_at=1.0,
+        origin_agent="agentX",
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    scored = ScoredTurn(
+        turn=turn,
+        importance=5.0,
+        components=ScoreComponents(arousal=0.1, novelty=0.1, causal_chain=0.1),
+        durability=DurabilityResult(durability=Durability.DURABLE, reasons=[], confidence=0.9),
+        emotion=None,
+        causal_reasons=[],
+        features={},
+    )
 
-        live_ctx = _daemon_write_context(turn, cfg)
-        assert live_ctx.profile_id == "work"  # live is bound
-        # snapshot effective must be default
-        bound = snapshot.get(turn.origin_agent) if turn.origin_agent else None
-        effective = bound if bound is not None else turn.profile_id
-        assert effective == "default"
-        # after fix, pipeline must use snapshot effective, not live
-        # so effective != live_ctx.profile_id must be detected
-        assert effective != live_ctx.profile_id
+    class FakeInner:
+        def __init__(self, item: ScoredTurn) -> None:
+            self._item = item
+            self.pool = MagicMock()
+            self.pool.add_points = MagicMock(return_value=())
+
+        def drain(self, session_id: str, bindings_snapshot: dict[str, str] | None = None) -> list[ScoredTurn]:
+            return [self._item]
+
+        def submit_turn(self, t: Turn) -> None:
+            pass
+
+        def end_session(self, *a: object, **kw: object) -> None:
+            pass
+
+        def sessions(self) -> tuple[str, ...]:
+            return ("s1",)
+
+        def prune_settled(self, *a: object, **kw: object) -> None:
+            pass
+
+    # reverse: snapshot {} (unbound) / live work -> must be default
+    cfg_live_work = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    cfg_snap_empty = Config(profiles=ProfilesConfig(agent_bindings={}))
+    fake_inner = FakeInner(scored)
+    mock_writer = MagicMock()
+    mock_writer.write_many = MagicMock(return_value=[])
+    pipe = WritingPipeline(
+        store=MagicMock(),
+        inner=fake_inner,  # type: ignore[arg-type]
+        writer=mock_writer,  # type: ignore[arg-type]
+        config=cfg_snap_empty,
+        context=lambda t: _daemon_write_context(t, cfg_live_work),
+    )
+    pipe.submit_turn(turn)
+    pipe.drain("s1")
+    ctx = mock_writer.write_many.call_args[0][0][0][1]
+    assert ctx.profile_id == "default", ctx
+    assert ctx.agent_label is None
+
+    # forward: snapshot work / live default -> must be work
+    cfg_snap_work = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    cfg_live_empty = Config(profiles=ProfilesConfig(agent_bindings={}))
+    fake_inner2 = FakeInner(scored)
+    mock_writer2 = MagicMock()
+    mock_writer2.write_many = MagicMock(return_value=[])
+    pipe2 = WritingPipeline(
+        store=MagicMock(),
+        inner=fake_inner2,  # type: ignore[arg-type]
+        writer=mock_writer2,  # type: ignore[arg-type]
+        config=cfg_snap_work,
+        context=lambda t: _daemon_write_context(t, cfg_live_empty),
+    )
+    pipe2.submit_turn(turn)
+    pipe2.drain("s1")
+    ctx2 = mock_writer2.write_many.call_args[0][0][0][1]
+    assert ctx2.profile_id == "work", ctx2
+    assert ctx2.agent_label == "work"
 
 
 def test_recall_pending_sweep_finds_effective_slot(config_path: Path) -> None:
@@ -1827,7 +1876,11 @@ def test_recall_pending_sweep_finds_effective_slot(config_path: Path) -> None:
             },
         )
         assert seed.status_code == 202, seed.text
-        assert client.post("/session/end", json={"session_id": "seed-sweep-work", "profile_id": "default"}).status_code == 200
+        resp = client.post(
+            "/session/end",
+            json={"session_id": "seed-sweep-work", "profile_id": "default"},
+        )
+        assert resp.status_code == 200, resp.text
         # park via bound ingest in a different session
         probe = client.post(
             "/ingest",

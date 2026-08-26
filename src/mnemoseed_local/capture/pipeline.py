@@ -285,9 +285,7 @@ class ScoringPipeline:
         """Swap the stripper ruleset; governs turns drained after this call."""
         self._stripper.reload_rules(ruleset)
 
-    def drain(
-        self, session_id: str, *, bindings_snapshot: dict[str, str] | None = None
-    ) -> list[ScoredTurn]:
+    def drain(self, session_id: str, *, bindings_snapshot: dict[str, str] | None = None) -> list[ScoredTurn]:
         """Process pending turns of one session; returns the newly scored turns.
 
         Verbatim contract: every turn is scored, retained, and its S credited

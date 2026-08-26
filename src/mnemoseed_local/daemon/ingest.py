@@ -20,6 +20,7 @@ from mnemoseed_local.capture import (
     SessionUnknownError,
     TurnSegmenter,
 )
+from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.schema.turn import (
@@ -46,7 +47,7 @@ def _observability(request: Request) -> Observability | None:
     return getattr(request.app.state, "observability", None)
 
 
-def _effective_ingest_profile(event: IngestEvent, config: Any | None) -> str:
+def _effective_ingest_profile(event: IngestEvent, config: Config | None) -> str:
     """Effective profile for capture-side routing (#130).
 
     When the ingest's origin agent is bound, the effective profile is the
@@ -54,7 +55,7 @@ def _effective_ingest_profile(event: IngestEvent, config: Any | None) -> str:
     profile_for helper so archived-does-not-unbind.
     """
     if config is not None and event.agent:
-        bound = config.profiles.profile_for(event.agent)
+        bound: str | None = config.profiles.profile_for(event.agent)
         if bound is not None:
             return bound
     return event.profile_id
