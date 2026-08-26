@@ -890,8 +890,36 @@ def test_doctor_flags_captured_profiles_missing_from_the_profiles_table(
     assert main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert "[warn] unknown profiles:" in out
+    listed = out.split("no profiles-table row:", 1)[1].split(" - ", 1)[0]
+    assert "default" not in listed
     assert "typo-x" in out
-    assert "typo" in out.lower() or "empty namespace" in out
+    assert "non-default namespaces may be intentional (MNEMOSEED_LOCAL_PROFILE_ID)" in out
+    assert "empty memory" in out
+
+
+def test_doctor_ignores_implicit_default_profile_with_no_row(cli_home: Path, monkeypatch, capsys) -> None:
+    """#109: 'default' is the conventionally-known namespace — an intentionally
+    empty profiles table on a single-user install must not cry wolf."""
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+
+    class _DefaultOnlyStores:
+        class vector:
+            @staticmethod
+            def distinct_profile_ids() -> set[str]:
+                return {"default"}
+
+        class meta:
+            @staticmethod
+            def list_profiles() -> list[object]:
+                return []
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("mnemoseed_local.storage.factory.build_stores", lambda config: _DefaultOnlyStores())
+    assert main(["doctor"]) == 0
+    assert "[warn]" not in capsys.readouterr().out
 
 
 def test_doctor_profile_check_quiet_when_every_id_is_registered(cli_home: Path, monkeypatch, capsys) -> None:
