@@ -2,7 +2,7 @@
 
 > 元信息：2026-08-26 用户提出引入 "TurboQuant" 类极低比特量化以降低本地资源占用；product-manager 与 solution-architect 联合评审裁定 **SHIP-WITH-ADJUSTMENTS（有条件可行）**，本 PRD 即条件化落地。
 > 名词定版（架构师事实核查）：**TurboQuant ≠ GGUF IQ3**。TurboQuant 是研究性在线向量量化方法（论文级技术路线，非 GGUF 生态发布格式）；HuggingFace 上以 "TurboQuant" 命名的 GGUF 仅系上传者借名。本批次落地物 = **llama.cpp i-matrix 量化（IQ3_XS / IQ3_S，~3.3 bpw）**。**2.5-bit（IQ2 系）明确排除**——mvp-design §7 风险 10 既定红线："IQ2 损失不掩饰"。
-> 基线：B4c 收口后（squash `7d923e3`）；当前门禁水位 **1671 passed / 5 skipped**。
+> 基线：B4c 收口后（squash `7d923e3`）；当前门禁水位 **~1803 collected / 1799 passed**（以 `pwsh -File scripts/gate.ps1` 为准）。
 > 立项：2026-08-26 用户拍板（issue #118）；live 矩阵实测另行待用户授权。
 > 依据：`docs/zh/design/08-eval-harness.md`（评测臂 + bar 纪律）、`PRD-B3-eval-harness.md`（B4 前置排查定案）、`PRD-B2-roadmap.md` B4b/B4c 收口记录、`docs/zh/design/mvp-design.md` §6 Phase B / §7 风险 10。
 
@@ -179,7 +179,7 @@ uv run python -m mnemoseed_local.eval rescore --report <CONFIG_DIR>/eval/<timest
 
 参数说明：
 
-- `--models` 逗号分隔 ollama tags；`matrix.py:44 ROSTER_DEFAULT` 的 6 模型仅为默认值，本批显式传入双 tag 即可。
+- `--models` 逗号分隔 ollama tags；`matrix.py:48 ROSTER_DEFAULT` 的 6 模型仅为默认值，本批显式传入双 tag 即可。
 - `--ensemble off,verify` 展开为 off 席与 verify 席（B 席默认 `gemma4:e4b`，可另用 `--verifier gemma4:e4b` 显式指定）。
 - `--extra-route` 形态 `driver|model|base_url[|key_env[|timeout[|max_tokens]]]`，llama.cpp 场景 `driver=openai_compatible`，`api_key_env` 留空亦可。
 - `rig_freshness` 自检（#132）在 `EvalRig.__init__` 对 `RigPaths.root` 做 fail-loud 校验；`run_matrix` 已为每 cell 分配 `root/runs/<run_id>/<cell_id>` 全新命名空间，跨跑报告已在 PRD-B2-roadmap B4b 记录中验证无污染。
