@@ -60,14 +60,6 @@ def _effective_ingest_profile(event: IngestEvent, config: Any | None) -> str:
     return event.profile_id
 
 
-def _effective_sighting_profile(profile_id: str, agent: str | None, config: Any | None) -> str:
-    if config is not None and agent:
-        bound = config.profiles.profile_for(agent)
-        if bound is not None:
-            return bound
-    return profile_id
-
-
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     segmenter: TurnSegmenter = request.app.state.segmenter
@@ -123,6 +115,8 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
 async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any]:
     observability = _observability(request)
     if observability is not None:
+        # settlement has no agent — sight the wire profile_id (effective is
+        # resolved at capture drain/pending sweep, not here)
         observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
@@ -192,6 +186,7 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
     """
     observability = _observability(request)
     if observability is not None:
+        # flush has no agent — sight the wire profile_id
         observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:

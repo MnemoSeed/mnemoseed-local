@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from mnemoseed_local.capture.pool import ScorePool
 from mnemoseed_local.capture.rulesets_v1 import RULESET_V1
@@ -451,17 +451,18 @@ class WritingPipeline:
             scored = self._inner.drain(session_id, bindings_snapshot=bindings_snapshot)
         else:
             scored = self._inner.drain(session_id)
-        # contexts are also snapshot-consistent
+        # contexts are snapshot-consistent — derive effective PURELY from snapshot
         contexts: list[tuple[ScoredTurn, WriteContext]] = []
         for item in scored:
             ctx = self._context(item.turn)
-            if bindings_snapshot is not None and item.turn.origin_agent is not None:
-                bound = bindings_snapshot.get(item.turn.origin_agent)
-                if bound is not None and bound != ctx.profile_id:
-                    # replace with snapshot-effective profile + persona
+            if bindings_snapshot is not None:
+                bound = bindings_snapshot.get(item.turn.origin_agent) if item.turn.origin_agent else None
+                effective = bound if bound is not None else item.turn.profile_id
+                expected_label = bound
+                if ctx.profile_id != effective or ctx.agent_label != expected_label:
                     from dataclasses import replace
 
-                    ctx = replace(ctx, profile_id=bound, agent_label=bound)
+                    ctx = replace(ctx, profile_id=effective, agent_label=expected_label)
             contexts.append((item, ctx))
         outcomes = self._writer.write_many(contexts)
         for outcome in outcomes:
