@@ -1196,13 +1196,15 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/profiles", status_code=status.HTTP_201_CREATED)
     async def profile_create(req: ProfileCreateRequest, request: Request) -> dict[str, Any]:
         meta = app.state.stores.meta
-        if meta.get_profile(req.profile_id) is not None:
+        # insert-only guard: a duplicate landing inside the race window is
+        # rejected here, never silently upserted over the existing row
+        if not meta.create_profile(
+            StoredProfile(profile_id=req.profile_id, display_name=req.display_name.strip())
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"profile {req.profile_id!r} already exists",
             )
-        profile = StoredProfile(profile_id=req.profile_id, display_name=req.display_name.strip())
-        meta.upsert_profile(profile)
         _audit_profile_write(request, "profile.create", {"profile_id": req.profile_id})
         return _profile_payload(meta.get_profile(req.profile_id))
 

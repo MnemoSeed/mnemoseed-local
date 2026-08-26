@@ -281,8 +281,10 @@ flowchart TB
 | 端点 / 动词 | 语义 | 关键约束 |
 |---|---|---|
 | `GET /api/v1/profiles`（CLI `profile list`） | 列出 profiles 表全部行 | `default` 是隐式约定命名空间，无需表行 |
-| `POST /api/v1/profiles`（CLI `profile create <id>`） | 注册命名空间（幂等性：重复 id → 409） | `profile_id` 非空白（ProfileRef 文法）；审计 `profile.create` 带 actor 归因 |
-| `POST /api/v1/profiles/archive`（CLI `profile archive/unarchive <id>`） | 设置 archived 旗标（console FR-7.3 同源语义） | 未知 id → 404；归档不删数据；审计 `profile.archive` |
+| `POST /api/v1/profiles`（CLI `profile create <id>`） | 注册命名空间（冲突拒绝：重复 id → 409，insert-only 守卫在单事务内裁决竞态） | `profile_id` 非空白（ProfileRef 文法）；审计 `profile.create` 带 actor 归因 |
+| `POST /api/v1/profiles/archive`（CLI `profile archive/unarchive <id>`） | 设置 archived 旗标（console FR-7.3 同源语义） | 未知 id → 404；审计 `profile.archive` |
+
+**归档写语义（v1 如实）**：archived 只是旗标——归档从不删除数据，也不解除绑定：已绑定的 agent 在解绑前继续照常写入并带 persona 标注。
 
 **绑定键形状**：单一注册表键 **`profiles.agent_bindings`** —— agent 标签 → profile_id 的映射，replace 语义同 `decay.lambda_per_type`（写入的映射就是映射）。它走 §1.1 的 configwrite 单一写者管线全程（校验→外科 patch→版本化记录→审计→热生效），因此受 DB-wins boot 覆层管辖（§1.3）；加载侧 `[profiles] agent_bindings` 表与注册表共享同一校验函数（同一规则、永不漂移，§1.2 先例）。热生效即时到达 daemon 写路径——persona 填充每次写入活读 live Config。
 

@@ -1250,3 +1250,32 @@ def test_profile_lifecycle_rest_surface(config_path: Path) -> None:
         meta = client.app.state.stores.meta
         actions = {entry.action for entry in meta.audit_query(AuditFilter(), Page(limit=100)).items}
         assert {"profile.create", "profile.archive"} <= actions
+
+
+def test_profile_create_race_window_still_rejects_duplicates(config_path: Path) -> None:
+    """M-4 race contract: the 409 never rides the check-then-insert window —
+    a duplicate landing after a stale existence read is rejected by the
+    insert-only guard and cannot clobber the existing row's display_name."""
+    with _boot(config_path) as client:
+        created = client.post("/api/v1/profiles", json={"profile_id": "research"})
+        assert created.status_code == 201, created.text
+
+        meta = client.app.state.stores.meta
+        original = meta.get_profile
+        # Simulate the loser's stale read in the create race: exactly one
+        # existence check sees nothing even though the row exists.
+        seen = {"checks": 0}
+
+        def stale_read(profile_id: str) -> object:
+            seen["checks"] += 1
+            return None if seen["checks"] == 1 else original(profile_id)
+
+        meta.get_profile = stale_read  # type: ignore[method-assign]
+        try:
+            dup = client.post("/api/v1/profiles", json={"profile_id": "research", "display_name": "Clobber"})
+            assert dup.status_code == 409, dup.text
+        finally:
+            meta.get_profile = original
+
+        listed = client.get("/api/v1/profiles").json()["profiles"]
+        assert [(p["profile_id"], p["display_name"]) for p in listed] == [("research", "")]

@@ -54,7 +54,7 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (34 methods)
+## MetaStore (35 methods)
 
 | Method | Contract test |
 |---|---|
@@ -67,6 +67,7 @@ Driver family covered by the `stack` fixture:
 | capabilities | `test_contract_meta.py::test_capabilities` |
 | count_users | `test_contract_meta.py::test_users_crud_and_password_rotation` |
 | create_owner | `test_contract_meta.py::test_create_owner_atomic_and_conflict` |
+| create_profile | `test_contract_meta.py::test_create_profile_is_insert_only` |
 | create_user | `test_contract_meta.py::test_users_crud_and_password_rotation` |
 | delete_profile | `test_contract_meta.py::test_profile_crud_and_token_cascade` |
 | finish_dream_run | `test_contract_meta.py::test_dream_run_finish_completes_the_row` |

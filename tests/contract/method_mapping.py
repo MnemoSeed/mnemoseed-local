@@ -61,6 +61,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "pool_states": "test_contract_meta.py::test_pool_states_returns_all_rows",
         "advance_watermark": "test_contract_meta.py::test_pool_watermark_gap_raises",
         "upsert_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
+        "create_profile": "test_contract_meta.py::test_create_profile_is_insert_only",
         "get_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
         "delete_profile": "test_contract_meta.py::test_profile_crud_and_token_cascade",
         "list_profiles": "test_contract_meta.py::test_profile_crud_and_token_cascade",
@@ -104,15 +105,13 @@ COVERAGE: dict[str, dict[str, str]] = {
 # update_dream_run_model (F2 per-run model pinning recorded on dream_runs), and
 # to 33 with finish_dream_run (the dream log surface: finish time + metered
 # tokens recorded at merge commit, 2026-08-17), and to 34 with pool_drain (the
-# atomic fire-time gauge->ledger drain on the score pool). VectorStore grew to
-# 15 with distinct_profile_ids (observational captured-namespace enumeration
-# behind the doctor's unknown-profile check).
-# GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
-# 2026-08-13, the console Graph View bulk edge listing), and to 21 with
-# supersede_link (the deliberate supersede verb's atomic close+link unit).
+# atomic fire-time gauge->ledger drain on the score pool), and to 35 with
+# create_profile (the insert-only duplicate guard behind POST /api/v1/profiles).
+# VectorStore grew to 15 with distinct_profile_ids (observational captured-
+# namespace enumeration behind the doctor's unknown-profile check).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 15,
     "GraphStore": 21,
-    "MetaStore": 34,
+    "MetaStore": 35,
     "Embedder": 3,
 }
