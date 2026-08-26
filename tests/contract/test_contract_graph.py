@@ -14,6 +14,8 @@ from _support import PROFILE, make_edge, make_intention, make_pref, make_prov
 from pydantic import ValidationError
 
 from mnemoseed_local.schema.graph import GraphNode, NodeType, PromotionStatus, RelType
+from mnemoseed_local.storage.drivers._time import epoch_from_iso, iso8601_utc
+from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
 from mnemoseed_local.storage.ports import (
     Capability,
     EdgeFilter,
@@ -459,6 +461,63 @@ def test_invalidate_closes_current_revision(stack) -> None:
     archived = stack.graph.versions("iv")
     assert len(archived) == 1
     assert archived[0].valid_to == pytest.approx(close_at, abs=0.002)
+
+
+def test_supersede_link_closes_and_links_in_one_transaction(stack) -> None:
+    """The supersede verb's storage unit: the invalidation and the SUPERSEDES
+    edge land together or not at all, from one clock reading."""
+    stack.graph.upsert_node(make_pref(node_id="sp-old"))
+    stack.graph.upsert_node(make_pref(node_id="sp-new"))
+    closed_at = time.time()
+
+    closed = stack.graph.supersede_link("sp-old", "sp-new", profile_id=PROFILE, closed_at=closed_at)
+
+    assert closed is True
+    assert stack.graph.get_node("sp-old") is None
+    chain = stack.graph.versions("sp-old")
+    assert chain[0].valid_to == pytest.approx(closed_at, abs=0.002)
+    rows = stack.graph._conn.execute(
+        "SELECT src, dst, created_at FROM edges WHERE rel = ? AND profile_id = ?", ("supersedes", PROFILE)
+    ).fetchall()
+    assert [(str(row["src"]), str(row["dst"])) for row in rows] == [("sp-new", "sp-old")]
+    assert all(epoch_from_iso(str(row["created_at"])) == pytest.approx(closed_at, abs=0.002) for row in rows)
+
+
+def test_supersede_link_without_a_current_revision_writes_nothing(stack) -> None:
+    stack.graph.upsert_node(make_pref(node_id="sp-live"))
+
+    closed = stack.graph.supersede_link("sp-missing", "sp-live", profile_id=PROFILE)
+
+    assert closed is False
+    assert stack.graph._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+
+
+def test_supersede_link_rechecks_under_the_write_lock(stack, monkeypatch) -> None:
+    """A competing close that becomes visible only once the write lock is held
+    must count as "nothing to close": the edge is never written and the caller
+    is not told a revision was closed."""
+    stack.graph.upsert_node(make_pref(node_id="lk-old"))
+    stack.graph.upsert_node(make_pref(node_id="lk-new"))
+    original_check = SqliteGraphDriver._get_current_version
+
+    def check_closing_once_locked(self, node_id: str):
+        version = original_check(self, node_id)
+        if node_id == "lk-old" and self._conn.in_transaction and version is not None:
+            # stands in for a competing writer whose commit serialized ahead
+            # of this transaction's BEGIN IMMEDIATE
+            self._conn.execute(
+                "UPDATE nodes SET valid_to = ? WHERE node_id = ? AND valid_to IS NULL",
+                (iso8601_utc(time.time()), node_id),
+            )
+            version = None
+        return version
+
+    monkeypatch.setattr(SqliteGraphDriver, "_get_current_version", check_closing_once_locked)
+
+    closed = stack.graph.supersede_link("lk-old", "lk-new", profile_id=PROFILE)
+
+    assert closed is False
+    assert stack.graph._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
 
 
 def test_append_version_supersedes_previous(stack) -> None:

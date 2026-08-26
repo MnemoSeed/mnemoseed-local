@@ -177,7 +177,7 @@ flowchart TB
 |---|---|
 | `initialize` | 返回 `protocolVersion`（本网关恒报 `2024-11-05`，接受任意客户端版本）+ `capabilities{tools}` + `serverInfo{mnemoseed-local, 版本}` |
 | `notifications/initialized` 及一切 `notifications/*` | 忽略，不响应（含 `notifications/cancelled`） |
-| `tools/list` | 返回 5 个工具及 JSON Schema inputSchema |
+| `tools/list` | 返回 6 个工具及 JSON Schema inputSchema |
 | `tools/call` | 代理到 daemon REST（actor = `mcp`）；失败/未知工具 → 结构化 `isError`，永不杀死循环 |
 | `ping` | 空结果 |
 | 未知方法（带 id） | 错误 `-32601`；不可解析行 → 能抢救出 id 则 `-32700`，否则丢弃 |
@@ -188,6 +188,7 @@ flowchart TB
 |---|---|---|---|
 | `recall` | `query`(必填), `top_k?` | POST `/memory/recall` | `top_k` 1..100 |
 | `remember` | `text`(必填) | POST `/memory/remember` | — |
+| `supersede` | `superseded_node_id`(必填), `successor_node_id`(必填) | POST `/memory/supersede` | — |
 | `dream_once` | — | POST `/memory/dream_once` | — |
 | `recent_sessions` | `n_sessions?`, `n_per_session?` | POST `/session/recent` | sessions 默认 2、≤5；per_session 默认 20、≤100 |
 | `session_windows` | `n_sessions?` | POST `/session/windows` | sessions 默认 3、≤10 |
@@ -311,6 +312,7 @@ flowchart TB
 | POST | `/memory/timeline` | 时间线 |
 | POST | `/memory/export` | 导出 |
 | POST | `/memory/forget_this` | 删除（chunk / node / entity） |
+| POST | `/memory/supersede` | 显式取代（关闭旧版本 + SUPERSEDES 边，单一事务） |
 | POST | `/memory/dream_once` | 手动单节梦境 |
 | POST | `/memory/dream_status` | 梦境触发状态 / 待处理队列 |
 | POST | `/session/recent` | 时序会话尾部（B2；`exclude_session_id` / `self_session_id`） |

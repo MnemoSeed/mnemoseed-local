@@ -209,6 +209,8 @@ flowchart LR
 - **衰减的例外**：provenance 永不衰减；`never_decay` 钉（FR-4.4，硬约束类节点）由 sweep 显式过滤；显式 pin / user 写入的 remembered 条目不在衰减面内。
   > **更正（2026-08-24，随实现批补注）**：上句后半对 chunk 不成立——`ChunkStamp` 根本没有 `never_decay` 字段，sweeper 的 chunk 路径也从无钉住豁免，显式钉住的条目实际一直按普通 chunk 速率（λ=0.03）衰减，构成静默信任缺陷。已由保留机制重设计修正：显式钉住条目现在读侧派生为 flashbulb 类，走慢衰减档 λ_pin=0.005（约 139 天半衰期），并配套同主题替换、线索救援与索引残迹；完整设计与缺陷取证见 `09-retention-redesign.md` §1–§3。原句按诚实规则保留不删，以此注为准。已 tombstone/已取代的版本因 sweep 只读当前版本而天然豁免。
 - **read-surface 时间结构**（PRD-B2.4 M1）：recall 条目携带 `session_id` + `ingested_at`（chunk 为真实值，ISO 格式；graph 条目诚实 null/null——整合节点无单一会话，借 `updated_at` 会制造来源混淆，违 TA-8），详情归 06。
+  > **修订（随实现批补注）**：会话归属两项对 graph 条目仍诚实 null，不变；图条目另携带事实字段 `valid_from`（ISO）——直读版本链的断言时间（该断言何时开始生效），是"断言时间"不是"会话归属"，不构成 TA-8 意义上的来源混淆。chunk 条目的 `valid_from` 恒为 null。原句按诚实规则保留。
+- **SUPERSEDES 边与显式取代动词**：`RelType.SUPERSEDES` 在边词汇表中注册后一直没有任何写入方（registered-but-unimplemented，如实记录），本批随显式动词落地：daemon 服务方法 + `POST /memory/supersede` 路由（请求 `{profile_id, superseded_node_id, successor_node_id}`）+ MCP 网关 `supersede` 工具，使模型可主动调用。语义：给定两个**现存的当前版本节点**——被取代节点的当前版本关闭与 `supersedes` 边（successor → superseded）写入在**同一存储事务**内完成（驱动层 `supersede_link`，即 PRD-08 附录 B.2 的原子纪律：中途失败整体回滚，绝不留下已关闭却无边可查的半取代态）；`valid_to=now`，链完整保留、当前读不再可见，边与本版的 `valid_to` 取同一次时钟读数。自引用拒绝（400）；目标缺失或跨 profile 拒绝（404）；目标在检查后被并发关闭时驱动报告"无可关闭修订"，同样 404 且**零写入**（绝不假成功）。审计只在成功后写一条 `supersede` 记录（失败不记）。**红线：取代只能由该显式动词触发，绝不是召回/评分的副作用。**诚实边界：console Graph View 的 `list_edges` 只列两端均为当前版本的边（防泄漏护栏，见该方法的契约），故触及已关闭节点的 supersedes 边不进图视图，但在存储层持久可查（audit / 版本链回放）。
 
 ## 4. 红线与诚实边界
 

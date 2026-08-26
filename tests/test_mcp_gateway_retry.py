@@ -210,6 +210,7 @@ def test_ping_and_tools_list_never_touch_the_client() -> None:
     assert {tool["name"] for tool in responses[1]["result"]["tools"]} == {
         "recall",
         "remember",
+        "supersede",
         "dream_once",
         "recent_sessions",
         "session_windows",

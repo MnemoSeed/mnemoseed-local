@@ -41,6 +41,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "set_flags": "test_contract_graph.py::test_set_and_clear_flags",
         "clear_flags": "test_contract_graph.py::test_set_and_clear_flags",
         "invalidate": "test_contract_graph.py::test_invalidate_closes_current_revision",
+        "supersede_link": "test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction",
         "append_version": "test_contract_graph.py::test_append_version_supersedes_previous",
         "versions": "test_contract_graph.py::test_versions_chain",
         "diff": "test_contract_graph.py::test_diff_reports_payload_change",
@@ -107,10 +108,11 @@ COVERAGE: dict[str, dict[str, str]] = {
 # 15 with distinct_profile_ids (observational captured-namespace enumeration
 # behind the doctor's unknown-profile check).
 # GraphStore is 20 with list_edges (PRD-08 appendix B.2 v1.1 amendment,
-# 2026-08-13, the console Graph View bulk edge listing).
+# 2026-08-13, the console Graph View bulk edge listing), and to 21 with
+# supersede_link (the deliberate supersede verb's atomic close+link unit).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 15,
-    "GraphStore": 20,
+    "GraphStore": 21,
     "MetaStore": 34,
     "Embedder": 3,
 }

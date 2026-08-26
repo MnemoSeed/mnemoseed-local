@@ -124,6 +124,9 @@ class AssembledEntry:
     recent_evidence: tuple[str, ...] = ()
     session_id: str | None = None
     ingested_at: float | None = None
+    # Assertion-time fact from the graph version chain (when the claim took
+    # effect); chunks carry None — it is not a session attribution.
+    valid_from: float | None = None
     # Inert provenance labels served read-only (origin attribution + encoding
     # host); graph entries and unlabeled chunks carry None.
     origin_agent: str | None = None
@@ -442,6 +445,8 @@ class Assembler:
                 "origin_agent": candidate.item.origin_agent,
                 "host": candidate.item.cues.host,
             }
+        elif isinstance(candidate.item, GraphNode):
+            provenance = {"valid_from": candidate.item.valid_from}
         return AssembledEntry(
             kind=candidate.kind,
             id=candidate.id,

@@ -10,9 +10,10 @@ Protocol surface (MCP ``2024-11-05`` shape):
   protocolVersion is accepted; the gateway always reports its own);
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
-- ``tools/list`` -> the daemon tools (recall / remember / dream_once /
-  recent_sessions / session_windows — recent_sessions is the B2 time-ordered
-  resume surface, session_windows the B2.4 per-session time-window surface);
+- ``tools/list`` -> the daemon tools (recall / remember / supersede /
+  dream_once / recent_sessions / session_windows — recent_sessions is the B2
+  time-ordered resume surface, session_windows the B2.4 per-session
+  time-window surface, supersede the deliberate belief-replacement verb);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -95,6 +96,21 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "supersede",
+        "description": "Record in mnemoseed-local that one belief replaces another: "
+        "the superseded node's current version is closed (history preserved) and an explicit "
+        "SUPERSEDES edge links the successor. A willful act only — never fired automatically.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "superseded_node_id": {"type": "string", "description": "the node being replaced"},
+                "successor_node_id": {"type": "string", "description": "the node that replaces it"},
+            },
+            "required": ["superseded_node_id", "successor_node_id"],
             "additionalProperties": False,
         },
     },
@@ -182,6 +198,15 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             if arguments.get("rules") is not None:
                 remember_body["rules"] = arguments["rules"]
             payload = client.post("/memory/remember", remember_body)
+        elif name == "supersede":
+            payload = client.post(
+                "/memory/supersede",
+                {
+                    "profile_id": client.profile_id,
+                    "superseded_node_id": arguments.get("superseded_node_id", ""),
+                    "successor_node_id": arguments.get("successor_node_id", ""),
+                },
+            )
         elif name == "dream_once":
             payload = client.post("/memory/dream_once", {"profile_id": client.profile_id})
         elif name == "recent_sessions":

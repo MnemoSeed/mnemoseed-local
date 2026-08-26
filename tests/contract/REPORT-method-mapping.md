@@ -28,7 +28,7 @@ Driver family covered by the `stack` fixture:
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 | upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
-## GraphStore (20 methods)
+## GraphStore (21 methods)
 
 | Method | Contract test |
 |---|---|
@@ -47,6 +47,7 @@ Driver family covered by the `stack` fixture:
 | list_nodes | `test_contract_graph.py::test_list_nodes_filter_pagination` |
 | query_intentions | `test_contract_graph.py::test_query_intentions_status_and_due` |
 | set_flags | `test_contract_graph.py::test_set_and_clear_flags` |
+| supersede_link | `test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction` |
 | timeline | `test_contract_graph.py::test_timeline_replays_versions` |
 | tombstone | `test_contract_graph.py::test_tombstone_tombstoned_node_via_port` |
 | traverse | `test_contract_graph.py::test_traverse_profile_scoped` |

@@ -22,7 +22,10 @@ from fastapi.testclient import TestClient
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
 from mnemoseed_local.daemon.app import DreamWorker, create_app
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
+from mnemoseed_local.schema.graph import GraphNode, NodeType
+from mnemoseed_local.schema.stamp import Provenance
 from mnemoseed_local.schema.turn import HostId
+from mnemoseed_local.storage.drivers._time import iso8601_utc
 from mnemoseed_local.storage.ports import TurnRange
 
 PROFILE = "default"
@@ -488,6 +491,120 @@ def test_recall_entries_carry_session_provenance_and_iso_ingested_at(config_path
         for entry in chunk_entries:
             assert entry["session_id"] == SESSION
             assert _ISO.fullmatch(entry["ingested_at"])
+            assert entry["valid_from"] is None
+
+
+def test_recall_graph_entries_carry_iso_valid_from_and_null_session(config_path: Path) -> None:
+    """Graph recall entries expose the version chain's assertion-time valid_from
+    as ISO-8601 UTC (a fact about when the assertion was made) while their
+    session attribution stays honestly null."""
+    _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+
+    with _boot(config_path) as client:
+        stores = client.app.state.stores  # type: ignore[attr-defined]
+        node = GraphNode(
+            node_id="g_valid",
+            profile_id=PROFILE,
+            node_type=NodeType.PREFERENCE,
+            entities=["LanceDb"],
+            props={
+                "domain": "coding",
+                "statement": "prefers the LanceDb loader",
+                "valence": 0.5,
+                "prior_width": 0.3,
+                "trait_anchor": "a",
+                "evidence_chain": [],
+            },
+            provenance=Provenance(asserted_by="test-model", source="x", session_id=None),
+            valid_from=100.0,
+        )
+        stores.graph.upsert_node(node)
+
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "LanceDb loader", "top_k": 5},
+        ).json()
+        entries = recall["memory"]["entries"]
+        graph_entry = next(entry for entry in entries if entry["kind"] == "graph")
+        assert graph_entry["id"] == "g_valid"
+        assert graph_entry["session_id"] is None
+        assert graph_entry["ingested_at"] is None
+        assert graph_entry["valid_from"] == iso8601_utc(100.0)
+        assert _ISO.fullmatch(graph_entry["valid_from"])
+
+
+def _graph_pref(node_id: str) -> GraphNode:
+    return GraphNode(
+        node_id=node_id,
+        profile_id=PROFILE,
+        node_type=NodeType.PREFERENCE,
+        entities=["Editor"],
+        props={
+            "domain": "coding",
+            "statement": f"editor stance of {node_id}",
+            "valence": 0.5,
+            "prior_width": 0.3,
+            "trait_anchor": "a",
+            "evidence_chain": [],
+        },
+        provenance=Provenance(asserted_by="test-model", source="x", session_id=None),
+    )
+
+
+def test_memory_supersede_route_closes_and_links(config_path: Path) -> None:
+    """The supersede verb is the only writer of SUPERSEDES edges: it closes the
+    superseded node's current version and links the successor in one call."""
+    with _boot(config_path) as client:
+        stores = client.app.state.stores  # type: ignore[attr-defined]
+        stores.graph.upsert_node(_graph_pref("sup-old"))
+        stores.graph.upsert_node(_graph_pref("sup-new"))
+
+        response = client.post(
+            "/memory/supersede",
+            json={
+                "profile_id": PROFILE,
+                "superseded_node_id": "sup-old",
+                "successor_node_id": "sup-new",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["superseded"] == "sup-old"
+        assert body["successor"] == "sup-new"
+        live = client.app.state.stores  # type: ignore[attr-defined]
+        assert live.graph.get_node("sup-old") is None, "the closed revision leaves current reads"
+        chain = live.graph.versions("sup-old")
+        assert chain[0].valid_to is not None, "the old version closed through the version chain"
+        rows = live.graph._conn.execute("SELECT src, dst FROM edges WHERE rel = 'supersedes'").fetchall()
+        assert [(str(row["src"]), str(row["dst"])) for row in rows] == [("sup-new", "sup-old")]
+
+
+def test_memory_supersede_unknown_node_is_404(config_path: Path) -> None:
+    with _boot(config_path) as client:
+        response = client.post(
+            "/memory/supersede",
+            json={
+                "profile_id": PROFILE,
+                "superseded_node_id": "ghost",
+                "successor_node_id": "ghost-too",
+            },
+        )
+        assert response.status_code == 404
+
+
+def test_memory_supersede_self_reference_is_400(config_path: Path) -> None:
+    with _boot(config_path) as client:
+        client.app.state.stores.graph.upsert_node(_graph_pref("solo"))  # type: ignore[attr-defined]
+        response = client.post(
+            "/memory/supersede",
+            json={
+                "profile_id": PROFILE,
+                "superseded_node_id": "solo",
+                "successor_node_id": "solo",
+            },
+        )
+        assert response.status_code == 400
 
 
 def test_recall_entries_carry_origin_agent_and_host(config_path: Path) -> None:
