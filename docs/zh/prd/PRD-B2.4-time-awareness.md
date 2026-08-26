@@ -94,6 +94,7 @@
 4. 时钟域：mtime=文件系统钟、`ingested_at`=宿主钟（同机今日）；远端产物=偏斜，不处理。
 5. `active` 进程内局部——daemon 重启清空缓冲注册表，直到各活 session 下次 ingest；静默未言的并行 session 在重启瞬间报 `active:false`。
 6. graph 条目永 `session_id:null`、`ingested_at:null`——整合节点无单一会话，不造假。
+   > **修订（随实现批补注）**：会话归属两项仍诚实 null；graph 条目另携带事实字段 `valid_from`（ISO）——版本链的断言时间，回答"该断言何时开始成立"，不是会话归属猜测。chunk 条目 `valid_from` 恒为 null。原边界按诚实规则保留，以此注为准。
 7. 共享 `?` 组 = 无标 pin 聚集，非 session，`active:false`。
 8. session-id 形态：MCP 面全量 id，T1 注入头只显尾段；跨面匹配用全量 id 或 `first==started=` 规则。
 9. 旧 daemon + 新 hook（字段缺席）：hook 退化为今日渲染；混合版本为不受支持边界。

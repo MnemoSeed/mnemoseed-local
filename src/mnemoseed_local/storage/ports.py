@@ -677,6 +677,21 @@ class GraphStore(Protocol):
     def invalidate(self, node_id: str, valid_to: float) -> None:
         raise NotImplementedError
 
+    def supersede_link(
+        self,
+        superseded_node_id: str,
+        successor_node_id: str,
+        *,
+        profile_id: str,
+        closed_at: float | None = None,
+    ) -> bool:
+        """Close the superseded node's current revision and insert the
+        SUPERSEDES edge to ``successor_node_id`` as ONE atomic unit — the
+        invalidation never lands without its link. Returns whether a revision
+        was actually closed; False means nothing was written and the caller
+        must not claim success (a concurrently closed target)."""
+        raise NotImplementedError
+
     def tombstone(self, node_id: str, deleted_at: float | None = None) -> bool:
         """Delete a node for good (GDPR right-to-erasure, design/03 storage-layer erasure).
 

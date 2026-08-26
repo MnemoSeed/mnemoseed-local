@@ -21,6 +21,10 @@ every request, never guessed, D5 isolation):
                               chunk rows are deleted, graph nodes are tombstoned
                               (version chain preserved), the audit trail records
                               exactly what was removed.
+- POST /memory/supersede    - deliberate belief replacement: the superseded
+                              node's current version closes through the version
+                              chain and an explicit SUPERSEDES edge links the
+                              successor; only this verb ever writes that edge.
 - POST /memory/dream_once   - the /dream command HTTP surface (FR-2.8
                               manual-first): run exactly one manual dream cycle
                               and read the trigger's observability.
@@ -172,6 +176,12 @@ class ForgetRequest(BaseModel):
         if self.chunk_id is None and self.node_id is None and self.entity is None:
             raise ValueError("forget_this requires a chunk_id, node_id, or entity target")
         return self
+
+
+class SupersedeRequest(BaseModel):
+    profile_id: ProfileRef
+    superseded_node_id: str
+    successor_node_id: str
 
 
 class DreamRequest(BaseModel):
@@ -544,6 +554,7 @@ class MemoryService:
             "recent_evidence": list(entry.recent_evidence),
             "session_id": entry.session_id,
             "ingested_at": iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
+            "valid_from": iso8601_utc(entry.valid_from) if entry.valid_from is not None else None,
             "origin_agent": entry.origin_agent,
             "host": entry.host,
         }
@@ -1327,6 +1338,54 @@ class MemoryService:
         )
         return {"removed": {"chunks": removed_chunks, "nodes": removed_nodes}}
 
+    # ------------------------------------------------------------ supersede
+
+    def supersede(
+        self,
+        *,
+        profile_id: str,
+        superseded_node_id: str,
+        successor_node_id: str,
+        actor: str = "console",
+    ) -> dict[str, Any]:
+        """Deliberate belief replacement between two existing current nodes:
+        the superseded node's current revision closes and the SUPERSEDES edge
+        to the successor lands as ONE store transaction (a failure rolls both
+        back, never a half-superseded node). Red line: only this verb writes
+        the edge — recall and scoring never supersede as a side effect. The
+        audit row records a completed supersession only."""
+        if superseded_node_id == successor_node_id:
+            raise ValueError("a node cannot supersede itself")
+        superseded = self._stores.graph.get_node(superseded_node_id)
+        if superseded is None or superseded.profile_id != profile_id:
+            raise MemoryNotFoundError(f"node {superseded_node_id!r} not found")
+        successor = self._stores.graph.get_node(successor_node_id)
+        if successor is None or successor.profile_id != profile_id:
+            raise MemoryNotFoundError(f"node {successor_node_id!r} not found")
+        closed_at = time.time()
+        closed = self._stores.graph.supersede_link(
+            superseded_node_id,
+            successor_node_id,
+            profile_id=profile_id,
+            closed_at=closed_at,
+        )
+        if not closed:
+            # The target lost its current revision between the check above and
+            # the write (concurrent close): report it, never claim success.
+            raise MemoryNotFoundError(f"node {superseded_node_id!r} has no current revision to close")
+        self._audit(
+            profile_id,
+            "supersede",
+            {
+                "superseded_node_id": superseded_node_id,
+                "successor_node_id": successor_node_id,
+                "closed_at": closed_at,
+                "profile_id": profile_id,
+            },
+            actor=actor,
+        )
+        return {"superseded": superseded_node_id, "successor": successor_node_id}
+
     # ------------------------------------------------------------ plumbing
 
     def _audit(self, profile_id: str, action: str, detail: dict[str, Any], *, actor: str = "console") -> None:
@@ -1465,6 +1524,22 @@ def memory_forget_this(req: ForgetRequest, request: Request) -> dict[str, Any]:
         )
     except MemoryNotFoundError as exc:
         raise _route_404(exc) from exc
+
+
+@router.post("/memory/supersede")
+def memory_supersede(req: SupersedeRequest, request: Request) -> dict[str, Any]:
+    service: MemoryService = request.app.state.memory
+    try:
+        return service.supersede(
+            profile_id=req.profile_id,
+            superseded_node_id=req.superseded_node_id,
+            successor_node_id=req.successor_node_id,
+            actor=resolve_actor(request),
+        )
+    except MemoryNotFoundError as exc:
+        raise _route_404(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 # ------------------------------------------------------------ /dream surface

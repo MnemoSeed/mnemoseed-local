@@ -306,29 +306,31 @@ class SqliteGraphDriver:
 
     def add_edge(self, edge: Edge) -> None:
         with _transaction(self._conn):
-            existing = self._conn.execute(
-                "SELECT id FROM edges WHERE src = ? AND dst = ? AND rel = ? AND profile_id = ?",
-                (edge.src, edge.dst, edge.rel.value, edge.profile_id),
-            ).fetchone()
-            if existing is not None:
-                self._conn.execute(
-                    "UPDATE edges SET weight = ? WHERE id = ?", (edge.weight, str(existing["id"]))
-                )
-            else:
-                self._conn.execute(
-                    "INSERT INTO edges (id, src, dst, rel, weight, profile_id, provenance, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex,
-                        edge.src,
-                        edge.dst,
-                        edge.rel.value,
-                        edge.weight,
-                        edge.profile_id,
-                        "{}",
-                        iso8601_utc(edge.created_at),
-                    ),
-                )
+            self._upsert_edge_locked(edge)
+
+    def _upsert_edge_locked(self, edge: Edge) -> None:
+        """Insert-or-reweight ``edge`` (caller holds a transaction)."""
+        existing = self._conn.execute(
+            "SELECT id FROM edges WHERE src = ? AND dst = ? AND rel = ? AND profile_id = ?",
+            (edge.src, edge.dst, edge.rel.value, edge.profile_id),
+        ).fetchone()
+        if existing is not None:
+            self._conn.execute("UPDATE edges SET weight = ? WHERE id = ?", (edge.weight, str(existing["id"])))
+        else:
+            self._conn.execute(
+                "INSERT INTO edges (id, src, dst, rel, weight, profile_id, provenance, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    uuid.uuid4().hex,
+                    edge.src,
+                    edge.dst,
+                    edge.rel.value,
+                    edge.weight,
+                    edge.profile_id,
+                    "{}",
+                    iso8601_utc(edge.created_at),
+                ),
+            )
 
     def bump_cooccurrence(self, node_a: str, node_b: str, profile_id: str) -> None:
         with _transaction(self._conn):
@@ -519,6 +521,38 @@ class SqliteGraphDriver:
         """Close the current revision at ``valid_to`` (single atomic step)."""
         with _transaction(self._conn):
             self._invalidate_locked(node_id, valid_to)
+
+    def supersede_link(
+        self,
+        superseded_node_id: str,
+        successor_node_id: str,
+        *,
+        profile_id: str,
+        closed_at: float | None = None,
+    ) -> bool:
+        """Close ``superseded_node_id``'s current revision and insert the
+        SUPERSEDES edge to ``successor_node_id`` in ONE transaction (PRD-08
+        appendix B.2 discipline): the invalidation never lands without its
+        link, so a mid-operation failure leaves the node open. The revision
+        check runs under BEGIN IMMEDIATE, serialized against competing
+        writers, so a concurrently closed target is seen before anything is
+        written. Returns whether a revision was actually closed; when False
+        nothing is written."""
+        at = time.time() if closed_at is None else closed_at
+        with _transaction(self._conn):
+            if self._get_current_version(superseded_node_id) is None:
+                return False
+            self._invalidate_locked(superseded_node_id, at)
+            self._upsert_edge_locked(
+                Edge(
+                    src=successor_node_id,
+                    dst=superseded_node_id,
+                    rel=RelType.SUPERSEDES,
+                    profile_id=profile_id,
+                    created_at=at,
+                )
+            )
+        return True
 
     def _invalidate_locked(self, node_id: str, valid_to: float) -> None:
         """Close the current revision at ``valid_to`` (caller holds a transaction)."""

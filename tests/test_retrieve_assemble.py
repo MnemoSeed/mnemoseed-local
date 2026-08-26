@@ -649,19 +649,25 @@ def test_chunk_entries_carry_verbatim_session_and_ingested_at(stack) -> None:
     entry = next(entry for entry in result.entries if entry.kind == "chunk")
     assert entry.session_id == "sess-9"
     assert entry.ingested_at == 42.0
+    assert entry.valid_from is None
 
 
-def test_graph_entries_carry_null_session_provenance(stack) -> None:
-    """Graph nodes aggregate many sessions; their source attribution stays the
-    honest null instead of borrowing the node's updated_at as an ingest time."""
+def test_graph_entries_carry_null_session_provenance_with_valid_from(stack) -> None:
+    """Graph nodes aggregate many sessions: their source attribution stays the
+    honest null instead of borrowing the node's updated_at as an ingest time,
+    while the version chain's assertion-time valid_from is served as a fact."""
     stack.graph.upsert_node(_node("g_src", statement="graph conclusion", entities=("LanceDb",)))
+    stored = stack.graph.get_node("g_src")
+    assert stored is not None
     result = _assemble(stack, _recall(stack, "graph conclusion", _query_cues(("LanceDb",))))
     entry = next(entry for entry in result.entries if entry.kind == "graph")
     assert entry.session_id is None
     assert entry.ingested_at is None
+    assert entry.valid_from == pytest.approx(stored.valid_from)
 
 
 def test_assembled_entry_defaults_provenance_to_null() -> None:
     entry = AssembledEntry(kind="chunk", id="c", source="s", text="t", score=1.0, tokens=1, flags=())
     assert entry.session_id is None
     assert entry.ingested_at is None
+    assert entry.valid_from is None

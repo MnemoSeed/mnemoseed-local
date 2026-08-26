@@ -105,7 +105,7 @@ flowchart TB
     end
 
     subgraph MCP["MCP gateway（stdio JSON-RPC 2024-11-05）"]
-        GW["recall / remember / dream_once<br/>recent_sessions / session_windows<br/>共 5 工具"]
+        GW["recall / remember / supersede / dream_once<br/>recent_sessions / session_windows<br/>共 6 工具"]
     end
 
     WD["watchdog / daemon.log（旁挂）<br/>socket 探针 + 全线程取证 dump"]
@@ -129,7 +129,7 @@ flowchart TB
     WD -.->|"探针 + 日志"| Daemon
 ```
 
-**文字走查**：opencode 宿主由 plugin.ts 将聊天/工具/生命周期事件映射为 `/ingest`（用户轮、助手轮、工具轮）、`/flush`（空闲/出错/压缩）、`/session/end`（仅 `session.deleted`）POST 进 daemon（fire-and-forget、2s 超时）。daemon 的 capture 管线在消费侧依次做 F1 剥噪、F2 持久性注解、F3 重要性打分，把 verbatim chunk 逐字写入 lancedb_embedded，并把每 turn 的 S 积分累入 ScorePool；达到门槛或硬期限后，事件经 DreamScheduler → DreamWorker（独立线程，不阻塞事件循环）→ snapshot/delta/reflect/merge 链，把反射出的 triple 按 core/isolated/salvage 写回 sqlite_graph，并对源 chunk 打 `consolidated` 标记（watermark 前进，仅按 provenance 可追溯取回）。检索侧从 graph 节点 + 未合并 chunks 双轨取候选，经预算门（top-k=5 / 800 tokens）、冲突成对、Freshness Guard 组装成上下文包，经 MCP 网关 5 工具或 REST 暴露给宿主；宿主把回放/回忆注入回 `chat.system.transform`。watchdog 与 `daemon.log` 旁挂在进程内：socket 探针失效即取证并 `os._exit(1)`，日志持久落盘。
+**文字走查**：opencode 宿主由 plugin.ts 将聊天/工具/生命周期事件映射为 `/ingest`（用户轮、助手轮、工具轮）、`/flush`（空闲/出错/压缩）、`/session/end`（仅 `session.deleted`）POST 进 daemon（fire-and-forget、2s 超时）。daemon 的 capture 管线在消费侧依次做 F1 剥噪、F2 持久性注解、F3 重要性打分，把 verbatim chunk 逐字写入 lancedb_embedded，并把每 turn 的 S 积分累入 ScorePool；达到门槛或硬期限后，事件经 DreamScheduler → DreamWorker（独立线程，不阻塞事件循环）→ snapshot/delta/reflect/merge 链，把反射出的 triple 按 core/isolated/salvage 写回 sqlite_graph，并对源 chunk 打 `consolidated` 标记（watermark 前进，仅按 provenance 可追溯取回）。检索侧从 graph 节点 + 未合并 chunks 双轨取候选，经预算门（top-k=5 / 800 tokens）、冲突成对、Freshness Guard 组装成上下文包，经 MCP 网关 6 工具或 REST 暴露给宿主；宿主把回放/回忆注入回 `chat.system.transform`。watchdog 与 `daemon.log` 旁挂在进程内：socket 探针失效即取证并 `os._exit(1)`，日志持久落盘。
 
 ---
 
@@ -207,7 +207,7 @@ flowchart TB
 - **retrieve**：`retrieve/{cues,hybrid,assemble}.py`（见 03）。
 - **decay**：`decay/{model,sweeper,reinforce}.py`（见 03）。
 - **daemon**：`daemon/{app,ingest,memory,watchdog,runner,actor}.py`；REST 面见 §1 走查。
-- **MCP 网关**：`mcp_gateway/{server,reliable_client}.py`——stdio 换行分隔 JSON-RPC 2.0，5 工具：recall / remember / dream_once / recent_sessions / session_windows（server.py TOOLS 列表）。
+- **MCP 网关**：`mcp_gateway/{server,reliable_client}.py`——stdio 换行分隔 JSON-RPC 2.0，6 工具：recall / remember / supersede / dream_once / recent_sessions / session_windows（server.py TOOLS 列表）。
 - **host 适配**：`hosts/opencode/plugin.ts`——`mnemoseed-local hook install` 部署；wire 事件映射契约见 plugin.ts:10-18。
 - **watchdog**：`daemon/watchdog.py`——boot grace 300s / refused grace 10s / 探针 1s（watchdog.py:40-42）；`daemon.log` 由 `daemon/app.py` `_attach_daemon_log_handler` 持久化。
 

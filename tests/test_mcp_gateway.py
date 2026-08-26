@@ -111,12 +111,13 @@ def test_ping_returns_empty_result() -> None:
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_five_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
         "recall",
         "remember",
+        "supersede",
         "dream_once",
         "recent_sessions",
         "session_windows",
@@ -133,6 +134,8 @@ def test_tools_list_has_exactly_the_five_tools_with_valid_schemas() -> None:
     assert recall["inputSchema"]["properties"]["top_k"]["type"] == "integer"
     remember = next(tool for tool in tools if tool["name"] == "remember")
     assert remember["inputSchema"]["required"] == ["text"]
+    supersede = next(tool for tool in tools if tool["name"] == "supersede")
+    assert supersede["inputSchema"]["required"] == ["superseded_node_id", "successor_node_id"]
     # B2: the time-ordered resume surface takes no required arguments
     recent = next(tool for tool in tools if tool["name"] == "recent_sessions")
     assert "required" not in recent["inputSchema"]
@@ -181,6 +184,36 @@ def test_call_remember_positive() -> None:
     assert responses[0]["result"]["isError"] is False
     assert json.loads(responses[0]["result"]["content"][0]["text"]) == payload
     assert client.calls == [("/memory/remember", {"profile_id": "default", "text": "prefers uv"})]
+
+
+def test_call_supersede_proxies_to_the_daemon_verb() -> None:
+    payload = {"superseded": "old", "successor": "new", "closed_at": "2026-08-26T00:00:00.000Z"}
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [
+            _request(
+                4,
+                "tools/call",
+                {
+                    "name": "supersede",
+                    "arguments": {"superseded_node_id": "old", "successor_node_id": "new"},
+                },
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert json.loads(responses[0]["result"]["content"][0]["text"]) == payload
+    assert client.calls == [
+        (
+            "/memory/supersede",
+            {
+                "profile_id": "default",
+                "superseded_node_id": "old",
+                "successor_node_id": "new",
+            },
+        )
+    ]
 
 
 def test_call_dream_once_positive() -> None:

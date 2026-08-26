@@ -247,6 +247,7 @@ sequenceDiagram
 - **`POST /session/recall-pending`**（路由 `memory.py:1152`，服务 `recall_pending` `memory.py:886`）：请求 `{profile_id, session_id, seen_chunk_ids?≤16}`；响应钉死 `{enabled, items[{kind,id,text}], non_focal_above_floor, budget_chars, slot_consumed}`。focal-only 扫描 `_focal_scan`（`memory.py:789`）embedding-free（`CueExtractor` 实体 + casefold 重叠 + `NodeFilter.entities`，`decay_weight ≥ capture.auto_recall_focal_floor`，排除当前 session `provenance.session_id`，`_SCAN_PAGE_LIMIT=50` 封顶）；non-focal 计数 `_non_focal_count`（`memory.py:860`，`NON_FOCAL_FLOOR=0.4`，只计不选）。预算权威在 daemon：贪心 `decay` 降序、同分新者先（毫秒量化，`round(ingested_at,3)` 与 ISO-8601 ms 可表示精度一致），边界项 T1 同款尾切（切片 = 剩余−2、"…" 标记、`_MIN_SLICE_CHARS=200` 整弃）。serve = mark-seen **锁内原子**（`self._pending_lock`，`memory.py:917`）；per-`(profile,session)` 生命周期：pending slot + `_pending_consumed` tombstone + `_scan_seq` 单调扫描序号 + `_session_epoch` settle 纪元（`end_session` `memory.py:950` 一并清空并 bump epoch；NIT-5 并发防线：stale scan 不得覆盖新 slot、settle 前起跑的 scan 不得 re-park）。
 - **`POST /memory/reinforce`**（路由 `memory.py:1166`，服务 `reinforce` `memory.py:968`）：请求 `{profile_id, chunk_ids≤64, node_ids≤64}`，`model_validator` 至少一表非空否则 422（`ReinforceRequest` `memory.py:199`）；走既有 `Reinforcer.record_hits`（未知 id 静默容忍契约）；响应钉死 `{"status": "ok"}`。**profile-agnostic（如实）**：`profile_id` 故意不转发——id 是不可猜的 store 键、usage 由 hook 引用守卫服务端证实，无跨 profile 猜表面可防。
 - **`/memory/recall` 条目增补**：`AssembledEntry` 增默认字段 `session_id`/`ingested_at`（`retrieve/assemble.py:124-125`），唯一构造点 `_entry`（`assemble.py:398`）从候选 chunk 直读（热路径零额外 store 读，`assemble.py:419-424`）；载荷渲染 ISO（`_entry_payload` `memory.py:482`：`ingested_at` 经 `iso8601_utc`；graph 条目诚实 null/null——整合节点无单一会话，绝不拿 `updated_at` 充数，违 TA-8）。
+  > **修订（随实现批补注）**：`AssembledEntry` 再增默认字段 `valid_from`——graph 条目从 `GraphNode.valid_from` 直读并以 ISO 渲染（版本链的断言时间，事实字段）；chunk 条目恒为 null。会话归属（`session_id`）对 graph 条目仍永为 null：断言时间 ≠ 会话归属，两者分开供给、绝不互相冒充。
 
 ### 3.2 捕获面联动（`daemon/ingest.py`）
 
@@ -287,7 +288,7 @@ sequenceDiagram
 **诚实边界（如实记录）**：
 
 - 窗是 **chunk 摄入窗**，非 session 真值（火忘延迟、30s 重放重叠、hook 捕获滞后、daemon 宕机空洞）；亚分钟级 mtime 对比不可靠，模型应以 ±分钟对待（B2.4 §边界 1）。
-- graph 条目永 `session_id:null`、`ingested_at:null`——整合节点无单一会话，不造假（B2.4 §边界 6）。
+- graph 条目永 `session_id:null`、`ingested_at:null`——整合节点无单一会话，不造假（B2.4 §边界 6）。**修订（随实现批）**：图条目的 `valid_from`（ISO，版本链断言时间）是事实字段，不受此边界约束——"不造假"只约束会话归属两项；断言时间是"该说法何时成立"，不是"它来自哪个会话"。
 - 共享 `?` 组 = 无标 pin 聚集，非 session；`chunk_count:null`（诚实未知）。
 - 任何窗外产物（非捕获工具所建、特性前遗留、他机）→ 诚实空结果"无可归因"，绝不猜（B2.4 §边界 3）。
 - `active` 进程内局部——daemon 重启清空缓冲注册表，直到各活 session 下次 ingest（B2.4 §边界 5）。
