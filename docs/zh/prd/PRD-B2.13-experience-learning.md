@@ -54,7 +54,9 @@
 
 ### E1 · 错误事件账本
 
-Append-only 派生注释行 `{profile_id, session_id, turn_range, detector_id, eligibility_tag, evidence_ptrs}`。确定性检测器、零模型调用。持久化模式循 merge salvage queue 先例（`merge.py:313`）。wire 格式不变。账本行 profile-scoped（依赖 #109 的 profile 绑定落地）。
+Append-only 派生注释行 `{profile_id, session_id, turn_range, detector_id, eligibility_tag, evidence_ptrs}`。确定性检测器、零模型调用。持久化模式循 merge salvage queue 先例（`merge.py:313`）。wire 格式不变。账本行 profile-scoped（依赖 #109 的 profile 绑定落地；行模式保留 `profile_id` 字段 ≠ 绑定语义——E1 无论 #109 进度如何一律先保留该字段，绑定语义归 #109）。
+
+**字段保留注记（#109）**：当前运行时只有隐式 profile、无生命周期管理面——env 变量已可产出 N 个隐式隔离命名空间，缺的是生命周期/绑定层，而非隔离本身。`profile_id` 现在（E1 落地时）就进入行模式——账本行生而 profile-scoped，#109 多 profile 运行时落地后无需任何迁移，也不另设第二套作用域机制。这与 #109 已核验的「每一层显式 `profile_id`、required and never guessed」既有不变量同构。
 
 ### E2 · dream 第二提取通道（Q3 在此落地）
 
@@ -66,6 +68,8 @@ Dream LLM 对提名账本行做裁决 → 经既有 verify/vote 质量门 + 预�
 4. **负向侧**：corrected-memory downweighting，对齐主仓 FR-4.10，走版本链（绝不改写历史）。
 
 **技能形态保留区（本设计文档内一页，不排期）**：dream 输出未来可序列化为 skill 候选链——lesson → scoped rule（认知层）→ INTENTION（联想层）→ 编译为 SKILL_SEQUENCE（自主层，R53 锚）→ USED_IN 强化 / λ-decay 兜底 → SUPERSEDES 演化。激活时的硬前置：promotion gate 实现（`PromotionStatus.QUARANTINED` 有字段无逻辑，`graph.py:53-64`）+ 来源归属对称不变量（镜像 `reflect.py:1026`：skill/lesson 节点永不得渲染为用户语句）。
+
+**同族机制协调（#123，红线级注记）**：读路径冲突标记 → dream 侧和解（#123）与本管线同族——底层问题同为「结局改变记忆地位」：#123 的读侧可逆 flag 与本管线的 `needs_reconcile` 错误信号最终汇入同一条 dream verify/vote 裁决流。两批必须共享同一裁决与降权机制（corrected-memory downweighting 一律走版本链），**不得各建一套分叉机制**。排期上 #123 依赖 B5 vote 门；后落地一方复用先落地一方的裁决通道，不重复设计。
 
 ### E3 · 投递面
 
@@ -105,7 +109,8 @@ Eval harness 复发臂：构造错误材料（context C + 错误动作 A + 纠�
 
 ## 相关
 
-- #109（profile 绑定——账本行 profile-scoped 的前置）
+- #109（profile 绑定——账本行 profile-scoped 的前置，见 E1 字段保留注记）
+- #123（读路径冲突标记 → dream 侧和解——同族机制，裁决流必须合一，见 E2 协调注记）
 - #105(originating agent——A/B 归因受益方)
 - #75(观察门)
 
