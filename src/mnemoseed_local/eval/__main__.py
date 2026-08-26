@@ -23,6 +23,7 @@ import argparse
 import re
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 from mnemoseed_local.eval.canary import canary_session
@@ -104,9 +105,12 @@ def _canary_command(args: argparse.Namespace) -> int:
 
     session = canary_session(args.seed)
     failures = 0
+    # one-shot run id: each self-check scopes its rigs under a fresh directory
+    # (fail-loud materialization — a reused root would refuse to build).
+    run_id = uuid.uuid4().hex[:8]
     for ensemble in ("off", "verify"):
         rig = EvalRig(
-            RigPaths(root=Path(args.workdir) / f"selfcheck-{ensemble}"),
+            RigPaths(root=Path(args.workdir) / f"selfcheck-{run_id}" / ensemble),
             EvalCell(
                 reflect=EvalRoute(driver="stub", model="stub-a"),
                 ensemble=ensemble,

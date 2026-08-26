@@ -101,7 +101,7 @@ issue #75 的 P0–P2 一周 dogfood 观察仍在运行。**范围缺口如实�
 
 ### 5.2 Gate 2 · eval rig 缺 warm-needle 材料类（前置依赖 issue #80）
 
-现有两套评测装置的生命周期契约分裂：`EvalRig`（`eval/harness.py:381`）matrix 命令仍是 wipes-by-construction，而 `RecallRig` / `RescueRig` 已是 fail-loud 的 `RigRootNotFresh` 物化语义（`eval/recall_harness.py:222-226`、`eval/rescue_harness.py:37`）——这正是 issue #80 要求统一（或书面论证必须不同）的对象。warm-needle 材料类（「先召回一次、随后换措辞在会话内追问同一事实」的多轮回放材料，现有 `eval/materials.py` / `eval/recall_materials.py` / `eval/rescue_materials.py` 均无此形态）必须在**统一后**的物化语义之上搭建：在分裂语义上建测量，等于把污染风险浇进校准 ε/λ_fast 所依赖的仪器本身。顺序：#80 落地 → warm-needle 材料类 + 基线测量 → 实现批 → 评测矩阵标定 → 才谈开启默认值。
+两套评测装置的生命周期契约曾分裂：`EvalRig`（`eval/harness.py`）matrix 命令原为 wipes-by-construction，而 `RecallRig` / `RescueRig` 已是 fail-loud 的 `RigRootNotFresh` 物化语义——这正是 issue #80 要求统一的分裂点。#80 已落地统一：三个评测 rig（`EvalRig` / `RecallRig` / `RescueRig`）现共享同一 fail-loud 物化契约（`eval/rig_freshness.py` 的 `require_fresh_root` / `RigRootNotFresh`：fresh = 不存在或空目录，既有痕迹绝不抹除；隔离改由调用方按 per-run 目录划分）。warm-needle 材料类（「先召回一次、随后换措辞在会话内追问同一事实」的多轮回放材料，现有 `eval/materials.py` / `eval/recall_materials.py` / `eval/rescue_materials.py` 均无此形态）必须搭建在**统一后**的物化语义之上（前置已满足）：在分裂语义上建测量，等于把污染风险浇进校准 ε/λ_fast 所依赖的仪器本身。剩余顺序：warm-needle 材料类 + 基线测量 → 实现批 → 评测矩阵标定 → 才谈开启默认值。
 
 ### 5.3 闸门顺序总结
 

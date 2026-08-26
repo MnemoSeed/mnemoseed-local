@@ -38,6 +38,10 @@ from fastapi.testclient import TestClient
 
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.eval.recall_metrics import RecallRunResult, ReplyObservation
+
+# re-export: the shared freshness contract keeps its historical import path
+from mnemoseed_local.eval.rig_freshness import RigRootNotFresh as RigRootNotFresh
+from mnemoseed_local.eval.rig_freshness import require_fresh_root
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.ports import ChunkFilter, Page, WeightUpdate
 
@@ -219,10 +223,6 @@ def release_daemon_log_handler(root: Path) -> None:
 # ---------------------------------------------------------------- the rig
 
 
-class RigRootNotFresh(RuntimeError):
-    """A rig root carried prior state when a point tried to materialize."""
-
-
 class RecallRig:
     """One T2-pipeline rig over a disposable daemon app, driven over HTTP.
 
@@ -245,11 +245,7 @@ class RecallRig:
         budget_chars: int = 1200,
         profile_id: str = "t4a",
     ) -> None:
-        if root.exists() and any(root.iterdir()):
-            raise RigRootNotFresh(
-                f"rig root {root} is not fresh: prior state present, refusing to materialize"
-            )
-        root.mkdir(parents=True, exist_ok=True)
+        require_fresh_root(root)
         self.root = root
         self.focal_floor = focal_floor
         self.budget_chars = budget_chars
