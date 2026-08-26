@@ -280,16 +280,31 @@ class ProfilesConfig:
     captured chunks carry. The map is replace semantics: what the file (or a
     configwrite write) says IS the map. The daemon write path resolves a
     turn's origin agent through this map onto the stamp's neutral
-    ``persona_id`` label; unbound agents leave it None.
+    ``persona_id`` label and the effective ``profile_id`` when routing
+    bound agents' captures to their bound profile (#130); unbound agents
+    leave it None.
     """
 
     agent_bindings: dict[str, str] = field(default_factory=dict)
 
-    def persona_for(self, origin_agent: str | None) -> str | None:
-        """The bound profile id for an agent label, None when unbound."""
+    def profile_for(self, origin_agent: str | None) -> str | None:
+        """The bound profile id for an agent label, None when unbound.
+
+        Routing helper for #130: when a turn's origin agent is bound, the
+        daemon writes the chunk under this profile id instead of the wire
+        value. Archived profiles keep the flag without unbinding.
+        """
         if origin_agent is None:
             return None
         return self.agent_bindings.get(origin_agent)
+
+    def persona_for(self, origin_agent: str | None) -> str | None:
+        """The bound profile id for an agent label, None when unbound.
+
+        Neutral carrier for persona annotation — same map as
+        :meth:`profile_for`, kept as an alias so the two surfaces cannot drift.
+        """
+        return self.profile_for(origin_agent)
 
 
 def validate_agent_bindings(value: Any) -> dict[str, str]:
