@@ -2,9 +2,13 @@
 
 **A local, single-user AI memory layer for coding agents.**
 
-MnemoSeed Local is the local-first edition of MnemoSeed: one profile
-(`default`), one machine, CLI-first. No accounts, no console, no cloud
-defaults. The core loop is capture -> dream -> decay -> retrieve, with dream
+MnemoSeed Local is the local-first edition of MnemoSeed: one machine,
+CLI-first, no accounts, no console, no cloud defaults. Memory lives in
+isolated per-profile namespaces: the conventional `default` namespace works
+out of the box, and extra profiles can be registered for other agents
+(`mnemoseed-local profile {create|list|archive|unarchive}`, bound via the
+`profiles.agent_bindings` config key). The core loop is capture -> dream ->
+decay -> retrieve, with dream
 inference running against a local model (ollama by default, with an
 OpenAI-compatible fallback driver). Both automations ship ON by default:
 dream consolidation fires on its own under its schedule triggers (`--once`
@@ -65,6 +69,9 @@ automatically (restart OpenCode to load it). `mnemoseed-local off` stops the
 daemon and disables the memory service persistently; `mnemoseed-local on`
 re-enables it and starts the daemon again. Hook lifecycle:
 `mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
+Profile namespaces are managed on the running daemon:
+`mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
+deletes data and does not unbind agents).
 
 ### Claude Code
 

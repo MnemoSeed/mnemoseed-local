@@ -948,3 +948,84 @@ def test_init_prints_next_steps_guidance(cli_home: Path, capsys) -> None:
     assert "  1. mnemoseed-local doctor   (self-check incl. hardware tier)" in out
     assert "  2. ollama pull qwen3.5:9b   (dream model, first time only)" in out
     assert "  3. mnemoseed-local up" in out
+
+
+# ---------------------------------------------------------------- profiles (#109)
+
+
+class _FakeProfileDaemon:
+    """Daemon double recording profile writes and answering the reads."""
+
+    def __init__(self, base_url: str, **kwargs: object) -> None:
+        self.base_url = base_url
+        self.calls: list[tuple[str, str, object]] = []
+
+    def get(self, path: str) -> dict[str, object]:
+        self.calls.append(("GET", path, None))
+        return {"profiles": [{"profile_id": "research", "display_name": "Research", "archived": False}]}
+
+    def post(self, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+        from mnemoseed_local.rest_client import DaemonRestError
+
+        self.calls.append(("POST", path, body))
+        assert body is not None
+        if path == "/api/v1/profiles":
+            return {
+                "profile_id": body["profile_id"],
+                "display_name": body.get("display_name", ""),
+                "archived": False,
+            }
+        if path == "/api/v1/profiles/archive" and body.get("profile_id") == "ghost":
+            raise DaemonRestError(404, "unknown profile")
+        return {
+            "profile_id": body.get("profile_id"),
+            "archived": body.get("archived", True),
+        }
+
+
+def _mock_profile_daemon(monkeypatch: pytest.MonkeyPatch) -> _FakeProfileDaemon:
+    daemon = _FakeProfileDaemon(base_url="http://localhost:7788")
+    monkeypatch.setattr("mnemoseed_local.rest_client.DaemonClient", lambda **kwargs: daemon)
+    return daemon
+
+
+def test_profile_create_posts_and_reports(cli_home: Path, monkeypatch, capsys) -> None:
+    daemon = _mock_profile_daemon(monkeypatch)
+    assert main(["profile", "create", "research", "--display-name", "Research"]) == 0
+    expected = {"profile_id": "research", "display_name": "Research"}
+    assert ("POST", "/api/v1/profiles", expected) in daemon.calls
+    assert "created profile research" in capsys.readouterr().out
+
+
+def test_profile_list_prints_rows_and_json(cli_home: Path, monkeypatch, capsys) -> None:
+    _mock_profile_daemon(monkeypatch)
+    assert main(["profile", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "research" in out
+    assert "[archived]" not in out
+    assert main(["profile", "list", "--json"]) == 0
+    assert '"profile_id": "research"' in capsys.readouterr().out
+
+
+def test_profile_archive_and_unarchive_post_the_flag(cli_home: Path, monkeypatch, capsys) -> None:
+    daemon = _mock_profile_daemon(monkeypatch)
+    assert main(["profile", "archive", "research"]) == 0
+    assert ("POST", "/api/v1/profiles/archive", {"profile_id": "research", "archived": True}) in daemon.calls
+    assert main(["profile", "unarchive", "research"]) == 0
+    assert ("POST", "/api/v1/profiles/archive", {"profile_id": "research", "archived": False}) in daemon.calls
+
+
+def test_profile_unknown_target_is_a_clean_error(cli_home: Path, monkeypatch, capsys) -> None:
+    _mock_profile_daemon(monkeypatch)
+    assert main(["profile", "archive", "ghost"]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_doctor_warning_points_at_profile_create(cli_home: Path, monkeypatch, capsys) -> None:
+    """#109 coherence: with lifecycle verbs landed, the unknown-profiles
+    warning names the registration fix."""
+    _write_doctor_config(cli_home)
+    _mock_profile_probe_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "mnemoseed-local profile create" in out

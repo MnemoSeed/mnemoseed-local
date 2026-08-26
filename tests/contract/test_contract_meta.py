@@ -138,6 +138,17 @@ def test_profile_crud_and_token_cascade(stack) -> None:
     assert raw_meta_row(stack, "tokens", "token_id", token.token_id) == {}  # FK cascade
 
 
+def test_create_profile_is_insert_only(stack) -> None:
+    """#109 lifecycle race contract: create_profile never overwrites — a
+    duplicate id (including one landing between the caller's check and the
+    insert) returns False and leaves the existing row untouched."""
+    stack.meta.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
+    assert stack.meta.create_profile(StoredProfile(profile_id="u2", display_name="Bob")) is True
+    assert stack.meta.get_profile("u2").display_name == "Bob"
+    assert stack.meta.create_profile(StoredProfile(profile_id="u1", display_name="Clobber")) is False
+    assert stack.meta.get_profile("u1").display_name == "Uma"
+
+
 def test_profile_archive_flag(stack) -> None:
     """FR-7.3 console profile archive: the flag roundtrips, rename never
     touches it (upsert updates display_name only), and unknown profiles raise."""

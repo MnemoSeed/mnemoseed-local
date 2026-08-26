@@ -272,6 +272,45 @@ class RecallConfig:
     rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
 
 
+@dataclass(frozen=True)
+class ProfilesConfig:
+    """Multi-profile runtime bindings ([profiles], #109).
+
+    ``agent_bindings`` maps an agent label to the profile id whose persona its
+    captured chunks carry. The map is replace semantics: what the file (or a
+    configwrite write) says IS the map. The daemon write path resolves a
+    turn's origin agent through this map onto the stamp's neutral
+    ``persona_id`` label; unbound agents leave it None.
+    """
+
+    agent_bindings: dict[str, str] = field(default_factory=dict)
+
+    def persona_for(self, origin_agent: str | None) -> str | None:
+        """The bound profile id for an agent label, None when unbound."""
+        if origin_agent is None:
+            return None
+        return self.agent_bindings.get(origin_agent)
+
+
+def validate_agent_bindings(value: Any) -> dict[str, str]:
+    """Shape-check an agent->profile binding map (shared loader/registry rule).
+
+    Keys and values must be non-empty strings after stripping; anything else
+    is a ValueError naming nothing (the caller names the key), so the loader
+    and the configwrite registry cannot drift apart.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("must be a table mapping agent label to profile id")
+    bindings: dict[str, str] = {}
+    for agent, profile_id in value.items():
+        agent_name = str(agent).strip()
+        target = profile_id.strip() if isinstance(profile_id, str) else ""
+        if not agent_name or not target:
+            raise ValueError("every binding needs a non-empty agent label and profile id")
+        bindings[agent_name] = target
+    return bindings
+
+
 # A2 MVP + B1 + B5: the dream LLM roles. The cloud deep_reflection /
 # short_increment split is trimmed for the local single-user daemon; roles
 # remain a pipeline-internal parameter so a future split can re-open them
@@ -371,6 +410,7 @@ class Config:
     decay: DecayConfig = field(default_factory=DecayConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
+    profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     llm: dict[str, RoleLLMConfig] = field(default_factory=lambda: dict(DEFAULT_LLM_ROUTES))
     source: Path | None = None
@@ -741,6 +781,19 @@ def load_config(path: Path | None = None) -> Config:
             raise ConfigError("recall.rescue_cue_min", "must be a number in (0, 1]")
         recall = RecallConfig(rescue_floor=float(floor_raw), rescue_cue_min=float(cue_raw))
 
+    # [profiles] table (#109): agent->profile persona bindings, replace
+    # semantics. The shape validator is shared with the configwrite registry,
+    # so load-time and write-time validation cannot drift.
+    profiles = ProfilesConfig()
+    profiles_raw = raw.get("profiles")
+    if profiles_raw is not None:
+        profiles_table = _require_table(profiles_raw, "profiles")
+        try:
+            bindings = validate_agent_bindings(profiles_table.get("agent_bindings", {}))
+        except ValueError as exc:
+            raise ConfigError("profiles.agent_bindings", str(exc)) from exc
+        profiles = ProfilesConfig(agent_bindings=bindings)
+
     # [logging] table (B2.12): observability toggles, all default OFF.
     logging_config = LoggingConfig()
     logging_raw = raw.get("logging")
@@ -759,6 +812,7 @@ def load_config(path: Path | None = None) -> Config:
         decay=decay,
         capture=capture,
         recall=recall,
+        profiles=profiles,
         logging=logging_config,
         llm=llm_routes,
         source=path,
@@ -881,6 +935,15 @@ path = "~/.mnemoseed-local/isolated.db"
 # auto_recall = true
 # auto_recall_focal_floor = 0.5
 # auto_recall_budget_chars = 2400
+
+# Multi-profile runtime (#109): agent->profile persona bindings. A bound
+# agent's captured chunks carry the bound profile id on their persona_id
+# label; unbound agents leave it None. Replace semantics: the map you write
+# IS the map. Manage via `mnemoseed-local config set profiles.agent_bindings
+# '{"planner": "research"}'`; create the target namespace first with
+# `mnemoseed-local profile create research`.
+# [profiles]
+# agent_bindings = {"planner" = "research"}
 
 # Request-level observability (B2.12): when ON, every HTTP request logs one
 # INFO line (method + path + status) to daemon.log; request bodies are never

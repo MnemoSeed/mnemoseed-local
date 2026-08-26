@@ -778,6 +778,16 @@ class MetaStore(Protocol):
     def upsert_profile(self, profile: StoredProfile) -> None:
         raise NotImplementedError
 
+    def create_profile(self, profile: StoredProfile) -> bool:
+        """Insert-only profile creation (#109 lifecycle verbs).
+
+        Unlike ``upsert_profile`` (rename semantics), an existing profile id
+        is never overwritten: concurrent duplicate creates serialize inside
+        one transaction and every loser returns False, so callers answer 409
+        deterministically instead of racing a check-then-insert window.
+        """
+        raise NotImplementedError
+
     def get_profile(self, profile_id: str) -> StoredProfile | None:
         raise NotImplementedError
 

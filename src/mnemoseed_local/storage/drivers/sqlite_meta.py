@@ -216,6 +216,33 @@ class SqliteMetaDriver:
             (profile.profile_id, profile.display_name, iso8601_utc(created), int(profile.archived)),
         )
 
+    def create_profile(self, profile: StoredProfile) -> bool:
+        """Insert-only creation: one transaction serializes concurrent
+        duplicate creates (the BEGIN IMMEDIATE create_owner precedent), so the
+        loser re-reads an existing row and returns False instead of overwriting
+        it; a UNIQUE-violation backstop maps to the same False."""
+        with _transaction(self._conn):
+            exists = self._conn.execute(
+                "SELECT 1 FROM profiles WHERE profile_id = ?", (profile.profile_id,)
+            ).fetchone()
+            if exists is not None:
+                return False
+            created = profile.created_at if profile.created_at else time.time()
+            try:
+                self._conn.execute(
+                    "INSERT INTO profiles (profile_id, display_name, created_at, archived) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        profile.profile_id,
+                        profile.display_name,
+                        iso8601_utc(created),
+                        int(profile.archived),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
     def get_profile(self, profile_id: str) -> StoredProfile | None:
         row = self._conn.execute(
             "SELECT profile_id, display_name, created_at, archived FROM profiles WHERE profile_id = ?",

@@ -16,7 +16,7 @@
 
 范围四块：
 
-1. **信任边界**：daemon 仅 loopback 绑定、非回环 baseurl 拒绝启动；localhost 隐式信任 = 正确性前提（无账号/令牌层）；CLI / MCP / 宿主 hook 一律经 REST loopback 进入；profile 固定 default（框架内部保留 profile 机制）。
+1. **信任边界**：daemon 仅 loopback 绑定、非回环 baseurl 拒绝启动；localhost 隐式信任 = 正确性前提（无账号/令牌层）；CLI / MCP / 宿主 hook 一律经 REST loopback 进入；本地单用户默认 default profile，多 profile 运行时的管理面（生命周期 + agent 绑定）见 §3.6。
 2. **secrets 三件套**：`FileSecretStore` + `ChainSecretStore` + `KeyringSecretStore`（`src/mnemoseed_local/secrets/`）；config 只存**引用**（`secrets:mnemoseed/dream/<role>` 或 env-var 名）；一切展示面 redaction（字面量 `<redacted>`、写入侧校验失败）。
 3. **configwrite 单一写者管线**：registry → 校验 → 外科式 TOML patch → 版本化 meta-store → 审计（actor 归因）→ 热生效；config.toml 是生成镜像，手改漂移侦测；DB-primary boot 覆层。
 4. **isolated 必需化 + 硬件档位/退阶**：isolated graph 实例四层强制（init 模板 / 加载校验 / boot 硬停 / doctor 硬查）；`dream.hardware_tier` 三档与 `dream.core_confidence_floor` 确定性降级。
@@ -26,7 +26,7 @@
 - **认知分级隔离 / 隐私架构**归主仓 `04`（认知分级 + E2EE/SaaS 面）。本仓与主仓是 sibling：同一设计哲学（信任最小化 + 诚实边界）并行演化，本篇只取本仓的本地单用户 loopback 工程面，不照搬主仓云端信任模型。
 - **记忆内容语义、学习/遗忘理论**归本系列 01–03；**审计与来源（provenance）规律**归 06（本篇仅以"审计可归/provenance 只追加"为工程基线，见 §2 理论锚）。
 - **daemon 生命周期**（watchdog、off/on 哨兵全流程）细节归 07 / PRD-B2.5；本篇只记哨兵与 configwrite 的关系一句话（§4.4）。
-- **多 profile、账号体系、云端/BYOK 托管**：明确裁掉（MVP §1）或属 Phase B 后显式 opt-in（见 §4 诚实边界）。
+- **账号体系、云端/BYOK 托管**：明确裁掉（MVP §1）或属 Phase B 后显式 opt-in（见 §4 诚实边界）；多 profile 管理面已落地（§3.6），非 loopback 信任的 auth/token 仍未实施。
 
 ---
 
@@ -180,7 +180,7 @@ flowchart TB
 | daemon 仅 loopback | `daemon/app.py` `lifespan`（`app.py:659-664`）：`urlparse(config.baseurl).hostname` 非回环 → `RuntimeError` "the local MVP is localhost-only" | 非回环地址**拒绝启动**，不是告警后继续 |
 | 写面 loopback 纵深 | `configwrite/routes.py:40-59`：`_is_loopback`（含 `127.*` 前缀与 IPv4-mapped IPv6）+ `_reject_remote_writes` → 403 | 读面随 daemon 绑定天然受限；写面再设一道 403 纵深 |
 | 隐式信任 = 正确性前提 | `daemon/actor.py:15-19`：`X-MnemoSeed-Actor` 仅归因，`_VALID_ACTORS = cli/console/mcp`，wire 值不参与授权 | 无账号/令牌层是**有意的**（MVP §1 裁掉账号体系）；任何能到达本机回环的进程在信任模型内 |
-| profile 固定 default | 全部内存/摄取路由显式携带 `profile_id`（schema/turn、daemon/memory、ingest）；框架内部保留 profile 机制（`storage` 各层按 profile_id 键控） | 本地单用户固定 default profile，机制保留供未来多 profile |
+| 多 profile 运行时 | 全部内存/摄取路由显式携带 `profile_id`（schema/turn、daemon/memory、ingest）；存储各层按 profile_id 键控 | 数据面是 N 个隐式隔离命名空间（惯例单个 `default`，无需表行）；生命周期与 agent→profile 绑定管理面见 §3.6 |
 | 记忆明文不出本机 | 无任何出站内存路径；`openai_compatible` 驱动仅作代码内保留（MVP §4.8"BYOK 推迟"） | 纯本地；BYOK 属 Phase B 后显式 opt-in（§4.1「未实施/在途」） |
 
 ### 3.2 secrets 三件套
@@ -271,6 +271,32 @@ flowchart TB
 **floor 确定性降级**：`Merger._confidence_floor` **每次 merge 活读** config（`merge.py:124-130`，configwrite 热改即时生效）；`_effective_route`（`merge.py:162-171`）两道门：先 anti-backflow（tier-3 证据 core 直接 deflected，永不进主图）、后 floor（core 且 `confidence < floor` 且非 tier-3 → 确定性改道 `Route.ISOLATED`）。`standard` 默认 `0.0`（现状不变）——**预期值如实标低**（MVP §4.8 原文）：它过滤的是模型自报的不确定度，自信的幻觉照样穿过；幻觉真防线 = isolated 结构 + ensemble 交叉验证。
 
 **capture-only 硬模式：未实施（如实）**。唯一已交付形态是 **boot 退化路径**：`_build_dream_llm`（`app.py:137-153`）对无法物化的 dream 路由返回 `_UnavailableLLM`（`app.py:111-134`），日志明示 "dreams degrade to capture-only until the route is fixed"——reflect 边界走既有 `LLMUnavailable` 类型路径、快照保持 journaled（FR-2.6）。`dream.auto_trigger=false` 是**软 capture-only**（自动不合并，手动 `dream --once` 仍合并）；**禁止手动 dream 的硬模式键 `dream.capture_only` 未实施，待 B4 按评测数据裁定**（MVP §4.8 + PRD-B2-roadmap B4）。
+
+### 3.6 多 Profile 运行时：生命周期与 agent 绑定
+
+> 本节锚定 batch/profile-runtime 批次（#109 designed scope）。数据面隔离（引擎各层按显式 profile_id 键控、跨 profile 污染测试钉死）此前已 shipped；本节落地的是**管理面**，在此之前的叙事口径是 "binding/management plane designed"。
+
+**Profile 生命周期动词**。端口层 CRUD（`ports.py` MetaStore 的 upsert/get/list/archive_profile，sqlite_meta 驱动实现）由 daemon REST 面接线：
+
+| 端点 / 动词 | 语义 | 关键约束 |
+|---|---|---|
+| `GET /api/v1/profiles`（CLI `profile list`） | 列出 profiles 表全部行 | `default` 是隐式约定命名空间，无需表行 |
+| `POST /api/v1/profiles`（CLI `profile create <id>`） | 注册命名空间（冲突拒绝：重复 id → 409，insert-only 守卫在单事务内裁决竞态） | `profile_id` 非空白（ProfileRef 文法）；审计 `profile.create` 带 actor 归因 |
+| `POST /api/v1/profiles/archive`（CLI `profile archive/unarchive <id>`） | 设置 archived 旗标（console FR-7.3 同源语义） | 未知 id → 404；审计 `profile.archive` |
+
+**归档写语义（v1 如实）**：archived 只是旗标——归档从不删除数据，也不解除绑定：已绑定的 agent 在解绑前继续照常写入并带 persona 标注。
+
+**绑定键形状**：单一注册表键 **`profiles.agent_bindings`** —— agent 标签 → profile_id 的映射，replace 语义同 `decay.lambda_per_type`（写入的映射就是映射）。它走 §1.1 的 configwrite 单一写者管线全程（校验→外科 patch→版本化记录→审计→热生效），因此受 DB-wins boot 覆层管辖（§1.3）；加载侧 `[profiles] agent_bindings` 表与注册表共享同一校验函数（同一规则、永不漂移，§1.2 先例）。热生效即时到达 daemon 写路径——persona 填充每次写入活读 live Config。
+
+**Persona 填充规则**：daemon 写路径组装 `WriteContext` 时以 turn 的 `origin_agent` 查绑定映射：命中则经中性载体字段 `agent_label` 把绑定的 profile_id 写到 stamp 的 `persona_id` 标签；未命中保持 None。两条红线原样成立：捕获中立（capture 不读 anima/preference 状态，`agent_label` 只是普通载体）；`origin_agent` 的惰性 provenance 语义不变（只透传到同名 stamp 列，绝不参与路由或排序）。绑定**只做 persona 标注，不重写 wire profile_id 路由**。
+
+**诚实边界（B2.5 式不借清单，工程控制面如实标注）**：
+
+- **非 loopback 信任的 auth/token 未实施**（#109 item 3，PRD-06 仅保留端口形状）：loopback 隐式信任仍是唯一信任模型，绑定故事最终需要的令牌层属 Phase B 后显式 opt-in。
+- **绑定不改变路由**：v1 中跨 profile 隔离仍由 hook/客户端显式携带的 `profile_id`（env-var 或宿主配置）承担；"第二 agent 经产品面指到第二 profile 并自动改道摄取" 属设计后续，不在本节交付内。
+- **hook 载荷父子 session 关联不在范围**：#75 P1 门未关，v1 保持 flat sessions 如实入账。
+- **无理论借用**：生命周期动词、绑定注册表、persona 标签都是工程控制面，照 PRD-B2.5 措辞纪律不给任何机制穿认知词汇。
+
 
 ---
 

@@ -77,7 +77,7 @@ from mnemoseed_local.llm.types import (
 )
 from mnemoseed_local.retrieve.cues import CueConfig, _is_tool_name, extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
-from mnemoseed_local.schema.turn import Turn, TurnRole
+from mnemoseed_local.schema.turn import ProfileArchiveRequest, ProfileCreateRequest, Turn, TurnRole
 from mnemoseed_local.storage.factory import Stores, build_stores
 from mnemoseed_local.storage.ports import (
     AuditEntry,
@@ -85,6 +85,8 @@ from mnemoseed_local.storage.ports import (
     CapabilityIssue,
     GraphStore,
     Page,
+    StorageError,
+    StoredProfile,
 )
 from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
@@ -277,7 +279,7 @@ def _turn_tool_names(turn: Turn) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _daemon_write_context(turn: Turn) -> WriteContext:
+def _daemon_write_context(turn: Turn, config: Config) -> WriteContext:
     """Per-write encoding context on the serving path (FR-1.6).
 
     Entity cues are extracted from the turn's user/assistant text — the same
@@ -287,7 +289,8 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
     entity-bearing query silently excludes the whole capture surface (D2).
     Tool-name cues come from the turn's TOOL steps (Option C): the retrieval
     β_tool overlap term is dead code unless capture stores the names it
-    matches on.
+    matches on. The agent binding map (#109) resolves the turn's origin agent
+    onto the neutral persona carrier — unbound agents leave it None.
     """
     text = " ".join(
         step.content
@@ -297,9 +300,10 @@ def _daemon_write_context(turn: Turn) -> WriteContext:
     entities = tuple(extract_cues(text).cues.entities) if text else ()
     return WriteContext(
         profile_id=turn.profile_id,
-        host=turn.host.value,
+        agent_label=config.profiles.persona_for(turn.origin_agent),
         cognitive_tier=CognitiveTier.TIER_1,
         origin_agent=turn.origin_agent,
+        host=turn.host.value,
         entities=entities,
         tools_used=_turn_tool_names(turn),
     )
@@ -634,6 +638,25 @@ class _WorkerTriggerForwarder:
         self._worker.enqueue_event(event)
 
 
+def _profile_payload(profile: StoredProfile) -> dict[str, Any]:
+    return {
+        "profile_id": profile.profile_id,
+        "display_name": profile.display_name,
+        "created_at": profile.created_at,
+        "archived": profile.archived,
+    }
+
+
+def _audit_profile_write(request: Request, action: str, detail: dict[str, Any]) -> None:
+    """Best-effort actor-attributed audit for a profile lifecycle write."""
+    try:
+        request.app.state.stores.meta.audit_append(
+            AuditEntry(actor=resolve_actor(request), action=action, detail=detail, at=time.time())
+        )
+    except Exception:  # noqa: BLE001 - journaling is best-effort
+        logger.warning("profile audit failed for %s", action, exc_info=True)
+
+
 def _audit_extract_failure(meta: Any, failure: ExtractFailure) -> None:
     """Observation log for failed dream extractions: one classified audit row
     per attempt, best-effort — an audit surface fault never breaks the dream
@@ -836,7 +859,9 @@ def _build_capture(
             store=stores.vector,
             inner=scoring,
             embedder=stores.embed,
-            context=_daemon_write_context,
+            # the live config rides the closure, so a profiles.agent_bindings
+            # write hot-applies to the next drained turn
+            context=lambda turn: _daemon_write_context(turn, config),
         ),
         trigger,
         pipeline,
@@ -1160,6 +1185,42 @@ def create_app() -> FastAPI:
             "offset": page.offset,
             "limit": page.limit,
         }
+
+    @app.get("/api/v1/profiles")
+    async def profiles_list() -> dict[str, Any]:
+        """Profile namespace rows (#109 lifecycle verbs; `default` is the
+        implicit conventional namespace and needs no row)."""
+        profiles = app.state.stores.meta.list_profiles()
+        return {"profiles": [_profile_payload(profile) for profile in profiles]}
+
+    @app.post("/api/v1/profiles", status_code=status.HTTP_201_CREATED)
+    async def profile_create(req: ProfileCreateRequest, request: Request) -> dict[str, Any]:
+        meta = app.state.stores.meta
+        # insert-only guard: a duplicate landing inside the race window is
+        # rejected here, never silently upserted over the existing row
+        if not meta.create_profile(
+            StoredProfile(profile_id=req.profile_id, display_name=req.display_name.strip())
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"profile {req.profile_id!r} already exists",
+            )
+        _audit_profile_write(request, "profile.create", {"profile_id": req.profile_id})
+        return _profile_payload(meta.get_profile(req.profile_id))
+
+    @app.post("/api/v1/profiles/archive")
+    async def profile_archive(req: ProfileArchiveRequest, request: Request) -> dict[str, Any]:
+        meta = app.state.stores.meta
+        try:
+            meta.archive_profile(req.profile_id, req.archived)
+        except StorageError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        _audit_profile_write(
+            request,
+            "profile.archive",
+            {"profile_id": req.profile_id, "archived": req.archived},
+        )
+        return _profile_payload(meta.get_profile(req.profile_id))
 
     @app.post("/daemon/shutdown")
     async def daemon_shutdown(request: Request) -> dict[str, Any]:
