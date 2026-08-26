@@ -350,14 +350,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 )
 
     # B2.12 (#110): captured namespaces with no profiles-table row are how a
-    # typo'd profile_id presents (an empty namespace, "fake amnesia").
+    # typo'd profile_id presents (an empty namespace, "fake amnesia"). The
+    # implicit "default" id is exempt (#109): the conventional single-user
+    # namespace needs no profiles-table row.
     if unregistered_profiles:
         warnings.append(
             (
                 "unknown profiles",
                 f"captured profile_ids with no profiles-table row: "
-                f"{', '.join(unregistered_profiles)} - typo'd ids present as empty "
-                "namespaces; re-ingest under the intended profile id",
+                f"{', '.join(unregistered_profiles)} - non-default namespaces may be "
+                "intentional (MNEMOSEED_LOCAL_PROFILE_ID); typo'd ids present as empty memory",
             )
         )
     return _doctor_report(checks, warnings)
@@ -405,12 +407,17 @@ def _daemon_activity(config: Config) -> dict[str, Any] | None:
 
 
 def _unregistered_profile_ids(stores: Any) -> list[str]:
-    """Captured profile_ids with no row in the profiles table (#110)."""
+    """Captured profile_ids with no row in the profiles table (#110).
+
+    The implicit "default" id is the conventionally-known namespace and is
+    never reported (#109).
+    """
     try:
         distinct = getattr(stores.vector, "distinct_profile_ids", None)
         if not callable(distinct):
             return []
         known = {profile.profile_id for profile in stores.meta.list_profiles()}
+        known.add(DEFAULT_PROFILE)
         return sorted(set(distinct()) - known)
     except Exception:  # noqa: BLE001 - purely observational check
         return []
