@@ -310,3 +310,39 @@ def test_logging_requests_rejects_non_bool(tmp_path, monkeypatch) -> None:
     _write(p, '[logging]\nrequests = "yes"\n')
     with pytest.raises(ConfigError, match=r"config\[logging.requests\]"):
         load_config(p)
+
+
+# ---------------------------------------------------------------- profiles (#109)
+
+
+def test_profiles_agent_bindings_parse(tmp_path, monkeypatch):
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, '[profiles]\nagent_bindings = { planner = "research" }\n')
+    cfg = load_config(p)
+    assert cfg.profiles.agent_bindings == {"planner": "research"}
+    assert cfg.profiles.persona_for("planner") == "research"
+
+
+def test_profiles_default_is_empty_and_unbound_agents_resolve_to_none(tmp_path, monkeypatch):
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(tmp_path / "missing.toml")
+    assert cfg.profiles.agent_bindings == {}
+    assert cfg.profiles.persona_for("planner") is None
+    assert cfg.profiles.persona_for(None) is None
+
+
+@pytest.mark.parametrize(
+    ("table", "bad_value"),
+    [
+        ('agent_bindings = { planner = "  " }', '"  "'),
+        ('agent_bindings = { "" = "research" }', '""'),
+        ("agent_bindings = { planner = 7 }", "7"),
+        ("agent_bindings = 3", "3"),
+    ],
+)
+def test_profiles_rejects_malformed_agent_bindings(tmp_path, table, bad_value):
+    p = tmp_path / "config.toml"
+    _write(p, f'preset = "embedded"\n[profiles]\n{table}\n')
+    with pytest.raises(ConfigError, match=r"config\[profiles\.agent_bindings\]"):
+        load_config(p)

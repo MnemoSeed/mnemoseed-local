@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
+from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.app import DreamWorker, create_app
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
 from mnemoseed_local.schema.graph import GraphNode, NodeType
@@ -305,7 +306,7 @@ def test_daemon_write_context_fills_entity_cues_from_turn_text() -> None:
         ],
     )
 
-    ctx = _daemon_write_context(turn)
+    ctx = _daemon_write_context(turn, Config())
 
     assert "MnemoSeed" in ctx.entities
 
@@ -340,7 +341,7 @@ def test_daemon_write_context_fills_tool_cues_from_turn_steps() -> None:
         ],
     )
 
-    ctx = _daemon_write_context(turn)
+    ctx = _daemon_write_context(turn, Config())
 
     assert ctx.tools_used == (
         "runTests",
@@ -367,7 +368,7 @@ def test_daemon_write_context_caps_tool_cues_at_retrieval_budget() -> None:
         steps=[TurnStep(role=TurnRole.TOOL, tool_name=f"tool-{i:02d}") for i in range(cap + 3)],
     )
 
-    ctx = _daemon_write_context(turn)
+    ctx = _daemon_write_context(turn, Config())
 
     assert len(ctx.tools_used) == cap
     assert ctx.tools_used == tuple(f"tool-{i:02d}" for i in range(cap))
@@ -389,7 +390,7 @@ def test_daemon_write_context_carries_turn_origin_agent() -> None:
         steps=[TurnStep(role=TurnRole.USER, content="以后都用 pnpm")],
     )
 
-    ctx = _daemon_write_context(turn)
+    ctx = _daemon_write_context(turn, Config())
 
     assert ctx.origin_agent == "build"
 
@@ -1157,3 +1158,95 @@ async def test_worker_stop_returns_in_finite_time_with_pending_jobs() -> None:
     await asyncio.wait_for(worker.stop(), timeout=2.0)
     assert await asyncio.wait_for(first, timeout=1.0) is True
     assert await asyncio.wait_for(second, timeout=1.0) is False
+
+
+# ------------------------------------------------ multi-profile runtime (#109)
+
+
+BOUND_SESSION = "sess-bound"
+PLAIN_SESSION = "sess-plain"
+
+
+def test_bound_agent_stamps_persona_and_unbound_stays_none(config_path: Path) -> None:
+    """#109 persona fill: a turn whose anchoring agent has a binding gets the
+    bound profile id on stamp.persona_id; an unbound (or absent) agent stays
+    None. origin_agent keeps its own inert label either way."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { planner = "research" }\n',
+        encoding="utf-8",
+    )
+
+    def _ingest(session: str, text: str, agent: str | None) -> None:
+        body = {
+            "host": HostId.CLAUDE_CODE.value,
+            "event": "user_prompt",
+            "session_id": session,
+            "profile_id": PROFILE,
+            "ts": 1.0,
+            "content": {"text": text},
+        }
+        if agent is not None:
+            body["agent"] = agent
+        response = client.post("/ingest", json=body)
+        assert response.status_code == 202, response.text
+
+    with _boot(config_path) as client:
+        _ingest(BOUND_SESSION, DURABLE_TEXT, "planner")
+        _ingest(PLAIN_SESSION, PLAIN_TEXT, None)
+        for session in (BOUND_SESSION, PLAIN_SESSION):
+            settled = client.post("/session/end", json={"session_id": session, "profile_id": PROFILE})
+            assert settled.status_code == 200, settled.text
+
+        from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+        chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id=PROFILE), Page(limit=10)
+        ).items
+        by_session = {chunk.provenance.session_id: chunk for chunk in chunks}
+        assert by_session[BOUND_SESSION].persona_id == "research"
+        assert by_session[BOUND_SESSION].origin_agent == "planner"
+        assert by_session[PLAIN_SESSION].persona_id is None
+
+
+def test_profile_lifecycle_rest_surface(config_path: Path) -> None:
+    """#109 lifecycle verbs on the REST face: create (409 on duplicate),
+    list, archive/unarchive (404 unknown), each write audited with actor
+    attribution."""
+    headers = {"X-MnemoSeed-Actor": "cli"}
+    with _boot(config_path) as client:
+        created = client.post("/api/v1/profiles", json={"profile_id": "research"}, headers=headers)
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["profile_id"] == "research"
+        assert body["archived"] is False
+
+        dup = client.post("/api/v1/profiles", json={"profile_id": "research"}, headers=headers)
+        assert dup.status_code == 409
+
+        listed = client.get("/api/v1/profiles").json()["profiles"]
+        assert [p["profile_id"] for p in listed] == ["research"]
+
+        missing = client.post(
+            "/api/v1/profiles/archive", json={"profile_id": "ghost", "archived": True}, headers=headers
+        )
+        assert missing.status_code == 404
+
+        archived = client.post("/api/v1/profiles/archive", json={"profile_id": "research"}, headers=headers)
+        assert archived.status_code == 200, archived.text
+        listed = client.get("/api/v1/profiles").json()["profiles"]
+        assert listed[0]["archived"] is True
+
+        unarchived = client.post(
+            "/api/v1/profiles/archive",
+            json={"profile_id": "research", "archived": False},
+            headers=headers,
+        )
+        assert unarchived.status_code == 200
+        listed = client.get("/api/v1/profiles").json()["profiles"]
+        assert listed[0]["archived"] is False
+
+        from mnemoseed_local.storage.ports import AuditFilter, Page
+
+        meta = client.app.state.stores.meta
+        actions = {entry.action for entry in meta.audit_query(AuditFilter(), Page(limit=100)).items}
+        assert {"profile.create", "profile.archive"} <= actions

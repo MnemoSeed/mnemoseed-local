@@ -670,3 +670,56 @@ def test_get_redacts_versions_too(tmp_path) -> None:
     service = ConfigWriteService(load_config(path), meta, clock=lambda: 1_700_000_000.0)
     service.reconcile_boot()
     assert "sk-proj-literal-value" not in repr(service.versions())
+
+
+# ------------------------------------------------- profiles.agent_bindings (#109)
+
+
+def test_registry_carries_the_agent_bindings_key() -> None:
+    """#109: the agent->profile binding map is a registry key, so binding
+    writes ride the full single-writer pipeline (patch -> version -> audit ->
+    live-apply, DB-wins at boot)."""
+    assert "profiles.agent_bindings" in CONFIG_KEY_REGISTRY
+
+
+def test_agent_bindings_write_patches_records_and_hot_applies(tmp_path) -> None:
+    meta = _meta(tmp_path)
+    service, path = _service(tmp_path, meta=meta)
+    result = service.set("profiles.agent_bindings", {"planner": "research"}, actor="cli")
+    assert result["ok"] is True
+    # the file mirror round-trips through the loader
+    assert load_config(path).profiles.agent_bindings == {"planner": "research"}
+    # hot-apply: the live config the daemon write path reads is updated
+    assert service._config.profiles.agent_bindings == {"planner": "research"}
+    assert service.generation == 1
+    # versioned record + audit attribution
+    listed = [entry for entry in service.versions() if entry["key"] == "profiles.agent_bindings"]
+    assert len(listed) == 1
+    assert listed[0]["value"] == {"planner": "research"}
+    actions = [entry.action for entry in _audit_entries(meta, "config.set")]
+    assert "config.set" in actions
+
+
+def test_agent_bindings_reject_malformed_maps(tmp_path) -> None:
+    service, _ = _service(tmp_path)
+    for bad in ({"planner": ""}, {"": "research"}, {"planner": 7}, "planner=research", {"p": "  "}):
+        with pytest.raises(ConfigWriteError, match=r"config\[profiles\.agent_bindings\]"):
+            service.set("profiles.agent_bindings", bad, actor="console")
+
+
+def test_agent_bindings_rollback_restores_file_and_live_config(tmp_path) -> None:
+    meta = _meta(tmp_path)
+    service, path = _service(tmp_path, meta=meta)
+    first = service.set("profiles.agent_bindings", {"planner": "research"}, actor="console")
+    service.set("profiles.agent_bindings", {"planner": "archived-x"}, actor="console")
+    rolled = service.rollback(first["version_id"], actor="console")
+    assert rolled["ok"] is True
+    assert load_config(path).profiles.agent_bindings == {"planner": "research"}
+    assert service._config.profiles.agent_bindings == {"planner": "research"}
+
+
+def test_agent_bindings_surface_on_the_read_face(tmp_path) -> None:
+    service, _ = _service(tmp_path)
+    service.set("profiles.agent_bindings", {"planner": "research"}, actor="console")
+    body = service.get()
+    assert body["config"]["profiles"]["agent_bindings"] == {"planner": "research"}

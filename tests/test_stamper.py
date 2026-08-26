@@ -565,3 +565,13 @@ def test_cross_profile_conflict_never_flags_other_profile_chunk() -> None:
     assert outcome.chunk_id != "chunk-alice"
     assert "chunk-alice" not in store.reconcile_flags
     assert pool.stats(BOB) is None
+
+
+def test_write_many_carries_the_persona_label() -> None:
+    """#109: the batched drain path stamps persona_id from the same neutral
+    agent_label carrier as the single-write path."""
+    store = _FakeVectorStore()
+    outcomes = _writer(store, _Clock()).write_many(
+        [(_scored("以后都用 pnpm"), WriteContext(profile_id=PROFILE, agent_label="research"))]
+    )
+    assert store.chunks[outcomes[0].chunk_id].persona_id == "research"

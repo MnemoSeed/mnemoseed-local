@@ -51,7 +51,9 @@ from mnemoseed_local.config import (
     Config,
     DecayConfig,
     DreamConfig,
+    ProfilesConfig,
     RoleLLMConfig,
+    validate_agent_bindings,
 )
 from mnemoseed_local.secrets.refs import SECRETS_REF_RE, is_secrets_ref
 from mnemoseed_local.storage.ports import AuditEntry, ConfigEntry
@@ -411,6 +413,21 @@ def _capture_apply(config: Config, field: str, value: Any) -> None:
         raw_capture[field] = value
 
 
+def _profiles_apply(config: Config, field: str, value: Any) -> None:
+    """Replace the frozen ProfilesConfig and mirror the change into config.raw.
+
+    The daemon write path reads the live config on every capture, so a
+    binding edit hot-applies to the NEXT drained turn without a restart.
+    """
+    bindings = {} if value is None else dict(value)
+    config.profiles = ProfilesConfig(agent_bindings=bindings)
+    raw_profiles = config.raw.setdefault("profiles", {})
+    if value is None:
+        raw_profiles.pop(field, None)
+    else:
+        raw_profiles[field] = dict(value)
+
+
 def _role_apply(config: Config, role: str, field: str, value: Any) -> None:
     """Rebuild the role's RoleLLMConfig with the new field and mirror raw."""
     cfg = config.llm.get(role)
@@ -636,6 +653,17 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         validate=_validate_positive_int,
         read=lambda config: config.capture.auto_recall_budget_chars,
         apply=lambda config, value: _capture_apply(config, "auto_recall_budget_chars", value),
+        live_apply=True,
+    ),
+    # Multi-profile runtime (#109): the agent->profile persona binding map.
+    # Replace semantics like decay.lambda_per_type; hot-applied — the daemon
+    # write path resolves bindings on every captured turn.
+    "profiles.agent_bindings": ConfigKey(
+        key_path="profiles.agent_bindings",
+        value_type="agent label -> profile id map",
+        validate=validate_agent_bindings,
+        read=lambda config: dict(config.profiles.agent_bindings),
+        apply=lambda config, value: _profiles_apply(config, "agent_bindings", value),
         live_apply=True,
     ),
 }
@@ -905,6 +933,9 @@ class ConfigWriteService:
                     "auto_recall": self._config.capture.auto_recall,
                     "auto_recall_focal_floor": self._config.capture.auto_recall_focal_floor,
                     "auto_recall_budget_chars": self._config.capture.auto_recall_budget_chars,
+                },
+                "profiles": {
+                    "agent_bindings": dict(self._config.profiles.agent_bindings),
                 },
             },
             "restart_required": {},

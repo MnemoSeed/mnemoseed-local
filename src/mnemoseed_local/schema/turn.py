@@ -112,6 +112,21 @@ class SessionEndRequest(BaseModel):
     ts: float | None = None  # host-stamped end time; server stamps when absent
 
 
+class ProfileCreateRequest(BaseModel):
+    """Request body for POST /api/v1/profiles (#109 lifecycle verbs)."""
+
+    profile_id: ProfileRef
+    display_name: str = ""
+
+
+class ProfileArchiveRequest(BaseModel):
+    """Request body for POST /api/v1/profiles/archive (archived flag only —
+    archive never deletes; unarchive passes ``archived = false``)."""
+
+    profile_id: ProfileRef
+    archived: bool = True
+
+
 class FlushRequest(BaseModel):
     """Request body for /flush (PreCompact live-site rescue, design/06 4).
 

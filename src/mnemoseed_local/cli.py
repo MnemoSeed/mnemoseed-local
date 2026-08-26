@@ -1,10 +1,11 @@
 """mnemoseed-local CLI entry point (A2 MVP).
 
 Verbs: init / up / on / off / status / doctor / recall / remember / dream
-(--once, status) / forget / config (get | set | rollback) / uninstall (--purge)
-/ hook (install | uninstall | status) / mcp (MCP stdio gateway).
-Local loopback by default; every state-changing verb talks to the daemon REST
-(FR-7.12); no identity/accounts/tokens in the local MVP.
+(--once, status) / forget / profile (create | list | archive | unarchive) /
+config (get | set | rollback) / uninstall (--purge) / hook (install |
+uninstall | status) / mcp (MCP stdio gateway). Local loopback by default;
+every state-changing verb talks to the daemon REST (FR-7.12); no
+identity/accounts/tokens in the local MVP.
 """
 
 from __future__ import annotations
@@ -359,7 +360,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "unknown profiles",
                 f"captured profile_ids with no profiles-table row: "
                 f"{', '.join(unregistered_profiles)} - non-default namespaces may be "
-                "intentional (MNEMOSEED_LOCAL_PROFILE_ID); typo'd ids present as empty memory",
+                "intentional (MNEMOSEED_LOCAL_PROFILE_ID); register them with "
+                "'mnemoseed-local profile create <id>'; typo'd ids present as empty memory",
             )
         )
     return _doctor_report(checks, warnings)
@@ -953,6 +955,52 @@ def cmd_config_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------ profile ops
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Profile lifecycle verbs (#109): create / list / archive / unarchive,
+    all over the daemon REST (loopback-trusted like the memory surface)."""
+    from mnemoseed_local.rest_client import resolve_client
+
+    try:
+        client = resolve_client(args)
+        if args.profile_command == "create":
+            body = client.post(
+                "/api/v1/profiles",
+                {
+                    "profile_id": args.profile_id,
+                    **({"display_name": args.display_name} if args.display_name else {}),
+                },
+            )
+            if not getattr(args, "json", False):
+                print(f"created profile {body.get('profile_id')}")
+                return 0
+        elif args.profile_command == "list":
+            body = client.get("/api/v1/profiles")
+            if getattr(args, "json", False):
+                return _emit_json(body)
+            profiles = body.get("profiles", [])
+            for profile in profiles:
+                archived = " [archived]" if profile.get("archived") else ""
+                name = f"  {profile['display_name']}" if profile.get("display_name") else ""
+                print(f"{profile['profile_id']}{archived}{name}")
+            print(f"{len(profiles)} profile(s)")
+            return 0
+        else:  # archive | unarchive
+            body = client.post(
+                "/api/v1/profiles/archive",
+                {"profile_id": args.profile_id, "archived": args.profile_command == "archive"},
+            )
+            if not getattr(args, "json", False):
+                state = "archived" if body.get("archived") else "unarchived"
+                print(f"profile {body.get('profile_id')} {state}")
+                return 0
+    except Exception as exc:
+        return _client_error(exc)
+    return _emit_json(body)
+
+
 # ------------------------------------------------------------ host hook (A3 T2)
 
 
@@ -1220,6 +1268,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_uninstall.add_argument("--purge", action="store_true", help="delete the data files too")
     p_uninstall.add_argument("--yes", action="store_true", help="skip the purge confirmation")
 
+    p_profile = sub.add_parser("profile", help="manage memory profiles: create | list | archive | unarchive")
+    profile_sub = p_profile.add_subparsers(dest="profile_command", required=True)
+    p_profile_create = profile_sub.add_parser("create", help="register a profile namespace")
+    p_profile_create.add_argument("profile_id")
+    p_profile_create.add_argument("--display-name", default="")
+    p_profile_create.add_argument("--baseurl", default=None)
+    p_profile_create.add_argument("--json", action="store_true")
+    p_profile_list = profile_sub.add_parser("list", help="list the registered profiles")
+    p_profile_list.add_argument("--baseurl", default=None)
+    p_profile_list.add_argument("--json", action="store_true")
+    p_profile_archive = profile_sub.add_parser("archive", help="archive a profile")
+    p_profile_archive.add_argument("profile_id")
+    p_profile_archive.add_argument("--baseurl", default=None)
+    p_profile_archive.add_argument("--json", action="store_true")
+    p_profile_unarchive = profile_sub.add_parser("unarchive", help="unarchive a profile")
+    p_profile_unarchive.add_argument("profile_id")
+    p_profile_unarchive.add_argument("--baseurl", default=None)
+    p_profile_unarchive.add_argument("--json", action="store_true")
+
     p_hook = sub.add_parser("hook", help="manage a host hook (host adapter plugin lifecycle)")
     p_hook.add_argument(
         "hook_command",
@@ -1270,6 +1337,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_forget(args)
     if args.command == "config":
         return cmd_config(args) if args.config_command != "rollback" else cmd_config_rollback(args)
+    if args.command == "profile":
+        return cmd_profile(args)
     if args.command == "uninstall":
         return cmd_uninstall(args)
     if args.command == "hook":
