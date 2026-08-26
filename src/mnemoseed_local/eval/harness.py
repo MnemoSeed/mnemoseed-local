@@ -31,7 +31,6 @@ import asyncio
 import logging
 import os
 import re
-import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -57,6 +56,7 @@ from mnemoseed_local.dream.merge import MergeOutcome, MergeSummary
 from mnemoseed_local.dream.reflect import ChatLLM, ReflectionResult
 from mnemoseed_local.dream.snapshot import Snapshot, load_snapshot_file
 from mnemoseed_local.eval.canary import CanarySession, CanaryTurn
+from mnemoseed_local.eval.rig_freshness import require_fresh_root
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import ChatResult
 from mnemoseed_local.schema.turn import HostId, IngestEvent, IngestEventType, MessageContent
@@ -398,13 +398,10 @@ class EvalRig:
         self.paths = paths
         self.cell = cell
         self.profile_id = profile_id
-        # idempotent over the artifacts this rig owns: a reused root must not
-        # re-ingest onto a prior run's stores/journal under the shared profile.
-        for p in (paths.stores_dir, paths.journal_dir):
-            if p.exists():
-                shutil.rmtree(p)
-        paths.config_path.unlink(missing_ok=True)
-        paths.root.mkdir(parents=True, exist_ok=True)
+        # fail-loud freshness (shared contract): prior state under root is
+        # contamination evidence, never wiped — matrix scopes each cell's rig
+        # under its own per-run directory instead.
+        require_fresh_root(paths.root)
         paths.stores_dir.mkdir(parents=True, exist_ok=True)
         paths.journal_dir.mkdir(parents=True, exist_ok=True)
 

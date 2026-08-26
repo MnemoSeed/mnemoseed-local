@@ -23,6 +23,10 @@ from mnemoseed_local.decay.reinforce import CANDIDATE_FLOOR
 from mnemoseed_local.eval.recall_harness import _point_config, release_daemon_log_handler
 from mnemoseed_local.eval.rescue_materials import DEAD_PIN_DECAY, RescueMaterial
 from mnemoseed_local.eval.rescue_matrix import RescuePointMetrics, pin_is_eligible
+
+# re-export: the shared freshness contract keeps its historical import path
+from mnemoseed_local.eval.rig_freshness import RigRootNotFresh as RigRootNotFresh
+from mnemoseed_local.eval.rig_freshness import require_fresh_root
 from mnemoseed_local.schema.stamp import (
     EXPLICIT_PIN_SOURCE,
     ChunkStamp,
@@ -32,10 +36,6 @@ from mnemoseed_local.schema.stamp import (
     ProvenanceEvent,
 )
 from mnemoseed_local.storage.ports import ChunkFilter, Page, StoredProfile
-
-
-class RigRootNotFresh(RuntimeError):
-    """A rig root carried prior state when a point tried to materialize."""
 
 
 def _config_toml(root: Path, rescue_floor: float, rescue_cue_min: float) -> str:
@@ -71,11 +71,7 @@ class RescueRig:
         rescue_cue_min: float,
         profile_id: str = "rescue-eval",
     ) -> None:
-        if root.exists() and any(root.iterdir()):
-            raise RigRootNotFresh(
-                f"rig root {root} is not fresh: prior state present, refusing to materialize"
-            )
-        root.mkdir(parents=True, exist_ok=True)
+        require_fresh_root(root)
         self.root = root
         self.rescue_floor = rescue_floor
         self.rescue_cue_min = rescue_cue_min

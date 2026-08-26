@@ -136,6 +136,47 @@ def test_repeat_runs_semantically_deterministic(tmp_path: Path) -> None:
     ]
 
 
+# ---------------------------------------------------------------- materialization contract
+
+
+def test_eval_rig_refuses_non_fresh_root(tmp_path: Path) -> None:
+    """Materialization is fail-loud and shared with the recall/rescue rigs:
+    a root carrying prior state raises the shared RigRootNotFresh and the
+    evidence survives untouched — never silently wiped."""
+    from mnemoseed_local.eval.rig_freshness import RigRootNotFresh
+
+    root = tmp_path / "rig"
+    forensic = root / "stores" / "meta.db"
+    forensic.parent.mkdir(parents=True)
+    forensic.write_text("keep me", encoding="utf-8")
+    with pytest.raises(RigRootNotFresh, match="not fresh"):
+        EvalRig(RigPaths(root=root), _stub_cell())
+    assert forensic.read_text(encoding="utf-8") == "keep me"
+
+
+def test_eval_rig_accepts_absent_or_empty_root(tmp_path: Path) -> None:
+    """Fresh = absent or an empty directory; both materialize cleanly."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    for root in (tmp_path / "absent", empty):
+        rig = EvalRig(RigPaths(root=root), _stub_cell())
+        try:
+            run = rig.run_canary(canary_session(28, facts=2, noise=1))
+        finally:
+            rig.close()
+        assert run.merge_committed
+
+
+def test_all_rigs_share_one_not_fresh_contract() -> None:
+    """One exception type across every eval rig — no per-harness duplicates."""
+    from mnemoseed_local.eval.recall_harness import RigRootNotFresh as recall_not_fresh
+    from mnemoseed_local.eval.rescue_harness import RigRootNotFresh as rescue_not_fresh
+    from mnemoseed_local.eval.rig_freshness import RigRootNotFresh
+
+    assert recall_not_fresh is RigRootNotFresh
+    assert rescue_not_fresh is RigRootNotFresh
+
+
 def test_cell_id_deterministic_and_discriminating() -> None:
     a = _stub_cell()
     assert a.cell_id == _stub_cell().cell_id
