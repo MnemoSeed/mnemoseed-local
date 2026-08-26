@@ -346,3 +346,27 @@ def test_profiles_rejects_malformed_agent_bindings(tmp_path, table, bad_value):
     _write(p, f'preset = "embedded"\n[profiles]\n{table}\n')
     with pytest.raises(ConfigError, match=r"config\[profiles\.agent_bindings\]"):
         load_config(p)
+
+
+def test_profiles_profile_for_resolves_bound_and_unbound(tmp_path, monkeypatch):
+    """#130 routing: profile_for is the write-path isolation helper — same
+    map as persona_for, None when unbound, and persona_for stays an alias so
+    the two surfaces cannot drift."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    p = tmp_path / "config.toml"
+    _write(p, '[profiles]\nagent_bindings = { planner = "research", worker = "work" }\n')
+    cfg = load_config(p)
+    assert cfg.profiles.profile_for("planner") == "research"
+    assert cfg.profiles.profile_for("worker") == "work"
+    assert cfg.profiles.profile_for("ghost") is None
+    assert cfg.profiles.profile_for(None) is None
+    # persona_for is the neutral carrier alias — same result, never diverges
+    assert cfg.profiles.persona_for("planner") == cfg.profiles.profile_for("planner")
+    assert cfg.profiles.persona_for(None) is None
+
+
+def test_profiles_profile_for_empty_map_returns_none(tmp_path, monkeypatch):
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    cfg = load_config(tmp_path / "missing.toml")
+    assert cfg.profiles.profile_for("planner") is None
+    assert cfg.profiles.profile_for(None) is None

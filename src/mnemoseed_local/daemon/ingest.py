@@ -20,6 +20,7 @@ from mnemoseed_local.capture import (
     SessionUnknownError,
     TurnSegmenter,
 )
+from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.schema.turn import (
@@ -46,17 +47,34 @@ def _observability(request: Request) -> Observability | None:
     return getattr(request.app.state, "observability", None)
 
 
+def _effective_ingest_profile(event: IngestEvent, config: Config | None) -> str:
+    """Effective profile for capture-side routing (#130).
+
+    When the ingest's origin agent is bound, the effective profile is the
+    bound profile, otherwise the wire profile_id. Uses the live config's
+    profile_for helper so archived-does-not-unbind.
+    """
+    if config is not None and event.agent:
+        bound: str | None = config.profiles.profile_for(event.agent)
+        if bound is not None:
+            return bound
+    return event.profile_id
+
+
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     segmenter: TurnSegmenter = request.app.state.segmenter
     observability = _observability(request)
+    config = getattr(request.app.state, "config", None)
+    effective_profile = _effective_ingest_profile(event, config)
     if observability is not None:
         # B2.12: capture-hook activity (vs other actors) feeds the doctor's
         # registered-but-never-connected check; every sighting feeds the
-        # first-sighting profile hygiene. Observational only.
+        # first-sighting profile hygiene. Observational only. Sight the
+        # effective profile for bound agents.
         if resolve_actor(request) == "hook":
             observability.note_capture_ingest()
-        observability.note_profile_sighting(event.profile_id)
+        observability.note_profile_sighting(effective_profile)
     try:
         segmenter.ingest(event)
     except ProfileMismatchError as exc:
@@ -73,14 +91,13 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         and isinstance(event.content, MessageContent)
         and event.content.text
     ):
-        config = getattr(request.app.state, "config", None)
         memory = getattr(request.app.state, "memory", None)
         if memory is not None and config is not None and config.capture.auto_recall:
             try:
                 await asyncio.wrap_future(
                     scan_executor.submit(
                         memory.note_user_prompt,
-                        event.profile_id,
+                        effective_profile,
                         event.session_id,
                         event.content.text,
                     )
@@ -99,6 +116,8 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
 async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any]:
     observability = _observability(request)
     if observability is not None:
+        # settlement has no agent — sight the wire profile_id (effective is
+        # resolved at capture drain/pending sweep, not here)
         observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:
@@ -168,6 +187,7 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
     """
     observability = _observability(request)
     if observability is not None:
+        # flush has no agent — sight the wire profile_id
         observability.note_profile_sighting(req.profile_id)
     segmenter: TurnSegmenter = request.app.state.segmenter
     try:

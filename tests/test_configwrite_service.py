@@ -723,3 +723,20 @@ def test_agent_bindings_surface_on_the_read_face(tmp_path) -> None:
     service.set("profiles.agent_bindings", {"planner": "research"}, actor="console")
     body = service.get()
     assert body["config"]["profiles"]["agent_bindings"] == {"planner": "research"}
+
+
+def test_agent_bindings_concurrent_writes_serialize_without_loss(tmp_path) -> None:
+    """Hot-apply serial: two successive binding edits both land versioned
+    records and the final live config converges on the last map — the
+    daemon's next write would see the new binding without a restart."""
+    meta = _meta(tmp_path)
+    service, path = _service(tmp_path, meta=meta)
+    service.set("profiles.agent_bindings", {"agentX": "work"}, actor="cli")
+    service.set("profiles.agent_bindings", {"agentX": "research"}, actor="cli")
+    versions = [v for v in service.versions() if v["key"] == "profiles.agent_bindings"]
+    assert len(versions) == 2
+    assert service._config.profiles.agent_bindings == {"agentX": "research"}
+    assert load_config(path).profiles.agent_bindings == {"agentX": "research"}
+    assert service._config.profiles.profile_for("agentX") == "research"
+    # the write path helper sees the same map as the persona helper
+    assert service._config.profiles.persona_for("agentX") == "research"

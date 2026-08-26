@@ -290,7 +290,10 @@ def _daemon_write_context(turn: Turn, config: Config) -> WriteContext:
     Tool-name cues come from the turn's TOOL steps (Option C): the retrieval
     β_tool overlap term is dead code unless capture stores the names it
     matches on. The agent binding map (#109) resolves the turn's origin agent
-    onto the neutral persona carrier — unbound agents leave it None.
+    onto the neutral persona carrier — unbound agents leave it None. For
+    #130 profile-bound isolation the effective write profile is resolved
+    from the same map: a bound agent's captures route to its bound profile,
+    otherwise the wire profile_id is kept unchanged (empty wire stays 422).
     """
     text = " ".join(
         step.content
@@ -298,8 +301,10 @@ def _daemon_write_context(turn: Turn, config: Config) -> WriteContext:
         if step.role in (TurnRole.USER, TurnRole.ASSISTANT) and step.content
     )
     entities = tuple(extract_cues(text).cues.entities) if text else ()
+    effective_profile = config.profiles.profile_for(turn.origin_agent)
+    profile_id = effective_profile if effective_profile is not None else turn.profile_id
     return WriteContext(
-        profile_id=turn.profile_id,
+        profile_id=profile_id,
         agent_label=config.profiles.persona_for(turn.origin_agent),
         cognitive_tier=CognitiveTier.TIER_1,
         origin_agent=turn.origin_agent,
@@ -853,14 +858,17 @@ def _build_capture(
     scoring = ScoringPipeline(
         scorer=TurnScorer(embedder=stores.embed),
         pool=pool,
+        config=config,
     )
     return (
         WritingPipeline(
             store=stores.vector,
             inner=scoring,
             embedder=stores.embed,
+            config=config,
             # the live config rides the closure, so a profiles.agent_bindings
-            # write hot-applies to the next drained turn
+            # write hot-applies to the next drained turn; the drain snapshots
+            # bindings so one session is atomic
             context=lambda turn: _daemon_write_context(turn, config),
         ),
         trigger,

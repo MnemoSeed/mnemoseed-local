@@ -1168,9 +1168,10 @@ PLAIN_SESSION = "sess-plain"
 
 
 def test_bound_agent_stamps_persona_and_unbound_stays_none(config_path: Path) -> None:
-    """#109 persona fill: a turn whose anchoring agent has a binding gets the
-    bound profile id on stamp.persona_id; an unbound (or absent) agent stays
-    None. origin_agent keeps its own inert label either way."""
+    """#109 persona fill + #130 routing: a turn whose anchoring agent has a
+    binding gets the bound profile id on stamp.persona_id AND its chunk is
+    routed to the bound profile namespace; an unbound (or absent) agent stays
+    None and remains in the wire profile."""
     config_path.write_text(
         config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { planner = "research" }\n',
         encoding="utf-8",
@@ -1199,13 +1200,22 @@ def test_bound_agent_stamps_persona_and_unbound_stays_none(config_path: Path) ->
 
         from mnemoseed_local.storage.ports import ChunkFilter, Page
 
-        chunks = client.app.state.stores.vector.list_chunks(
+        # #130: bound agent's chunk is isolated under its bound profile
+        bound_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="research"), Page(limit=10)
+        ).items
+        plain_chunks = client.app.state.stores.vector.list_chunks(
             ChunkFilter(profile_id=PROFILE), Page(limit=10)
         ).items
-        by_session = {chunk.provenance.session_id: chunk for chunk in chunks}
-        assert by_session[BOUND_SESSION].persona_id == "research"
-        assert by_session[BOUND_SESSION].origin_agent == "planner"
-        assert by_session[PLAIN_SESSION].persona_id is None
+        by_bound = {chunk.provenance.session_id: chunk for chunk in bound_chunks}
+        by_plain = {chunk.provenance.session_id: chunk for chunk in plain_chunks}
+        assert by_bound[BOUND_SESSION].persona_id == "research"
+        assert by_bound[BOUND_SESSION].origin_agent == "planner"
+        assert by_bound[BOUND_SESSION].profile_id == "research"
+        assert len(bound_chunks) == 1
+        assert len(plain_chunks) == 1
+        assert by_plain[PLAIN_SESSION].persona_id is None
+        assert by_plain[PLAIN_SESSION].profile_id == PROFILE
 
 
 def test_profile_lifecycle_rest_surface(config_path: Path) -> None:
@@ -1279,3 +1289,624 @@ def test_profile_create_race_window_still_rejects_duplicates(config_path: Path) 
 
         listed = client.get("/api/v1/profiles").json()["profiles"]
         assert [(p["profile_id"], p["display_name"]) for p in listed] == [("research", "")]
+
+
+# ------------------------------------------------ #130 profile-bound isolation (routing)
+
+
+def test_daemon_write_context_routes_bound_agent_to_bound_profile() -> None:
+    """#130 routing: a bound agent without an explicit profile env still writes
+    into its bound profile (not default annotated) — the daemon resolves the
+    effective profile_id from agent_bindings."""
+    from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    cfg = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        origin_agent="agentX",
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    ctx = _daemon_write_context(turn, cfg)
+    assert ctx.profile_id == "work"
+    assert ctx.agent_label == "work"
+    assert ctx.origin_agent == "agentX"
+
+
+def test_daemon_write_context_unbound_keeps_wire_profile() -> None:
+    """Unbound agents keep the wire profile_id; persona stays None."""
+    from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    cfg = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        origin_agent="unbound",
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    ctx = _daemon_write_context(turn, cfg)
+    assert ctx.profile_id == "default"
+    assert ctx.agent_label is None
+
+
+def test_daemon_write_context_no_agent_keeps_wire_profile() -> None:
+    """Turns without an origin agent never route — wire profile_id wins."""
+    from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    cfg = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        origin_agent=None,
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    ctx = _daemon_write_context(turn, cfg)
+    assert ctx.profile_id == "default"
+    assert ctx.agent_label is None
+
+
+def test_bound_agent_captures_isolated_via_daemon(config_path: Path) -> None:
+    """End-to-end isolation: a bound agent whose host still sends
+    profile_id=default writes its chunk under the bound profile, not default."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        settled = client.post(
+            "/session/end",
+            json={"session_id": "sess-work", "profile_id": "default"},
+        )
+        assert settled.status_code == 200, settled.text
+        from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+        # default namespace sees nothing; bound namespace owns the chunk
+        default_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="default"), Page(limit=10)
+        ).items
+        assert len(default_chunks) == 0, default_chunks
+        work_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="work"), Page(limit=10)
+        ).items
+        assert len(work_chunks) == 1, work_chunks
+        assert work_chunks[0].persona_id == "work"
+        assert work_chunks[0].origin_agent == "agentX"
+        assert work_chunks[0].profile_id == "work"
+        # recall under the bound profile finds it, default does not
+        recall_work = client.post(
+            "/memory/recall", json={"profile_id": "work", "query": "pnpm", "top_k": 5}
+        ).json()
+        assert recall_work["memory"]["entries"], recall_work
+        recall_default = client.post(
+            "/memory/recall", json={"profile_id": "default", "query": "pnpm", "top_k": 5}
+        ).json()
+        assert recall_default["memory"]["entries"] == []
+
+
+def test_archived_but_bound_still_routes(config_path: Path) -> None:
+    """Archived flag does not unbind: an archived profile's binding still
+    routes captures to that profile until explicitly unbound."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        created = client.post("/api/v1/profiles", json={"profile_id": "work"})
+        assert created.status_code == 201, created.text
+        archived = client.post("/api/v1/profiles/archive", json={"profile_id": "work", "archived": True})
+        assert archived.status_code == 200, archived.text
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-archived",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        settled = client.post("/session/end", json={"session_id": "sess-archived", "profile_id": "default"})
+        assert settled.status_code == 200, settled.text
+        from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+        work_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="work"), Page(limit=10)
+        ).items
+        assert len(work_chunks) == 1, work_chunks
+        assert work_chunks[0].profile_id == "work"
+
+
+def test_wire_empty_profile_id_is_422_and_never_guessed(config_path: Path) -> None:
+    """Wire explicit never guessed: empty/blank profile_id stays 422, no
+    fallback to default or binding."""
+    with _boot(config_path) as client:
+        for bad in ("", "   ", "\t"):
+            resp = client.post(
+                "/ingest",
+                json={
+                    "host": HostId.CLAUDE_CODE.value,
+                    "event": "user_prompt",
+                    "session_id": "sess-bad",
+                    "profile_id": bad,
+                    "ts": 1.0,
+                    "content": {"text": DURABLE_TEXT},
+                },
+            )
+            assert resp.status_code == 422, resp.text
+
+
+def test_concurrent_binding_update_is_hot_applied(config_path: Path) -> None:
+    """DB-wins hot-apply: a binding edit via the configwrite face applies to
+    the NEXT drained turn without a restart."""
+    with _boot(config_path) as client:
+        # first turn: no binding, lands in default
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-a",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        settled = client.post("/session/end", json={"session_id": "sess-a", "profile_id": "default"})
+        assert settled.status_code == 200, settled.text
+        # bind agentX -> work live
+        result = client.post(
+            "/api/v1/config/set",
+            json={"key_path": "profiles.agent_bindings", "value": {"agentX": "work"}},
+        ).json()
+        assert result["ok"] is True
+        # second turn: now routes to work
+        resp2 = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-b",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": PLAIN_TEXT},
+            },
+        )
+        assert resp2.status_code == 202, resp2.text
+        settled2 = client.post("/session/end", json={"session_id": "sess-b", "profile_id": "default"})
+        assert settled2.status_code == 200, settled2.text
+        from mnemoseed_local.storage.ports import ChunkFilter, Page
+
+        default_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="default"), Page(limit=10)
+        ).items
+        work_chunks = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="work"), Page(limit=10)
+        ).items
+        assert len(default_chunks) == 1, default_chunks
+        assert len(work_chunks) == 1, work_chunks
+        # unbind live: next turn goes back to default
+        result2 = client.post(
+            "/api/v1/config/set",
+            json={"key_path": "profiles.agent_bindings", "value": {}},
+        ).json()
+        assert result2["ok"] is True
+        resp3 = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-c",
+                "profile_id": "default",
+                "ts": 3.0,
+                "agent": "agentX",
+                "content": {"text": "第三轮以后都用 pip 管理"},
+            },
+        )
+        assert resp3.status_code == 202, resp3.text
+        settled3 = client.post("/session/end", json={"session_id": "sess-c", "profile_id": "default"})
+        assert settled3.status_code == 200, settled3.text
+        default_chunks2 = client.app.state.stores.vector.list_chunks(
+            ChunkFilter(profile_id="default"), Page(limit=10)
+        ).items
+        assert len(default_chunks2) == 2, default_chunks2
+
+
+def test_daemon_write_context_concurrent_binding_update_is_visible() -> None:
+    """Thread-visibility: _daemon_write_context reads the live Config, so a
+    binding mutated on another thread is visible to the next write without a
+    restart. The effective profile flips atomically with the replace."""
+    import threading
+
+    from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    cfg = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host=HostId.OPENCODE,
+        started_at=1.0,
+        origin_agent="agentX",
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    # baseline routes to work
+    assert _daemon_write_context(turn, cfg).profile_id == "work"
+    # concurrent writer flips the binding — reader does pre/post barrier reads
+    # so both work and research are observed (atomic flip, no corruption)
+    barrier = threading.Barrier(2)
+    flip_done = threading.Event()
+
+    def _writer() -> None:
+        barrier.wait(timeout=2)
+        cfg.profiles = ProfilesConfig(agent_bindings={"agentX": "research"})
+        flip_done.set()
+
+    reader_results: list[str] = []
+
+    def _reader() -> None:
+        for _ in range(25):
+            reader_results.append(_daemon_write_context(turn, cfg).profile_id)
+        barrier.wait(timeout=2)
+        assert flip_done.wait(timeout=2)
+        for _ in range(25):
+            reader_results.append(_daemon_write_context(turn, cfg).profile_id)
+
+    t_writer = threading.Thread(target=_writer)
+    t_reader = threading.Thread(target=_reader)
+    t_writer.start()
+    t_reader.start()
+    t_writer.join(timeout=2)
+    t_reader.join(timeout=2)
+    assert not t_writer.is_alive() and not t_reader.is_alive()
+    # after the writer finished, the live config permanently routes to research
+    assert _daemon_write_context(turn, cfg).profile_id == "research"
+    assert all(v in ("work", "research") for v in reader_results)
+    assert "work" in reader_results
+    assert "research" in reader_results
+
+
+# ------------------------------------------------ BLOCKER-1/2 regression oracles (must fail before fix)
+
+
+def test_bound_agent_pool_balances_are_isolated(config_path: Path) -> None:
+    """BLOCKER-1: pool balances must be isolated — a bound agent's S credits
+    the bound profile's pool, not the wire default."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-pool-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        settled = client.post("/session/end", json={"session_id": "sess-pool-work", "profile_id": "default"})
+        assert settled.status_code == 200, settled.text
+        pool = client.app.state.score_pool
+        balances = pool.balances()
+        # work must have received the S, default must stay 0
+        assert balances.get("work", 0.0) > 0, balances
+        assert balances.get("default", 0.0) == 0.0, balances
+
+
+def test_bound_agent_recent_and_pool_share_effective_profile(config_path: Path) -> None:
+    """BLOCKER-1: scorer recent window and pool must share the same effective
+    profile — two identical bound turns must score as repetition under the bound
+    profile, not as novel under default."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # first bound turn
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-recent-a",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        client.post("/session/end", json={"session_id": "sess-recent-a", "profile_id": "default"})
+        # second identical bound turn — scorer should see it as repetition under work
+        resp2 = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-recent-b",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp2.status_code == 202, resp2.text
+        client.post("/session/end", json={"session_id": "sess-recent-b", "profile_id": "default"})
+        pool = client.app.state.score_pool
+        # both turns credited to work, default never sees points
+        assert pool.balances().get("work", 0.0) > 0
+        assert pool.balances().get("default", 0.0) == 0.0
+
+
+def test_bound_agent_focal_pending_isolation(config_path: Path) -> None:
+    """BLOCKER-2: focal pending slot must be parked under the effective profile,
+    not the wire — a bound agent's user_prompt parks pending for work, probe
+    under work sees it, default sees nothing."""
+    # ensure some memory exists to be focal (need a prior chunk)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[profiles]\nagent_bindings = { agentX = "work" }\n'
+        + "[capture]\nauto_recall = true\n",
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # seed a chunk under work via bound ingest
+        seed = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "seed-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed focal seed for work profile isolation"},
+            },
+        )
+        assert seed.status_code == 202, seed.text
+        client.post("/session/end", json={"session_id": "seed-work", "profile_id": "default"})
+        # focal probe from same bound agent
+        probe = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "probe-work",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed focal probe"},
+            },
+        )
+        assert probe.status_code == 202, probe.text
+        # pending slot should be under work, not default
+        memory = client.app.state.memory
+        work_key = ("work", "probe-work")
+        default_key = ("default", "probe-work")
+        # wait a tick for scan thread
+        import time
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if work_key in memory._pending_slots:
+                break
+            time.sleep(0.05)
+        assert work_key in memory._pending_slots, (
+            f"pending not parked under work: {list(memory._pending_slots.keys())}"
+        )
+        assert default_key not in memory._pending_slots
+
+
+def test_orphan_binding_warns_and_audits(config_path: Path) -> None:
+    """IMPORTANT-1: binding to a non-existent profile must warn (and not
+    silently orphan). Minimal oracle: logger warning + audit."""
+    with _boot(config_path) as client:
+        resp = client.post(
+            "/api/v1/config/set",
+            json={
+                "key_path": "profiles.agent_bindings",
+                "value": {"agentX": "ghost"},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["ok"] is True
+        # the binding is still stored (typo not rejected)
+        cfg = client.get("/api/v1/config").json()["config"]
+        assert cfg["profiles"]["agent_bindings"] == {"agentX": "ghost"}
+        audit = client.get("/api/v1/audit", params={"action": "profile_binding_orphan"}).json()
+        assert audit["total"] >= 1, audit
+
+
+def test_writing_pipeline_snapshot_is_pure_and_atomic() -> None:
+    """BLOCKER-1: WritingPipeline must derive effective purely from snapshot.
+
+    Reverse (snapshot {} / live work) must revert to default and forward
+    (snapshot work / live default) must stay work — half-patch fails reverse.
+    """
+    from unittest.mock import MagicMock
+
+    from mnemoseed_local.capture.pipeline import WritingPipeline
+    from mnemoseed_local.capture.scorer import Durability, DurabilityResult, ScoreComponents, ScoredTurn
+    from mnemoseed_local.config import Config, ProfilesConfig
+    from mnemoseed_local.daemon.app import _daemon_write_context
+    from mnemoseed_local.schema.turn import Turn, TurnRole, TurnStep
+
+    turn = Turn(
+        turn_index=0,
+        session_id="s1",
+        profile_id="default",
+        host="opencode",
+        started_at=1.0,
+        origin_agent="agentX",
+        steps=[TurnStep(role=TurnRole.USER, content="hello")],
+    )
+    scored = ScoredTurn(
+        turn=turn,
+        importance=5.0,
+        components=ScoreComponents(arousal=0.1, novelty=0.1, causal_chain=0.1),
+        durability=DurabilityResult(durability=Durability.DURABLE, reasons=[], confidence=0.9),
+        emotion=None,
+        causal_reasons=[],
+        features={},
+    )
+
+    class FakeInner:
+        def __init__(self, item: ScoredTurn) -> None:
+            self._item = item
+            self.pool = MagicMock()
+            self.pool.add_points = MagicMock(return_value=())
+
+        def drain(self, session_id: str, bindings_snapshot: dict[str, str] | None = None) -> list[ScoredTurn]:
+            return [self._item]
+
+        def submit_turn(self, t: Turn) -> None:
+            pass
+
+        def end_session(self, *a: object, **kw: object) -> None:
+            pass
+
+        def sessions(self) -> tuple[str, ...]:
+            return ("s1",)
+
+        def prune_settled(self, *a: object, **kw: object) -> None:
+            pass
+
+    # reverse: snapshot {} (unbound) / live work -> must be default
+    cfg_live_work = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    cfg_snap_empty = Config(profiles=ProfilesConfig(agent_bindings={}))
+    fake_inner = FakeInner(scored)
+    mock_writer = MagicMock()
+    mock_writer.write_many = MagicMock(return_value=[])
+    pipe = WritingPipeline(
+        store=MagicMock(),
+        inner=fake_inner,  # type: ignore[arg-type]
+        writer=mock_writer,  # type: ignore[arg-type]
+        config=cfg_snap_empty,
+        context=lambda t: _daemon_write_context(t, cfg_live_work),
+    )
+    pipe.submit_turn(turn)
+    pipe.drain("s1")
+    ctx = mock_writer.write_many.call_args[0][0][0][1]
+    assert ctx.profile_id == "default", ctx
+    assert ctx.agent_label is None
+
+    # forward: snapshot work / live default -> must be work
+    cfg_snap_work = Config(profiles=ProfilesConfig(agent_bindings={"agentX": "work"}))
+    cfg_live_empty = Config(profiles=ProfilesConfig(agent_bindings={}))
+    fake_inner2 = FakeInner(scored)
+    mock_writer2 = MagicMock()
+    mock_writer2.write_many = MagicMock(return_value=[])
+    pipe2 = WritingPipeline(
+        store=MagicMock(),
+        inner=fake_inner2,  # type: ignore[arg-type]
+        writer=mock_writer2,  # type: ignore[arg-type]
+        config=cfg_snap_work,
+        context=lambda t: _daemon_write_context(t, cfg_live_empty),
+    )
+    pipe2.submit_turn(turn)
+    pipe2.drain("s1")
+    ctx2 = mock_writer2.write_many.call_args[0][0][0][1]
+    assert ctx2.profile_id == "work", ctx2
+    assert ctx2.agent_label == "work"
+
+
+def test_recall_pending_sweep_finds_effective_slot(config_path: Path) -> None:
+    """BLOCKER-2: pending parked under effective 'work' must be pullable via
+    wire 'default' session_id sweep — otherwise hook sees empty slot."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[profiles]\nagent_bindings = { agentX = "work" }\n'
+        + "[capture]\nauto_recall = true\n",
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # seed a chunk under work via bound ingest + drain
+        seed = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "seed-sweep-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed sweep seed for recall_pending work isolation"},
+            },
+        )
+        assert seed.status_code == 202, seed.text
+        resp = client.post(
+            "/session/end",
+            json={"session_id": "seed-sweep-work", "profile_id": "default"},
+        )
+        assert resp.status_code == 200, resp.text
+        # park via bound ingest in a different session
+        probe = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-recall-sweep",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed sweep probe work"},
+            },
+        )
+        assert probe.status_code == 202, probe.text
+        import time
+
+        memory = client.app.state.memory
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and ("work", "sess-recall-sweep") not in memory._pending_slots:
+            time.sleep(0.05)
+        assert ("work", "sess-recall-sweep") in memory._pending_slots
+        assert ("default", "sess-recall-sweep") not in memory._pending_slots
+        # wire pull should sweep and find it — via HTTP surface
+        http_pulled = client.post(
+            "/session/recall-pending",
+            json={"profile_id": "default", "session_id": "sess-recall-sweep", "seen_chunk_ids": []},
+        ).json()
+        # after fix, HTTP pull via wire must find the effective slot (sweep), before fix it returns []
+        assert len(http_pulled["items"]) > 0, http_pulled

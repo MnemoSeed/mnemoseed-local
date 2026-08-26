@@ -1191,34 +1191,54 @@ class MemoryService:
                 "slot_consumed": False,
             }
         with self._pending_lock:
-            served = self._seen_chunk_ids.get(key)
-            excluded = (served if served is not None else frozenset()) | set(seen_chunk_ids)
+            # session-scoped sweep: pending is parked under effective profile
+            # (bound agent → bound profile) while the hook pull carries the
+            # wire profile_id. Like end_session, sweep by session_id so the
+            # effective slot is found regardless of wire.
+            actual_key = key
             slot = self._pending_slots.get(key)
+            if slot is None:
+                for k in self._pending_slots:
+                    if k[1] == session_id:
+                        actual_key = k
+                        slot = self._pending_slots.get(k)
+                        break
+            # served set follows the actual pending slot when found
+            served = self._seen_chunk_ids.get(actual_key if slot is not None else key)
+            # fallback sweep for served when slot was swept
+            if served is None and slot is not None and actual_key != key:
+                served = self._seen_chunk_ids.get(actual_key)
+            excluded = (served if served is not None else frozenset()) | set(seen_chunk_ids)
+            # slot already resolved via sweep
             items = [item for item in slot if item["id"] not in excluded] if slot is not None else []
             if items:
                 if served is None:
                     served = set()
-                    self._seen_chunk_ids[key] = served
+                    self._seen_chunk_ids[actual_key] = served
                 served.update(item["id"] for item in items)
-                self._pending_slots.pop(key, None)
-                non_focal = self._pending_non_focal.pop(key, 0)
-                self._pending_consumed[key] = True  # the serve leaves its tombstone
+                self._pending_slots.pop(actual_key, None)
+                non_focal = self._pending_non_focal.pop(actual_key, 0)
+                self._pending_consumed[actual_key] = True  # the serve leaves its tombstone
                 # B2.7: accrue the daemon-side T2 char count (budget_consumed).
-                self._budget_consumed[key] = self._budget_consumed.get(key, 0) + sum(
+                self._budget_consumed[actual_key] = self._budget_consumed.get(actual_key, 0) + sum(
                     len(item["text"]) + 1 for item in items
                 )
                 slot_consumed = True
             elif slot is not None:
                 # D6 empty serve: the slot survives so a fresh pull can still
                 # consume it; nothing is marked, the tombstone is untouched.
-                non_focal = self._pending_non_focal.get(key, 0)
+                non_focal = self._pending_non_focal.get(actual_key, 0)
                 slot_consumed = False
             else:
-                # No slot: a consumed tombstone means an earlier serve already
-                # took it (the hook's clearing signal); otherwise this session
-                # never had anything to serve (or was settled) — false.
+                # No slot: check tombstone with sweep as well
+                tomb_key = key
+                if key not in self._pending_consumed:
+                    for k in self._pending_consumed:
+                        if k[1] == session_id:
+                            tomb_key = k
+                            break
                 non_focal = 0
-                slot_consumed = self._pending_consumed.get(key, False)
+                slot_consumed = self._pending_consumed.get(tomb_key, False)
         return {
             "enabled": True,
             "items": items,
@@ -1233,16 +1253,48 @@ class MemoryService:
         signal — a pull after the settle finds nothing to serve, the tombstone
         is gone, and the seen-set stops accumulating. The settlement epoch is
         bumped under the lock (NIT-5b): a scan started BEFORE the settle can
-        never re-park a slot afterwards."""
+        never re-park a slot afterwards.
+
+        Profile-bound routing (#130) parks pending slots under the effective
+        profile, while the settle request carries the wire profile_id. To avoid
+        orphan slots, the drop is by session_id — every profile key for that
+        session is cleared and its epoch bumped.
+        """
         key = (profile_id, session_id)
         with self._pending_lock:
+            # exact key
             self._pending_slots.pop(key, None)
             self._pending_non_focal.pop(key, None)
             self._seen_chunk_ids.pop(key, None)
             self._pending_consumed.pop(key, None)
             self._budget_consumed.pop(key, None)
             self._scan_seq.pop(key, None)
+            # orphan pending slots parked under the effective profile (bound
+            # agent's wire vs effective mismatch) — sweep any other profile
+            # keys for the same session_id
+            for k in list(self._pending_slots.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_slots.pop(k, None)
+            for k in list(self._pending_non_focal.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_non_focal.pop(k, None)
+            for k in list(self._seen_chunk_ids.keys()):
+                if k[1] == session_id and k != key:
+                    self._seen_chunk_ids.pop(k, None)
+            for k in list(self._pending_consumed.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_consumed.pop(k, None)
+            for k in list(self._budget_consumed.keys()):
+                if k[1] == session_id and k != key:
+                    self._budget_consumed.pop(k, None)
+            for k in list(self._scan_seq.keys()):
+                if k[1] == session_id and k != key:
+                    self._scan_seq.pop(k, None)
+            # bump epoch for the exact key and any orphan keys
             self._session_epoch[key] = self._session_epoch.get(key, 0) + 1
+            for k in list(self._session_epoch.keys()):
+                if k[1] == session_id and k != key:
+                    self._session_epoch[k] = self._session_epoch.get(k, 0) + 1
 
     # ------------------------------------------------------------ reinforce (B2.1 T3)
 
