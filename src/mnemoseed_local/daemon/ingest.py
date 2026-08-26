@@ -46,17 +46,42 @@ def _observability(request: Request) -> Observability | None:
     return getattr(request.app.state, "observability", None)
 
 
+def _effective_ingest_profile(event: IngestEvent, config: Any | None) -> str:
+    """Effective profile for capture-side routing (#130).
+
+    When the ingest's origin agent is bound, the effective profile is the
+    bound profile, otherwise the wire profile_id. Uses the live config's
+    profile_for helper so archived-does-not-unbind.
+    """
+    if config is not None and event.agent:
+        bound = config.profiles.profile_for(event.agent)
+        if bound is not None:
+            return bound
+    return event.profile_id
+
+
+def _effective_sighting_profile(profile_id: str, agent: str | None, config: Any | None) -> str:
+    if config is not None and agent:
+        bound = config.profiles.profile_for(agent)
+        if bound is not None:
+            return bound
+    return profile_id
+
+
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     segmenter: TurnSegmenter = request.app.state.segmenter
     observability = _observability(request)
+    config = getattr(request.app.state, "config", None)
+    effective_profile = _effective_ingest_profile(event, config)
     if observability is not None:
         # B2.12: capture-hook activity (vs other actors) feeds the doctor's
         # registered-but-never-connected check; every sighting feeds the
-        # first-sighting profile hygiene. Observational only.
+        # first-sighting profile hygiene. Observational only. Sight the
+        # effective profile for bound agents.
         if resolve_actor(request) == "hook":
             observability.note_capture_ingest()
-        observability.note_profile_sighting(event.profile_id)
+        observability.note_profile_sighting(effective_profile)
     try:
         segmenter.ingest(event)
     except ProfileMismatchError as exc:
@@ -73,14 +98,13 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         and isinstance(event.content, MessageContent)
         and event.content.text
     ):
-        config = getattr(request.app.state, "config", None)
         memory = getattr(request.app.state, "memory", None)
         if memory is not None and config is not None and config.capture.auto_recall:
             try:
                 await asyncio.wrap_future(
                     scan_executor.submit(
                         memory.note_user_prompt,
-                        event.profile_id,
+                        effective_profile,
                         event.session_id,
                         event.content.text,
                     )

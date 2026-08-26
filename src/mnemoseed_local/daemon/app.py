@@ -858,14 +858,17 @@ def _build_capture(
     scoring = ScoringPipeline(
         scorer=TurnScorer(embedder=stores.embed),
         pool=pool,
+        config=config,
     )
     return (
         WritingPipeline(
             store=stores.vector,
             inner=scoring,
             embedder=stores.embed,
+            config=config,
             # the live config rides the closure, so a profiles.agent_bindings
-            # write hot-applies to the next drained turn
+            # write hot-applies to the next drained turn; the drain snapshots
+            # bindings so one session is atomic
             context=lambda turn: _daemon_write_context(turn, config),
         ),
         trigger,

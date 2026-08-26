@@ -1233,16 +1233,48 @@ class MemoryService:
         signal — a pull after the settle finds nothing to serve, the tombstone
         is gone, and the seen-set stops accumulating. The settlement epoch is
         bumped under the lock (NIT-5b): a scan started BEFORE the settle can
-        never re-park a slot afterwards."""
+        never re-park a slot afterwards.
+
+        Profile-bound routing (#130) parks pending slots under the effective
+        profile, while the settle request carries the wire profile_id. To avoid
+        orphan slots, the drop is by session_id — every profile key for that
+        session is cleared and its epoch bumped.
+        """
         key = (profile_id, session_id)
         with self._pending_lock:
+            # exact key
             self._pending_slots.pop(key, None)
             self._pending_non_focal.pop(key, None)
             self._seen_chunk_ids.pop(key, None)
             self._pending_consumed.pop(key, None)
             self._budget_consumed.pop(key, None)
             self._scan_seq.pop(key, None)
+            # orphan pending slots parked under the effective profile (bound
+            # agent's wire vs effective mismatch) — sweep any other profile
+            # keys for the same session_id
+            for k in list(self._pending_slots.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_slots.pop(k, None)
+            for k in list(self._pending_non_focal.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_non_focal.pop(k, None)
+            for k in list(self._seen_chunk_ids.keys()):
+                if k[1] == session_id and k != key:
+                    self._seen_chunk_ids.pop(k, None)
+            for k in list(self._pending_consumed.keys()):
+                if k[1] == session_id and k != key:
+                    self._pending_consumed.pop(k, None)
+            for k in list(self._budget_consumed.keys()):
+                if k[1] == session_id and k != key:
+                    self._budget_consumed.pop(k, None)
+            for k in list(self._scan_seq.keys()):
+                if k[1] == session_id and k != key:
+                    self._scan_seq.pop(k, None)
+            # bump epoch for the exact key and any orphan keys
             self._session_epoch[key] = self._session_epoch.get(key, 0) + 1
+            for k in list(self._session_epoch.keys()):
+                if k[1] == session_id and k != key:
+                    self._session_epoch[k] = self._session_epoch.get(k, 0) + 1
 
     # ------------------------------------------------------------ reinforce (B2.1 T3)
 

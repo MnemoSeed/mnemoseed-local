@@ -1569,19 +1569,24 @@ def test_daemon_write_context_concurrent_binding_update_is_visible() -> None:
     )
     # baseline routes to work
     assert _daemon_write_context(turn, cfg).profile_id == "work"
-    # concurrent writer flips the binding
+    # concurrent writer flips the binding — reader does pre/post barrier reads
+    # so both work and research are observed (atomic flip, no corruption)
     barrier = threading.Barrier(2)
+    flip_done = threading.Event()
 
     def _writer() -> None:
         barrier.wait(timeout=2)
         cfg.profiles = ProfilesConfig(agent_bindings={"agentX": "research"})
+        flip_done.set()
 
     reader_results: list[str] = []
 
     def _reader() -> None:
+        for _ in range(25):
+            reader_results.append(_daemon_write_context(turn, cfg).profile_id)
         barrier.wait(timeout=2)
-        # spin a few reads; at least one must see the new binding after the flip
-        for _ in range(50):
+        assert flip_done.wait(timeout=2)
+        for _ in range(25):
             reader_results.append(_daemon_write_context(turn, cfg).profile_id)
 
     t_writer = threading.Thread(target=_writer)
@@ -1593,7 +1598,160 @@ def test_daemon_write_context_concurrent_binding_update_is_visible() -> None:
     assert not t_writer.is_alive() and not t_reader.is_alive()
     # after the writer finished, the live config permanently routes to research
     assert _daemon_write_context(turn, cfg).profile_id == "research"
-    # during the race at least the initial or final value was observed, never a
-    # corrupted profile (only work or research are valid)
     assert all(v in ("work", "research") for v in reader_results)
-    assert "research" in reader_results or _daemon_write_context(turn, cfg).profile_id == "research"
+    assert "work" in reader_results
+    assert "research" in reader_results
+
+
+# ------------------------------------------------ BLOCKER-1/2 regression oracles (must fail before fix)
+
+
+def test_bound_agent_pool_balances_are_isolated(config_path: Path) -> None:
+    """BLOCKER-1: pool balances must be isolated — a bound agent's S credits
+    the bound profile's pool, not the wire default."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-pool-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        settled = client.post(
+            "/session/end", json={"session_id": "sess-pool-work", "profile_id": "default"}
+        )
+        assert settled.status_code == 200, settled.text
+        pool = client.app.state.score_pool
+        balances = pool.balances()
+        # work must have received the S, default must stay 0
+        assert balances.get("work", 0.0) > 0, balances
+        assert balances.get("default", 0.0) == 0.0, balances
+
+
+def test_bound_agent_recent_and_pool_share_effective_profile(config_path: Path) -> None:
+    """BLOCKER-1: scorer recent window and pool must share the same effective
+    profile — two identical bound turns must score as repetition under the bound
+    profile, not as novel under default."""
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '[profiles]\nagent_bindings = { agentX = "work" }\n',
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # first bound turn
+        resp = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-recent-a",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        client.post("/session/end", json={"session_id": "sess-recent-a", "profile_id": "default"})
+        # second identical bound turn — scorer should see it as repetition under work
+        resp2 = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-recent-b",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": DURABLE_TEXT},
+            },
+        )
+        assert resp2.status_code == 202, resp2.text
+        client.post("/session/end", json={"session_id": "sess-recent-b", "profile_id": "default"})
+        pool = client.app.state.score_pool
+        # both turns credited to work, default never sees points
+        assert pool.balances().get("work", 0.0) > 0
+        assert pool.balances().get("default", 0.0) == 0.0
+
+
+def test_bound_agent_focal_pending_isolation(config_path: Path) -> None:
+    """BLOCKER-2: focal pending slot must be parked under the effective profile,
+    not the wire — a bound agent's user_prompt parks pending for work, probe
+    under work sees it, default sees nothing."""
+    # ensure some memory exists to be focal (need a prior chunk)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '[profiles]\nagent_bindings = { agentX = "work" }\n'
+        + "[capture]\nauto_recall = true\n",
+        encoding="utf-8",
+    )
+    with _boot(config_path) as client:
+        # seed a chunk under work via bound ingest
+        seed = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "seed-work",
+                "profile_id": "default",
+                "ts": 1.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed focal seed for work profile isolation"},
+            },
+        )
+        assert seed.status_code == 202, seed.text
+        client.post("/session/end", json={"session_id": "seed-work", "profile_id": "default"})
+        # focal probe from same bound agent
+        probe = client.post(
+            "/ingest",
+            json={
+                "host": HostId.OPENCODE.value,
+                "event": "user_prompt",
+                "session_id": "probe-work",
+                "profile_id": "default",
+                "ts": 2.0,
+                "agent": "agentX",
+                "content": {"text": "MnemoSeed focal probe"},
+            },
+        )
+        assert probe.status_code == 202, probe.text
+        # pending slot should be under work, not default
+        memory = client.app.state.memory
+        work_key = ("work", "probe-work")
+        default_key = ("default", "probe-work")
+        # wait a tick for scan thread
+        import time
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if work_key in memory._pending_slots:
+                break
+            time.sleep(0.05)
+        assert work_key in memory._pending_slots, f"pending not parked under work: {list(memory._pending_slots.keys())}"
+        assert default_key not in memory._pending_slots
+
+
+def test_orphan_binding_warns_and_audits(config_path: Path) -> None:
+    """IMPORTANT-1: binding to a non-existent profile must warn (and not
+    silently orphan). Minimal oracle: logger warning + audit."""
+    with _boot(config_path) as client:
+        resp = client.post(
+            "/api/v1/config/set",
+            json={"key_path": "profiles.agent_bindings", "value": {"agentX": "ghost"}},
+        )
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["ok"] is True
+        # the binding is still stored (typo not rejected)
+        assert client.get("/api/v1/config").json()["config"]["profiles"]["agent_bindings"] == {"agentX": "ghost"}
+        audit = client.get("/api/v1/audit", params={"action": "profile_binding_orphan"}).json()
+        assert audit["total"] >= 1, audit

@@ -1014,6 +1014,28 @@ class ConfigWriteService:
         _patch_toml(path, key_path, validated)
         version_id = self._record(key_path, validated)
         spec.apply(self._config, validated)
+        # orphan namespace warning (IMPORTANT-1): typo like {"planner":"reserach"}
+        # would silently route to a non-existent profile. Warn + audit, not reject.
+        if key_path == "profiles.agent_bindings" and self._meta is not None:
+            try:
+                list_profiles = getattr(self._meta, "list_profiles", None)
+                if callable(list_profiles):
+                    existing = {p.profile_id for p in list_profiles()}
+                    existing.add("default")
+                    orphans = sorted({t for t in validated.values() if t not in existing})
+                    if orphans:
+                        logger.warning(
+                            "profile_binding_orphan: bindings %s point to non-existent profile(s) %s",
+                            validated,
+                            orphans,
+                        )
+                        self._audit(
+                            "profile_binding_orphan",
+                            {"orphans": orphans, "key_path": key_path, "value": validated},
+                            actor,
+                        )
+            except Exception:  # pragma: no cover - warning path must never fail the write
+                logger.warning("orphan binding check failed", exc_info=True)
         self._touch_fingerprint()
         self._bump(key_path)
         restart_required = not spec.live_apply

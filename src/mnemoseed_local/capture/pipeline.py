@@ -228,6 +228,10 @@ class ScoringPipeline:
     (surfaced as stats telemetry), never a persistence gate; the score pool is
     credited with EVERY turn's S. Recent text per profile feeds the scorer's
     novelty / repetition terms.
+
+    Profile-bound isolation (#130): the effective profile for scoring and
+    pooling is resolved from agent_bindings (bound agent → bound profile)
+    snapshot at drain entry, so one drain is atomic.
     """
 
     def __init__(
@@ -238,6 +242,8 @@ class ScoringPipeline:
         scorer: TurnScorer | None = None,
         pool: ScorePool | None = None,
         recent_capacity: int = 16,
+        config: Any | None = None,
+        profile_resolver: Callable[[Turn], str] | None = None,
     ) -> None:
         self._delegate = delegate if delegate is not None else InMemoryCapturePipeline()
         self._stripper = stripper if stripper is not None else Stripper(RULESET_V1)
@@ -246,10 +252,28 @@ class ScoringPipeline:
         )
         self._pool = pool if pool is not None else ScorePool(clock=time.monotonic)
         self._recent_capacity = recent_capacity
+        self._config = config
+        self._profile_resolver = profile_resolver
         self._stripped: dict[str, list[Turn]] = {}
         self._scored: dict[str, list[ScoredTurn]] = {}
         self._recent: dict[str, list[str]] = {}
         self._stats = ScoringStats()
+
+    def _effective_profile(self, turn: Turn, snapshot: dict[str, str] | None = None) -> str:
+        """Effective write/score profile for a turn.
+
+        Uses the per-drain snapshot when provided (atomic drain), otherwise
+        falls back to the live resolver or config. Unbound keeps wire.
+        """
+        if snapshot is not None:
+            bound = snapshot.get(turn.origin_agent) if turn.origin_agent else None
+            return bound if bound is not None else turn.profile_id
+        if self._profile_resolver is not None:
+            return self._profile_resolver(turn)
+        if self._config is not None:
+            bound = self._config.profiles.profile_for(turn.origin_agent)
+            return bound if bound is not None else turn.profile_id
+        return turn.profile_id
 
     def submit_turn(self, turn: Turn) -> None:
         self._delegate.submit_turn(turn)
@@ -261,13 +285,24 @@ class ScoringPipeline:
         """Swap the stripper ruleset; governs turns drained after this call."""
         self._stripper.reload_rules(ruleset)
 
-    def drain(self, session_id: str) -> list[ScoredTurn]:
+    def drain(
+        self, session_id: str, *, bindings_snapshot: dict[str, str] | None = None
+    ) -> list[ScoredTurn]:
         """Process pending turns of one session; returns the newly scored turns.
 
         Verbatim contract: every turn is scored, retained, and its S credited
         to the pool; the F2 durability verdict only lands as annotation
         telemetry — nothing is ever dropped here.
+
+        When a config or resolver is bound, the effective profile is snapshot
+        at drain entry so one drain is atomic.
         """
+        # atomic snapshot for the whole drain
+        if bindings_snapshot is None and self._config is not None:
+            bindings_snapshot = dict(self._config.profiles.agent_bindings)
+        elif bindings_snapshot is None and self._profile_resolver is not None:
+            # resolver without snapshot: fall back to per-turn resolver
+            bindings_snapshot = None
         raw = self._delegate.turns(session_id)
         stripped_done = len(self._stripped.get(session_id, []))
         results: list[ScoredTurn] = []
@@ -280,7 +315,8 @@ class ScoringPipeline:
             for rule_id, size in stripped.stats.matched_by_rule.items():
                 self._stats.matched_by_rule[rule_id] = self._stats.matched_by_rule.get(rule_id, 0) + size
             self._stripped.setdefault(session_id, []).append(stripped.turn)
-            recent = self._recent.setdefault(turn.profile_id, [])
+            effective = self._effective_profile(turn, bindings_snapshot)
+            recent = self._recent.setdefault(effective, [])
             scored = self._scorer.score_turn(
                 stripped.turn,
                 recent_texts=tuple(recent),
@@ -288,7 +324,7 @@ class ScoringPipeline:
             )
             self._stats.turns_in += 1
             next_recent = [*recent, _user_text(stripped.turn)]
-            self._recent[turn.profile_id] = next_recent[-self._recent_capacity :]
+            self._recent[effective] = next_recent[-self._recent_capacity :]
             if scored.durability.durability is Durability.DURABLE:
                 self._stats.durable_flagged += 1
             else:
@@ -297,7 +333,7 @@ class ScoringPipeline:
                 self._stats.disposable_reasons[reason] = self._stats.disposable_reasons.get(reason, 0) + 1
             self._scored.setdefault(session_id, []).append(scored)
             fired = self._pool.add_points(
-                turn.profile_id,
+                effective,
                 scored.importance,
                 TurnRange(turn.turn_index, turn.turn_index),
             )
@@ -375,12 +411,14 @@ class WritingPipeline:
         # provenance times), which every downstream consumer (decay sweep,
         # ingest windows, audit) reads as epoch (D3)
         clock: Callable[[], float] = time.time,
+        config: Any | None = None,
     ) -> None:
         resolved_embedder = embedder if embedder is not None else cast(Embedder, SyntheticEmbedder())
         self._inner = (
             inner if inner is not None else ScoringPipeline(scorer=TurnScorer(embedder=resolved_embedder))
         )
         self._context = context if context is not None else _default_write_context
+        self._config = config
         if writer is None:
             writer = StampWriter(
                 store,
@@ -401,9 +439,31 @@ class WritingPipeline:
         self._inner.reload_rules(ruleset)
 
     def drain(self, session_id: str) -> list[WriteOutcome]:
-        """Score pending turns, then write the durable ones to the store."""
-        scored = self._inner.drain(session_id)
-        outcomes = self._writer.write_many([(item, self._context(item.turn)) for item in scored])
+        """Score pending turns, then write the durable ones to the store.
+
+        One drain is atomic: agent_bindings are snapshot at entry so a
+        mid-drain binding update cannot split one session across two profiles.
+        """
+        # snapshot for atomic drain — mirrors ScoringPipeline snapshot
+        bindings_snapshot: dict[str, str] | None = None
+        if self._config is not None:
+            bindings_snapshot = dict(self._config.profiles.agent_bindings)
+            scored = self._inner.drain(session_id, bindings_snapshot=bindings_snapshot)
+        else:
+            scored = self._inner.drain(session_id)
+        # contexts are also snapshot-consistent
+        contexts: list[tuple[ScoredTurn, WriteContext]] = []
+        for item in scored:
+            ctx = self._context(item.turn)
+            if bindings_snapshot is not None and item.turn.origin_agent is not None:
+                bound = bindings_snapshot.get(item.turn.origin_agent)
+                if bound is not None and bound != ctx.profile_id:
+                    # replace with snapshot-effective profile + persona
+                    from dataclasses import replace
+
+                    ctx = replace(ctx, profile_id=bound, agent_label=bound)
+            contexts.append((item, ctx))
+        outcomes = self._writer.write_many(contexts)
         for outcome in outcomes:
             self._stats.turns_written += 1
             if outcome.kind is WriteOutcomeKind.NEW_CHUNK:
