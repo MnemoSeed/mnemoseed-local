@@ -386,3 +386,17 @@ def test_distinct_profile_ids(stack) -> None:
     stack.vector.upsert_chunk(make_stamp("a1", "alpha beta gamma"), a.dense, a.sparse)
     stack.vector.upsert_chunk(make_stamp("b1", "delta epsilon zeta", profile_id="bob"), a.dense, a.sparse)
     assert stack.vector.distinct_profile_ids() == {PROFILE, "bob"}
+
+
+def test_get_dense_batch_projection(stack) -> None:
+    """get_dense: projects vector_dense per chunk id; missing ids omitted."""
+    a = stack.embed.embed("alpha beta gamma")
+    b = stack.embed.embed("delta epsilon zeta")
+    stack.vector.upsert_chunk(make_stamp("a1", "alpha beta gamma"), a.dense, a.sparse)
+    stack.vector.upsert_chunk(make_stamp("b1", "delta epsilon zeta"), b.dense, b.sparse)
+    result = stack.vector.get_dense(["a1", "b1", "missing"])
+    assert set(result.keys()) == {"a1", "b1"}
+    assert result["a1"] == pytest.approx(list(a.dense))
+    assert result["b1"] == pytest.approx(list(b.dense))
+    assert stack.vector.get_dense([]) == {}
+    assert stack.vector.get_dense(["ghost"]) == {}

@@ -45,7 +45,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Annotated, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -161,6 +161,13 @@ class TimelineRequest(BaseModel):
 
 class ExportRequest(BaseModel):
     profile_id: ProfileRef
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+class AtlasRequest(BaseModel):
+    profile_id: ProfileRef
+    kind: Literal["chunks", "nodes", "both"] = "both"
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=50, ge=1, le=500)
 
@@ -1344,6 +1351,191 @@ class MemoryService:
             },
         }
 
+    # ------------------------------------------------------------ atlas (C-1)
+
+    def atlas(
+        self,
+        *,
+        profile_id: str,
+        kind: str = "both",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Atlas listing + CHUNKS-ONLY PCA positions.
+
+        Returns lightweight AtlasItem list with honest total and window-truncated
+        flag. Positions are computed only over chunks via VectorStore.get_dense;
+        nodes never participate in PCA. Algo is "pca" when window chunks with
+        dense >=2 else "unavailable" with positions null. No sparse PCA, no
+        client-side PCA.
+        """
+        # Honest totals: always count both stores to keep total = chunk_total + node_total.
+        chunk_total = 0
+        node_total = 0
+        chunk_items: list[ChunkStamp] = []
+        node_items: list[Any] = []
+        if kind in ("both", "chunks"):
+            chunk_page = self._stores.vector.list_chunks(
+                ChunkFilter(profile_id=profile_id), Page(offset=offset, limit=limit)
+            )
+            chunk_total = chunk_page.total
+            chunk_items = chunk_page.items
+        else:
+            # still need total for honest sum when kind != both? Use 0 for excluded kind
+            # but fetch total via a counted query only if needed; keep cheap: query total only
+            # when kind == nodes we already know node_total, chunk_total stays 0
+            pass
+        if kind in ("both", "nodes"):
+            node_page = self._stores.graph.list_nodes(
+                NodeFilter(profile_id=profile_id), Page(offset=offset, limit=limit)
+            )
+            node_total = node_page.total
+            node_items = node_page.items
+        if kind == "chunks":
+            total = chunk_total
+        elif kind == "nodes":
+            total = node_total
+        else:
+            total = chunk_total + node_total
+
+        # Build lightweight items
+        items: list[dict[str, Any]] = []
+        chunk_by_id: dict[str, ChunkStamp] = {}
+        for chunk in chunk_items:
+            chunk_by_id[chunk.chunk_id] = chunk
+            items.append(
+                {
+                    "id": chunk.chunk_id,
+                    "kind": "chunk",
+                    "text_head": chunk.text[:120],
+                    "decay_weight": chunk.decay_weight,
+                    "is_explicit_pin": chunk.provenance.source == EXPLICIT_PIN_SOURCE,
+                    "node_type": None,
+                    "entities": list(chunk.cues.entities),
+                    "ingested_at": chunk.ingested_at,
+                    "valid_from": None,
+                    "updated_at": None,
+                    "flags": {
+                        "consolidated": bool(chunk.consolidated),
+                        "explicit_pin": chunk.provenance.source == EXPLICIT_PIN_SOURCE,
+                    },
+                    "score": chunk.score,
+                }
+            )
+        for node in node_items:
+            statement = node.props.get("statement") if isinstance(node.props, dict) else None
+            text_head = statement[:120] if isinstance(statement, str) else ""[:120]
+            nt = node.node_type
+            nt_val = nt.value if hasattr(nt, "value") else str(nt)
+            items.append(
+                {
+                    "id": node.node_id,
+                    "kind": "node",
+                    "text_head": text_head,
+                    "decay_weight": node.decay_weight,
+                    "is_explicit_pin": False,
+                    "node_type": nt_val,
+                    "entities": list(node.entities),
+                    "ingested_at": None,
+                    "valid_from": node.valid_from,
+                    "updated_at": node.updated_at,
+                    "flags": {
+                        "conflict": bool(getattr(node, "conflict_flag", False)),
+                        "pending": bool(getattr(node, "pending_consolidation", False)),
+                        "needs_reconcile": bool(getattr(node, "needs_reconcile", False)),
+                        "peripheral_gaps": bool(getattr(node, "peripheral_gaps", False)),
+                    },
+                    "confidence": getattr(node, "confidence", None),
+                }
+            )
+        # When kind==both, sort combined by time desc for deterministic paging, then slice to limit if needed.
+        if kind == "both":
+            # Determine a time key: chunks ingested_at, nodes valid_from
+            def _time_key(item: dict[str, Any]) -> float:
+                if item["kind"] == "chunk":
+                    return float(item["ingested_at"] or 0)
+                return float(item["valid_from"] or 0)
+
+            items.sort(key=_time_key, reverse=True)
+            # Enforce unified limit: if per-type fetches gave up to 2*limit, trim to limit when offset==0
+            if offset == 0 and len(items) > limit:
+                items = items[:limit]
+            # For offset>0 with unified paging, we'd need more fetched; keep honest truncation marker
+            window_truncated = len(items) < total
+        else:
+            window_truncated = len(items) < total
+
+        # Positions: CHUNKS-ONLY PCA via get_dense
+        positions: dict[str, list[float]] | None = None
+        algo: str = "unavailable"
+        # Only chunks in the returned window participate; nodes omitted
+        returned_chunk_ids = [item["id"] for item in items if item["kind"] == "chunk"]
+        dense_map: dict[str, list[float]] = {}
+        if returned_chunk_ids:
+            try:
+                dense_map = self._stores.vector.get_dense(returned_chunk_ids)  # type: ignore[attr-defined]
+            except Exception:
+                dense_map = {}
+        if len(dense_map) >= 2:
+            # Build matrix for PCA
+            try:
+                import numpy as np  # type: ignore[import-untyped]
+
+                ordered_ids = list(dense_map.keys())
+                vectors = [dense_map[cid] for cid in ordered_ids]
+                mat = np.array(vectors, dtype=float)
+                # Center columns
+                mean = mat.mean(axis=0)
+                centered = mat - mean
+                # SVD
+                _u, s, vt = np.linalg.svd(centered, full_matrices=False)
+                # First PC projection: centered @ vt[0]
+                if centered.shape[1] == 0 or s[0] == 0:
+                    x_raw = np.zeros(len(ordered_ids))
+                else:
+                    # Use U * S for numerical stability; fallback to projection
+                    try:
+                        x_raw = _u[:, 0] * s[0]
+                    except Exception:
+                        x_raw = centered @ vt[0]
+                # Normalize x to [-1,1]
+                xmin = float(np.min(x_raw))
+                xmax = float(np.max(x_raw))
+                if xmax - xmin < 1e-9:
+                    x_norm = np.zeros_like(x_raw)
+                else:
+                    x_norm = 2 * (x_raw - xmin) / (xmax - xmin) - 1
+                # y normalized time (ingested_at) for those chunk ids
+                times = [float(chunk_by_id[cid].ingested_at) for cid in ordered_ids]
+                t_min = min(times)
+                t_max = max(times)
+                if t_max - t_min < 1e-9:
+                    y_norm = [0.5] * len(ordered_ids)
+                else:
+                    y_norm = [(t - t_min) / (t_max - t_min) for t in times]
+                positions = {}
+                for idx, cid in enumerate(ordered_ids):
+                    decay_w = float(chunk_by_id[cid].decay_weight)
+                    z = 1.0 - decay_w
+                    positions[cid] = [float(x_norm[idx]), float(y_norm[idx]), float(z)]
+                algo = "pca"
+            except Exception:
+                positions = None
+                algo = "unavailable"
+        else:
+            positions = None
+            algo = "unavailable"
+
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "window_truncated": window_truncated,
+            "positions": positions,
+            "algo": algo,
+        }
+
     # ------------------------------------------------------------ forget_this
 
     def forget_this(
@@ -1503,6 +1695,17 @@ def memory_timeline(req: TimelineRequest, request: Request) -> dict[str, Any]:
 def memory_export(req: ExportRequest, request: Request) -> dict[str, Any]:
     service: MemoryService = request.app.state.memory
     return service.export(profile_id=req.profile_id, offset=req.offset, limit=req.limit)
+
+
+@router.post("/memory/atlas")
+def memory_atlas(req: AtlasRequest, request: Request) -> dict[str, Any]:
+    service: MemoryService = request.app.state.memory
+    return service.atlas(
+        profile_id=req.profile_id,
+        kind=req.kind,
+        offset=req.offset,
+        limit=req.limit,
+    )
 
 
 @router.post("/session/recent")

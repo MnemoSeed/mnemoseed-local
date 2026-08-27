@@ -27,6 +27,7 @@ COVERAGE: dict[str, dict[str, str]] = {
         "update_weights": "test_contract_vector.py::test_update_weights",
         "update_chunk_state": "test_contract_vector.py::test_update_chunk_state_usage_counts",
         "list_chunks": "test_contract_vector.py::test_list_chunks_filter_pagination",
+        "get_dense": "test_contract_vector.py::test_get_dense_batch_projection",
         "distinct_profile_ids": "test_contract_vector.py::test_distinct_profile_ids",
     },
     "GraphStore": {
@@ -108,9 +109,10 @@ COVERAGE: dict[str, dict[str, str]] = {
 # atomic fire-time gauge->ledger drain on the score pool), and to 35 with
 # create_profile (the insert-only duplicate guard behind POST /api/v1/profiles).
 # VectorStore grew to 15 with distinct_profile_ids (observational captured-
-# namespace enumeration behind the doctor's unknown-profile check).
+# namespace enumeration behind the doctor's unknown-profile check) and to 16
+# with get_dense (Atlas CHUNKS-ONLY PCA dense projection).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
-    "VectorStore": 15,
+    "VectorStore": 16,
     "GraphStore": 21,
     "MetaStore": 35,
     "Embedder": 3,

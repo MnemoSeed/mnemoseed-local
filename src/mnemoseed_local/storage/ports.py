@@ -630,6 +630,15 @@ class VectorStore(Protocol):
     def list_chunks(self, filter: ChunkFilter, page: Page) -> PageResult[ChunkStamp]:
         raise NotImplementedError
 
+    def get_dense(self, chunk_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Batch dense-vector projection for Atlas PCA (CHUNKS-ONLY).
+
+        Returns the dense vector per chunk id for the requested ids; missing ids
+        are omitted silently. Only the ``vector_dense`` column is projected —
+        sparse vectors never participate.
+        """
+        raise NotImplementedError
+
     def distinct_profile_ids(self) -> set[str]:
         """Every profile_id present in stored chunks (observational reads).
 
