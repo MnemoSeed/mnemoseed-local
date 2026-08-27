@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>MnemoSeed Local — Console</title>
+  <meta name="description" content="MnemoSeed Local console — daemon status and Memory Atlas.">
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar" role="banner">
+    <div class="topbar-inner">
+      <div class="brand" aria-label="MnemoSeed Local Console">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">MnemoSeed <span class="brand-muted">Local</span></span>
+        <span class="brand- Pill" title="local-only, no cloud">local-only</span>
+      </div>
+      <nav class="tabs" aria-label="Primary">
+        <a href="#/overview" data-route="overview" class="tab is-active" aria-current="page">Overview</a>
+        <a href="#/memory/atlas" data-route="atlas" class="tab">Memory Atlas</a>
+      </nav>
+      <div class="topbar-actions">
+        <span id="daemon-dot" class="daemon-dot is-unknown" aria-hidden="true"></span>
+        <span id="daemon-dot-label" class="daemon-dot-label">Checking…</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="daemon-unreachable" class="banner banner-error" hidden role="alert">
+    <strong>Daemon unreachable at http://localhost:7788</strong> — run <code>mnemoseed-local up</code>
+    <span class="banner-hint">The console is served by the daemon itself (loopback only). Start the daemon and refresh.</span>
+  </div>
+
+  <main id="main" class="shell">
+    <!-- ================= OVERVIEW ================= -->
+    <section id="view-overview" class="view" aria-labelledby="overview-title">
+      <div class="page-head">
+        <h1 id="overview-title" class="page-title">Overview</h1>
+        <p class="page-desc">Daemon health, observability counters, and resolved config (redacted — names only).</p>
+      </div>
+
+      <div class="overview-grid">
+        <!-- Daemon status card -->
+        <article class="card card-status" aria-labelledby="status-title">
+          <div class="card-head">
+            <h2 id="status-title" class="card-title">Daemon status</h2>
+            <button id="overview-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+          </div>
+          <div id="status-body" class="card-body">
+            <div class="skeleton skeleton-line" style="width:62%"></div>
+            <div class="skeleton skeleton-line" style="width:78%"></div>
+            <div class="skeleton skeleton-line" style="width:54%"></div>
+          </div>
+          <div id="status-meta" class="card-foot muted"></div>
+        </article>
+
+        <!-- Observability -->
+        <article class="card" aria-labelledby="obs-title">
+          <div class="card-head">
+            <h2 id="obs-title" class="card-title">Observability</h2>
+            <span class="badge badge-muted">since boot</span>
+          </div>
+          <div id="observability-body" class="card-body">
+            <div class="skeleton skeleton-line" style="width: 70%"></div>
+            <div class="skeleton skeleton-line" style="width: 55%"></div>
+          </div>
+          <p id="observability-foot" class="card-foot muted"></p>
+        </article>
+
+        <!-- Health detail -->
+        <article class="card" aria-labelledby="health-title">
+          <div class="card-head">
+            <h2 id="health-title" class="card-title">Drivers</h2>
+            <span class="badge">/health</span>
+          </div>
+          <div id="health-body" class="card-body">
+            <div class="skeleton skeleton-line" style="width: 68%"></div>
+            <div class="skeleton skeleton-line" style="width: 82%"></div>
+          </div>
+          <p class="card-foot muted">Vector · Graph · Meta · Embed driver names from <code>/health</code>.</p>
+        </article>
+      </div>
+
+      <!-- Config read-only -->
+      <article class="card card-config" aria-labelledby="config-title">
+        <div class="card-head">
+          <h2 id="config-title" class="card-title">Config — read-only</h2>
+          <span class="badge badge-muted">GET /api/v1/config · redacted</span>
+        </div>
+        <p class="config-lead">Secrets are never shown — only env-var names. This page never writes.</p>
+        <div id="config-body" class="card-body">
+          <div class="skeleton skeleton-line" style="width: 90%"></div>
+          <div class="skeleton skeleton-line" style="width: 86%"></div>
+          <div class="skeleton skeleton-line" style="width: 72%"></div>
+          <div class="skeleton skeleton-block"></div>
+        </div>
+        <div id="config-foot" class="card-foot muted"></div>
+      </article>
+    </section>
+
+    <!-- ================= ATLAS ================= -->
+    <section id="view-atlas" class="view" hidden aria-labelledby="atlas-title">
+      <div class="page-head atlas-head">
+        <div>
+          <h1 id="atlas-title" class="page-title">Memory Atlas — see all your long-term memories in one place.</h1>
+          <p class="page-desc">3D ↔ List · color = type · depth = decay · size = score/hits · drag to orbit, scroll to zoom, click a point for details.</p>
+        </div>
+        <div class="atlas-head-actions">
+          <div class="segmented" role="group" aria-label="View mode">
+            <button id="mode-3d" class="seg-btn is-active" type="button" aria-pressed="true">3D</button>
+            <button id="mode-list" class="seg-btn" type="button" aria-pressed="false">List</button>
+          </div>
+          <label class="field field-inline">
+            <span class="field-label">Profile</span>
+            <select id="atlas-profile" class="select" aria-label="Profile">
+              <option value="">Pick a profile to explore</option>
+              <option value="default">default</option>
+            </select>
+          </label>
+          <button id="atlas-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+          <button id="atlas-share" class="btn btn-ghost btn-sm" type="button" title="Copy URL with filters and selection">Share view</button>
+        </div>
+      </div>
+
+      <!-- Filter bar — minimal: Kind/Type/Decay/Time/Entities + Density -->
+      <div class="filterbar" role="toolbar" aria-label="Filters">
+        <label class="field">
+          <span class="field-label">Kind</span>
+          <select id="f-kind" class="select">
+            <option value="all">All</option>
+            <option value="chunks">Chunks</option>
+            <option value="nodes">Nodes</option>
+          </select>
+        </label>
+
+        <label class="field" id="field-type">
+          <span class="field-label">Type</span>
+          <select id="f-type" class="select">
+            <option value="all">All</option>
+            <option value="USER">USER</option>
+            <option value="HABIT">HABIT</option>
+            <option value="PREFERENCE">PREFERENCE</option>
+            <option value="ANIMA">ANIMA</option>
+            <option value="INTENTION">INTENTION</option>
+            <option value="CONSTRAINT">CONSTRAINT</option>
+            <option value="EPISODE">EPISODE</option>
+            <option value="SKILL_SEQUENCE">SKILL_SEQUENCE</option>
+            <option value="DECISION">DECISION</option>
+            <option value="PROJECT">PROJECT</option>
+            <option value="TOOL">TOOL</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Decay</span>
+          <select id="f-decay" class="select">
+            <option value="all">All</option>
+            <option value="healthy">Healthy (≥0.40)</option>
+            <option value="rescue">Rescue (0.15–0.40)</option>
+            <option value="fading">Fading (&lt;0.15)</option>
+            <option value="never">Never-decay</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Time</span>
+          <select id="f-time" class="select">
+            <option value="all">All</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+            <option value="90d">Last 90 days</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+
+        <label class="field field-entities">
+          <span class="field-label">Entities</span>
+          <input id="f-entities" class="input" type="search" placeholder="Filter by entities, comma separated — e.g. ai, lancedb" autocomplete="off" spellcheck="false">
+        </label>
+
+        <label class="field">
+          <span class="field-label">Density</span>
+          <select id="f-density" class="select" title="3D render cap">
+            <option value="auto">Auto</option>
+            <option value="500">500</option>
+            <option value="2000">2k</option>
+            <option value="10000">10k</option>
+          </select>
+        </label>
+
+        <button id="f-clear" class="btn btn-ghost btn-sm" type="button">Clear</button>
+        <span class="filterbar-spacer" aria-hidden="true"></span>
+        <span id="atlas-count" class="count pill pill-muted" aria-live="polite">—</span>
+      </div>
+
+      <!-- Time custom row (collapsed) -->
+      <div id="time-custom-row" class="time-custom-row" hidden>
+        <label class="field">
+          <span class="field-label">From</span>
+          <input id="f-time-from" class="input input-sm" type="datetime-local">
+        </label>
+        <label class="field">
+          <span class="field-label">To</span>
+          <input id="f-time-to" class="input input-sm" type="datetime-local">
+        </label>
+      </div>
+
+      <!-- Banners -->
+      <div id="atlas-banner-fallback" class="banner banner-warn" hidden role="status">
+        3D unavailable — showing 2.5D fallback. <button id="retry-3d" class="btn btn-sm" type="button">Retry 3D</button>
+        <span class="banner-hint">Offline or CDN blocked — isometric Canvas fallback keeps filters and details working.</span>
+      </div>
+      <div id="atlas-banner-truncated" class="banner banner-warn" hidden role="status">
+        Window truncated — some older memories are hidden. Narrow the time range.
+        <span id="truncated-detail" class="banner-hint"></span>
+      </div>
+      <div id="atlas-banner-error" class="banner banner-error" hidden role="alert"></div>
+
+      <!-- Main: canvas/list + drawer -->
+      <div class="atlas-main">
+        <div class="atlas-stage">
+          <!-- 3D / 2.5D canvas -->
+          <div id="atlas-canvas-wrap" class="canvas-wrap" tabindex="0" role="img" aria-label="Memory 3D atlas, use arrow keys to orbit, F to focus selection, R to reset view">
+            <canvas id="atlas-canvas" class="atlas-canvas" width="800" height="520" aria-hidden="true"></canvas>
+            <canvas id="atlas-canvas-2d" class="atlas-canvas atlas-canvas-2d" hidden width="800" height="520" aria-hidden="true"></canvas>
+            <div id="atlas-hover" class="hover-card" hidden></div>
+            <div id="atlas-empty" class="canvas-empty" hidden>
+              <div class="empty-star" aria-hidden="true"></div>
+              <p class="empty-title">No memories yet — start a conversation, then return here.</p>
+              <a href="#/overview" class="btn btn-primary btn-sm">Go to Overview</a>
+            </div>
+            <div id="atlas-filtered-empty" class="canvas-empty" hidden>
+              <p class="empty-title">No matches for these filters — try clearing Decay or Entities.</p>
+              <button id="clear-from-empty" class="btn btn-ghost btn-sm" type="button">Clear filters</button>
+            </div>
+            <div id="atlas-loading" class="canvas-loading" hidden aria-live="polite">Loading your memories…</div>
+            <div class="legend" aria-hidden="true">
+              <span class="legend-title">Legend</span>
+              <span class="legend-row">
+                <i class="dot" style="--c: var(--atlas-c1)"></i> USER
+                <i class="dot" style="--c: var(--atlas-c2)"></i> HABIT
+                <i class="dot" style="--c: var(--atlas-c3)"></i> PREFERENCE
+                <i class="dot" style="--c: var(--atlas-c4)"></i> ANIMA
+                <i class="dot" style="--c: var(--atlas-c5)"></i> INTENTION
+                <i class="dot" style="--c: var(--atlas-c6)"></i> CONSTRAINT
+                <i class="dot" style="--c: var(--atlas-c7)"></i> EPISODE
+                <i class="dot" style="--c: var(--atlas-c8)"></i> SKILL
+                <i class="dot" style="--c: var(--atlas-c9)"></i> DECISION
+                <i class="dot" style="--c: var(--atlas-c10)"></i> PROJECT
+                <i class="dot" style="--c: var(--atlas-c11)"></i> TOOL
+                <i class="dot dot-chunk"></i> Chunk
+                <i class="dot dot-pin"></i> Pinned
+                <span class="legend-sep">—</span> Relation <span class="legend-dashed">··</span> Co-occurrence <span class="legend-ring"></span> Conflict <span class="legend-ring legend-ring-pending"></span> Pending
+              </span>
+            </div>
+            <div class="canvas-hint">3D memory map — drag to orbit, scroll to zoom, click a point for details. <span class="muted">F — Focus · R — Reset view · E — Edges · C — Consolidated · / — Search entities · Esc — Clear</span></div>
+          </div>
+
+          <!-- List (virtualized) -->
+          <div id="atlas-list-wrap" class="list-wrap" hidden>
+            <div class="list-head" role="rowgroup">
+              <div class="list-row list-row-head" role="row">
+                <span class="col col-kind" role="columnheader">Kind</span>
+                <span class="col col-title" role="columnheader">Title</span>
+                <span class="col col-type" role="columnheader">Type</span>
+                <span class="col col-entities" role="columnheader">Entities</span>
+                <span class="col col-decay" role="columnheader">Decay</span>
+                <span class="col col-updated" role="columnheader">Updated</span>
+                <span class="col col-flags" role="columnheader">Flags</span>
+                <span class="col col-hits" role="columnheader">Hits</span>
+              </div>
+            </div>
+            <div id="atlas-list" class="list-body" role="table" aria-label="List of memories" tabindex="0">
+              <div id="list-spacer" class="list-spacer"></div>
+              <div id="list-viewport" class="list-viewport"></div>
+            </div>
+            <div id="list-empty" class="canvas-empty" hidden>
+              <p class="empty-title">No matches for these filters — try clearing Decay or Entities.</p>
+              <button class="btn btn-ghost btn-sm js-clear-filters" type="button">Clear filters</button>
+            </div>
+          </div>
+
+          <div id="atlas-statusbar" class="statusbar muted" aria-live="polite"></div>
+        </div>
+
+        <!-- Drawer -->
+        <aside id="drawer" class="drawer" aria-label="Details for selected memory">
+          <div class="drawer-drag" id="drawer-drag" aria-hidden="true" title="Drag to resize (320–480px)"></div>
+          <div class="drawer-head">
+            <h2 class="drawer-title">Details</h2>
+            <button id="drawer-close" class="btn btn-ghost btn-sm" type="button" aria-label="Close details">×</button>
+          </div>
+          <div id="drawer-empty" class="drawer-empty muted">
+            <p>Select a point or row to see details.</p>
+            <p class="small">Header · Provenance · Decay & Health · Scores · Graph · Timeline · Audit · Actions — all read-only except explicit verbs.</p>
+          </div>
+          <div id="drawer-content" class="drawer-content" hidden>
+            <!-- 1 Header -->
+            <section class="drawer-sec is-open" data-sec="header">
+              <button class="drawer-sec-head" type="button" aria-expanded="true">Header</button>
+              <div class="drawer-sec-body">
+                <p id="d-title" class="d-title"></p>
+                <p class="d-badges">
+                  <span id="d-kind" class="badge"></span>
+                  <span id="d-type" class="badge badge-muted"></span>
+                  <span id="d-pinned" class="badge badge-pin" hidden>Pinned</span>
+                  <span id="d-consolidated" class="badge badge-muted" hidden>Consolidated</span>
+                  <span id="d-version" class="badge badge-muted"></span>
+                  <span id="d-id" class="badge badge-id" title="Click to copy full ID"></span>
+                </p>
+                <p class="small muted"><span id="d-profile"></span> <span id="d-session"></span></p>
+                <p class="small muted"><span id="d-time"></span></p>
+              </div>
+            </section>
+            <!-- 2 Provenance -->
+            <section class="drawer-sec is-open" data-sec="provenance">
+              <button class="drawer-sec-head" type="button" aria-expanded="true">Provenance</button>
+              <div class="drawer-sec-body small">
+                <p><strong>Asserted by</strong> <span id="d-asserted-by">—</span> · <strong>Source</strong> <span id="d-source">—</span> · <strong>Confidence</strong> <span id="d-confidence">—</span> · <strong>At</strong> <span id="d-asserted-at">—</span></p>
+                <div id="d-history" class="timeline-mini"></div>
+                <p><span id="d-gaps" class="badge badge-muted" hidden>Peripheral gaps</span> <span id="d-promotion" class="badge badge-muted" hidden>Promotion: promoted</span></p>
+              </div>
+            </section>
+            <!-- 3 Decay -->
+            <section class="drawer-sec is-open" data-sec="decay">
+              <button class="drawer-sec-head" type="button" aria-expanded="true">Decay & Health</button>
+              <div class="drawer-sec-body">
+                <div class="decay-big">
+                  <span id="d-decay-val" class="decay-val">—</span>
+                  <span id="d-decay-label" class="badge"></span>
+                </div>
+                <div class="progress" aria-hidden="true"><div id="d-decay-bar" class="progress-bar"></div></div>
+                <p class="small muted">w = confidence × exp(-λ·days) · <span id="d-lambda">λ = —</span> · <span id="d-half">Half-life —</span></p>
+                <p class="small muted"><span id="d-last-reinforced">—</span> · <span id="d-reinforce-count">—</span> · <span id="d-hit-count">—</span></p>
+                <p class="small muted">30-day forecast <span id="d-forecast-30">—</span> · 90-day <span id="d-forecast-90">—</span></p>
+              </div>
+            </section>
+            <!-- 4 Scores -->
+            <section class="drawer-sec" data-sec="scores">
+              <button class="drawer-sec-head" type="button" aria-expanded="false">Scores & Retrieval signals</button>
+              <div class="drawer-sec-body small" hidden>
+                <p><strong id="d-score">Score —</strong> <span id="d-rescued" class="badge badge-warn" hidden>Rescued — this pin was below the main floor but strong cues brought it back</span></p>
+                <p id="d-pending-note" class="badge badge-pending" hidden>Pending consolidation — fresh evidence overlaps this fact</p>
+                <p id="d-score-note" class="muted">Not from a recall — scores appear when you arrive from Search</p>
+              </div>
+            </section>
+            <!-- 5 Graph -->
+            <section class="drawer-sec" data-sec="graph">
+              <button class="drawer-sec-head" type="button" aria-expanded="false">Graph & Edges</button>
+              <div class="drawer-sec-body small" hidden>
+                <p class="muted">1-hop neighbors (20 max)</p>
+                <ul id="d-edges" class="edge-list"></ul>
+                <button id="d-view-edges" class="btn btn-ghost btn-sm" type="button">View all edges</button>
+              </div>
+            </section>
+            <!-- 6 Timeline -->
+            <section class="drawer-sec" data-sec="timeline">
+              <button class="drawer-sec-head" type="button" aria-expanded="false">Version chain · Timeline</button>
+              <div class="drawer-sec-body small" hidden>
+                <ul id="d-timeline" class="timeline-list"></ul>
+                <p id="d-no-timeline" class="muted" hidden>No versions — this is a chunk · <span id="d-turns"></span></p>
+              </div>
+            </section>
+            <!-- 7 Audit -->
+            <section class="drawer-sec" data-sec="audit">
+              <button class="drawer-sec-head" type="button" aria-expanded="false">Audit</button>
+              <div class="drawer-sec-body small" hidden>
+                <ul id="d-audit" class="audit-list"></ul>
+                <button id="d-view-audit" class="btn btn-ghost btn-sm" type="button">View all in Audit</button>
+              </div>
+            </section>
+            <!-- 8 Actions -->
+            <section class="drawer-sec drawer-sec-danger" data-sec="actions">
+              <button class="drawer-sec-head" type="button" aria-expanded="true">Actions</button>
+              <div class="drawer-sec-body">
+                <p class="small muted">Danger zone — these actions change your long-term memory.</p>
+                <div class="action-row">
+                  <button id="a-copy-text" class="btn btn-ghost btn-sm" type="button">Copy text</button>
+                  <button id="a-copy-id" class="btn btn-ghost btn-sm" type="button">Copy ID</button>
+                  <button id="a-export" class="btn btn-ghost btn-sm" type="button">Export JSON</button>
+                </div>
+                <div class="action-row">
+                  <button id="a-pin" class="btn btn-primary btn-sm" type="button">Pin again (reinforce)</button>
+                  <button id="a-supersede" class="btn btn-ghost btn-sm" type="button">Supersede…</button>
+                  <button id="a-forget" class="btn btn-danger btn-sm" type="button">Forget…</button>
+                </div>
+                <p id="action-feedback" class="small" role="status" aria-live="polite"></p>
+              </div>
+            </section>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <!-- Confirm dialogs -->
+  <dialog id="dlg-forget" class="dialog">
+    <form method="dialog" class="dialog-body">
+      <h3 class="dialog-title">Forget this memory?</h3>
+      <p>This cannot be undone. For nodes the version chain is kept but hidden; for chunks the text is deleted.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
+        <button value="confirm" class="btn btn-danger" type="submit">Forget</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-supersede" class="dialog">
+    <form method="dialog" class="dialog-body">
+      <h3 class="dialog-title">Supersede</h3>
+      <p>Supersede requires a successor node ID.</p>
+      <label class="field" style="width:100%">
+        <span class="field-label">Successor node ID</span>
+        <input id="supersede-input" class="input" type="text" placeholder="Enter successor node_id" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
+        <button value="confirm" class="btn btn-primary" type="submit">Supersede</button>
+      </div>
+    </form>
+  </dialog>
+
+  <footer class="foot muted small">
+    MnemoSeed Local — loopback only · no analytics · no outbound fonts · <code>GET /healthz</code> + <code>/health</code> + <code>/api/v1/observability</code> + <code>/api/v1/config</code> + <code>POST /memory/atlas</code>
+  </footer>
+
+  <div id="a11y-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
