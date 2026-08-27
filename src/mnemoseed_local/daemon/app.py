@@ -27,10 +27,12 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.staticfiles import StaticFiles
 
 from mnemoseed_local import __version__
 from mnemoseed_local.capture import (
@@ -1256,6 +1258,14 @@ def create_app() -> FastAPI:
 
         asyncio.create_task(_run_hook())
         return {"ok": True, "status": "shutting_down"}
+
+    # Mounted last: Starlette matches in registration order, so "/" must come
+    # after every route or it would shadow /healthz, /memory/*, /api/v1/*.
+    app.mount(
+        "/",
+        StaticFiles(directory=Path(__file__).parent.parent / "console" / "static", html=True),
+        name="console",
+    )
 
     return app
 
