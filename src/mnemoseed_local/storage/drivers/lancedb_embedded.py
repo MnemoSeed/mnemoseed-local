@@ -416,6 +416,23 @@ class LanceDbEmbeddedStore:
             limit=page.limit,
         )
 
+    def get_dense(self, chunk_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Batch dense projection backing Atlas PCA (CHUNKS-ONLY)."""
+        ids = [str(cid) for cid in chunk_ids if cid]
+        if not ids:
+            return {}
+        clause = ", ".join(_escape(cid) for cid in ids)
+        where = f"chunk_id IN ({clause})"
+        rows = self._table.search().where(where).select(["chunk_id", "vector_dense"]).to_list()
+        result: dict[str, list[float]] = {}
+        for row in rows:
+            cid = str(row.get("chunk_id"))
+            vec = row.get("vector_dense")
+            if vec is None:
+                continue
+            result[cid] = [float(v) for v in vec]
+        return result
+
     async def close(self) -> None:
         """Release the connection (no-op; LanceDB owns no client handle)."""
 
