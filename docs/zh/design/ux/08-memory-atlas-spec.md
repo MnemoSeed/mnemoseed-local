@@ -1,7 +1,7 @@
 # 08 · Memory Atlas 长期记忆浏览页 — UX 规格
 
 > 归属：Memory 路由的增强（Overview / Memory / Dream / Config / Profiles / System·Doctor / Audit）。本页命名 `Memory Atlas`（控制台路由 `#/memory/atlas`，侧边栏文案 "Memory Atlas"），不新增顶级路由，只在 Memory 下增加二级视图。
-> 技术前提：单 HTML 零构建（`StaticFiles` 同源直连 `http://localhost:7788`，loopback 信任，无鉴权 token，见 `src/mnemoseed_local/daemon/app.py:1101-1113`）。无模型调用，无云。
+> 技术前提：单 HTML 零构建（**待建**：需在 `daemon/app.py:create_app()` 新增 `app.mount('/', StaticFiles(...))` 同源托管，与 `GET /healthz` 同 `loopback` 信任（见 `src/mnemoseed_local/daemon/app.py:54-60,121-125` loopback 与 `app.py:1115-1180` health/audit），无鉴权 token）。无模型调用，无云。
 > 状态：设计规格（docs-only），已锁定 5 项待决策（见 §19）。未写产品代码。实现前需工程确认 §15.2 后端需求。
 
 ---
@@ -20,7 +20,7 @@
 
 ### 1.3 技术约束
 
-- 零构建：单 HTML + 原生 ES 模块（`importmap`），与现有 `StaticFiles` 同源直连一致。
+- 零构建：单 HTML + 原生 ES 模块（`importmap`），与**待建** `StaticFiles` 同源托管一致（需在 `daemon/app.py:create_app()` 新增 `app.mount('/', StaticFiles(...))`，与 `GET /healthz` 同 `loopback` 信任，见 `app.py:54-60,121-125` + `1115-1180`）。
 - 无新增 Python 依赖首版可行（PCA 用 `numpy` 已间接存在；UMAP 后续再议，见 §19 决议 1）。
 
 ---
@@ -70,33 +70,33 @@ Memory（现有）
 
 本页所有映射均来自已落地 schema/端口，**禁止臆造**。行号以 `0e79e37` 为准：
 
-**Vector Chunk（`src/mnemoseed_local/schema/stamp.py:85-115` `ChunkStamp`）**
-`chunk_id, profile_id, text, cognitive_tier(1-3), model_id, persona_id, origin_agent, cues{project, host, task, tools_used[], time_bucket, entities[], emotion{valence, arousal, peripheral_gaps}}, provenance{asserted_by, agent_id, session_id, source, confidence, asserted_at, history[ProvenanceEvent{at, action, actor, detail}]}, decay_weight[0,1], last_reinforced, score, consolidated(bool), ingested_at(epoch), turn_start/end, rules[], explicit_pin(派生: source==memory.remember 见 L63-69)`
+**Vector Chunk（`src/mnemoseed_local/schema/stamp.py:85-138` `ChunkStamp` + `metadata_filter_view()`）**
+`chunk_id, profile_id, text, cognitive_tier(1-3), model_id, persona_id, origin_agent, cues{project, host, task, tools_used[], time_bucket, entities[], emotion{valence, arousal, peripheral_gaps}}, provenance{asserted_by, agent_id, session_id, source, confidence, asserted_at, history[ProvenanceEvent{at, action, actor, detail}]}, decay_weight[0,1], last_reinforced, score, consolidated(bool), ingested_at(epoch), turn_start/end, rules[], explicit_pin(派生: `source==memory.remember` 见 `stamp.py:63-69` `EXPLICIT_PIN_SOURCE`/`is_explicit_pin`))`
 
-`metadata_filter_view()` 暴露的可筛字段见 `stamp.py:116-138`：`chunk_id, profile_id, cognitive_tier, model_id, project, entities, consolidated, decay_weight, ingested_at, turn_start/end, explicit_pin`
+`metadata_filter_view()` 暴露的可筛字段（同 `stamp.py:85-138`）：`chunk_id, profile_id, cognitive_tier, model_id, project, entities, consolidated, decay_weight, ingested_at, turn_start/end, explicit_pin`
 
-**Graph Node（`src/mnemoseed_local/schema/graph.py:67-112` `GraphNode`）**
-`node_id, profile_id, node_type(11种见 L20-34: USER/HABIT/PREFERENCE/ANIMA/INTENTION/CONSTRAINT/EPISODE/SKILL_SEQUENCE/DECISION/PROJECT/TOOL), entities[], props{statement/rule/summary/... per NODE_PAYLOAD_SCHEMA L129-154}, confidence, decay_weight, never_decay, last_reinforced, reinforce_count, needs_reconcile, pending_consolidation, peripheral_gaps, conflict_flag, conflict_group, promotion_status, hit_count, last_hit_at, version, prev_version_id, valid_from, valid_to(null=现行), cognitive_tier, provenance, created_at, updated_at, is_current(L110-111)`
+**Graph Node（`src/mnemoseed_local/schema/graph.py:20-34` `NodeType` + `67-112` `GraphNode`）**
+`node_id, profile_id, node_type(11种见 `graph.py:20-34`: USER/HABIT/PREFERENCE/ANIMA/INTENTION/CONSTRAINT/EPISODE/SKILL_SEQUENCE/DECISION/PROJECT/TOOL), entities[], props{statement/rule/summary/...}, confidence, decay_weight, never_decay, last_reinforced, reinforce_count, needs_reconcile, pending_consolidation, peripheral_gaps, conflict_flag, conflict_group, promotion_status, hit_count, last_hit_at, version, prev_version_id, valid_from, valid_to(null=现行), cognitive_tier, provenance, created_at, updated_at, is_current(`graph.py:110-111`)`
 
-**Edge（`src/mnemoseed_local/storage/ports.py:159-172` `EdgeEntry` + `175-194` `EdgeFilter`）**
-`edge_id, src, dst, kind(RELATION/COOCCURRENCE 见 L152-157), weight, created_at`，经 `EdgeFilter{profile_id, node_types[], created_after/before, tier, min_weight}` + `list_edges` 分页（已落地，`storage/ports.py:728-736`）
+**Edge（`src/mnemoseed_local/storage/ports.py:152-194` `EdgeKind`/`EdgeEntry`/`EdgeFilter`）**
+`edge_id, src, dst, kind(RELATION/COOCCURRENCE 见 `ports.py:152-157`), weight, created_at`，经 `EdgeFilter{profile_id, node_types[], created_after/before, tier, min_weight}` + `list_edges` 分页（已落地，`storage/ports.py:630-736` `VectorStore.list_chunks`/`GraphStore.list_nodes`/`list_edges`）
 
-**Filter/分页原语**
+**Filter/分页原语（`src/mnemoseed_local/storage/ports.py:77-93` `Page`/`PageResult` + `105-132` `ChunkFilter` + `143-150` `NodeFilter` + `152-194` `EdgeKind`/`EdgeEntry`/`EdgeFilter` + `630-736` `list_*`）**
 
-- `ChunkFilter`（`ports.py:105-132`）：`profile_id, min_decay, pin_min_decay, ingested_after/before, session_id, turn_start/end, entities[], consolidated?, needs_reconcile?, entities_allow_missing, rules_not_null` + `Page{offset, limit}`（L77-82 `Page` / L85-93 `PageResult`）
+- `ChunkFilter`（`ports.py:105-132`）：`profile_id, min_decay, pin_min_decay, ingested_after/before, session_id, turn_start/end, entities[], consolidated?, needs_reconcile?, entities_allow_missing, rules_not_null` + `Page{offset, limit}`（`ports.py:77-82` `Page` / `85-93` `PageResult`）
 - `NodeFilter`（`ports.py:143-150`）：`profile_id, node_type?, entities[], min_decay`
-- `EdgeFilter`（`ports.py:176-194`）：`profile_id, node_types[], created_after/before, tier, min_weight`（端点必为 `valid_to IS NULL` 的现行节点）
-- `AuditEntry/AuditFilter`（L274-293）、`TimelineEvent`（L205-211）、`Capability`（L350-373）等复用
+- `EdgeFilter`（`ports.py:152-194`）：`profile_id, node_types[], created_after/before, tier, min_weight`（端点必为 `valid_to IS NULL` 的现行节点）
+- `AuditEntry/AuditFilter`（`ports.py:274-293`）、`TimelineEvent`（`ports.py:205-211`）、`Capability`（`ports.py:350-373`）等复用
 
 **Retrieval 侧已落地但本页不作 3D 主坐标的派生**
 
-`HybridConfig{min_decay≈floor, rescue_min_decay=0.15, rescue_cue_min=0.2}`（`config.py:128-129` 默认值）、`decay.model{λ per type, half_life≈69/139/23d, pin λ=0.005}`（`config.py:188-208` `DEFAULT_LAMBDA_PER_TYPE` + `src/mnemoseed_local/decay/model.py:69-101`）、`assemble{conflict_pair/omitted, pending_consolidation, rescued}` — 仅用于图例与详情文案，不作 3D 主坐标。
+`HybridConfig{min_decay≈floor, rescue_min_decay=0.15, rescue_cue_min=0.2}`（`config.py:127-128` `DEFAULT_RECALL_RESCUE_FLOOR/CUE_MIN` 与 `config.py:140-150` `DreamConfig` 上下文，`RecallConfig:269-270`）、`decay.model{λ per type, half_life≈69/139/23d, pin λ=0.005}`（`config.py:188-208` `DEFAULT_LAMBDA_PER_TYPE` + `src/mnemoseed_local/decay/model.py:69-101` `decay_weight`/`lambda_for`/`half_life_days`）、`assemble{conflict_pair/omitted, pending_consolidation, rescued}` — 仅用于图例与详情文案，不作 3D 主坐标。
 
-**Daemon 已有端点（`src/mnemoseed_local/daemon/memory.py` / `app.py`）**
+**Daemon 已有端点（`src/mnemoseed_local/daemon/memory.py:127-208` / `app.py:54-60,121-125` + `1115-1180`）**
 
 - `RecallRequest{profile_id, query, host?, project?, time_bucket?, top_k?, budget?}`（`memory.py:127-137`）
-- `RememberRequest{profile_id, text, rules?}`（L139-143）、`AuditRequest/AuditTargets`（L145-155）、`TimelineRequest{profile_id, node_id?}`（L157-159）、`ExportRequest{offset, limit≤500}`（L162-165）、`ForgetRequest{chunk_id?, node_id?, entity?}`（L168-178）、`SupersedeRequest`（L181-184）、`SessionRecentRequest/SessionWindowsRequest`（L193-208）
-- `GET /healthz`、`GET /api/v1/audit`、`GET /api/v1/observability` 已具备（`app.py:1115-1186`）
+- `RememberRequest{profile_id, text, rules?}`（`memory.py:139-143`）、`AuditRequest`（`memory.py:145-155`）、`TimelineRequest{profile_id, node_id?}`（`memory.py:157-159`）、`ExportRequest{offset, limit≤500}`（`memory.py:162-165`）、`ForgetRequest{chunk_id?, node_id?, entity?}`（`memory.py:168-178`）、`SupersedeRequest`（`memory.py:181-184`）、`SessionRecentRequest/SessionWindowsRequest`（`memory.py:193-208`）
+- `GET /healthz`（`app.py:1115-1130`）、`GET /api/v1/audit`（`app.py:1165-1180`）、`GET /api/v1/observability`（`app.py:1157-1164`）已具备；`loopback` 信任见 `app.py:54-60,121-125`
 
 ---
 
@@ -125,7 +125,7 @@ Memory（现有）
 ### 5.3 离线策略（已决 — 决议 5）
 
 - **首版：CDN 优先（importmap 直连 `cdn.jsdelivr.net`），不 vendor**。离线/拦截时自动降级为 2.5D，不阻塞首版发布。
-- **后续：若真实用户反馈离线可用诉求强烈**，再 vendor 一份 `three.module.min.js` 随 `StaticFiles` 同源托管（~150KB 常驻体积），切换为同源 `importmap` 而无需改业务代码。
+- **后续：若真实用户反馈离线可用诉求强烈**，再 vendor 一份 `three.module.min.js` 随**待建** `StaticFiles` 同源托管（`daemon/app.py:create_app()` 新增 `app.mount('/', StaticFiles(...))`，见 `app.py:54-60,121-125` + `1115-1180`，~150KB 常驻体积），切换为同源 `importmap` 而无需改业务代码。
 - 选择理由：本地 loopback 场景离线率低，首版不为小概率增体积；降级已保证可用性。
 
 ### 5.4 不选
@@ -176,21 +176,21 @@ Memory（现有）
 | 视觉通道 | 映射 | 数据字段 | 动机/可验证性 |
 |---|---|---|---|
 | **X** | 语义主轴（后端 PCA 第一主成分，后续可切 UMAP） | 后端 `POST /memory/atlas` 预计算 `x,y`（见 §15.2）；不可用时前端 `hash(id)` 伪随机兜底（仅降级） | 横向展开主题（决议 1：PCA 首版） |
-| **Y** | 时间轴（近 → 远，由上至下） | `ingested_at`（chunks）/ `updated_at` 或 `valid_from`（nodes），归一到 `[0,1]` | "记忆在时间中下沉"的直觉 |
-| **Z** | 衰减深度（越深越淡） | `decay_weight` 反向：`z = 1 - decay_weight` | 直接可视化遗忘深度，`config.py:188-208` + `decay/model.py:69-78` |
+| **Y** | 时间轴（近 → 远，由上至下） | **chunks: `ingested_at`** / **nodes: `valid_from`（仅 `valid_to IS NULL` 现行节点）**，归一到 `[0,1]`；`updated_at` 仅用于 tooltip，不作 Y | "记忆在时间中下沉"的直觉（Y 锁定 `ingested_at`/`valid_from`，见 §10/§11） |
+| **Z** | 衰减深度（越深越淡） | `decay_weight` 反向：`z = 1 - decay_weight` | 直接可视化遗忘深度，`config.py:188-208` + `decay/model.py:69-101` |
 | **颜色** | 类别 | `node_type`（11 色，色盲友好调色板，见 §8）；chunks 用 `explicit_pin ? pin色 : chunk色` + `cognitive_tier` 明度分级 | 一眼区分事实/偏好/情节/意图等 |
 | **大小** | 重要度/热度 | `score`（chunks）或 `hit_count`+`reinforce_count` 归一；救援带内（`0.15≤w<0.4`）统一缩小 30% | 大而亮=常用且新鲜 |
 | **透明度** | 可及性 | `decay_weight` 线性：`opacity = 0.35 + 0.65·w`；`consolidated==true` 的 chunks 不进点云（已退出搜索面，见 `docs/zh/design/03` §4.1）但可通过"Show consolidated"开关以空心描边显示 | 淡=将遗忘 |
 | **描边/光晕** | 冲突与待合并 | `conflict_flag==true` → 橙色描边 + 脉冲环；`pending_consolidation==true` → 紫色虚线环；二者叠加为双环 | 来自 `GraphNode.conflict_flag/pending_consolidation` |
-| **连线** | 关系 | `list_edges` 的 `RELATION` 实线 / `COOCCURRENCE` 点线，权重映射线宽；仅在选中节点或"Show edges"开关时绘制，避免全量连线成毛线球 | `EdgeEntry` 真实关系（`ports.py:159-172`） |
+| **连线** | 关系 | `list_edges` 的 `RELATION` 实线 / `COOCCURRENCE` 点线，权重映射线宽；仅在选中节点或"Show edges"开关时绘制，避免全量连线成毛线球 | `EdgeEntry` 真实关系（`ports.py:152-194`） |
 | **分组晕染** | 同冲突组 | `conflict_group` 相同者外围共用半透明 hull（2D 凸包投影） | 来自 `GraphNode.conflict_group` |
 
 **坐标预计算（已决 — 决议 1：PCA 首版，零新增依赖）**
 
-- 后端一次性对请求窗口内的 `dense` 向量做 **PCA 第一主成分**得 `x`（`y` 取第二主成分或 `ingested_at` 归一，二选一实现取 `y = normalized_time` 更稳，见下），与 `z=1-decay_weight` 组成 3D 坐标，随 `POST /memory/atlas` 分页下发并缓存（见 §15.2）。**PCA 仅需 `numpy`（已间接依赖），不新增 `umap-learn` / `scikit-learn`**。
-- `x = PCA1(dense)` 归一到 `[-1,1]`；`y = 归一时间轴`（`ingested_at` / `updated_at` 线性归一）；`z = 1 - decay_weight`。该组合首版即可用且语义可解释。
+- 后端一次性对请求窗口内的 `dense` 向量做 **PCA 第一主成分**得 `x`（`y` 固定取归一时间，不取 PCA 第二主成分，保证时间可解释性），与 `z=1-decay_weight` 组成 3D 坐标，随 `POST /memory/atlas` 分页下发并缓存（见 §15.2）。**PCA 仅需 `numpy`（已间接依赖），不新增 `umap-learn` / `scikit-learn`；绝不对 `sparse` 做 PCA，也不在前端做 PCA。**
+- `x = PCA1(dense)` 归一到 `[-1,1]`；`y = 归一时间轴`（chunks 用 `ingested_at`，nodes 用 `valid_from` 且仅 `valid_to IS NULL` 现行节点；线性归一到 `[0,1]`，`updated_at` 仅作 tooltip）；`z = 1 - decay_weight`。该组合首版即可用且语义可解释。
+- **降级契约（degraded drivers）**：当 `embed` 驱动缺失或窗口内 `dense` 不可用时，`POST /memory/atlas` 返回 `positions: null` 且 `algo: "unavailable"`，前端改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；后端不回退到 `sparse` PCA，前端不做客户端 PCA。
 - **后续演进**：若真实语义聚类效果需更强非线性，再引入 `umap-learn` 切 `algo=umap`（后端可选依赖，前端无感，`positions` 契约不变）。
-- 前端 `hash(id)` 伪随机布局仅作**后端不可用时的降级兜底**，不作首版主路径。
 
 **图例（Canvas 右下常驻）**
 `● Fact  ● Preference  ● Episode  …  ○ Chunk  ◉ Pinned  ─ Relation  ·· Co-occurrence  ◯ Conflict  ◍ Pending`
@@ -225,9 +225,9 @@ Memory（现有）
 - **Kind**：`All / Chunks / Nodes`。
 - **Node Type**：多选，仅当 `Kind≠Chunks` 时可见（No dead inputs）。
 - **Decay**：分段单选 `All | Healthy ≥0.4 | Rescue 0.15–0.4 | Fading <0.15 | Never-decay`（`never_decay` 仅对 nodes，`graph.py:79`）。
-- **Time**：`All / 7d / 30d / 90d / Custom`（基于 `ingested_at / updated_at`，ISO UTC）。
+- **Time**：`All / 7d / 30d / 90d / Custom`（chunks 基于 `ingested_at`，nodes 基于 `valid_from`（仅 `valid_to IS NULL` 现行），ISO UTC；`updated_at` 不参与时间筛选，仅 tooltip）。
 - **Entities**：`⌕` 输入框，逗号分隔，大小写不敏感（`casefold`），空实体 chunk 在 `entities_allow_missing` 语义下仍可见（`docs/zh/design/03` D2）——过滤时与后端 `ChunkFilter.entities` / `NodeFilter.entities` 保持一致。
-- **Flags**：`Conflict / Pending / Needs reconcile / Peripheral gaps / Pinned only / Consolidated`（Pinned 仅 chunks（`stamp.py:136` `explicit_pin`），Pending/Conflict 仅 nodes）。
+- **Flags**：`Conflict / Pending / Needs reconcile / Peripheral gaps / Pinned only / Consolidated`（Pinned 仅 chunks（`stamp.py:85-138` `explicit_pin`），Pending/Conflict 仅 nodes）。
 - **Sort**：`Recent / Decay ↑↓ / Score / Hit count / Type`（仅 List 排序；3D 排序不改变坐标，只改变拾取优先级与 List 虚拟滚动顺序）。
 - **Density（LOD）**：`Auto / 500 / 2k / 10k`（3D 渲染上限，超出用确定性采样 + 底部 `+N hidden — tighten filters` 提示）。
 - **More（折叠）**：`session_id`（**次级过滤，默认折叠**，见决议 2）、`Turn range`、`Peripheral gaps` 等非主路径筛选项收于此（渐进披露）。
@@ -259,7 +259,7 @@ Memory（现有）
 | Type | 110 | `node_type` / `—` | 仅 nodes 有值 |
 | Entities | 160 | `cues.entities / entities` | 最多 2 + `+N` |
 | Decay | 120 | `decay_weight` | 进度条 + 数值 `0.73` + 颜色分段 |
-| Updated | 140 | `ingested_at / updated_at / valid_from` | 相对时间 + ISO tooltip |
+| Updated | 140 | `ingested_at`（chunks）/ `valid_from`（nodes，仅 `valid_to IS NULL` 现行） | 相对时间 + ISO tooltip；`updated_at` 仅在 tooltip 中展示，不作排序主 Y |
 | Flags | 96 | `conflict_flag, pending_consolidation, needs_reconcile` | 点状徽标 |
 | Hits | 64 | `hit_count / score` | 右对齐 |
 
@@ -278,7 +278,7 @@ Memory（现有）
 1. **Header**
    - 标题全文（`text` / `statement`，可复制，`word-break`）
    - 徽标行：`Kind · Type · Pinned/Consolidated · Version v3 · ID short(8) + Copy`
-   - 辅行：`profile_id · session_id → recent tail link · ingested_at ISO + relative`
+   - 辅行：`profile_id · session_id → recent tail link · 时间：chunks 为 `ingested_at` / nodes 为 `valid_from`（现行 `valid_to IS NULL`）ISO + relative；`updated_at` 仅在 tooltip 中展示`
 
 2. **Provenance**
    - `asserted_by / source / confidence / asserted_at`（`stamp.py:72-82` `Provenance`）
@@ -287,7 +287,7 @@ Memory（现有）
 
 3. **Decay & Health**
    - 仪表：`decay_weight` 大数字 + 进度条（分段色：≥0.4 绿 / 0.15–0.4 琥珀 / <0.15 红）
-   - 公式提示：`w = confidence × exp(-λ·days)`，`λ` 取 `config[decay.lambda_per_type][type]`（`chunk:0.03 / pin:0.005 / fact:0.01 …`，见 `config.py:188-208` `DEFAULT_LAMBDA_PER_TYPE` 与 `decay/model.py:81-96` `lambda_for`）
+   - 公式提示：`w = confidence × exp(-λ·days)`，`λ` 取 `config[decay.lambda_per_type][type]`（`chunk:0.03 / pin:0.005 / fact:0.01 …`，见 `config.py:188-208` `DEFAULT_LAMBDA_PER_TYPE` 与 `decay/model.py:69-101` `decay_weight`/`lambda_for`/`half_life_days`）
    - 曲线：30/90/180 天预测（前端本地 `exp` 计算，非后端）
    - 字段：`last_reinforced / reinforce_count / hit_count / last_hit_at`（`stamp.py:101-105` / `graph.py:80-96`）
 
@@ -349,8 +349,8 @@ Memory（现有）
 
 - **List**：虚拟滚动（固定行高 + `IntersectionObserver`），10k 行常驻 DOM ≤ 24 行。
 - **3D LOD**：`Auto` 时按 `devicePixelRatio` 与 `hardwareConcurrency` 自适应；`Points` + `InstancedMesh` 合批；`frustumCulled=true`；超出 `Density` 上限做**确定性采样**（`hash(id) %`），不随机闪烁。
-- **分页拉取**：首屏 `limit=500`，滚动/缩放按需 `offset` 增量拉取（`list_chunks / list_nodes / list_edges` 均已分页，`ports.py:631/657/728`）；`Page.total` 用于总数与截断提示。
-- **坐标缓存**：`positions` 按 `profile_id` 缓存在 `localStorage`（key `atlas:positions:{profile_id}:{count}:{maxIngestedAt}`），命中则跳过后端投影请求。
+- **分页拉取**：首屏 `limit=500`，滚动/缩放按需 `offset` 增量拉取（`list_chunks / list_nodes / list_edges` 均已分页，`ports.py:630-736`）；`Page.total` 用于总数与截断提示。
+- **坐标缓存**：`positions` 按 `profile_id` 缓存在 `localStorage`（key `atlas:positions:{profile_id}:{count}:{maxId}` 或 `:{hash}`——用 `count:maxId` 或 `hash(ids)` 作缓存键，避免 `float epoch` 精度漂移；命中则跳过后端投影请求）。
 - **防抖**：过滤输入 300ms，视角 `idle` 500ms 后再请求视锥内 `list_edges`。
 - **内存**：`positions` 用 `Float32Array`；`text` 仅在 Drawer 需要时按 `get_chunk/get_node` 懒取全文，点云只存 `id/type/decay/entities` 轻量。
 
@@ -360,24 +360,25 @@ Memory（现有）
 
 ### 15.1 已具备（直接复用）
 
-- `POST /memory/timeline`（`TimelineRequest{profile_id, node_id?}` `memory.py:157-159`）、`POST /memory/audit`（`AuditRequest{profile_id, node_id|chunk_id}` `memory.py:145-155`）、`POST /memory/export`（`memory.py:162-165` 分页 JSON，`limit≤500`）、`GET /api/v1/audit`（`app.py:1165-1186` 分页过滤）、`POST /session/recent` / `POST /session/windows`（`memory.py:193-208` 会话窗 honest null 语义）、`VectorStore.list_chunks(ChunkFilter, Page)`（`ports.py:630-631`）、`GraphStore.list_nodes(NodeFilter, Page)`（`ports.py:656-657`）、`GraphStore.list_edges(EdgeFilter, Page)`（`ports.py:728-736`）、`GraphStore.traverse`（`ports.py:665-666`）等（见 `storage/ports.py`、`daemon/memory.py`、`daemon/app.py`）。
-- `GET /healthz` 与 `GET /api/v1/observability` 可作 Atlas 的"store 能力/自检"脚注（`app.py:1115-1164`）。
+- `POST /memory/timeline`（`TimelineRequest{profile_id, node_id?}` `memory.py:157-159`）、`POST /memory/audit`（`AuditRequest{profile_id, node_id|chunk_id}` `memory.py:145-155`）、`POST /memory/export`（`memory.py:162-165` 分页 JSON，`limit≤500`）、`GET /api/v1/audit`（`app.py:1165-1180` 分页过滤）、`POST /session/recent` / `POST /session/windows`（`memory.py:193-208` 会话窗 honest null 语义）、`VectorStore.list_chunks(ChunkFilter, Page)`（`ports.py:629-631`）、`GraphStore.list_nodes(NodeFilter, Page)`（`ports.py:655-657`）、`GraphStore.list_edges(EdgeFilter, Page)`（`ports.py:727-736`）、`GraphStore.traverse`（`ports.py:664-666`）等（见 `storage/ports.py:77-93,105-132,143-150,152-194,630-736`、`daemon/memory.py:127-208`、`daemon/app.py:54-60,121-125,1115-1180`）。
+- `GET /healthz`（`app.py:1115-1130`）与 `GET /api/v1/observability`（`app.py:1157-1164`）可作 Atlas 的"store 能力/自检"脚注；`loopback` 信任见 `app.py:54-60,121-125`。
 
 ### 15.2 待建（实现 Atlas 所需的最小新增面）
 
-> 以下为**显式后端需求**，不实现则 Atlas 无法以合理性能落地；均保持零鉴权 loopback 信任不变（`app.py:121-125`）。
+> 以下为**显式后端需求**，不实现则 Atlas 无法以合理性能落地；均保持零鉴权 loopback 信任不变（`app.py:54-60,121-125`）。
 
 1. **`POST /memory/atlas`（或 `GET /api/v1/atlas`）— 批量轻量清单 + 3D 坐标**
    - 入参：`{profile_id, kind: "all"|"chunks"|"nodes", filter: {node_types?, entities?, min_decay?, max_decay?, session_id?, ingested_after/before?, flags?}, sort?, offset, limit (≤500)}`
-   - 出参：`{items: AtlasItem[], total, offset, limit, window_truncated, positions: {id: [x,y,z]}?}`
-   - `AtlasItem` 轻量（不含 `text` 全文）：`{id, kind, node_type?, text_head(120), entities[3], decay_weight, ingested_at/updated_at/valid_from, flags{conflict, pending, needs_reconcile, peripheral_gaps, consolidated, explicit_pin}, hit_count?, score?}`
-   - `positions`：后端对窗口内 `dense` 做 **PCA（`numpy`，零新增依赖）**得 `x = PCA1` 归一到 `[-1,1]`，`y = 归一时间`，`z = 1 - decay_weight`；与 `items` 同页返回或单独 `GET /api/v1/atlas/positions?profile_id=&limit=&algo=pca|umap|hash`。**首版 `algo=pca` 即满足可用性；`algo=umap` 作为后续可选演进，前端契约不变。`algo=hash` 仅作后端不可用时的前端兜底。**
+   - 出参：`{items: AtlasItem[], total, offset, limit, window_truncated, positions: {id: [x,y,z]} | null, algo: "pca" | "umap" | "unavailable"}`
+   - `AtlasItem` 轻量（不含 `text` 全文）：`{id, kind, node_type?, text_head(120), entities[3], decay_weight, ingested_at(valid_from for nodes), flags{conflict, pending, needs_reconcile, peripheral_gaps, consolidated, explicit_pin}, hit_count?, score?, valid_from, updated_at(tooltip only)}`（chunks 用 `ingested_at`，nodes 用 `valid_from` 且仅 `valid_to IS NULL` 现行；`updated_at` 仅作 tooltip，不作 Y/筛选主轴）
+   - `positions`：后端对窗口内 `dense` 做 **PCA（`numpy`，零新增依赖）**得 `x = PCA1` 归一到 `[-1,1]`，`y = 归一时间`（`y = normalized(ingested_at)` for chunks / `normalized(valid_from)` for nodes，仅现行；`updated_at` 不参与），`z = 1 - decay_weight`；与 `items` 同页返回或单独 `GET /api/v1/atlas/positions?profile_id=&limit=&algo=pca|umap`。**首版 `algo=pca` 即满足可用性；`algo=umap` 作为后续可选演进，前端契约不变。**
+   - **降级契约（degraded drivers，显式）**：当 `embed` 驱动缺失或窗口内 `dense` 不可用时，后端返回 `positions: null` 且 `algo: "unavailable"`，前端改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；**后端绝不对 `sparse` 做 PCA，前端绝不做客户端 PCA**。`algo=hash` 仅指前端本地 `hash(id)` 兜底，不作为后端 `algo` 值。
 
 2. **批量全文端点（可选，优化 Drawer 懒取）**
    - 复用 `get_chunk/get_node` 单条亦可；若要批量，新增 `POST /memory/batch_get {profile_id, chunk_ids[], node_ids[]}` 返回全文与 `provenance.history` 全量。
 
-3. **CORS/Static 同源保证**
-   - Atlas HTML 由 `StaticFiles` 同源托管（与现有 `healthz` 同源，`app.py:1101-1113`），无需 CORS；若后续抽离为独立静态，需显式允许 `localhost` 同源。
+3. **CORS/Static 同源保证（待建）**
+   - Atlas HTML **待建**：需在 `daemon/app.py:create_app()` 新增 `app.mount('/', StaticFiles(...))` 同源托管，与 `GET /healthz` 同 `loopback` 信任（见 `app.py:54-60,121-125` + `1115-1180`），无需 CORS；若后续抽离为独立静态，需显式允许 `localhost` 同源。
 
 4. **分页与流式说明**
    - `embeddings` 不下发前端（体积与隐私）；`positions` 已是降维后坐标，前端不再触 `dense/sparse`。
@@ -456,7 +457,7 @@ flowchart LR
 **Filters**
 
 - `Kind: All / Chunks / Nodes`
-- `Type: All` / `Fact · Preference · Episode · Habit · Intention · Constraint · User · Anima · Decision · Project · Tool · Skill`（11 种全称，`graph.py:20-34`）
+- `Type: All` / `Fact · Preference · Episode · Habit · Intention · Constraint · User · Anima · Decision · Project · Tool · Skill` — 11 types total, see `graph.py:20-34`
 - `Decay: All / Healthy (≥0.40) / Rescue (0.15–0.40) / Fading (<0.15) / Never-decay`
 - `Time: All / Last 7 days / Last 30 days / Last 90 days / Custom…`
 - `Entities` placeholder: `Filter by entities, comma separated — e.g. ai, lancedb`
@@ -594,7 +595,7 @@ flowchart LR
 
 ### 决议 5 — 离线 3D 资源策略 ✅ 已决：CDN 首版，vendor 后续按需
 
-- **选项**：A) 完全 CDN（需联网，离线即 fallback） / B) 随 `StaticFiles` vendor 一份 `three.module.min.js`（常驻体积但离线可用）。
+- **选项**：A) 完全 CDN（需联网，离线即 fallback） / B) 随**待建** `StaticFiles`（`daemon/app.py:create_app()` 新增 `app.mount('/', StaticFiles(...))`，与 `GET /healthz` 同 `loopback` 信任，见 `app.py:54-60,121-125` + `1115-1180`）vendor 一份 `three.module.min.js`（常驻体积但离线可用）。
 - **已决**：**A 首版 + B 待用户反馈后再 vendor**。首版 CDN via `importmap`（`§5.1`），离线自动降级为 2.5D（`§5.2`）；后续若离线诉求强烈，再 vendor 同源托管，前端无感切换。
 
 ---
@@ -664,4 +665,4 @@ mnemoseed-local down
 
 ---
 
-*验证锚：`src/mnemoseed_local/schema/stamp.py:85-138` `ChunkStamp/metadata_filter_view` / `src/mnemoseed_local/schema/graph.py:20-112` `NodeType/GraphNode` / `src/mnemoseed_local/storage/ports.py:77-93` `Page/PageResult` + `105-132` `ChunkFilter` + `142-150` `NodeFilter` + `152-194` `EdgeEntry/EdgeFilter` / `src/mnemoseed_local/daemon/memory.py:127-208` `Recall/Remember/Audit/Timeline/Export/Forget/Supersede/Session*` / `src/mnemoseed_local/daemon/app.py:1101-1130` `StaticFiles+loopback` / `src/mnemoseed_local/config.py:188-208` `DEFAULT_LAMBDA_PER_TYPE` / `src/mnemoseed_local/decay/model.py:69-101` `decay_weight/lambda_for` / `docs/zh/design/03-storage-and-retrieval.md` / `docs/zh/design/09-retention-redesign.md`*
+*验证锚（以 `0e79e37` 为准）：`src/mnemoseed_local/schema/stamp.py:63-69` `EXPLICIT_PIN_SOURCE`/`is_explicit_pin` + `85-138` `ChunkStamp`/`metadata_filter_view` / `src/mnemoseed_local/schema/graph.py:20-34` `NodeType` + `67-112` `GraphNode` / `src/mnemoseed_local/storage/ports.py:77-93` `Page`/`PageResult` + `105-132` `ChunkFilter` + `143-150` `NodeFilter` + `152-194` `EdgeKind`/`EdgeEntry`/`EdgeFilter` + `630-736` `list_chunks`/`list_nodes`/`list_edges`/`traverse` / `src/mnemoseed_local/daemon/memory.py:127-208` `Recall`/`Remember`/`Audit`/`Timeline`/`Export`/`Forget`/`Supersede`/`Session*` / `src/mnemoseed_local/daemon/app.py:54-60,121-125` `loopback` + `1115-1180` `health/audit/observability`（`StaticFiles` 为**待建**：需在 `create_app()` 新增 `app.mount('/', StaticFiles(...))` 与 `GET /healthz` 同 `loopback` 信任） / `src/mnemoseed_local/config.py:127-128` `DEFAULT_RECALL_RESCUE_*` + `140-150` `DreamConfig` + `188-208` `DEFAULT_LAMBDA_PER_TYPE` + `269-270` `RecallConfig` / `src/mnemoseed_local/decay/model.py:69-101` `decay_weight`/`lambda_for`/`half_life_days` / `docs/zh/design/03-storage-and-retrieval.md` / `docs/zh/design/09-retention-redesign.md`*
