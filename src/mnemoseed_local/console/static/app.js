@@ -4,7 +4,6 @@
    Copy verbatim from docs/zh/design/ux/08-memory-atlas-spec.md §17.
 */
 
-const BASE = location.origin; // same-origin StaticFiles
 const DAEMON_URL = "http://localhost:7788";
 const DAEMON_MSG = `Daemon unreachable at ${DAEMON_URL} — run mnemoseed-local up`;
 
@@ -228,7 +227,7 @@ async function loadOverview(){
       cfgBody.innerHTML = `<div class="kv-grid">${rows.map(([k,v])=>{
         let val = v;
         // never show raw secret strings: if value looks like key/token, show env-var name hint
-        if(typeof val==="string" && val.length>32 && /^(sk-|api_|key)/i.test(val)) val = "•••• (redacted)";
+        if(typeof val==="string" && /(?:sk-|api_|key|token|secret|password|ghp_)/i.test(val)) val = "•••• (redacted)";
         if(typeof val==="object") val = JSON.stringify(val);
         return `<dl class="kv"><dt>${esc(k)}</dt><dd>${esc(String(val))}</dd></dl>`;
       }).join("")}</div>`;
@@ -510,6 +509,7 @@ async function fetchAtlas(){
     retry.className="btn btn-sm"; retry.textContent="Retry"; retry.addEventListener("click", fetchAtlas);
     bannerErr.appendChild(retry);
     bannerErr.hidden = false;
+    empty.hidden = false;
     countEl.textContent = "Couldn’t load";
     loading.hidden = true;
     statusbar.textContent = `Error ${e.status||""} — ${msg}`;
@@ -675,7 +675,7 @@ async function render3d(THREE, OrbitControls){
     let s = 6;
     if(it.score!=null) s = 5 + clamp(Number(it.score)*2, 0, 8);
     else if(it.hit_count!=null) s = 5 + clamp(Math.log10(Number(it.hit_count)+1)*3, 0, 7);
-    // rescue缩小 30%
+    // rescue band: shrink 30%
     const wgt = it.decay_weight;
     if(wgt!=null && wgt>=0.15 && wgt<0.4) s *= 0.7;
     sizes[i]= s;
@@ -1182,7 +1182,7 @@ function openDrawer(id){
       const succ = $("#supersede-input").value.trim();
       if(!succ){ $("#action-feedback").textContent="Supersede requires a successor node ID."; return; }
       try{
-        await fetchJson("/memory/supersede", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({profile_id: atlasState.profile, node_id: id, successor_node_id: succ})});
+        await fetchJson("/memory/supersede", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({profile_id: atlasState.profile, superseded_node_id: id, successor_node_id: succ})});
         $("#action-feedback").textContent="Superseded.";
         a11yLive("Superseded."); fetchAtlas();
       } catch(e){ $("#action-feedback").textContent=`Couldn’t supersede — ${e.message}`; }
