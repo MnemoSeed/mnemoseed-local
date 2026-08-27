@@ -170,3 +170,9 @@ pip-wheel-metadata/
 # Eval harness scratch stores (B3: `python -m mnemoseed_local.eval` --workdir default)
 .eval-rigs/
 /eval/
+
+# Impeccable skill runtime working dir (ephemeral, per-dev; skill is vendored
+# under .opencode/skills and .github/skills, not regenerated here)
+.impeccable/
+.opencode/package.json
+.opencode/package-lock.json
