@@ -66,7 +66,10 @@ def test_console_mount_does_not_shadow_routes(config_path: Path) -> None:
         recall = client.post("/memory/recall", json={})
         assert recall.status_code == 422, recall.text
 
-        # Only .gitkeep exists and html=True: the missing index.html answers 404
-        # from the StaticFiles mount, proving "/" now belongs to the console.
+        # "/" belongs to the console mount (StaticFiles html=True). When index.html
+        # exists it serves 200 with the console; when only .gitkeep exists it
+        # answers 404 — either proves the mount is at "/" without shadowing.
         root = client.get("/")
-        assert root.status_code == 404, root.text
+        assert root.status_code in (200, 404), root.text
+        if root.status_code == 200:
+            assert "MnemoSeed Local" in root.text
