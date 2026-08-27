@@ -175,7 +175,7 @@ Memory（现有）
 
 | 视觉通道 | 映射 | 数据字段 | 动机/可验证性 |
 |---|---|---|---|
-| **X** | 语义主轴（后端 PCA 第一主成分，后续可切 UMAP） | 后端 `POST /memory/atlas` 预计算 `x,y`（见 §15.2）；不可用时前端 `hash(id)` 伪随机兜底（仅降级） | 横向展开主题（决议 1：PCA 首版） |
+| **X** | 语义主轴（后端 PCA 第一主成分，后续可切 UMAP — 仅 chunks） | 后端 `POST /memory/atlas` 对**窗口内 chunks 的 `dense`** via `VectorStore.get_dense` 预计算 `x`（见 §15.2）；**nodes 无向量（无 `dense`），不参与 PCA，仅前端 `hash(id)` 兜底**；后端不可用时 `positions:null` 前端统一 `hash(id)` | 横向展开主题（决议 1：PCA 首版，CHUNKS-ONLY） |
 | **Y** | 时间轴（近 → 远，由上至下） | **chunks: `ingested_at`** / **nodes: `valid_from`（仅 `valid_to IS NULL` 现行节点）**，归一到 `[0,1]`；`updated_at` 仅用于 tooltip，不作 Y | "记忆在时间中下沉"的直觉（Y 锁定 `ingested_at`/`valid_from`，见 §10/§11） |
 | **Z** | 衰减深度（越深越淡） | `decay_weight` 反向：`z = 1 - decay_weight` | 直接可视化遗忘深度，`config.py:188-208` + `decay/model.py:69-101` |
 | **颜色** | 类别 | `node_type`（11 色，色盲友好调色板，见 §8）；chunks 用 `explicit_pin ? pin色 : chunk色` + `cognitive_tier` 明度分级 | 一眼区分事实/偏好/情节/意图等 |
@@ -185,11 +185,11 @@ Memory（现有）
 | **连线** | 关系 | `list_edges` 的 `RELATION` 实线 / `COOCCURRENCE` 点线，权重映射线宽；仅在选中节点或"Show edges"开关时绘制，避免全量连线成毛线球 | `EdgeEntry` 真实关系（`ports.py:152-194`） |
 | **分组晕染** | 同冲突组 | `conflict_group` 相同者外围共用半透明 hull（2D 凸包投影） | 来自 `GraphNode.conflict_group` |
 
-**坐标预计算（已决 — 决议 1：PCA 首版，零新增依赖）**
+**坐标预计算（已决 — 决议 1：PCA 首版，零新增依赖，CHUNKS-ONLY）**
 
-- 后端一次性对请求窗口内的 `dense` 向量做 **PCA 第一主成分**得 `x`（`y` 固定取归一时间，不取 PCA 第二主成分，保证时间可解释性），与 `z=1-decay_weight` 组成 3D 坐标，随 `POST /memory/atlas` 分页下发并缓存（见 §15.2）。**PCA 仅需 `numpy`（已间接依赖），不新增 `umap-learn` / `scikit-learn`；绝不对 `sparse` 做 PCA，也不在前端做 PCA。**
-- `x = PCA1(dense)` 归一到 `[-1,1]`；`y = 归一时间轴`（chunks 用 `ingested_at`，nodes 用 `valid_from` 且仅 `valid_to IS NULL` 现行节点；线性归一到 `[0,1]`，`updated_at` 仅作 tooltip）；`z = 1 - decay_weight`。该组合首版即可用且语义可解释。
-- **降级契约（degraded drivers）**：当 `embed` 驱动缺失或窗口内 `dense` 不可用时，`POST /memory/atlas` 返回 `positions: null` 且 `algo: "unavailable"`，前端改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；后端不回退到 `sparse` PCA，前端不做客户端 PCA。
+- 后端仅对请求窗口内 **chunks 的 `dense`**（via 新 `VectorStore.get_dense(chunk_ids)` 投影 `vector_dense` 列，缺失 id 忽略）做 **PCA 第一主成分**得 `x`（`y` 固定取归一时间，不取 PCA 第二主成分，保证时间可解释性），与 `z=1-decay_weight` 组成 3D 坐标，随 `POST /memory/atlas` 分页下发并缓存（见 §15.2）。**PCA 仅需 `numpy`（已间接依赖），不新增 `umap-learn` / `scikit-learn`；绝不对 `sparse` 做 PCA，也不在前端做 PCA；`GraphNode` 无向量，永不参与 PCA。** CHUNKS-ONLY 为 BLOCKER-1 修复。
+- `x = PCA1(dense)` 归一到 `[-1,1]`（对居中后的 `dense` 矩阵做 SVD 取第一主成分，线性映射到 `[-1,1]`）；`y = 归一时间轴`（**仅 chunks 参与 `positions` 时用 `ingested_at` 线性归一到 `[0,1]`；nodes 的 `valid_from` 仅用于 List/详情，不进入 `positions`**；`updated_at` 仅作 tooltip）；`z = 1 - decay_weight`。该组合首版即可用且语义可解释。
+- **降级契约（degraded drivers，显式）**：仅当窗口内**有 `dense` 的 chunk 数 `>=2`** 时后端返回 `positions:{id:[x,y,z]}` 且 `algo:"pca"`；否则返回 `positions:null` 且 `algo:"unavailable"`（`dense` 不可用、窗口内 chunk `<2`、或窗口仅含 nodes/**degraded chunks** 时均走此分支），前端对缺失项改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；**后端绝不对 `sparse` 做 PCA，前端绝不做客户端 PCA。**
 - **后续演进**：若真实语义聚类效果需更强非线性，再引入 `umap-learn` 切 `algo=umap`（后端可选依赖，前端无感，`positions` 契约不变）。
 
 **图例（Canvas 右下常驻）**
@@ -367,12 +367,12 @@ Memory（现有）
 
 > 以下为**显式后端需求**，不实现则 Atlas 无法以合理性能落地；均保持零鉴权 loopback 信任不变（`app.py:54-60,121-125`）。
 
-1. **`POST /memory/atlas`（或 `GET /api/v1/atlas`）— 批量轻量清单 + 3D 坐标**
-   - 入参：`{profile_id, kind: "all"|"chunks"|"nodes", filter: {node_types?, entities?, min_decay?, max_decay?, session_id?, ingested_after/before?, flags?}, sort?, offset, limit (≤500)}`
-   - 出参：`{items: AtlasItem[], total, offset, limit, window_truncated, positions: {id: [x,y,z]} | null, algo: "pca" | "umap" | "unavailable"}`
-   - `AtlasItem` 轻量（不含 `text` 全文）：`{id, kind, node_type?, text_head(120), entities[3], decay_weight, ingested_at(valid_from for nodes), flags{conflict, pending, needs_reconcile, peripheral_gaps, consolidated, explicit_pin}, hit_count?, score?, valid_from, updated_at(tooltip only)}`（chunks 用 `ingested_at`，nodes 用 `valid_from` 且仅 `valid_to IS NULL` 现行；`updated_at` 仅作 tooltip，不作 Y/筛选主轴）
-   - `positions`：后端对窗口内 `dense` 做 **PCA（`numpy`，零新增依赖）**得 `x = PCA1` 归一到 `[-1,1]`，`y = 归一时间`（`y = normalized(ingested_at)` for chunks / `normalized(valid_from)` for nodes，仅现行；`updated_at` 不参与），`z = 1 - decay_weight`；与 `items` 同页返回或单独 `GET /api/v1/atlas/positions?profile_id=&limit=&algo=pca|umap`。**首版 `algo=pca` 即满足可用性；`algo=umap` 作为后续可选演进，前端契约不变。**
-   - **降级契约（degraded drivers，显式）**：当 `embed` 驱动缺失或窗口内 `dense` 不可用时，后端返回 `positions: null` 且 `algo: "unavailable"`，前端改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；**后端绝不对 `sparse` 做 PCA，前端绝不做客户端 PCA**。`algo=hash` 仅指前端本地 `hash(id)` 兜底，不作为后端 `algo` 值。
+1. **`POST /memory/atlas`（或 `GET /api/v1/atlas`）— 批量轻量清单 + 3D 坐标（CHUNKS-ONLY PCA）**
+   - 入参：`{profile_id, kind: "chunks"|"nodes"|"both" (default both), offset, limit (≤500)}`（C-1 最小面，见 `ExportRequest` `le=500` 模式；filter/sort 后续迭代）
+   - 出参：`{items: AtlasItem[], total, offset, limit, window_truncated, positions: {id: [x,y,z]} | null, algo: "pca" | "unavailable"}`（C-1 仅 `pca`/`unavailable`，`umap` 后续演进）
+   - `AtlasItem` 轻量（不含 `text` 全文）：`{id, kind, node_type?, text_head(≤120), entities[3], decay_weight, is_explicit_pin, ingested_at(valid_from for nodes), flags{conflict, pending, needs_reconcile, peripheral_gaps, consolidated, explicit_pin}, hit_count?, score?, valid_from, updated_at(tooltip only)}`（chunks 用 `ingested_at`，nodes 用 `valid_from` 且仅 `valid_to IS NULL` 现行；`updated_at` 仅作 tooltip，不作 Y/筛选主轴；`text_head` 截断 120 字符）
+   - `positions`（CHUNKS-ONLY，BLOCKER-1 修复）：后端仅对**窗口内 chunks** via 新 `VectorStore.get_dense(chunk_ids)`（投影 `vector_dense` 列，缺失 id 忽略）取 `dense`，对有 `dense` 的 chunk 数 `>=2` 时做 **PCA（`numpy` 纯 `SVD`，零新增依赖，居中列后 `SVD` 取第一主成分并归一到 `[-1,1]`）**得 `x = PCA1`，`y = normalized(ingested_at)`（仅 chunks，`[0,1]` 线性归一；`nodes` 不参与 `positions`，前端 `hash(id)` 兜底），`z = 1 - decay_weight`；与 `items` 同页返回。**首版 `algo=pca` 即满足可用性；`algo=unavailable` 覆盖 `dense` 不可用/`<2` chunks/仅 nodes 场景；`algo=umap` 作为后续可选演进，前端契约 `positions: {id:[x,y,z]}` 不变。**
+   - **降级契约（degraded drivers，显式，CHUNKS-ONLY）**：仅当窗口内有 `dense` 的 chunk 数 `>=2` 时后端返回 `positions:{id:[x,y,z]}` 且 `algo:"pca"`；否则返回 `positions:null` 且 `algo:"unavailable"`（含 `embed` 驱动缺失、窗口 `dense` 不可用、窗口内可用 `dense` `<2`、或窗口仅含 `nodes`/degraded chunks 时）；前端对缺失项（所有 `nodes` + 无 `dense` 的 `chunks`）改用 `hash(id)` 伪随机兜底（确定性，不闪烁）；**后端绝不对 `sparse` 做 PCA，前端绝不做客户端 PCA**。`algo=hash` 仅指前端本地 `hash(id)` 兜底，不作为后端 `algo` 值。
 
 2. **批量全文端点（可选，优化 Drawer 懒取）**
    - 复用 `get_chunk/get_node` 单条亦可；若要批量，新增 `POST /memory/batch_get {profile_id, chunk_ids[], node_ids[]}` 返回全文与 `provenance.history` 全量。
