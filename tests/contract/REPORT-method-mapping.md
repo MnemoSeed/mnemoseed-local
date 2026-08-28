@@ -29,7 +29,7 @@ Driver family covered by the `stack` fixture:
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 | upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
-## GraphStore (21 methods)
+## GraphStore (23 methods)
 
 | Method | Contract test |
 |---|---|
@@ -40,6 +40,7 @@ Driver family covered by the `stack` fixture:
 | bump_cooccurrence | `test_contract_graph.py::test_bump_cooccurrence_symmetric_and_increments` |
 | capabilities | `test_contract_graph.py::test_capabilities` |
 | clear_flags | `test_contract_graph.py::test_set_and_clear_flags` |
+| clear_read_conflict | `test_contract_graph.py::test_clear_read_conflict_clears_single_side` |
 | diff | `test_contract_graph.py::test_diff_reports_payload_change` |
 | find_same_predicate | `test_contract_graph.py::test_find_same_predicate` |
 | get_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
@@ -48,6 +49,7 @@ Driver family covered by the `stack` fixture:
 | list_nodes | `test_contract_graph.py::test_list_nodes_filter_pagination` |
 | query_intentions | `test_contract_graph.py::test_query_intentions_status_and_due` |
 | set_flags | `test_contract_graph.py::test_set_and_clear_flags` |
+| set_read_conflict | `test_contract_graph.py::test_read_conflict_sets_reciprocal_pointers` |
 | supersede_link | `test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction` |
 | timeline | `test_contract_graph.py::test_timeline_replays_versions` |
 | tombstone | `test_contract_graph.py::test_tombstone_tombstoned_node_via_port` |

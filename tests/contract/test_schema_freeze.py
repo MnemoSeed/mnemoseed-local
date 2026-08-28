@@ -151,6 +151,10 @@ def test_graph_schema_freeze_walk() -> None:
     assert "pinned" not in names, "pinned is a migration delta, not a v1 base column"
     assert "promotion_status" in added_columns
     assert "promotion_status" not in names, "promotion_status is a migration delta, not a v1 base column"
+    # v10: the read-side conflict evidence pointer is an AddColumn delta, never a
+    # v1 base column — readers raise it reversibly, capture and vote never touch it
+    assert "read_conflict_id" in added_columns
+    assert "read_conflict_id" not in names, "read_conflict_id is a migration delta, not a v1 base column"
 
 
 # ---------------------------------------------------------------- A.3 meta
@@ -215,7 +219,7 @@ def test_named_graph_instances_build(tmp_path) -> None:
     main = SqliteGraphDriver(path=tmp_path / "graph-main.db")
     isolated = SqliteGraphDriver(path=tmp_path / "graph-isolated.db")
     assert main.info.name == isolated.info.name == "sqlite_graph"
-    assert current_schema_version(main._conn, "graph") == 5
-    assert current_schema_version(isolated._conn, "graph") == 5
+    assert current_schema_version(main._conn, "graph") == 10
+    assert current_schema_version(isolated._conn, "graph") == 10
     asyncio.run(main.close())
     asyncio.run(isolated.close())

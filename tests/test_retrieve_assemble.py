@@ -671,3 +671,228 @@ def test_assembled_entry_defaults_provenance_to_null() -> None:
     assert entry.session_id is None
     assert entry.ingested_at is None
     assert entry.valid_from is None
+
+
+# ------------------------------------------------------------ read-side conflict flag
+
+
+def _read_conflict_nodes(
+    stack: _Stack,
+    a_id: str,
+    a_statement: str,
+    b_id: str,
+    b_statement: str,
+    *,
+    entity: str = "LanceDb",
+) -> None:
+    stack.graph.upsert_node(_node(a_id, statement=a_statement, entities=(entity,)))
+    stack.graph.upsert_node(_node(b_id, statement=b_statement, entities=(entity,)))
+
+
+def test_read_conflict_flags_pair_as_reciprocal_evidence_pointers(stack) -> None:
+    _read_conflict_nodes(
+        stack,
+        "rc_a",
+        "Alice was born in berlin",
+        "rc_b",
+        "Alice was born in paris",
+    )
+    result = _assemble(stack, _recall(stack, "alice birthplace", _query_cues(("LanceDb",))))
+    entries = {entry.id: entry for entry in result.entries}
+    assert set(entries) == {"rc_a", "rc_b"}
+    for entry in entries.values():
+        assert EntryFlag.READ_CONFLICT in entry.flags
+    ga, gb = stack.graph.get_node("rc_a"), stack.graph.get_node("rc_b")
+    assert ga is not None and gb is not None
+    assert ga.read_conflict_id == "rc_b"
+    assert gb.read_conflict_id == "rc_a"
+
+
+def test_read_conflict_raises_without_mutating_confidence_or_text(stack) -> None:
+    _read_conflict_nodes(
+        stack,
+        "rc_a",
+        "Alice was born in berlin",
+        "rc_b",
+        "Alice was born in paris",
+    )
+    before_a = stack.graph.get_node("rc_a")
+    before_b = stack.graph.get_node("rc_b")
+    assert before_a is not None and before_b is not None
+    pre_conf_a = before_a.confidence
+    pre_conf_b = before_b.confidence
+    pre_text_a = before_a.props["statement"]
+    pre_text_b = before_b.props["statement"]
+
+    _assemble(stack, _recall(stack, "alice birthplace", _query_cues(("LanceDb",))))
+
+    after_a = stack.graph.get_node("rc_a")
+    after_b = stack.graph.get_node("rc_b")
+    assert after_a is not None and after_b is not None
+    assert after_a.confidence == pre_conf_a
+    assert after_b.confidence == pre_conf_b
+    assert after_a.props["statement"] == pre_text_a
+    assert after_b.props["statement"] == pre_text_b
+
+
+def test_read_conflict_under_flags_ambiguous_or_identical_statements(stack) -> None:
+    # Dissimilar facts about the same entity are complementary, not a
+    # contradiction: below the frame-similarity floor, no flag.
+    _read_conflict_nodes(
+        stack,
+        "rc_c",
+        "Alice is a software engineer",
+        "rc_d",
+        "Alice enjoys classical opera",
+    )
+    result = _assemble(stack, _recall(stack, "alice profile", _query_cues(("LanceDb",))))
+    assert not any(EntryFlag.READ_CONFLICT in entry.flags for entry in result.entries)
+    assert stack.graph.get_node("rc_c").read_conflict_id is None
+    assert stack.graph.get_node("rc_d").read_conflict_id is None
+
+    # Identical statements agree (a near-duplicate, not a contradiction): no flag.
+    _read_conflict_nodes(
+        stack,
+        "rc_e",
+        "Alice pronouns are they them",
+        "rc_f",
+        "Alice pronouns are they them",
+    )
+    result = _assemble(stack, _recall(stack, "alice pronouns", _query_cues(("LanceDb",))))
+    assert not any(EntryFlag.READ_CONFLICT in entry.flags for entry in result.entries)
+    assert stack.graph.get_node("rc_e").read_conflict_id is None
+    assert stack.graph.get_node("rc_f").read_conflict_id is None
+
+
+# ------------------------------------------------- read-conflict boundary families
+#
+# The QA-flagged regions: near-identical agreements (tense, typo, date-update)
+# must NEVER be flagged even though character similarity is high; divergent
+# opposite assertions (city/year/name, explicit negation) MUST be flagged even
+# when they share a wording frame. The detector keys on token divergence, not on
+# raw character overlap.
+
+_NEAR_AGREEMENT = [
+    # (id, statement_a, statement_b, entity) — the shared subject is the entity.
+    ("na_tense", "Alice lives in Rome", "Alice lived in Rome", "Alice"),
+    ("na_typo", "Alice moved to Paris in 2019", "Alice mosved to Paris in 2019", "Alice"),
+    ("na_date", "Alice was born in 1985", "Alice was born in 1987", "Alice"),
+]
+
+_DIVERGENT_OPPOSITE = [
+    # (id, statement_a, statement_b, entity) — the shared subject is the entity.
+    (
+        "dv_city",
+        "Alice grew up in London, England",
+        "Alice grew up in Paris, France",
+        "Alice",
+    ),
+    (
+        "dv_year",
+        "Bob was born in 1985",
+        "Bob was born in 2001",
+        "Bob",
+    ),
+    (
+        "dv_name",
+        "Carol's current name is Carol Smith",
+        "Carol's current name is Carol Jones",
+        "Carol",
+    ),
+    (
+        "dv_negation",
+        "Dana enjoys classical opera",
+        "Dana does not enjoy classical opera",
+        "Dana",
+    ),
+]
+
+
+def test_read_conflict_near_agreement_family_never_flags(stack) -> None:
+    for node_id, text_a, text_b, entity in _NEAR_AGREEMENT:
+        a_id, b_id = f"{node_id}_a", f"{node_id}_b"
+        _read_conflict_nodes(stack, a_id, text_a, b_id, text_b, entity=entity)
+        result = _assemble(stack, _recall(stack, "alice fact", _query_cues((entity,))))
+        entries = {entry.id: entry for entry in result.entries}
+        assert {a_id, b_id} <= set(entries), (text_a, text_b)
+        for entry in entries.values():
+            assert EntryFlag.READ_CONFLICT not in entry.flags, (text_a, text_b)
+        _assert_unflagged(stack, a_id)
+        _assert_unflagged(stack, b_id)
+
+
+def test_read_conflict_divergent_opposite_family_flags(stack) -> None:
+    for node_id, text_a, text_b, entity in _DIVERGENT_OPPOSITE:
+        a_id, b_id = f"{node_id}_a", f"{node_id}_b"
+        _read_conflict_nodes(stack, a_id, text_a, b_id, text_b, entity=entity)
+        result = _assemble(stack, _recall(stack, "alice fact", _query_cues((entity,))))
+        entries = {entry.id: entry for entry in result.entries}
+        assert {a_id, b_id} <= set(entries), (text_a, text_b)
+        for entry in entries.values():
+            assert EntryFlag.READ_CONFLICT in entry.flags, (text_a, text_b)
+        _assert_reciprocal(stack, a_id, b_id)
+
+
+def test_read_conflict_year_divergence_flags_with_subject_entity(stack) -> None:
+    # Regression: when the shared subject (Alice) is registered as the node's
+    # entity, the divergent value pair must still flag — the subject mention
+    # stays in the frame comparison, so "born" + "Alice" form the shared frame
+    # and 1985/2001 read as a same-frame value divergence.
+    _read_conflict_nodes(
+        stack,
+        "rdv_a",
+        "Alice was born in 1985",
+        "rdv_b",
+        "Alice was born in 2001",
+        entity="Alice",
+    )
+    result = _assemble(stack, _recall(stack, "alice fact", _query_cues(("Alice",))))
+    entries = {entry.id: entry for entry in result.entries}
+    assert {"rdv_a", "rdv_b"} <= set(entries)
+    for entry in entries.values():
+        assert EntryFlag.READ_CONFLICT in entry.flags
+    _assert_reciprocal(stack, "rdv_a", "rdv_b")
+
+
+def test_read_conflict_contrast_is_mutation_sensitive(stack) -> None:
+    # The SAME one-token edit: a char-similar (tense/typo) variant must NOT flag,
+    # a char-distinct divergent value variant MUST. Proves the detector keys on
+    # lexical divergence, not on pair membership or a similarity band.
+    _read_conflict_nodes(
+        stack,
+        "ct_a",
+        "Alice lives in Rome",
+        "ct_b",
+        "Alice lived in Rome",
+        entity="CueContrast",
+    )
+    result = _assemble(stack, _recall(stack, "alice fact", _query_cues(("CueContrast",))))
+    assert {e.id for e in result.entries} >= {"ct_a", "ct_b"}
+    assert not any(EntryFlag.READ_CONFLICT in e.flags for e in result.entries)
+
+    _read_conflict_nodes(
+        stack,
+        "cv_a",
+        "Alice lives in Rome",
+        "cv_b",
+        "Alice lives in Paris",
+        entity="CueContrast2",
+    )
+    result = _assemble(stack, _recall(stack, "alice fact", _query_cues(("CueContrast2",))))
+    assert {e.id for e in result.entries} >= {"cv_a", "cv_b"}
+    for entry in result.entries:
+        if entry.id in {"cv_a", "cv_b"}:
+            assert EntryFlag.READ_CONFLICT in entry.flags
+    _assert_reciprocal(stack, "cv_a", "cv_b")
+
+
+def _assert_unflagged(stack: _Stack, node_id: str) -> None:
+    node = stack.graph.get_node(node_id)
+    assert node is not None and node.read_conflict_id is None, node_id
+
+
+def _assert_reciprocal(stack: _Stack, a_id: str, b_id: str) -> None:
+    a, b = stack.graph.get_node(a_id), stack.graph.get_node(b_id)
+    assert a is not None and b is not None
+    assert a.read_conflict_id == b_id, a_id
+    assert b.read_conflict_id == a_id, b_id

@@ -1444,6 +1444,7 @@ class MemoryService:
                         "pending": bool(getattr(node, "pending_consolidation", False)),
                         "needs_reconcile": bool(getattr(node, "needs_reconcile", False)),
                         "peripheral_gaps": bool(getattr(node, "peripheral_gaps", False)),
+                        "read_conflict": bool(getattr(node, "read_conflict_id", False)),
                     },
                     "confidence": getattr(node, "confidence", None),
                 }

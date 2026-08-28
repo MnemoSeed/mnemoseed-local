@@ -324,6 +324,39 @@ def test_conflict_group_pairing_set_and_clear(driver):
     assert driver.get_node("cb").conflict_group is None
 
 
+def test_read_conflict_pair_sets_reciprocal_evidence_pointers(driver):
+    a = make_pref(node_id="ra")
+    b = make_pref(node_id="rb")
+    driver.upsert_node(a)
+    driver.upsert_node(b)
+    driver.set_read_conflict("ra", "rb")
+    ga = driver.get_node("ra")
+    gb = driver.get_node("rb")
+    assert ga.read_conflict_id == "rb"
+    assert gb.read_conflict_id == "ra"
+
+
+def test_clear_read_conflict_clears_single_side(driver):
+    a = make_pref(node_id="rc1a")
+    b = make_pref(node_id="rc1b")
+    c = make_pref(node_id="rc1c")
+    driver.upsert_node(a)
+    driver.upsert_node(b)
+    driver.upsert_node(c)
+    driver.set_read_conflict("rc1a", "rc1b")
+    driver.set_read_conflict("rc1c", "rc1a")
+    # Cross-read overwrite: a is now paired with c (b->a orphaned one-sided).
+    assert driver.get_node("rc1a").read_conflict_id == "rc1c"
+    assert driver.get_node("rc1b").read_conflict_id == "rc1a"
+    assert driver.get_node("rc1c").read_conflict_id == "rc1a"
+    driver.clear_read_conflict("rc1a")
+    assert driver.get_node("rc1a").read_conflict_id is None
+    # The sibling's one-sided pointer survives reparation to a tracked follow-up;
+    # clearing one side must not touch the other nodes.
+    assert driver.get_node("rc1b").read_conflict_id == "rc1a"
+    assert driver.get_node("rc1c").read_conflict_id == "rc1a"
+
+
 def test_flag_set_clear_roundtrip(driver):
     n = make_pref(node_id="fl")
     driver.upsert_node(n)
@@ -444,12 +477,13 @@ def test_query_intentions_status_and_due(driver):
 
 
 def _insert_node_row_at_v1(conn, driver_scratch, node) -> None:
-    # The scratch driver is at head (schema v5); the target is a v1 file whose
+    # The scratch driver is at head (schema v10); the target is a v1 file whose
     # nodes table predates the delta columns, so the head-added columns
-    # (promotion_status v5; pinned v2, already absent from _NODE_COLUMNS) are
-    # excluded and backfilled by the migration's NOT NULL DEFAULTs instead.
+    # (read_conflict_id v10; promotion_status v5; pinned v2, already absent
+    # from _NODE_COLUMNS) are excluded and backfilled by the migration's
+    # NOT NULL DEFAULTs (or NULL) instead.
     row = driver_scratch._node_row(node)
-    dropped = {"promotion_status"}
+    dropped = {"promotion_status", "read_conflict_id"}
     columns = [c for c in driver_scratch._NODE_COLUMNS if c not in dropped]
     values = [v for c, v in zip(driver_scratch._NODE_COLUMNS, row, strict=True) if c not in dropped]
     placeholders = ", ".join(["?"] * len(columns))
@@ -464,6 +498,7 @@ def test_migration_1_to_head_data_preserved(tmp_path):
     assert current_schema_version(conn, "graph") == 1
     assert "pinned" not in _column_names(conn, "nodes")
     assert "promotion_status" not in _column_names(conn, "nodes")
+    assert "read_conflict_id" not in _column_names(conn, "nodes")
 
     node = make_pref(
         node_id="survivor",
@@ -492,15 +527,18 @@ def test_migration_1_to_head_data_preserved(tmp_path):
     # a driver opening the v1 file auto-migrates it to head and preserves rows
     driver = SqliteGraphDriver(path=path)
     try:
-        assert current_schema_version(driver._conn, "graph") == 5
+        assert current_schema_version(driver._conn, "graph") == 10
         assert "pinned" in _column_names(driver._conn, "nodes")
         assert "promotion_status" in _column_names(driver._conn, "nodes")
+        assert "read_conflict_id" in _column_names(driver._conn, "nodes")
         got = driver.get_node("survivor")
         assert got is not None
         assert got.props["statement"] == "keep me"
         assert got.profile_id == "p1"
         # v5 back-compat: the migrated row reads back as promoted
         assert got.promotion_status.value == "promoted"
+        # v10 back-compat: the nullable read-conflict pointer back-fills NULL
+        assert got.read_conflict_id is None
     finally:
         asyncio.run(driver.close())
 
@@ -568,7 +606,7 @@ def test_graph_file_contains_only_graph_tables(tmp_path):
         apply_migrations(conn, "graph")
         tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert tables == {"schema_version", "nodes", "node_versions", "edges"}
-        assert current_schema_version(conn, "graph") == 5  # v2/v5 are graph-tagged
+        assert current_schema_version(conn, "graph") == 10  # v2/v5/v10 are graph-tagged
     finally:
         conn.close()
 
@@ -601,7 +639,7 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
 def test_migration_sequence_is_shared_and_forward_only():
     versions = [m.version for m in MIGRATIONS]
     assert versions == sorted(versions)
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     stores = {op.store for m in MIGRATIONS for op in m.ops}
     assert stores == {"graph", "meta"}
     # every store-region can reach the tail of the shared sequence independently

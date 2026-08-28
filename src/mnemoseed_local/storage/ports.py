@@ -683,6 +683,29 @@ class GraphStore(Protocol):
     def clear_flags(self, nodes: Sequence[str], flags: Sequence[GraphFlag]) -> None:
         raise NotImplementedError
 
+    def set_read_conflict(self, node_a: str, node_b: str) -> None:
+        """Raise the read-side conflict annotation between two in-effect nodes.
+
+        Each node stores the other as its ``read_conflict_id`` evidence pointer.
+        A read observation only — it never decides correctness, never rewrites a
+        statement, and never touches ``provenance.confidence``; offline
+        resolution consumes (and clears) the annotation later.
+
+        A consumer must NEVER assume reciprocity: each pointer is the single
+        latest observed peer for that node, and an overwrite on one side (e.g.
+        ``b`` repointed to a third node) can leave the old peer's one-sided
+        pointer orphaned. Orphan reparation is a tracked follow-up in the dream
+        chain, not this call's job.
+        """
+        raise NotImplementedError
+
+    def clear_read_conflict(self, node_id: str) -> None:
+        """Clear this node's read-side conflict evidence pointer
+        (``read_conflict_id`` = NULL). Addresses one side only; any peer's
+        one-sided pointer to ``node_id`` is left for the tracked reparation.
+        """
+        raise NotImplementedError
+
     def invalidate(self, node_id: str, valid_to: float) -> None:
         raise NotImplementedError
 

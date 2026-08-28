@@ -491,6 +491,17 @@ _V9_ADD_POOL_FILED_TOTAL = AddColumn(
     column=Column("filed_points_total", "REAL", not_null=True, default=0),
 )
 
+# v10 (read-side conflict annotation): nullable read_conflict_id evidence
+# pointer on graph.nodes. Readers raise it (reversibly) when two in-effect
+# statements about one entity surface in a single response; each party stores
+# the peer's node_id. Nullable + no default so every existing row back-fills
+# NULL (un-flagged); it is never written by capture or vote.
+_V10_ADD_READ_CONFLICT_ID = AddColumn(
+    store="graph",
+    table="nodes",
+    column=Column("read_conflict_id", "TEXT"),
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -579,6 +590,15 @@ MIGRATIONS: tuple[Migration, ...] = (
             "profile_score_pool (born-empty backfill, written only by pool_drain)"
         ),
         ops=(_V9_ADD_POOL_FILED_TOTAL,),
+    ),
+    Migration(
+        version=10,
+        description=(
+            "read-side conflict annotation: nullable read_conflict_id evidence "
+            "pointer on graph.nodes (raised reversibly by readers, never by "
+            "capture or vote)"
+        ),
+        ops=(_V10_ADD_READ_CONFLICT_ID,),
     ),
 )
 

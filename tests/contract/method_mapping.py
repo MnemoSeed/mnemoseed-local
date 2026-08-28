@@ -41,6 +41,8 @@ COVERAGE: dict[str, dict[str, str]] = {
         "find_same_predicate": "test_contract_graph.py::test_find_same_predicate",
         "set_flags": "test_contract_graph.py::test_set_and_clear_flags",
         "clear_flags": "test_contract_graph.py::test_set_and_clear_flags",
+        "set_read_conflict": "test_contract_graph.py::test_read_conflict_sets_reciprocal_pointers",
+        "clear_read_conflict": "test_contract_graph.py::test_clear_read_conflict_clears_single_side",
         "invalidate": "test_contract_graph.py::test_invalidate_closes_current_revision",
         "supersede_link": "test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction",
         "append_version": "test_contract_graph.py::test_append_version_supersedes_previous",
@@ -111,9 +113,11 @@ COVERAGE: dict[str, dict[str, str]] = {
 # VectorStore grew to 15 with distinct_profile_ids (observational captured-
 # namespace enumeration behind the doctor's unknown-profile check) and to 16
 # with get_dense (Atlas CHUNKS-ONLY PCA dense projection).
+# GraphStore grew to 23 with set_read_conflict + clear_read_conflict (read-side
+# reversible evidence pointer backing the read-conflict annotation).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
-    "GraphStore": 21,
+    "GraphStore": 23,
     "MetaStore": 35,
     "Embedder": 3,
 }

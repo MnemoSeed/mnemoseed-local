@@ -448,6 +448,30 @@ def test_conflict_group_pairing_set_and_clear(stack) -> None:
     assert stack.graph.get_node("cb").conflict_group is None
 
 
+def test_read_conflict_sets_reciprocal_pointers(stack) -> None:
+    a = make_pref(node_id="rca")
+    b = make_pref(node_id="rcb")
+    stack.graph.upsert_node(a)
+    stack.graph.upsert_node(b)
+    stack.graph.set_read_conflict("rca", "rcb")
+    ga = stack.graph.get_node("rca")
+    gb = stack.graph.get_node("rcb")
+    assert ga.read_conflict_id == "rcb"
+    assert gb.read_conflict_id == "rca"
+
+
+def test_clear_read_conflict_clears_single_side(stack) -> None:
+    a = make_pref(node_id="rca1")
+    b = make_pref(node_id="rcb1")
+    stack.graph.upsert_node(a)
+    stack.graph.upsert_node(b)
+    stack.graph.set_read_conflict("rca1", "rcb1")
+    assert stack.graph.get_node("rca1").read_conflict_id == "rcb1"
+    stack.graph.clear_read_conflict("rca1")
+    assert stack.graph.get_node("rca1").read_conflict_id is None
+    assert stack.graph.get_node("rcb1").read_conflict_id == "rca1"
+
+
 # ---------------------------------------------------------------- version chain
 
 

@@ -87,6 +87,11 @@ class GraphNode(BaseModel):
     conflict_flag: bool = False
     conflict_group: str | None = None  # shared group id pairs both parties
 
+    # Read-side reversible annotation: the peer node this in-effect statement
+    # was observed conflicting with on a read. Evidence pointer, not a
+    # correctness verdict — resolution happens offline. None = not flagged.
+    read_conflict_id: str | None = None
+
     # promotion gate (design/02 §11, prd-08 A.2 v5): carrier only — the gate
     # logic and retrieval filtering land in a later task.
     promotion_status: PromotionStatus = PromotionStatus.PROMOTED
