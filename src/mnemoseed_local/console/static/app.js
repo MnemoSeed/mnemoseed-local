@@ -322,6 +322,14 @@ let configVersions = null;
 let configGeneration = null; // optimistic-lock generation from GET /api/v1/config (if backend provides it)
 let configRawMeta = null; // full GET payload for restart_required etc.
 
+async function refreshConfigGeneration(){
+  try{
+    const data = await fetchJson("/api/v1/config");
+    configRawMeta = data;
+    configGeneration = data.generation ?? data.config_generation ?? null;
+  }catch{}
+}
+
 function cfgGroupFor(key){
   const dot = key.indexOf(".");
   const top = key.slice(0, dot);
@@ -563,7 +571,6 @@ function cfgFieldError(key, msg){
   if(/requires the 'isolated' graph instance/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 add [storage.graph.instances.isolated] to config.toml (driver = \"sqlite_graph\").";
   if(/must be >= dream\.core_confidence_floor/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 lower the core confidence floor first.";
   if(/must be <= dream\.pool_forced_cap/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 raise pool_forced_cap first.";
-  if(/must be >= dream\.floor_pool_points/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 raise floor_pool_points first or lower the cap.";
 }
 
 async function loadConfigVersions(){
@@ -639,7 +646,8 @@ let profilesStore = []; // {profile_id, display_name, created_at, archived}
 async function loadProfilesPage(){
   const errBanner = $("#profiles-error-banner");
   errBanner.hidden = true;
-  await Promise.all([refreshProfilesList(), refreshBindingsEditor()]);
+  await refreshProfilesList();
+  await refreshBindingsEditor();
 }
 
 async function refreshProfilesList(){
@@ -764,6 +772,7 @@ async function saveBindings(){
     });
     fb.textContent = "Saved.";
     a11yLive("Bindings saved");
+    await refreshConfigGeneration();
     await refreshBindingsEditor();
     refreshOrphanBanner();
     if($("#config-versions-body").dataset.loaded === "true") await loadConfigVersions();
@@ -878,12 +887,27 @@ async function renderDreamReflect(){
 
 async function loadDreamAutoToggle(){
   const toggle = $("#dream-auto-toggle");
+  const banner = $("#dream-error-banner");
   try{
     const data = await fetchJson("/api/v1/config");
     const on = !!(data.config && data.config.dream && data.config.dream.auto_trigger);
     toggle.setAttribute("aria-checked", String(on));
-  }catch{
-    toggle.setAttribute("aria-checked", "true");
+    toggle.disabled = false;
+    toggle.setAttribute("aria-disabled", "false");
+    if(banner) banner.hidden = true;
+  }catch(e){
+    toggle.setAttribute("aria-checked", "false");
+    toggle.disabled = true;
+    toggle.setAttribute("aria-disabled", "true");
+    if(banner){
+      banner.hidden = false;
+      const isDown = String(e.message||"").toLowerCase().includes("failed to fetch") || e.status===0 || e.status==null;
+      if(isDown){
+        banner.innerHTML = `<strong>Daemon unreachable</strong> — <span>${esc(DAEMON_MSG)}</span> <span class="banner-hint">Start the daemon and refresh.</span>`;
+      } else {
+        banner.innerHTML = `<strong>Couldn\u2019t load automatic dreams</strong> — <span>${esc(e.message||"network error")}</span>`;
+      }
+    }
   }
 }
 
@@ -945,6 +969,7 @@ async function toggleAutoDream(){
     });
     toggle.setAttribute("aria-checked", String(next));
     a11yLive(`Automatic dreams ${next?"on":"off"}`);
+    await refreshConfigGeneration();
   }catch(e){
     if(e.status===409){
       a11yLive("Toggle failed: someone else changed this — reloaded");
