@@ -63,6 +63,16 @@ from mnemoseed_local.eval.rescue_matrix import (
     RescuePointMetrics,
     rescue_grid_descent,
 )
+from mnemoseed_local.eval.warm_harness import run_warm_point
+from mnemoseed_local.eval.warm_materials import (
+    WARM_MATERIALS_SEED,
+    warm_materials,
+)
+from mnemoseed_local.eval.warm_matrix import (
+    WARM_EPSILON_BASELINE,
+    WarmProbeMetrics,
+    aggregate_warm_probes,
+)
 
 
 def _matrix_command(args: argparse.Namespace) -> int:
@@ -334,6 +344,41 @@ def _rescue_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warm_command(args: argparse.Namespace) -> int:
+    """Short-term activation ε=0 baseline (design/10 §5.2, Gate 2): drive every
+    warm-needle point's within-session re-query over the real recall daemon and
+    report whether the SAME fact re-surfaces immediately vs after a delay. The
+    activation mechanism does not exist yet — the run is labelled activation-off
+    (ε=0), the baseline a future activation is measured against."""
+
+    materials = warm_materials()
+    all_probes: list[WarmProbeMetrics] = []
+    for material in materials:
+        runs_root = Path(args.workdir) / "runs" / material.point_id
+        result = run_warm_point(material, root=runs_root)
+        all_probes.extend(result.probe_metrics)
+        assert result.activation_enabled is False
+        assert result.activation_eps == WARM_EPSILON_BASELINE
+        for metric in result.probe_metrics:
+            print(
+                f"  [{material.point_id}/{metric.window}] "
+                f"first={metric.first_surfaced} re_surfaced={metric.re_surfaced} "
+                f"re_rank={metric.re_rank} re_score={metric.re_score}"
+            )
+
+    report = aggregate_warm_probes(all_probes)
+    print(f"\nwarm-needle baseline: {len(materials)} points, activation-off (ε={report.activation_eps:g})")
+    for agg in report.aggregates:
+        fr = "None" if agg.first_surface_rate is None else f"{agg.first_surface_rate:.3f}"
+        rr = "None" if agg.re_surface_rate is None else f"{agg.re_surface_rate:.3f}"
+        sc = "None" if agg.median_re_score is None else f"{agg.median_re_score:.3f}"
+        print(
+            f"  window={agg.window}: first_surface={fr} re_surface={rr} "
+            f"median_re_score={sc} probes={agg.points}"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mnemoseed_local.eval", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -399,6 +444,18 @@ def main(argv: list[str] | None = None) -> int:
         help="write ACCEPTED values to config.py (never a DEMOTED outcome)",
     )
 
+    warm = sub.add_parser(
+        "warm",
+        help="short-term activation ε=0 baseline: within-session re-query of a recalled fact",
+    )
+    warm.add_argument("--workdir", default=".eval-rigs", help="scratch root for rig stores")
+    warm.add_argument(
+        "--seed",
+        type=int,
+        default=WARM_MATERIALS_SEED,
+        help="material catalog seed (pinned; overrides are rejected)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "recall" and args.seed != RECALL_MATERIALS_SEED:
         # Material identity is part of the calibration bar: the descent's bars
@@ -409,6 +466,14 @@ def main(argv: list[str] | None = None) -> int:
             f"--seed {args.seed}: seed override not supported for calibration "
             f"comparability (bars assume the pinned catalog seed {RECALL_MATERIALS_SEED})"
         )
+    if args.command == "warm" and args.seed != WARM_MATERIALS_SEED:
+        # Material identity is part of the measurement's comparability: a
+        # non-default catalog is rejected — the ε=0 baseline only holds for the
+        # pinned warm-needle seed.
+        parser.error(
+            f"--seed {args.seed}: seed override not supported for baseline "
+            f"comparability (measurement assumes the pinned catalog seed {WARM_MATERIALS_SEED})"
+        )
     if args.command == "matrix":
         return _matrix_command(args)
     if args.command == "rescore":
@@ -417,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
         return _recall_command(args)
     if args.command == "rescue":
         return _rescue_command(args)
+    if args.command == "warm":
+        return _warm_command(args)
     return _canary_command(args)
 
 
