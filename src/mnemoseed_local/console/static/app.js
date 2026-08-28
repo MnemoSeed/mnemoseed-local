@@ -327,7 +327,10 @@ async function refreshConfigGeneration(){
     const data = await fetchJson("/api/v1/config");
     configRawMeta = data;
     configGeneration = data.generation ?? data.config_generation ?? null;
-  }catch{}
+  }catch(e){
+    configGeneration = null;
+    console.warn("refreshConfigGeneration failed", e);
+  }
 }
 
 function cfgGroupFor(key){
@@ -897,11 +900,16 @@ async function loadDreamAutoToggle(){
     if(banner) banner.hidden = true;
   }catch(e){
     toggle.setAttribute("aria-checked", "false");
-    toggle.disabled = true;
-    toggle.setAttribute("aria-disabled", "true");
+    const isDown = String(e.message||"").toLowerCase().includes("failed to fetch") || e.status===0 || e.status==null;
+    if(isDown){
+      toggle.disabled = true;
+      toggle.setAttribute("aria-disabled", "true");
+    } else {
+      toggle.disabled = false;
+      toggle.setAttribute("aria-disabled", "false");
+    }
     if(banner){
       banner.hidden = false;
-      const isDown = String(e.message||"").toLowerCase().includes("failed to fetch") || e.status===0 || e.status==null;
       if(isDown){
         banner.innerHTML = `<strong>Daemon unreachable</strong> — <span>${esc(DAEMON_MSG)}</span> <span class="banner-hint">Start the daemon and refresh.</span>`;
       } else {
