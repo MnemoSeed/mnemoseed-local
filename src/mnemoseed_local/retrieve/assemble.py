@@ -45,8 +45,10 @@ network. Ties break by (kind, id) exactly like the hybrid retriever.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Any
 
@@ -82,6 +84,17 @@ class AssembleConfig:
     evidence_cap: int = 2
     evidence_max_chars: int = 400
     freshness_demotion: float = 0.8
+    # Read-side deterministic contradiction probe (prefer-to-under-flag): two
+    # same-entity in-effect statements are flagged only when the probe finds
+    # a lexically-relevant value/assertion divergence — never for raw character
+    # overlap. ``read_conflict_min_frame`` is the token-set Jaccard floor on
+    # content tokens (entity + stopwords removed) below which the facts are
+    # complementary, not contradictory; ``read_conflict_token_sim`` is the
+    # minimum character-similarity a differing token needs to count as a
+    # same-word edit (typo/tense/small date correction) that is agreement, not
+    # a contradiction.
+    read_conflict_min_frame: float = 0.25
+    read_conflict_token_sim: float = 0.55
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -94,6 +107,10 @@ class AssembleConfig:
             raise ValueError("evidence_max_chars must be positive")
         if not 0.0 < self.freshness_demotion <= 1.0:
             raise ValueError("freshness_demotion must be in (0, 1]")
+        if not 0.0 <= self.read_conflict_min_frame < 1.0:
+            raise ValueError("read_conflict_min_frame must satisfy 0 <= min < 1")
+        if not 0.0 < self.read_conflict_token_sim <= 1.0:
+            raise ValueError("read_conflict_token_sim must be in (0, 1]")
 
 
 # ---------------------------------------------------------------- output types
@@ -107,6 +124,7 @@ class EntryFlag(StrEnum):
     CONFLICT_OMITTED = "conflict_omitted"
     FRESH_EVIDENCE = "fresh_evidence"
     RESCUED = "rescued"  # design/09 §3.5: admitted through the cue-driven rescue band
+    READ_CONFLICT = "read_conflict"  # raised by the read path; peer via read_conflict_id
 
 
 @dataclass(frozen=True)
@@ -251,8 +269,13 @@ class Assembler:
         if marked:
             graph_store.set_flags(list(marked), [GraphFlag.PENDING_CONSOLIDATION])
 
+        read_pairs = self._read_conflict_pairs(admitted, config)
+        for node_a, node_b in read_pairs:
+            graph_store.set_read_conflict(node_a, node_b)
+        read_conflict_ids = {node_id for pair in read_pairs for node_id in pair}
+
         entries = tuple(
-            self._entry(admission, marked, config)
+            self._entry(admission, marked, config, read_conflict_ids)
             for admission in sorted(
                 admitted,
                 key=lambda item: (item.order, item.candidate.kind, item.candidate.id),
@@ -419,6 +442,7 @@ class Assembler:
         admission: _Admission,
         marked: Mapping[str, tuple[str, ...]],
         config: AssembleConfig,
+        read_conflict_ids: set[str],
     ) -> AssembledEntry:
         candidate = admission.candidate
         flags: list[EntryFlag] = []
@@ -436,6 +460,8 @@ class Assembler:
         for flag in admission.flags:
             if flag not in flags:
                 flags.append(flag)
+        if candidate.id in read_conflict_ids:
+            flags.append(EntryFlag.READ_CONFLICT)
         text = self._entry_text(candidate)
         provenance: dict[str, Any] = {}
         if candidate.kind == "chunk" and isinstance(candidate.item, ChunkStamp):
@@ -489,6 +515,82 @@ class Assembler:
             return tuple(item.entities)
         return ()
 
+    def _read_conflict_pairs(
+        self,
+        admitted: Sequence[_Admission],
+        config: AssembleConfig,
+    ) -> list[tuple[str, str]]:
+        """Pair same-entity in-effect graph statements the deterministic probe
+        judges as looking contradictory.
+
+        The read path raises the annotation but never decides which side is
+        correct and never rewrites a statement. Under-flag posture: unrelated
+        (complementary) facts and near-identical agreement — a tense change,
+        a typo, a minor date correction — are never paired. Deterministic by
+        (a, b) node id order.
+        """
+        in_effect: list[GraphNode] = []
+        for admission in admitted:
+            candidate = admission.candidate
+            if candidate.kind != "graph":
+                continue
+            node = candidate.item
+            if not isinstance(node, GraphNode) or node.valid_to is not None:
+                continue
+            if not node.entities or not Assembler._node_statement(node):
+                continue
+            in_effect.append(node)
+        pairs: list[tuple[str, str]] = []
+        paired: set[str] = set()
+        for a, b in _pairwise(in_effect):
+            if a.node_id in paired or b.node_id in paired:
+                continue
+            a_entities = {self._fold(e) for e in a.entities}
+            b_entities = {self._fold(e) for e in b.entities}
+            if not (a_entities & b_entities):
+                continue
+            if not self._is_read_conflict(
+                Assembler._node_statement(a),
+                Assembler._node_statement(b),
+                a_entities,
+                config,
+            ):
+                continue
+            pairs.append((a.node_id, b.node_id))
+            paired.add(a.node_id)
+            paired.add(b.node_id)
+        return pairs
+
+    def _is_read_conflict(
+        self,
+        statement_a: str,
+        statement_b: str,
+        entities: set[str],
+        config: AssembleConfig,
+    ) -> bool:
+        """Deterministic, model-free contradiction probe over two statements.
+
+        Decision order (each branch returns): (1) an explicit-negation polarity
+        flip over a shared content token is a direct contradiction; (2) a pure
+        agreement edit — every differing token is a character-similar same-word
+        edit (typo, inflection, small date correction) or one side refines the
+        other — is NEVER a contradiction; (3) otherwise, only a shared assertion
+        frame (at least two shared content tokens and a content-token Jaccard at
+        or above the floor) with lexically distinct value tokens is a divergence
+        worth flagging — a lone shared subject-mention is complementary, not
+        contradictory.
+        """
+        content_a, neg_a = _statement_tokens(statement_a, entities)
+        content_b, neg_b = _statement_tokens(statement_b, entities)
+        if neg_a != neg_b and content_a & content_b:
+            return True
+        if _is_agreement_edit(content_a, content_b, config.read_conflict_token_sim):
+            return False
+        shared = content_a & content_b
+        if len(shared) < 2:
+            return False
+        return _token_jaccard(content_a, content_b) >= config.read_conflict_min_frame
+
     @staticmethod
     def _entry_text(candidate: Candidate) -> str:
         """The assembled text this entry exposes (token accounting source)."""
@@ -498,6 +600,11 @@ class Assembler:
         node = candidate.item
         if not isinstance(node, GraphNode):
             return ""
+        return Assembler._node_statement(node)
+
+    @staticmethod
+    def _node_statement(node: GraphNode) -> str:
+        """The assertion text carried on a graph node (its entry text)."""
         for key in ("statement", "rule", "summary", "name", "trigger_condition", "action", "domain"):
             value = node.props.get(key)
             if isinstance(value, str) and value:
@@ -505,3 +612,137 @@ class Assembler:
         if node.entities:
             return f"{node.node_type.value}: {', '.join(node.entities)}"
         return node.node_type.value
+
+
+def _pairwise(nodes: Sequence[GraphNode]) -> Iterator[tuple[GraphNode, GraphNode]]:
+    """Ordered unique node pairs, deterministically sorted by node id."""
+    ordered = sorted(nodes, key=lambda node: node.node_id)
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            yield ordered[i], ordered[j]
+
+
+# ------------------------------------------------------------ read-conflict probe
+
+# Content tokens are the assertion's lexical substance; function words and
+# negation markers are removed. The shared subject mention (usually the node's
+# entity) is retained: together with a predicate it forms the shared frame the
+# ≥2-token gate keys on, so dropping it would hide a same-frame value
+# divergence behind a single bare predicate token.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "and",
+        "or",
+        "but",
+        "does",
+        "do",
+        "did",
+        "done",
+        "it",
+        "this",
+        "that",
+        "these",
+        "those",
+        "he",
+        "she",
+        "they",
+        "them",
+        "his",
+        "her",
+        "its",
+        "their",
+        "our",
+        "we",
+        "you",
+        "i",
+        "me",
+        "my",
+        "your",
+        "as",
+        "by",
+        "from",
+        "into",
+        "about",
+        "has",
+        "have",
+        "had",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+    }
+)
+
+_NEGATION = frozenset({"no", "not", "never", "none", "nor", "nobody", "nothing", "without"})
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _statement_tokens(statement: str, entities: set[str]) -> tuple[set[str], bool]:
+    """Tokenize a statement into its content token set and its negation flag.
+
+    Stopwords and negation markers drop out of the content surface; negation is
+    read off the raw token stream so polarity can flip without the marker being
+    swallowed. The shared subject mention (which is typically the node's
+    registered entity) is KEPT in the content surface so a single predicate
+    still forms a shared frame with it — dropping the subject would collapse a
+    genuine same-frame value divergence down to one bare predicate token and hide
+    the contradiction.
+    """
+    raw = _TOKEN_RE.findall(statement.casefold())
+    negated = any(token in _NEGATION for token in raw)
+    drop = _STOPWORDS | _NEGATION
+    content = {token for token in raw if len(token) > 1 and token not in drop}
+    return content, negated
+
+
+def _token_jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    union = a | b
+    if not union:
+        return 1.0
+    return len(a & b) / len(union)
+
+
+def _is_agreement_edit(a: set[str], b: set[str], token_sim: float) -> bool:
+    """True when the two statements differ only in the small-edit sense.
+
+    Identical sets, a one-side refinement, or every differing token having a
+    character-similar distinct partner on the other side (a typo, an inflection,
+    a small date correction) all read as agreement, not contradiction.
+    """
+    diff_a = a - b
+    diff_b = b - a
+    if not diff_a and not diff_b:
+        return True
+    if not diff_a or not diff_b:
+        return True  # one statement refines/elaborates the other
+    if len(diff_a) != len(diff_b):
+        return False
+    avail: set[str] = set(diff_b)
+    for token in sorted(diff_a):
+        best = max(avail, key=lambda other: SequenceMatcher(None, token, other).ratio())
+        if SequenceMatcher(None, token, best).ratio() < token_sim:
+            return False
+        avail.remove(best)
+    return True

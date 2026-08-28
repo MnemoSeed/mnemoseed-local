@@ -81,6 +81,7 @@ class SqliteGraphDriver:
         "needs_reconcile",
         "pending_consolidation",
         "peripheral_gaps",
+        "read_conflict_id",
         "valid_from",
         "valid_to",
         "last_reinforced",
@@ -141,6 +142,7 @@ class SqliteGraphDriver:
             "needs_reconcile": int(node.needs_reconcile),
             "pending_consolidation": int(node.pending_consolidation),
             "peripheral_gaps": int(node.peripheral_gaps),
+            "read_conflict_id": node.read_conflict_id,
             "valid_from": iso8601_utc(node.valid_from),
             "valid_to": iso8601_utc(node.valid_to) if node.valid_to is not None else None,
             "last_reinforced": iso8601_utc(node.last_reinforced),
@@ -172,6 +174,7 @@ class SqliteGraphDriver:
             "needs_reconcile": bool(int(row["needs_reconcile"])),
             "pending_consolidation": bool(int(row["pending_consolidation"])),
             "peripheral_gaps": bool(int(row["peripheral_gaps"])),
+            "read_conflict_id": row["read_conflict_id"],
             "valid_from": epoch_from_iso(str(row["valid_from"])),
             "valid_to": _maybe_epoch(row["valid_to"]),
             "last_reinforced": epoch_from_iso(str(row["last_reinforced"])),
@@ -514,6 +517,33 @@ class SqliteGraphDriver:
                     f"UPDATE nodes SET {column} = ? WHERE node_id IN ({placeholders}) AND valid_to IS NULL",
                     [value, *params],
                 )
+
+    def set_read_conflict(self, node_a: str, node_b: str) -> None:
+        """Raise the read-side conflict annotation: each in-effect node records
+        the other as its evidence pointer (``read_conflict_id`` = peer node_id).
+        Append-only with respect to provenance.confidence and captured text;
+        resolution happens offline. Overwriting one side's pointer can orphan
+        the previous peer's — a consumer must never assume reciprocity;
+        reparation is a tracked follow-up."""
+        with _transaction(self._conn):
+            self._conn.execute(
+                "UPDATE nodes SET read_conflict_id = ? WHERE node_id = ? AND valid_to IS NULL",
+                (node_b, node_a),
+            )
+            self._conn.execute(
+                "UPDATE nodes SET read_conflict_id = ? WHERE node_id = ? AND valid_to IS NULL",
+                (node_a, node_b),
+            )
+
+    def clear_read_conflict(self, node_id: str) -> None:
+        """Clear a single node's read-side evidence pointer
+        (``read_conflict_id`` = NULL); any peer's one-sided pointer is left for
+        tracked reparation."""
+        with _transaction(self._conn):
+            self._conn.execute(
+                "UPDATE nodes SET read_conflict_id = NULL WHERE node_id = ? AND valid_to IS NULL",
+                (node_id,),
+            )
 
     # ------------------------------------------------------------ version chain
 
