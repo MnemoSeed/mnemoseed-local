@@ -252,6 +252,75 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font
 .hidden{display:none !important}
 .kv-grid{display:grid; gap:8px}
 
+/* ============ Config tab ============ */
+.cfg-group{border:1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-soft); margin-bottom:14px; overflow:hidden}
+.cfg-group-head{padding:12px 14px; border-bottom:1px solid var(--line); background: linear-gradient(180deg,#fff,#FBFDFF); display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.cfg-group-title{margin:0; font-size:13px; font-weight:700; letter-spacing:-.01em}
+.cfg-group-desc{margin:0; color: var(--muted); font-size:12px}
+.cfg-row{display:grid; grid-template-columns: 220px 1fr auto; gap:12px; align-items:center; padding:12px 14px; border-bottom:1px solid var(--line)}
+.cfg-row:last-child{border-bottom:none}
+.cfg-row.is-error{background: var(--danger-bg)}
+.cfg-key{display:flex; flex-direction:column; gap:3px}
+.cfg-key code{font-size:12px; word-break:break-all}
+.cfg-sub{color: var(--muted); font-size:11px}
+.cfg-value{display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0}
+.cfg-value .input{width:100%; max-width:260px}
+.cfg-value .select{width:auto}
+.cfg-badges{display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end}
+.cfg-edit{display:flex; gap:8px; align-items:center; flex:1; min-width:0}
+.cfg-edit .input,.cfg-edit .select{flex:0 1 auto}
+.cfg-err{grid-column:1 / -1; color:#7F1D1D; font-size:12px; padding:4px 2px 0}
+.badge-restart{background:#FFF1E6; border-color:#FFD8B8; color:#9A3412}
+.badge-live{background:#ECFDF5; border-color:#A7F3D0; color:#065F46}
+.badge-source{background:#F8FAFC; color: var(--muted)}
+.badge-boot{background:#EEF2F6; color: var(--muted); border-color: var(--line-strong)}
+.cfg-role{border-top:1px solid var(--line); padding:10px 14px; display:grid; gap:10px}
+.cfg-role:first-child{border-top:none}
+.cfg-role-head{display:flex; gap:8px; align-items:center; padding:4px 0 2px; font-weight:700}
+.cfg-json{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; min-width:260px}
+.cfg-fields{display:grid; gap:0}
+.cfg-foot-note{color: var(--muted); font-size:12px; padding:8px 2px}
+@media (max-width:720px){ .cfg-row{grid-template-columns:1fr; gap:8px} .cfg-badges{justify-content:flex-start} }
+
+/* Version history */
+.ver-table{width:100%; border-collapse:collapse; font-size:12.5px}
+.ver-table th,.ver-table td{text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top}
+.ver-table th{font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color: var(--muted); background: var(--surface-2)}
+.ver-table code{font-size:11.5px; word-break:break-all}
+.ver-val{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11.5px; max-width:340px; overflow-wrap:anywhere}
+.ver-current{color: var(--accent); font-weight:700}
+.ver-row-current td{background: var(--accent-weak)}
+
+/* ============ Profiles tab ============ */
+.row-form{display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap}
+.profile-table{width:100%; border-collapse:collapse; font-size:13px}
+.profile-table th,.profile-table td{text-align:left; padding:8px 10px; border-bottom:1px solid var(--line)}
+.profile-table th{font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color: var(--muted); background: var(--surface-2)}
+.profile-table td code{font-size:12px}
+.badge-archived{background:#F1F5F9; color: var(--muted); border-color: var(--line)}
+
+/* Bindings editor */
+.bindings-editor{display:grid; gap:8px}
+.binding-row{display:flex; gap:8px; align-items:center}
+.binding-row .input{flex:1}
+.binding-row .select{flex:1}
+.binding-row.is-orphan{background: var(--warn-bg); border:1px solid var(--warn-line); border-radius:10px; padding:8px}
+.binding-remove{appearance:none; border:1px solid var(--line); background: var(--surface); color: var(--muted); width:28px; height:28px; border-radius:8px; cursor:pointer; font-size:16px; line-height:1}
+.binding-remove:hover{color: var(--danger); border-color: var(--danger)}
+
+/* Switch */
+.switch-row{display:flex; align-items:center; gap:10px}
+.switch{appearance:none; width:40px; height:22px; border-radius:999px; background: var(--surface-3); border:1px solid var(--line-strong); cursor:pointer; position:relative; transition: background .15s; flex:0 0 auto}
+.switch::after{content:""; position:absolute; left:2px; top:2px; width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(15,23,42,.3); transition: transform .15s}
+.switch[aria-checked="true"]{background: var(--accent); border-color: var(--accent)}
+.switch[aria-checked="true"]::after{transform: translateX(18px)}
+.switch:focus-visible{box-shadow: var(--focus)}
+
+/* ============ Dream tab ============ */
+.pool-chip{display:inline-flex; align-items:baseline; gap:6px; font-variant-numeric: tabular-nums}
+.pool-balance{font-size:22px; font-weight:800; letter-spacing:-.02em}
+.kv-grid.dream-kv .kv{grid-template-columns: 180px 1fr}
+
 /* Responsive Atlas Stage + Drawer on mobile: drawer as bottom sheet */
 @media (max-width: 768px){
   .atlas-main{grid-template-columns: 1fr}
