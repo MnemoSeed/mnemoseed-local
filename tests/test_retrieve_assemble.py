@@ -886,6 +886,63 @@ def test_read_conflict_contrast_is_mutation_sensitive(stack) -> None:
     _assert_reciprocal(stack, "cv_a", "cv_b")
 
 
+def test_read_conflict_stopword_entity_subject_force_kept_flags(stack) -> None:
+    # Regression: an entity that collides with a STOPWORD (e.g. "Will") is a real
+    # subject mention; it must stay in the content surface. Dropping it would
+    # collapse a same-frame value divergence ("lives in Rome"/"lives in Paris")
+    # down to a single bare predicate token and hide the contradiction.
+    _read_conflict_nodes(
+        stack,
+        "sw_a",
+        "Will lives in Rome",
+        "sw_b",
+        "Will lives in Paris",
+        entity="Will",
+    )
+    result = _assemble(stack, _recall(stack, "will location", _query_cues(("Will",))))
+    entries = {entry.id: entry for entry in result.entries}
+    assert {"sw_a", "sw_b"} <= set(entries)
+    for entry in entries.values():
+        assert EntryFlag.READ_CONFLICT in entry.flags
+    _assert_reciprocal(stack, "sw_a", "sw_b")
+
+
+def test_read_conflict_stopword_entity_near_agreement_never_flags(stack) -> None:
+    # A stopword-colliding subject must not turn tense/typo/date corrections
+    # into contradictions once it is force-kept in the frame.
+    cases = [
+        ("sw_na", "Will lives in Rome", "Will lived in Rome"),
+        ("sw_ty", "Will moved to Paris in 2019", "Will mosved to Paris in 2019"),
+        ("sw_dt", "Will was born in 1985", "Will was born in 1987"),
+    ]
+    for prefix, text_a, text_b in cases:
+        a_id, b_id = f"{prefix}_a", f"{prefix}_b"
+        _read_conflict_nodes(stack, a_id, text_a, b_id, text_b, entity="Will")
+        result = _assemble(stack, _recall(stack, "will fact", _query_cues(("Will",))))
+        entries = {entry.id: entry for entry in result.entries}
+        assert {a_id, b_id} <= set(entries), (text_a, text_b)
+        assert not any(EntryFlag.READ_CONFLICT in entry.flags for entry in result.entries), (text_a, text_b)
+        _assert_unflagged(stack, a_id)
+        _assert_unflagged(stack, b_id)
+
+
+def test_read_conflict_stopword_entity_complementary_never_flags(stack) -> None:
+    # A lone shared subject mention stays complementary even when it names a
+    # stopword: only the subject is force-kept, other stopwords still drop.
+    _read_conflict_nodes(
+        stack,
+        "sw_c_a",
+        "Will is a software engineer",
+        "sw_c_b",
+        "Will enjoys classical opera",
+        entity="Will",
+    )
+    result = _assemble(stack, _recall(stack, "will profile", _query_cues(("Will",))))
+    assert not any(EntryFlag.READ_CONFLICT in entry.flags for entry in result.entries)
+    _assert_unflagged(stack, "sw_c_a")
+    _assert_unflagged(stack, "sw_c_b")
+
+
 def _assert_unflagged(stack: _Stack, node_id: str) -> None:
     node = stack.graph.get_node(node_id)
     assert node is not None and node.read_conflict_id is None, node_id
