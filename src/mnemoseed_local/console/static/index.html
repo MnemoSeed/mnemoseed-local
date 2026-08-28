@@ -102,13 +102,13 @@
           <span class="badge badge-muted">GET /api/v1/config · redacted</span>
         </div>
         <p class="config-lead">Secrets are never shown — only env-var names. This page never writes.</p>
-        <div id="config-body" class="card-body">
+        <div id="overview-config-body" class="card-body">
           <div class="skeleton skeleton-line" style="width: 90%"></div>
           <div class="skeleton skeleton-line" style="width: 86%"></div>
           <div class="skeleton skeleton-line" style="width: 72%"></div>
           <div class="skeleton skeleton-block"></div>
         </div>
-        <div id="config-foot" class="card-foot muted"></div>
+        <div id="overview-config-foot" class="card-foot muted"></div>
       </article>
     </section>
 
@@ -137,7 +137,7 @@
       </div>
 
       <!-- Filter bar — minimal: Kind/Type/Decay/Time/Entities + Density -->
-      <div class="filterbar" role="toolbar" aria-label="Filters">
+      <div class="filterbar" role="group" aria-label="Filters">
         <label class="field">
           <span class="field-label">Kind</span>
           <select id="f-kind" class="select">
@@ -234,7 +234,7 @@
       <div class="atlas-main">
         <div class="atlas-stage">
           <!-- 3D / 2.5D canvas -->
-          <div id="atlas-canvas-wrap" class="canvas-wrap" tabindex="0" role="img" aria-label="Memory 3D atlas, use arrow keys to orbit, F to focus selection, R to reset view">
+          <div id="atlas-canvas-wrap" class="canvas-wrap" tabindex="0" role="region" aria-label="Memory 3D atlas, use arrow keys to orbit, F to focus selection, R to reset view">
             <canvas id="atlas-canvas" class="atlas-canvas" width="800" height="520" aria-hidden="true"></canvas>
             <canvas id="atlas-canvas-2d" class="atlas-canvas atlas-canvas-2d" hidden width="800" height="520" aria-hidden="true"></canvas>
             <div id="atlas-hover" class="hover-card" hidden></div>
@@ -576,9 +576,9 @@
   </main>
 
   <!-- Confirm dialogs -->
-  <dialog id="dlg-forget" class="dialog">
+  <dialog id="dlg-forget" class="dialog" aria-labelledby="dlg-forget-title">
     <form method="dialog" class="dialog-body">
-      <h3 class="dialog-title">Forget this memory?</h3>
+      <h3 id="dlg-forget-title" class="dialog-title">Forget this memory?</h3>
       <p>This cannot be undone. For nodes the version chain is kept but hidden; for chunks the text is deleted.</p>
       <div class="dialog-actions">
         <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
@@ -587,9 +587,9 @@
     </form>
   </dialog>
 
-  <dialog id="dlg-supersede" class="dialog">
+  <dialog id="dlg-supersede" class="dialog" aria-labelledby="dlg-supersede-title">
     <form method="dialog" class="dialog-body">
-      <h3 class="dialog-title">Supersede</h3>
+      <h3 id="dlg-supersede-title" class="dialog-title">Supersede</h3>
       <p>Supersede requires a successor node ID.</p>
       <label class="field" style="width:100%">
         <span class="field-label">Successor node ID</span>
