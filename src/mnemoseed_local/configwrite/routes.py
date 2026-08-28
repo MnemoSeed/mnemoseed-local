@@ -3,14 +3,14 @@
 The /api/v1/config contract the CLI codes against:
 
 - GET    /api/v1/config             resolved config, secrets redacted to
-                                    env-var NAMES only; the body is
-                                    ``{"config": {...}, "restart_required": {...}}``.
+                                     env-var NAMES only; the body is
+                                     ``{"config": {...}, "restart_required": {...}, "generation": int}``.
 - POST   /api/v1/config/set         ``{key_path, value}`` -> ``{ok, version_id,
-                                    restart_required}``; a typed failure is a
-                                    422 whose message names the offending key.
+                                     restart_required}``; a typed failure is a
+                                     422 whose message names the offending key.
 - GET    /api/v1/config/versions    the versioned history.
 - POST   /api/v1/config/rollback    ``{version_id}`` -> ``{ok, version_id,
-                                    restored}``, append-only.
+                                     restored}``, append-only.
 
 Actor attribution comes from the ``X-MnemoSeed-Actor`` header
 (cli|console|mcp, default console). Config writes are config operations: they
@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 
 from mnemoseed_local.config import Config
-from mnemoseed_local.configwrite.service import ConfigWriteError, ConfigWriteService
+from mnemoseed_local.configwrite.service import ConfigWriteError, ConfigWriteService, GenerationMismatchError
 from mnemoseed_local.daemon.actor import resolve_actor
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -59,6 +59,38 @@ def _reject_remote_writes(request: Request) -> None:
         )
 
 
+def _expected_generation(request: Request) -> int | None:
+    """Parse If-Match into an expected generation, or None when absent.
+
+    Weak validators (W/) and quotes are stripped per RFC 7232; inner and
+    surrounding whitespace is trimmed. An empty, whitespace-only or
+    non-integer value is treated as a mismatch and raises 409 with the
+    current generation in the detail so callers can resync.
+    """
+    raw = request.headers.get("if-match")
+    if raw is None:
+        raw = request.headers.get("If-Match")
+    if raw is None:
+        return None
+    candidate = raw.strip()
+    if candidate.startswith("W/"):
+        candidate = candidate[2:].strip()
+    if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
+        candidate = candidate[1:-1].strip()
+    if not candidate:
+        raise HTTPException(
+            status_code=409,
+            detail=f"generation mismatch: current generation is {_service(request).generation}",
+        )
+    try:
+        return int(candidate)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"generation mismatch: current generation is {_service(request).generation}",
+        ) from exc
+
+
 @router.get("/config")
 def get_config(request: Request) -> dict[str, Any]:
     """FR-7.11: the resolved config for the settings page (names only)."""
@@ -75,27 +107,11 @@ def set_config(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     key_path = body.get("key_path")
     if not isinstance(key_path, str) or not key_path:
         raise HTTPException(status_code=422, detail="body.key_path must be a non-empty string")
-    # Optimistic-lock: If-Match must equal the current generation when present.
-    # The header lookup is case-insensitive (Starlette normalizes), but we check
-    # both casings explicitly so the contract accepts either spelling.
-    if_match = request.headers.get("if-match")
-    if if_match is None:
-        if_match = request.headers.get("If-Match")
-    if if_match is not None:
-        current = _service(request).generation
-        candidate = if_match.strip()
-        # Strip weak validator and quotes (If-Match may be quoted per RFC 7232).
-        if candidate.startswith("W/"):
-            candidate = candidate[2:].strip()
-        if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
-            candidate = candidate[1:-1].strip()
-        if candidate != str(current):
-            raise HTTPException(
-                status_code=409,
-                detail=f"generation mismatch: current generation is {current}",
-            )
+    expected = _expected_generation(request)
     try:
-        result = _service(request).set(key_path, body.get("value"), actor=actor)
+        result = _service(request).set(key_path, body.get("value"), actor=actor, expected_generation=expected)
+    except GenerationMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ConfigWriteError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
@@ -117,8 +133,11 @@ def config_rollback(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """FR-7.11: restore a recorded version (append-only, a new record)."""
     actor = resolve_actor(request)
     _reject_remote_writes(request)
+    expected = _expected_generation(request)
     try:
-        result = _service(request).rollback(body.get("version_id"), actor=actor)
+        result = _service(request).rollback(body.get("version_id"), actor=actor, expected_generation=expected)
+    except GenerationMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ConfigWriteError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": result["ok"], "version_id": result["version_id"], "restored": result["restored"]}

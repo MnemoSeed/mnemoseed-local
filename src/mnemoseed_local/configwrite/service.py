@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -77,6 +78,16 @@ class ConfigWriteError(ValueError):
     def __init__(self, key_path: str, message: str) -> None:
         self.key_path = key_path
         super().__init__(f"config[{key_path}]: {message}")
+
+
+class GenerationMismatchError(ConfigWriteError):
+    """Optimistic-lock failure: If-Match does not match the current generation (mapped to 409)."""
+
+    def __init__(self, current: int) -> None:
+        self.current = current
+        # Bypass ConfigWriteError's key_path formatting; message already contains current.
+        ValueError.__init__(self, f"generation mismatch: current generation is {current}")
+        self.key_path = "generation"
 
 
 class ConfigWriteMeta(Protocol):
@@ -881,6 +892,7 @@ class ConfigWriteService:
         # consumers (the role router) rebuild exactly what changed.
         self._generation = 0
         self._role_generations: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------ generation (F2)
 
@@ -997,107 +1009,126 @@ class ConfigWriteService:
 
     # ------------------------------------------------------------ writes
 
-    def set(self, key_path: str, value: Any, *, actor: str = "console") -> dict[str, Any]:
+    def set(
+        self,
+        key_path: str,
+        value: Any,
+        *,
+        actor: str = "console",
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Validate, patch, record, audit and live-apply one config write."""
-        spec = CONFIG_KEY_REGISTRY.get(key_path)
-        if spec is None:
-            raise ConfigWriteError(key_path, "unknown config key (not writable)")
-        try:
-            validated = spec.validate(value)
-        except ValueError as exc:
-            raise ConfigWriteError(key_path, str(exc)) from exc
-        if spec.cross_validate is not None:
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise GenerationMismatchError(self._generation)
+            spec = CONFIG_KEY_REGISTRY.get(key_path)
+            if spec is None:
+                raise ConfigWriteError(key_path, "unknown config key (not writable)")
             try:
-                spec.cross_validate(self._config, validated)
+                validated = spec.validate(value)
             except ValueError as exc:
                 raise ConfigWriteError(key_path, str(exc)) from exc
-        path = self._config_path()
-        _patch_toml(path, key_path, validated)
-        version_id = self._record(key_path, validated)
-        spec.apply(self._config, validated)
-        # orphan namespace warning (IMPORTANT-1): typo like {"planner":"reserach"}
-        # would silently route to a non-existent profile. Warn + audit, not reject.
-        if key_path == "profiles.agent_bindings" and self._meta is not None:
-            try:
-                list_profiles = getattr(self._meta, "list_profiles", None)
-                if callable(list_profiles):
-                    existing = {p.profile_id for p in list_profiles()}
-                    existing.add("default")
-                    orphans = sorted({t for t in validated.values() if t not in existing})
-                    if orphans:
-                        logger.warning(
-                            "profile_binding_orphan: bindings %s point to non-existent profile(s) %s",
-                            validated,
-                            orphans,
-                        )
-                        self._audit(
-                            "profile_binding_orphan",
-                            {"orphans": orphans, "key_path": key_path, "value": validated},
-                            actor,
-                        )
-            except Exception:  # pragma: no cover - warning path must never fail the write
-                logger.warning("orphan binding check failed", exc_info=True)
-        self._touch_fingerprint()
-        self._bump(key_path)
-        restart_required = not spec.live_apply
-        self._audit(
-            "config.set",
-            {
-                "key_path": key_path,
-                "value": validated,
+            if spec.cross_validate is not None:
+                try:
+                    spec.cross_validate(self._config, validated)
+                except ValueError as exc:
+                    raise ConfigWriteError(key_path, str(exc)) from exc
+            path = self._config_path()
+            _patch_toml(path, key_path, validated)
+            version_id = self._record(key_path, validated)
+            spec.apply(self._config, validated)
+            # orphan namespace warning (IMPORTANT-1): typo like {"planner":"reserach"}
+            # would silently route to a non-existent profile. Warn + audit, not reject.
+            if key_path == "profiles.agent_bindings" and self._meta is not None:
+                try:
+                    list_profiles = getattr(self._meta, "list_profiles", None)
+                    if callable(list_profiles):
+                        existing = {p.profile_id for p in list_profiles()}
+                        existing.add("default")
+                        orphans = sorted({t for t in validated.values() if t not in existing})
+                        if orphans:
+                            logger.warning(
+                                "profile_binding_orphan: bindings %s point to non-existent profile(s) %s",
+                                validated,
+                                orphans,
+                            )
+                            self._audit(
+                                "profile_binding_orphan",
+                                {"orphans": orphans, "key_path": key_path, "value": validated},
+                                actor,
+                            )
+                except Exception:  # pragma: no cover - warning path must never fail the write
+                    logger.warning("orphan binding check failed", exc_info=True)
+            self._touch_fingerprint()
+            self._bump(key_path)
+            restart_required = not spec.live_apply
+            self._audit(
+                "config.set",
+                {
+                    "key_path": key_path,
+                    "value": validated,
+                    "version_id": version_id,
+                    "restart_required": restart_required,
+                },
+                actor,
+            )
+            return {
+                "ok": True,
                 "version_id": version_id,
                 "restart_required": restart_required,
-            },
-            actor,
-        )
-        return {
-            "ok": True,
-            "version_id": version_id,
-            "restart_required": restart_required,
-            "key_path": key_path,
-            "value": validated,
-            "persisted_to": str(path),
-            "actor": actor,
-        }
+                "key_path": key_path,
+                "value": validated,
+                "persisted_to": str(path),
+                "actor": actor,
+            }
 
-    def rollback(self, version_id: Any, *, actor: str = "console") -> dict[str, Any]:
+    def rollback(
+        self,
+        version_id: Any,
+        *,
+        actor: str = "console",
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Restore a recorded version, append-only (a new record, never a
         delete): the file, the live config and the versioned store converge on
         the restored value."""
-        if self._meta is None:
-            raise ConfigWriteError("rollback", "no versioned config store available")
-        resolved = _coerce_version_id(version_id)
-        key_path, version = _resolve_version_id(resolved)
-        spec = CONFIG_KEY_REGISTRY.get(key_path)
-        if spec is None:
-            raise ConfigWriteError(key_path, "unknown config key (not writable)")
-        target = self._meta.get_config(key_path, version)
-        if target is None:
-            raise ConfigWriteError(key_path, f"no version {version} recorded for {key_path!r}")
-        self._meta.rollback_config(key_path, version)
-        restored = self._meta.get_config(key_path)
-        if restored is None:
-            raise ConfigWriteError(key_path, "rollback produced no restored record")
-        restored_value = restored.value.get("value")
-        path = self._config_path()
-        _patch_toml(path, key_path, restored_value)
-        spec.apply(self._config, restored_value)
-        self._touch_fingerprint()
-        self._bump(key_path)
-        new_version_id = _version_id(key_path, restored.version)
-        self._audit(
-            "config.rollback",
-            {"key_path": key_path, "restored_version": version, "version_id": new_version_id},
-            actor,
-        )
-        return {
-            "ok": True,
-            "version_id": new_version_id,
-            "restored": new_version_id,
-            "key_path": key_path,
-            "persisted_to": str(path),
-            "actor": actor,
-        }
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise GenerationMismatchError(self._generation)
+            if self._meta is None:
+                raise ConfigWriteError("rollback", "no versioned config store available")
+            resolved = _coerce_version_id(version_id)
+            key_path, version = _resolve_version_id(resolved)
+            spec = CONFIG_KEY_REGISTRY.get(key_path)
+            if spec is None:
+                raise ConfigWriteError(key_path, "unknown config key (not writable)")
+            target = self._meta.get_config(key_path, version)
+            if target is None:
+                raise ConfigWriteError(key_path, f"no version {version} recorded for {key_path!r}")
+            self._meta.rollback_config(key_path, version)
+            restored = self._meta.get_config(key_path)
+            if restored is None:
+                raise ConfigWriteError(key_path, "rollback produced no restored record")
+            restored_value = restored.value.get("value")
+            path = self._config_path()
+            _patch_toml(path, key_path, restored_value)
+            spec.apply(self._config, restored_value)
+            self._touch_fingerprint()
+            self._bump(key_path)
+            new_version_id = _version_id(key_path, restored.version)
+            self._audit(
+                "config.rollback",
+                {"key_path": key_path, "restored_version": version, "version_id": new_version_id},
+                actor,
+            )
+            return {
+                "ok": True,
+                "version_id": new_version_id,
+                "restored": new_version_id,
+                "key_path": key_path,
+                "persisted_to": str(path),
+                "actor": actor,
+            }
 
     # ------------------------------------------------------------ boot reconcile (E1-4 DB-primary)
 
