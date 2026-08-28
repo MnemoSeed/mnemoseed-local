@@ -181,7 +181,7 @@ async function loadOverview(){
     const stores = healthz.stores ? Object.entries(healthz.stores).map(([k,v])=> `${esc(k)}: ${esc(Object.values(v).join(", ")||"—")}`).join(" · ") : "—";
     statusBody.innerHTML = `
       <div class="kv-grid">
-        <dl class="kv"><dt>Status</dt><dd><span class="badge ${gate.ok ? 'badge-ok' : 'badge-warn'}" style="${gate.ok ? '' : 'background:#FEF2F2; border-color:#FECACA; color:#7F1D1D'}">${gate.ok ? "ok":"degraded"}</span> ${esc(healthz.status||"ok")} · preset <code>${preset}</code></dd></dl>
+        <dl class="kv"><dt>Status</dt><dd><span class="badge ${gate.ok ? 'badge-ok' : 'badge-danger'}">${gate.ok ? "ok":"degraded"}</span> ${esc(healthz.status||"ok")} · preset <code>${preset}</code></dd></dl>
         <dl class="kv"><dt>Uptime</dt><dd>${esc(uptime||"—")}</dd></dl>
         <dl class="kv"><dt>Stores</dt><dd>${stores}</dd></dl>
         ${deg.length ? `<dl class="kv"><dt>Degradations</dt><dd>${esc(deg.map(d=>d.feature||d.capability).join(", "))}</dd></dl>` : ""}
@@ -1802,8 +1802,7 @@ function openDrawer(id){
   const band = decayBand(w);
   const labelEl = $("#d-decay-label");
   labelEl.textContent = decayLabel(w);
-  labelEl.className = "badge " + (band==="healthy"?"": band==="rescue"?"badge-warn":"");
-  if(band==="fading") labelEl.style.background="#FEF2F2"; else labelEl.style.background="";
+  labelEl.className = "badge " + (band==="healthy"?"": band==="rescue"?"badge-warn": band==="fading"?"badge-fading":"");
   const bar = $("#d-decay-bar");
   bar.style.width = `${clamp((w||0)*100,0,100)}%`;
   bar.className = "progress-bar " + (band==="healthy"?"is-healthy": band==="rescue"?"is-rescue": band==="fading"?"is-fading":"");

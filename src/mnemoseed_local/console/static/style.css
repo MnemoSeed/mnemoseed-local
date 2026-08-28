@@ -131,6 +131,8 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font
 .badge-muted{background:#F8FAFC; color: var(--muted)}
 .badge-pin{background:#FFF1E6; border-color:#FFD8B8; color:#9A3412}
 .badge-warn{background:#FFFBEB; border-color:#FDE68A; color:#92400E}
+.badge-danger{background:#FEF2F2; border-color:#FECACA; color:#7F1D1D}
+.badge-fading{background:#FEF2F2; border-color:var(--line); color:var(--text)}
 .badge-pending{background:#F5F3FF; border-color:#DDD6FE; color:#5B21B6}
 .badge-id{font-family: ui-monospace, monospace; cursor:pointer}
 .pill{padding:4px 8px; border-radius:999px; background: var(--surface-2); border:1px solid var(--line); font-weight:600; font-size:12px}
@@ -324,7 +326,7 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font
 .kv-grid.dream-kv .kv{grid-template-columns: 180px 1fr}
 
 /* Focus visibility on interactive groups */
-.filterbar:focus-within{box-shadow: var(--focus)}
+.filterbar:has(:focus-visible){box-shadow: var(--focus)}
 /* Coarse-pointer touch targets (impeccable a11y, no visual regression at desktop) */
 @media (pointer: coarse){
   .tab{padding:10px 14px}
