@@ -127,7 +127,7 @@ async function loadOverview(){
   const statusBody = $("#status-body"), statusMeta = $("#status-meta");
   const obsBody = $("#observability-body"), obsFoot = $("#observability-foot");
   const healthBody = $("#health-body");
-  const cfgBody = $("#config-body"), cfgFoot = $("#config-foot");
+  const cfgBody = $("#overview-config-body"), cfgFoot = $("#overview-config-foot");
 
   // default loading skeletons already in HTML; replace on success
   let healthz = null, health = null, obs = null, cfg = null;
@@ -181,7 +181,7 @@ async function loadOverview(){
     const stores = healthz.stores ? Object.entries(healthz.stores).map(([k,v])=> `${esc(k)}: ${esc(Object.values(v).join(", ")||"—")}`).join(" · ") : "—";
     statusBody.innerHTML = `
       <div class="kv-grid">
-        <dl class="kv"><dt>Status</dt><dd><span class="badge" style="background:${gate.ok ? '#DCFCE7':'#FEF2F2'}; border-color:${gate.ok?'#BBF7D0':'#FECACA'}">${gate.ok ? "ok":"degraded"}</span> ${esc(healthz.status||"ok")} · preset <code>${preset}</code></dd></dl>
+        <dl class="kv"><dt>Status</dt><dd><span class="badge ${gate.ok ? 'badge-ok' : 'badge-warn'}" style="${gate.ok ? '' : 'background:#FEF2F2; border-color:#FECACA; color:#7F1D1D'}">${gate.ok ? "ok":"degraded"}</span> ${esc(healthz.status||"ok")} · preset <code>${preset}</code></dd></dl>
         <dl class="kv"><dt>Uptime</dt><dd>${esc(uptime||"—")}</dd></dl>
         <dl class="kv"><dt>Stores</dt><dd>${stores}</dd></dl>
         ${deg.length ? `<dl class="kv"><dt>Degradations</dt><dd>${esc(deg.map(d=>d.feature||d.capability).join(", "))}</dd></dl>` : ""}
@@ -438,16 +438,16 @@ function cfgRowHtml(k, cfg){
     const note = k.readonly ? "read-only in console" : "file-scoped \u00B7 restart required";
     input = `${display} <span class="badge badge-boot" title="${esc(note)}">${esc(note)}</span>`;
   } else if(k.type==="bool"){
-    input = `<select class="select" data-key="${esc(k.key)}"><option value="true" ${cur===true?"selected":""}>true</option><option value="false" ${cur===false?"selected":""}>false</option></select>`;
+    input = `<select class="select" data-key="${esc(k.key)}" aria-label="${esc(k.key)}"><option value="true" ${cur===true?"selected":""}>true</option><option value="false" ${cur===false?"selected":""}>false</option></select>`;
   } else if(k.type==="choice"){
-    input = `<select class="select" data-key="${esc(k.key)}">${(k.options||[]).map(o=>`<option value="${esc(o)}" ${cur===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
+    input = `<select class="select" data-key="${esc(k.key)}" aria-label="${esc(k.key)}">${(k.options||[]).map(o=>`<option value="${esc(o)}" ${cur===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
   } else if(k.type==="json"){
-    input = `<textarea class="input cfg-json" data-key="${esc(k.key)}" rows="3" spellcheck="false">${esc(valStr)}</textarea>`;
+    input = `<textarea class="input cfg-json" data-key="${esc(k.key)}" aria-label="${esc(k.key)}" rows="3" spellcheck="false">${esc(valStr)}</textarea>`;
   } else if(k.type==="env"){
-    input = `<input class="input" data-key="${esc(k.key)}" type="text" placeholder="e.g. FIREWORKS_API_KEY" value="${esc(cur||"")}" spellcheck="false">`;
+    input = `<input class="input" data-key="${esc(k.key)}" aria-label="${esc(k.key)}" type="text" placeholder="e.g. FIREWORKS_API_KEY" value="${esc(cur||"")}" spellcheck="false">`;
   } else {
     const t = k.type==="int" ? "number" : "text";
-    input = `<input class="input" data-key="${esc(k.key)}" type="${t}" ${k.type==="int"?"step=\"1\"":""} value='${esc(cur==null?"":String(cur))}' spellcheck="false">`;
+    input = `<input class="input" data-key="${esc(k.key)}" aria-label="${esc(k.key)}" type="${t}" ${k.type==="int"?"step=\"1\"":""} value='${esc(cur==null?"":String(cur))}' spellcheck="false">`;
   }
 
   const badges = `${sourceBadge} ${liveBadge}`;
@@ -1130,7 +1130,7 @@ function buildAtlasRequestBody(){
   }
   const body = {
     profile_id: atlasState.profile || "default",
-    kind: atlasState.kind,
+    kind: atlasState.kind==="all" ? "both" : atlasState.kind,
     filter,
     sort: atlasState.sort || "recent",
     offset: 0,
