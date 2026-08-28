@@ -95,6 +95,9 @@ async function tryFetchJson(paths, opts){
 function currentRoute(){
   const h = location.hash || "#/overview";
   if(h.startsWith("#/memory/atlas")) return "atlas";
+  if(h.startsWith("#/config")) return "config";
+  if(h.startsWith("#/profiles")) return "profiles";
+  if(h.startsWith("#/dream")) return "dream";
   return "overview";
 }
 function syncRoute(){
@@ -106,7 +109,13 @@ function syncRoute(){
   });
   $("#view-overview").hidden = r!=="overview";
   $("#view-atlas").hidden = r!=="atlas";
+  $("#view-config").hidden = r!=="config";
+  $("#view-profiles").hidden = r!=="profiles";
+  $("#view-dream").hidden = r!=="dream";
   if(r==="atlas") ensureAtlasLoaded();
+  if(r==="config") loadConfigPage();
+  if(r==="profiles") loadProfilesPage();
+  if(r==="dream") loadDreamPage();
 }
 window.addEventListener("hashchange", syncRoute);
 
@@ -255,6 +264,704 @@ function flattenConfig(obj, prefix="", out=[]){
     }
   }
   return out;
+}
+
+// ---------- Config tab ----------
+// Closed writable-key schema, mirrored from the backend CONFIG_KEY_REGISTRY so
+// the form can render the right input per key (zero-build, no schema endpoint).
+// type: "bool" | "number" | "int" | "choice" | "string" | "env" | "json"
+const CONFIG_GROUPS = [
+  { id:"schedule", title:"Dream schedule", desc:"When automatic dreams fire — score-pool floor + idle + hard deadline." },
+  { id:"tier", title:"Hardware tier & ensemble", desc:"Tier anchors verification, thresholds bound merge and the delta clamp. Batched reflection lives here — restart required." },
+  { id:"decay", title:"Decay", desc:"Unreinforced memories fade through w = confidence \u00D7 exp(-\u03BB\u00B7days)." },
+  { id:"capture", title:"Capture auto-recall", desc:"The mid-session recall pipeline — one switch turns it off." },
+  { id:"recall", title:"Recall rescue", desc:"Cue-driven rescue band — below-main-floor pins return only when cue overlap clears the floor." },
+  { id:"profiles", title:"Profiles bindings", desc:"Agent \u2192 profile persona map. Edited on the Profiles tab." },
+];
+const CONFIG_KEYS = [
+  // dream schedule
+  { key:"dream.auto_trigger", group:"schedule", type:"bool", label:"Automatic dreams", hint:"Off holds triggers as pending manual runs." },
+  { key:"dream.floor_pool_points", group:"schedule", type:"number", label:"Pool floor", hint:"Eligible once the score pool holds this many points." },
+  { key:"dream.idle_min_sec", group:"schedule", type:"number", label:"Idle window (s)", hint:"Profile must be idle at least this long." },
+  { key:"dream.hard_deadline_sec", group:"schedule", type:"number", label:"Hard deadline (s)", hint:"Force a dream once the oldest chunk waits this long." },
+  // tier & ensemble (reflect_batch lives here, restart-required)
+  { key:"dream.hardware_tier", group:"tier", type:"choice", options:["standard","lite","advanced"], label:"Hardware tier", hint:"standard | lite | advanced — lite locks the ensemble off." },
+  { key:"dream.ensemble", group:"tier", type:"choice", options:["off","verify","vote"], label:"Ensemble", hint:"off | verify | vote — dual-reflect verification layer." },
+  { key:"dream.core_confidence_floor", group:"tier", type:"number", label:"Core confidence floor", hint:"[0,1] — core triples below it downgrade to the isolated graph." },
+  { key:"dream.delta_budget_ceiling_tokens", group:"tier", type:"int", label:"Delta budget ceiling", hint:"\u2265 5000 — the dynamic delta clamp's ceiling." },
+  { key:"dream.pool_forced_cap", group:"tier", type:"number", label:"Forced cap", hint:"\u2265 floor — the score pool's forced-consolidation cap." },
+  { key:"dream.reflect_batch_max_tokens", group:"tier", type:"int", label:"Batch cap (tokens)", hint:"0 disables batching; positive slices oversized backlogs. Restart required.", restart:true },
+  // decay
+  { key:"decay.enabled", group:"decay", type:"bool", label:"Decay sweep", hint:"Master switch for the daily decay sweep." },
+  { key:"decay.sweep_interval_s", group:"decay", type:"number", label:"Sweep interval (s)", hint:"Default once daily (86400)." },
+  { key:"decay.min_apply_delta", group:"decay", type:"number", label:"Min apply delta", hint:"Skip writes below this weight change." },
+  { key:"decay.lambda_per_type", group:"decay", type:"json", label:"\u03BB per type", hint:"Node-type \u2192 decay-rate map (replace semantics).", jsonKeys:["USER","HABIT","PREFERENCE","ANIMA","INTENTION","CONSTRAINT","EPISODE","SKILL_SEQUENCE","DECISION","PROJECT","TOOL","chunk","pin"] },
+  // capture
+  { key:"capture.auto_recall", group:"capture", type:"bool", label:"Auto-recall", hint:"Enable the mid-session recall pipeline." },
+  { key:"capture.auto_recall_focal_floor", group:"capture", type:"number", label:"Focal floor", hint:"(0,1] — below it a chunk is never focal." },
+  { key:"capture.auto_recall_budget_chars", group:"capture", type:"int", label:"Recall budget (chars)", hint:"The pending-recall selection budget." },
+  // recall rescue — read-only mirror of [recall] (not yet writable via registry; file-scoped until backend promotes it)
+  { key:"recall.rescue_floor", group:"recall", type:"number", label:"Rescue floor", hint:"(0,1] — lower bound of the rescue band.", readonly:true },
+  { key:"recall.rescue_cue_min", group:"recall", type:"number", label:"Cue minimum", hint:"(0,1] — cue overlap a below-floor pin must clear.", readonly:true },
+];
+const LLM_ROLES = ["dream","dream_verifier","dream_vote"];
+const LLM_FIELDS = [
+  { key:"driver", type:"string", label:"Driver", hint:"ollama | openai_compatible | stub — the route's driver." },
+  { key:"model", type:"string", label:"Model", hint:"The model this role generates with." },
+  { key:"base_url", type:"string", label:"Base URL", hint:"Endpoint for the driver (e.g. http://localhost:11434)." },
+  { key:"api_key_env", type:"env", label:"API key env", hint:"Env-var NAME only — the key value is never stored or shown.", secret:true },
+  { key:"max_tokens", type:"int", label:"Max tokens", hint:"Optional generation cap." },
+  { key:"provider", type:"string", label:"Provider", hint:"Optional provider label (openai-compatible)." },
+  { key:"think", type:"bool", label:"Thinking", hint:"Enable thinking models (off by default for structured extraction)." },
+  { key:"num_ctx", type:"int", label:"Context window", hint:"Ollama context size (e.g. 16384)." },
+  { key:"num_predict", type:"int", label:"Max predict", hint:"Ollama generation token cap." },
+];
+
+// version history — never cached across writes, always fresh-fetched before rollback
+let configVersions = null;
+let configGeneration = null; // optimistic-lock generation from GET /api/v1/config (if backend provides it)
+let configRawMeta = null; // full GET payload for restart_required etc.
+
+function cfgGroupFor(key){
+  const dot = key.indexOf(".");
+  const top = key.slice(0, dot);
+  if(top==="dream") return key.startsWith("dream.reflect_batch") ? "tier" : (["hardware_tier","ensemble","core_confidence_floor","delta_budget_ceiling_tokens","pool_forced_cap","reflect_batch_max_tokens"].includes(key.split(".").pop()) ? "tier" : "schedule");
+  if(top==="decay") return "decay";
+  if(top==="capture") return "capture";
+  if(top==="recall") return "recall";
+  return "profiles";
+}
+
+async function loadConfigPage(){
+  const body = $("#config-body"), foot = $("#config-foot");
+  const errBanner = $("#config-error-banner");
+  errBanner.hidden = true;
+  body.innerHTML = `<div class="skeleton skeleton-line" style="width:80%"></div><div class="skeleton skeleton-line" style="width:60%"></div>`;
+  try{
+    const data = await fetchJson("/api/v1/config");
+    configRawMeta = data;
+    configGeneration = data.generation ?? data.config_generation ?? null;
+    renderConfigForm(data.config || data);
+    // also refresh version history quietly if user already opened it once
+    if($("#config-versions-body").dataset.loaded === "true"){
+      loadConfigVersions();
+    }
+  }catch(e){
+    errBanner.hidden = false;
+    const isDown = String(e.message||"").toLowerCase().includes("failed to fetch") || e.status===0;
+    if(isDown){
+      errBanner.innerHTML = `<strong>Daemon unreachable</strong> — <span>${esc(DAEMON_MSG)}</span> <span class="banner-hint">Start the daemon and refresh.</span>`;
+    } else {
+      errBanner.innerHTML = `<strong>Couldn\u2019t load config</strong> — <span>${esc(e.message||"network error")}</span>`;
+    }
+    body.innerHTML = "";
+  }
+}
+
+function renderConfigForm(cfg){
+  const body = $("#config-body");
+  const groups = CONFIG_GROUPS.map(g => {
+    const scalars = CONFIG_KEYS.filter(k => k.group===g.id);
+    return { g, rows: scalars };
+  });
+  let html = "";
+  for(const {g, rows} of groups){
+    html += `<div class="cfg-group"><div class="cfg-group-head"><h3 class="cfg-group-title">${esc(g.title)}</h3><p class="cfg-group-desc">${esc(g.desc)}</p></div>`;
+    html += rows.map(k => cfgRowHtml(k, cfg)).join("");
+    if(g.id==="profiles"){
+      html += profilesBindingRowHtml(cfg);
+    }
+    html += `</div>`;
+  }
+  // LLM roles section — 2 primary roles per spec (dream + dream_verifier); dream_vote as optional third when present
+  html += `<div class="cfg-group"><div class="cfg-group-head"><h3 class="cfg-group-title">LLM roles</h3><p class="cfg-group-desc">Per-role routes for dream generation and the ensemble seats. Each field shows its env-var name only (never a value) and whether it live-applies.</p></div>`;
+  for(const role of LLM_ROLES){
+    const isPrimary = role==="dream" || role==="dream_verifier";
+    const badgeExtra = role==="dream_vote" ? `<span class="badge badge-source">no default route</span>` : (isPrimary ? `<span class="badge badge-source">primary</span>` : "");
+    html += `<div class="cfg-role"><div class="cfg-role-head"><span class="badge badge-muted">${esc(role)}</span>${badgeExtra}</div>`;
+    for(const f of LLM_FIELDS){
+      const key = `dream.llm.${role}.${f.key}`;
+      html += cfgRowHtml({...f, key, group:"llm"}, cfg);
+    }
+    html += `</div>`;
+  }
+  html += `</div>`;
+
+  body.innerHTML = html;
+  $$("#config-body [data-save-key]").forEach(btn=>{
+    btn.addEventListener("click", ()=> saveConfigKey(btn.dataset.saveKey));
+  });
+  $$("#config-body input[data-key], #config-body select[data-key], #config-body textarea[data-key]").forEach(inp=>{
+    inp.addEventListener("keydown", (e)=>{ if(e.key==="Enter" && inp.tagName!=="TEXTAREA"){ e.preventDefault(); saveConfigKey(inp.dataset.key); } });
+  });
+
+  const restartHint = CONFIG_KEYS.filter(k=>k.restart).map(k=>k.key).concat(["preset","storage.vector","storage.graph","storage.meta","storage.embed","baseurl"]);
+  const restartBanner = $("#config-restart-banner");
+  restartBanner.hidden = false;
+  $("#config-restart-hint").textContent = "Boot-scope keys (preset \u00B7 baseurl \u00B7 storage.*) and dream.reflect_batch_max_tokens only apply after a restart. All other keys are live-applied.";
+  const genNote = configGeneration!=null ? ` · generation ${esc(String(configGeneration))}` : "";
+  $("#config-foot").textContent = `Writes are versioned and audited (X-MnemoSeed-Actor: console). Rollback restores an earlier version as a new one \u2014 nothing is deleted${genNote}. DB is primary, config.toml is its mirror.`;
+}
+
+function cfgCurValue(key, cfg){
+  const parts = key.split(".");
+  let cur = cfg;
+  for(const p of parts){ if(cur==null) return undefined; cur = cur[p]; }
+  return cur;
+}
+
+function cfgRowHtml(k, cfg){
+  const cur = cfgCurValue(k.key, cfg);
+  const valStr = cur==null ? "\u2014" : (typeof cur==="object" ? JSON.stringify(cur) : String(cur));
+  const isSecret = !!k.secret;
+  const bootScoped = k.readonly || ["preset","baseurl"].includes(k.key) || k.key.startsWith("storage.") || k.key.startsWith("recall.");
+  const restart = !!(k.restart || bootScoped);
+  const sourceBadge = bootScoped
+    ? `<span class="badge badge-boot" title="File-scoped; change it in config.toml and restart">file-scoped</span>`
+    : `<span class="badge badge-source" title="DB is primary, file is the generated mirror">DB-primary</span>`;
+  const liveBadge = `<span class="badge ${restart?"badge-restart":"badge-live"}" title="${restart?"Needs restart":"Applied to the running daemon immediately"}">${restart?"restart":"live"}</span>`;
+
+  let input = "";
+  if(bootScoped){
+    const display = k.secret ? cfgSecretDisplay(cur) : `<code class="muted">${esc(valStr)}</code>`;
+    const note = k.readonly ? "read-only in console" : "file-scoped \u00B7 restart required";
+    input = `${display} <span class="badge badge-boot" title="${esc(note)}">${esc(note)}</span>`;
+  } else if(k.type==="bool"){
+    input = `<select class="select" data-key="${esc(k.key)}"><option value="true" ${cur===true?"selected":""}>true</option><option value="false" ${cur===false?"selected":""}>false</option></select>`;
+  } else if(k.type==="choice"){
+    input = `<select class="select" data-key="${esc(k.key)}">${(k.options||[]).map(o=>`<option value="${esc(o)}" ${cur===o?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
+  } else if(k.type==="json"){
+    input = `<textarea class="input cfg-json" data-key="${esc(k.key)}" rows="3" spellcheck="false">${esc(valStr)}</textarea>`;
+  } else if(k.type==="env"){
+    input = `<input class="input" data-key="${esc(k.key)}" type="text" placeholder="e.g. FIREWORKS_API_KEY" value="${esc(cur||"")}" spellcheck="false">`;
+  } else {
+    const t = k.type==="int" ? "number" : "text";
+    input = `<input class="input" data-key="${esc(k.key)}" type="${t}" ${k.type==="int"?"step=\"1\"":""} value='${esc(cur==null?"":String(cur))}' spellcheck="false">`;
+  }
+
+  const badges = `${sourceBadge} ${liveBadge}`;
+  const saveBtn = bootScoped ? "" : `<button class="btn btn-primary btn-sm" data-save-key="${esc(k.key)}" type="button">Save</button>`;
+  return `<div class="cfg-row" data-x="${esc(k.key)}">
+    <div class="cfg-key">
+      <code>${esc(k.key)}</code>
+      <span class="cfg-sub">${esc(k.label)}${k.hint?` \u2014 ${esc(k.hint)}`:""}</span>
+    </div>
+    <div class="cfg-value">
+      <div class="cfg-edit">${input}</div>
+      <div class="cfg-badges">${badges}</div>
+      ${saveBtn}
+    </div>
+    <div class="cfg-err" data-err="${esc(k.key)}" hidden></div>
+  </div>`;
+}
+
+function cfgSecretDisplay(v){
+  if(v==null || v==="") return "\u2014";
+  const names = String(v).split(",").map(s=>s.trim()).filter(Boolean);
+  return names.length ? names.map(n=>`<code>${esc(n)}</code>`).join(", ") : "\u2014";
+}
+
+function profilesBindingRowHtml(cfg){
+  const bindings = (cfg.profiles && cfg.profiles.agent_bindings) || {};
+  const keys = Object.keys(bindings);
+  const summary = keys.length ? keys.map(a=>`<code>${esc(a)} \u2192 ${esc(bindings[a])}</code>`).join(" \u00B7 ") : "<span class='muted'>no bindings</span>";
+  return `<div class="cfg-row">
+    <div class="cfg-key"><code>profiles.agent_bindings</code><span class="cfg-sub">Agent \u2192 profile map (replace semantics)</span></div>
+    <div class="cfg-value">${summary}</div>
+    <a href="#/profiles" class="btn btn-ghost btn-sm">Edit in Profiles</a>
+  </div>`;
+}
+
+function specForKey(key){
+  const scalar = CONFIG_KEYS.find(k => k.key === key);
+  if (scalar) return scalar;
+  const m = /^dream\.llm\.[^.]+\.(.+)$/.exec(key);
+  if (m) {
+    const field = LLM_FIELDS.find(f => f.key === m[1]);
+    if (field) return { ...field, key };
+  }
+  return {};
+}
+
+async function saveConfigKey(key){
+  const inp = $(`[data-key="${key}"]`);
+  const errEl = $(`[data-err="${key}"]`);
+  const row = $(`.cfg-row[data-x="${key}"]`);
+  if(errEl) errEl.hidden = true;
+  if(row) row.classList.remove("is-error");
+  if(!inp){ return; }
+
+  let value;
+  const spec = specForKey(key);
+  if(spec.type==="bool"){
+    value = inp.value === "true";
+  } else if(spec.type==="int"){
+    const n = inp.value.trim();
+    if(n==="" || !/^-?\d+$/.test(n)){ return cfgFieldError(key, "must be an integer"); }
+    value = parseInt(n,10);
+  } else if(spec.type==="json"){
+    try{ value = JSON.parse(inp.value.trim()); }
+    catch{ return cfgFieldError(key, "must be valid JSON (e.g. {\"USER\": 0.01})"); }
+  } else if(spec.type==="choice" || spec.type==="string" || spec.type==="env"){
+    value = inp.value;
+  } else {
+    const n = inp.value.trim();
+    if(n===""){ return cfgFieldError(key, "value is required"); }
+    const f = Number(n);
+    if(Number.isNaN(f)){ return cfgFieldError(key, "must be a number"); }
+    value = f;
+  }
+
+  const btn = $(`[data-save-key="${key}"]`);
+  if(btn){ btn.disabled = true; btn.textContent = "Saving\u2026"; }
+  try{
+    const headers = {"content-type":"application/json", "x-mnemoseed-actor":"console"};
+    if(configGeneration!=null){
+      headers["if-match"] = String(configGeneration);
+      headers["If-Match"] = String(configGeneration);
+    }
+    await fetchJson("/api/v1/config/set", {
+      method:"POST",
+      headers,
+      body: JSON.stringify({ key_path: key, value }),
+    });
+    a11yLive(`Saved ${key}`);
+    await loadConfigPage();
+    if($("#config-versions-body").dataset.loaded === "true"){
+      await loadConfigVersions();
+    }
+  }catch(e){
+    if(e.status===409){
+      cfgFieldError(key, "Someone else changed this \u2014 reloaded. Your change was not applied.");
+      await loadConfigPage();
+      if($("#config-versions-body").dataset.loaded === "true") await loadConfigVersions();
+    } else if(e.status===422){
+      const raw = (e.message||"").replace(/^config\[[^\]]*\]:\s*/, "");
+      const msg = raw || "invalid value";
+      cfgFieldError(key, msg);
+    } else if(e.status===403){
+      cfgFieldError(key, "Config writes are rejected \u2014 the daemon baseurl is non-loopback.");
+    } else {
+      cfgFieldError(key, e.message||"write failed");
+    }
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = "Save"; }
+  }
+}
+
+function cfgFieldError(key, msg){
+  const errEl = $(`[data-err="${key}"]`);
+  const row = $(`.cfg-row[data-x="${key}"]`);
+  if(errEl){ errEl.hidden = false; errEl.textContent = msg; }
+  if(row) row.classList.add("is-error");
+  a11yLive(`${key}: ${msg}`);
+  if(/locks the ensemble off/i.test(msg)){
+    const el = $(`[data-err="${key}"]`);
+    if(el) el.textContent = msg + " \u2014 pick 'off' for ensemble, or change hardware_tier off 'lite' first.";
+  }
+  if(/must be <= dream\.delta_budget_ceiling_tokens/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 raise the delta ceiling, or lower this cap.";
+  if(/requires the 'isolated' graph instance/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 add [storage.graph.instances.isolated] to config.toml (driver = \"sqlite_graph\").";
+  if(/must be >= dream\.core_confidence_floor/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 lower the core confidence floor first.";
+  if(/must be <= dream\.pool_forced_cap/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 raise pool_forced_cap first.";
+  if(/must be >= dream\.floor_pool_points/i.test(msg) && errEl) errEl.textContent = msg + " \u2014 raise floor_pool_points first or lower the cap.";
+}
+
+async function loadConfigVersions(){
+  const body = $("#config-versions-body");
+  body.dataset.loaded = "true";
+  body.innerHTML = `<div class="skeleton skeleton-line" style="width:70%"></div><div class="skeleton skeleton-line" style="width:55%"></div>`;
+  try{
+    const data = await fetchJson("/api/v1/config/versions");
+    const versions = data.versions || data || [];
+    configVersions = versions;
+    renderConfigVersions(versions);
+  }catch(e){
+    body.innerHTML = `<p class="muted">Couldn\u2019t load versions \u2014 ${esc(e.message||"network error")}.</p>`;
+  }
+}
+
+function renderConfigVersions(versions){
+  const body = $("#config-versions-body");
+  if(!versions || versions.length===0){
+    body.innerHTML = `<p class="muted">No versions yet \u2014 writes appear here once you save a key.</p>`;
+    return;
+  }
+  const sorted = [...versions].sort((a,b)=> (b.version_id||b.version||0) - (a.version_id||a.version||0));
+  const rows = sorted.slice(0, 50).map(v=>{
+    const key = esc(v.key||v.key_path||"\u2014");
+    const ver = esc(String(v.version||"\u2014"));
+    const vid = esc(String(v.version_id||"\u2014"));
+    const val = v.value==null ? "\u2014" : esc(typeof v.value==="object" ? JSON.stringify(v.value) : String(v.value));
+    const when = v.updated_at ? esc(fmtRel(v.updated_at)) : "\u2014";
+    const whenTitle = v.updated_at ? esc(fmtISO(v.updated_at)) : "";
+    return `<tr>
+      <td><code>${key}</code></td>
+      <td>v${ver}</td>
+      <td class="ver-val" title="${val}">${val}</td>
+      <td title="${whenTitle}">${when}</td>
+      <td><code>${vid}</code></td>
+      <td><button class="btn btn-ghost btn-sm" data-rollback="${esc(String(v.version_id))}" type="button">Restore</button></td>
+    </tr>`;
+  }).join("");
+  body.innerHTML = `<table class="ver-table"><thead><tr><th>Key</th><th>Version</th><th>Value</th><th>Updated</th><th>Version ID</th><th></th></tr></thead><tbody>${rows}</tbody></table><p class="small muted">Restore creates a new version (append-only) and live-applies it. Version IDs are fetched fresh on every load \u2014 never cached.</p>`;
+  $$("#config-versions-body [data-rollback]").forEach(btn=>{
+    btn.addEventListener("click", async ()=>{
+      const vid = btn.dataset.rollback;
+      btn.disabled = true; btn.textContent = "Restoring\u2026";
+      try{
+        // always refetch versions fresh before rollback (never use cached id)
+        const fresh = await fetchJson("/api/v1/config/versions");
+        const found = (fresh.versions||fresh||[]).find(x=> String(x.version_id)===String(vid));
+        const targetId = found ? found.version_id : vid;
+        await fetchJson("/api/v1/config/rollback", {
+          method:"POST",
+          headers:{"content-type":"application/json","x-mnemoseed-actor":"console"},
+          body: JSON.stringify({ version_id: Number(targetId) }),
+        });
+        a11yLive(`Restored ${vid}`);
+        await loadConfigPage();
+        await loadConfigVersions();
+      }catch(e){
+        a11yLive(`Rollback failed: ${e.message}`);
+        const banner = $("#config-error-banner");
+        banner.hidden = false;
+        banner.innerHTML = `<strong>Rollback failed</strong> — <span>${esc(e.message||"error")}</span>`;
+      }finally{
+        btn.disabled = false; btn.textContent = "Restore";
+      }
+    });
+  });
+}
+
+// ---------- Profiles tab ----------
+let profilesStore = []; // {profile_id, display_name, created_at, archived}
+
+async function loadProfilesPage(){
+  const errBanner = $("#profiles-error-banner");
+  errBanner.hidden = true;
+  await Promise.all([refreshProfilesList(), refreshBindingsEditor()]);
+}
+
+async function refreshProfilesList(){
+  const body = $("#profiles-list-body");
+  try{
+    const data = await fetchJson("/api/v1/profiles");
+    profilesStore = data.profiles || [];
+    renderProfilesList();
+    refreshOrphanBanner();
+  }catch(e){
+    body.innerHTML = `<p class="muted">Couldn’t load profiles — ${esc(e.message||"network error")}.</p>`;
+  }
+}
+
+function renderProfilesList(){
+  const body = $("#profiles-list-body");
+  const archBanner = $("#profiles-archived-banner");
+  const hasArchived = profilesStore.some(p=> p.archived);
+  if(archBanner) archBanner.hidden = !hasArchived;
+  if(profilesStore.length===0){
+    body.innerHTML = `<p class="muted">No profiles yet — the <code>default</code> profile is implicit and always available. Create one above.</p>`;
+    return;
+  }
+  const rows = profilesStore.map(p=>{
+    const arch = p.archived;
+    return `<tr>
+      <td><code>${esc(p.profile_id)}</code></td>
+      <td>${esc(p.display_name||"\u2014")}</td>
+      <td>${p.created_at ? esc(fmtRel(p.created_at)) : "\u2014"}</td>
+      <td>${arch ? `<span class="badge badge-archived">archived</span>` : `<span class="badge badge-live">active</span>`}</td>
+      <td>
+        <button class="btn btn-ghost btn-sm" data-archive="${esc(p.profile_id)}" data-archived="${arch}" type="button">${arch ? "Unarchive" : "Archive"}</button>
+      </td>
+    </tr>`;
+  }).join("");
+  body.innerHTML = `<table class="profile-table"><thead><tr><th>Profile ID</th><th>Display name</th><th>Created</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  $$("#profiles-list-body [data-archive]").forEach(b=> b.addEventListener("click", ()=> archiveProfile(b.dataset.archive, b.dataset.archived==="true")));
+}
+
+async function archiveProfile(id, currentlyArchived){
+  const next = !currentlyArchived;
+  try{
+    await fetchJson("/api/v1/profiles/archive", {
+      method:"POST", headers:{"content-type":"application/json", "x-mnemoseed-actor":"console"},
+      body: JSON.stringify({ profile_id: id, archived: next }),
+    });
+    a11yLive(`${id} ${next?"archived":"unarchived"}`);
+    await refreshProfilesList();
+  }catch(e){
+    const banner = $("#profiles-error-banner");
+    banner.hidden = false;
+    banner.innerHTML = `<strong>Archive failed</strong> — <span>${esc(e.message||"error")}</span>`;
+  }
+}
+
+async function refreshDrawnBindings(){
+  // returns the current bindings from config (fresh)
+  try{
+    const data = await fetchJson("/api/v1/config");
+    return (data.config && data.config.profiles && data.config.profiles.agent_bindings) || {};
+  }catch{ return {}; }
+}
+
+async function refreshBindingsEditor(){
+  const editor = $("#bindings-editor");
+  const bindings = await refreshDrawnBindings();
+  const profileIds = new Set(["default", ...profilesStore.map(p=>p.profile_id)]);
+  const entries = Object.entries(bindings);
+  renderBindings(entries.map(([agent, pid])=>({agent, pid})));
+  // refresh orphan warning using live profile list
+  refreshOrphanBanner();
+}
+
+function renderBindings(entries){
+  const editor = $("#bindings-editor");
+  if(!entries.length){
+    editor.innerHTML = `<p class="muted">No bindings — add one to route an agent's captures to a profile.</p>`;
+    return;
+  }
+  const profileIds = ["default", ...profilesStore.map(p=>p.profile_id)];
+  editor.innerHTML = entries.map((e,i)=>{
+    const orphan = !profileIds.includes(e.pid);
+    return `<div class="binding-row ${orphan?"is-orphan":""}" data-i="${i}">
+      <input class="input binding-agent" type="text" value="${esc(e.agent)}" placeholder="agent label (e.g. planner)" spellcheck="false">
+      <select class="select binding-pid">
+        <option value="">Pick a profile…</option>
+        ${["default", ...profilesStore.map(p=>p.profile_id)].filter(unique).map(id=>`<option value="${esc(id)}" ${id===e.pid?"selected":""}>${esc(id)}</option>`).join("")}
+        ${orphan && !profileIds.includes(e.pid) ? `<option value="${esc(e.pid)}" selected>${esc(e.pid)} (missing)</option>` : ""}
+      </select>
+      <button class="binding-remove" type="button" aria-label="Remove binding" title="Remove">×</button>
+      ${orphan?`<span class="badge badge-warn">orphan</span>`:""}
+    </div>`;
+  }).join("");
+  $$("#bindings-editor .binding-remove").forEach(b=> b.addEventListener("click", ()=>{
+    b.closest(".binding-row").remove();
+    if(!$$("#bindings-editor .binding-row").length) renderBindings([]);
+  }));
+}
+
+function unique(v,i,a){ return a.indexOf(v)===i; }
+
+function collectBindings(){
+  const out = {};
+  $$("#bindings-editor .binding-row").forEach(row=>{
+    const agent = row.querySelector(".binding-agent").value.trim();
+    const pid = row.querySelector(".binding-pid").value;
+    if(agent && pid) out[agent] = pid;
+  });
+  return out;
+}
+
+async function saveBindings(){
+  const fb = $("#bindings-feedback");
+  const value = collectBindings();
+  fb.textContent = "Saving\u2026";
+  try{
+    const headers = {"content-type":"application/json", "x-mnemoseed-actor":"console"};
+    if(configGeneration!=null){ headers["if-match"] = String(configGeneration); headers["If-Match"] = String(configGeneration); }
+    await fetchJson("/api/v1/config/set", {
+      method:"POST", headers,
+      body: JSON.stringify({ key_path: "profiles.agent_bindings", value }),
+    });
+    fb.textContent = "Saved.";
+    a11yLive("Bindings saved");
+    await refreshBindingsEditor();
+    refreshOrphanBanner();
+    if($("#config-versions-body").dataset.loaded === "true") await loadConfigVersions();
+  }catch(e){
+    if(e.status===409){
+      fb.textContent = "Someone else changed this \u2014 reloaded. Your change was not applied.";
+      await refreshBindingsEditor();
+    } else if(e.status===422){
+      fb.textContent = `Invalid: ${(e.message||"").replace(/^config\[[^\]]*\]:\s*/, "")}`;
+    } else {
+      fb.textContent = `Couldn\u2019t save \u2014 ${e.message||"error"}`;
+    }
+    a11yLive("Bindings save failed");
+  }
+}
+
+function refreshOrphanBanner(){
+  const banner = $("#profiles-orphan-banner");
+  const listEl = $("#profiles-orphan-list");
+  const profileIds = new Set(["default", ...profilesStore.map(p=>p.profile_id)]);
+  const orphans = [];
+  $$("#bindings-editor .binding-row.is-orphan .binding-pid").forEach(sel=>{
+    if(sel.value && !profileIds.has(sel.value)) orphans.push(sel.value);
+  });
+  if(orphans.length){
+    banner.hidden = false;
+    listEl.textContent = `${[...new Set(orphans)].join(", ")} — repoint these bindings or the captures will route to a profile that doesn't exist.`;
+  } else {
+    banner.hidden = true;
+  }
+}
+
+// ---------- Dream tab ----------
+let dreamAbort = null;
+
+async function loadDreamPage(){
+  const errBanner = $("#dream-error-banner");
+  errBanner.hidden = true;
+  // populate profile selector
+  try{
+    const data = await fetchJson("/api/v1/profiles");
+    const ids = new Set(["default", ...(data.profiles||[]).map(p=>p.profile_id)]);
+    const sel = $("#dream-profile");
+    sel.innerHTML = Array.from(ids).map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  }catch{ /* keep default */ }
+  await loadDreamStatus();
+  await loadDreamAutoToggle();
+}
+
+async function loadDreamStatus(){
+  const body = $("#dream-status-body"), foot = $("#dream-status-foot");
+  const poolBody = $("#dream-pool-body");
+  try{
+    const data = await fetchJson("/memory/dream_status", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ profile_id: $("#dream-profile").value || "default" }),
+    });
+    const state = data.state || "unknown";
+    const pending = data.pending_queue!=null ? data.pending_queue : (data.pending_manual||0);
+    body.innerHTML = `<div class="kv-grid">
+      <dl class="kv"><dt>State</dt><dd><span class="badge">${esc(state)}</span></dd></dl>
+      <dl class="kv"><dt>Pending manual</dt><dd>${fmtNum(data.pending_manual ?? 0)}</dd></dl>
+      <dl class="kv"><dt>Pending queue</dt><dd>${fmtNum(data.pending_queue ?? 0)}</dd></dl>
+      ${data.current_range ? `<dl class="kv"><dt>Current range</dt><dd>${esc(data.current_range.start)} → ${esc(data.current_range.end)}</dd></dl>` : ""}
+    </div>`;
+    foot.textContent = data.last_event ? `Last event ${fmtRel(data.last_event.fired_at)} · ${esc(data.last_event.kind)}` : "No dream event yet.";
+    renderDreamPool(data);
+  }catch(e){
+    body.innerHTML = `<p class="muted">Couldn’t load dream status — ${esc(e.message||"network error")}.</p>`;
+    poolBody.innerHTML = `<p class="muted">Score pool unavailable — ${esc(e.message||"network error")}.</p>`;
+  }
+}
+
+function renderDreamPool(data){
+  const poolBody = $("#dream-pool-body");
+  const pool = data.pool || {};
+  const balance = pool.balance ?? 0;
+  const threshold = pool.threshold ?? 0;
+  const pct = threshold>0 ? clamp((balance/threshold)*100, 0, 100) : 0;
+  const overFloor = balance >= threshold && threshold>0;
+  const commitment = pool.lifetime_filed ?? null;
+  const watermark = data.watermark;
+  const hist = data.history || {};
+  const failEntries = Object.entries(hist.extract_failures || {});
+  const failSummary = failEntries.length ? failEntries.map(([c,n])=>`${esc(c)} ${n}`).join(" \u00B7 ") : "none";
+  poolBody.innerHTML = `<div class="kv-grid dream-kv">
+    <dl class="kv"><dt>Pool balance</dt><dd class="pool-chip"><span class="pool-balance">${fmtNum(balance)}</span> <span class="muted">/ floor ${fmtNum(threshold)}</span> ${overFloor?`<span class="badge badge-warn">at floor</span>`:`<span class="badge badge-muted">${fmtNum(Math.max(0, threshold-balance))} to floor</span>`}</dd></dl>
+    <dl class="kv"><dt>Progress</dt><dd><div class="progress" title="${pct.toFixed(1)}% of floor"><div class="progress-bar ${overFloor?"is-healthy":""}" style="width:${pct}%"></div></div><span class="small muted">${pct.toFixed(0)}% — ${overFloor?"eligible once idle":"collecting"}</span></dd></dl>
+    <dl class="kv"><dt>Lifetime filed</dt><dd>${commitment==null?"\u2014":fmtNum(commitment)}</dd></dl>
+    <dl class="kv"><dt>Watermark</dt><dd>${watermark ? `${esc(String(watermark.start))} \u2192 ${esc(String(watermark.end))}` : "\u2014"}</dd></dl>
+    <dl class="kv"><dt>Committed runs</dt><dd>${fmtNum(hist.committed_runs ?? 0)}${hist.last_commit_at ? ` \u00B7 last ${esc(fmtRel(hist.last_commit_at))}` : ""}</dd></dl>
+    <dl class="kv"><dt>Extract failures</dt><dd>${esc(failSummary)}</dd></dl>
+  </div>`;
+  renderDreamReflect();
+}
+
+async function renderDreamReflect(){
+  const body = $("#dream-reflect-body");
+  if(!body) return;
+  try{
+    const data = await fetchJson("/api/v1/config");
+    const cap = data.config && data.config.dream ? data.config.dream.reflect_batch_max_tokens : null;
+    const ceiling = data.config && data.config.dream ? data.config.dream.delta_budget_ceiling_tokens : null;
+    const val = cap==null ? "\u2014" : fmtNum(cap);
+    const ceilNote = ceiling!=null ? ` (ceiling ${fmtNum(ceiling)})` : "";
+    const hint = cap===0 ? "0 \u2014 batching disabled, single-pack reflect" : `${val}${ceilNote}`;
+    body.innerHTML = `<dl class="kv"><dt>Batch cap</dt><dd><span class="pool-balance">${esc(hint)}</span> <span class="badge badge-restart">restart required</span></dd></dl><p class="small muted">Must be \u2264 delta ceiling; 0 restores legacy single-pack. Change does not hot-apply.</p>`;
+  }catch{
+    body.innerHTML = `<p class="muted">Couldn\u2019t load reflect cap \u2014 ${esc(DAEMON_MSG)}</p>`;
+  }
+}
+
+async function loadDreamAutoToggle(){
+  const toggle = $("#dream-auto-toggle");
+  try{
+    const data = await fetchJson("/api/v1/config");
+    const on = !!(data.config && data.config.dream && data.config.dream.auto_trigger);
+    toggle.setAttribute("aria-checked", String(on));
+  }catch{
+    toggle.setAttribute("aria-checked", "true");
+  }
+}
+
+function initDreamEvents(){
+  $("#dream-run").addEventListener("click", runDreamOnce);
+  $("#dream-cancel").addEventListener("click", cancelDreamOnce);
+  $("#dream-auto-toggle").addEventListener("click", toggleAutoDream);
+  $("#dream-profile").addEventListener("change", loadDreamStatus);
+}
+
+async function runDreamOnce(){
+  const runBtn = $("#dream-run"), cancelBtn = $("#dream-cancel"), fb = $("#dream-run-feedback");
+  const profile = $("#dream-profile").value || "default";
+  runBtn.disabled = true;
+  cancelBtn.hidden = false;
+  fb.textContent = "Running… this can take a while.";
+  dreamAbort = new AbortController();
+  const timeout = setTimeout(()=>{ dreamAbort.abort(); }, 30000);
+  try{
+    const data = await fetchJson("/memory/dream_once", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ profile_id: profile }),
+      signal: dreamAbort.signal,
+    });
+    const launched = data.launched;
+    fb.textContent = launched ? "Launched — check status above." : `Not launched (state: ${data.state||"unknown"}).`;
+    a11yLive(launched ? "Dream launched" : "Dream not launched");
+    loadDreamStatus();
+  }catch(e){
+    if(e.name==="AbortError" || (e.status && e.status===499)){
+      fb.textContent = "Timed out — the dream may still be running. Check status in a moment.";
+    } else {
+      fb.textContent = `Couldn’t run — ${e.message||"error"}`;
+    }
+    a11yLive("Dream run failed");
+  } finally {
+    clearTimeout(timeout);
+    dreamAbort = null;
+    runBtn.disabled = false;
+    cancelBtn.hidden = true;
+  }
+}
+
+function cancelDreamOnce(){
+  if(dreamAbort){ dreamAbort.abort(); }
+  $("#dream-run-feedback").textContent = "Cancelled.";
+}
+
+async function toggleAutoDream(){
+  const toggle = $("#dream-auto-toggle");
+  const cur = toggle.getAttribute("aria-checked")==="true";
+  const next = !cur;
+  try{
+    const headers = {"content-type":"application/json", "x-mnemoseed-actor":"console"};
+    if(configGeneration!=null){ headers["if-match"] = String(configGeneration); headers["If-Match"] = String(configGeneration); }
+    await fetchJson("/api/v1/config/set", {
+      method:"POST", headers,
+      body: JSON.stringify({ key_path: "dream.auto_trigger", value: next }),
+    });
+    toggle.setAttribute("aria-checked", String(next));
+    a11yLive(`Automatic dreams ${next?"on":"off"}`);
+  }catch(e){
+    if(e.status===409){
+      a11yLive("Toggle failed: someone else changed this — reloaded");
+      await loadDreamAutoToggle();
+    } else {
+      a11yLive(`Toggle failed: ${e.message||"error"}`);
+    }
+    const banner = $("#dream-error-banner");
+    banner.hidden = false;
+    if(e.status===422){
+      banner.innerHTML = `<strong>Toggle failed</strong> — <span>${esc((e.message||"").replace(/^config\[[^\]]*\]:\s*/, ""))}</span>`;
+    } else if(e.status===409){
+      banner.innerHTML = `<strong>Toggle failed</strong> — <span>Someone else changed this \u2014 reloaded. Try again.</span>`;
+    } else {
+      banner.innerHTML = `<strong>Toggle failed</strong> — <span>${esc(e.message||"error")}</span>`;
+    }
+  }
 }
 
 // ---------- Atlas state ----------
@@ -1255,6 +1962,50 @@ function initEvents(){
     const url = location.href;
     try{ await navigator.clipboard.writeText(url); a11yLive("Copied link — Share view"); } catch{ a11yLive(url); }
   });
+
+  // Config / Profiles / Dream tab wiring
+  const cfgVerBtn = $("#config-versions-refresh");
+  if(cfgVerBtn) cfgVerBtn.addEventListener("click", loadConfigVersions);
+  $("#profiles-refresh").addEventListener("click", refreshProfilesList);
+  $("#profile-create-form").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const id = $("#profile-create-id").value.trim();
+    const name = $("#profile-create-name").value.trim();
+    const fb = $("#profile-create-feedback");
+    if(!id){ fb.textContent = "Profile ID is required."; return; }
+    fb.textContent = "Creating…";
+    try{
+      await fetchJson("/api/v1/profiles", {
+        method:"POST", headers:{"content-type":"application/json", "x-mnemoseed-actor":"console"},
+        body: JSON.stringify({ profile_id: id, display_name: name }),
+      });
+      fb.textContent = `Created ${id}.`;
+      a11yLive(`Profile ${id} created`);
+      $("#profile-create-id").value = ""; $("#profile-create-name").value = "";
+      await refreshProfilesList();
+      await refreshBindingsEditor();
+    }catch(e){
+      fb.textContent = e.status===409 ? `Profile "${id}" already exists.` : `Couldn’t create — ${e.message||"error"}`;
+    }
+  });
+  $("#bindings-add").addEventListener("click", ()=>{
+    // append an empty binding row
+    const editor = $("#bindings-editor");
+    if(!$$("#bindings-editor .binding-row").length && editor.querySelector(".muted")){
+      editor.innerHTML = "";
+    }
+    const div = document.createElement("div");
+    div.className = "binding-row";
+    const profileIds = ["default", ...profilesStore.map(p=>p.profile_id)];
+    div.innerHTML = `<input class="input binding-agent" type="text" placeholder="agent label (e.g. planner)" spellcheck="false"><select class="select binding-pid"><option value="">Pick a profile…</option>${profileIds.filter(unique).map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select><button class="binding-remove" type="button" aria-label="Remove binding" title="Remove">×</button>`;
+    editor.appendChild(div);
+    div.querySelector(".binding-remove").addEventListener("click", ()=>{
+      div.remove();
+      if(!$$("#bindings-editor .binding-row").length) renderBindings([]);
+    });
+  });
+  $("#bindings-save").addEventListener("click", saveBindings);
+  initDreamEvents();
   $("#mode-3d").addEventListener("click", ()=>{ atlasState.viewMode="3d"; pushAtlasHash(); syncAtlasViewMode(); });
   $("#mode-list").addEventListener("click", ()=>{ atlasState.viewMode="list"; pushAtlasHash(); syncAtlasViewMode(); });
   $("#atlas-profile").addEventListener("change", (e)=>{ atlasState.profile=e.target.value; atlasState.selectedId=null; pushAtlasHash(); syncAtlasControlsFromState(); fetchAtlas(); });

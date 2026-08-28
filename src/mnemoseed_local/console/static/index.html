@@ -29,6 +29,9 @@
       <nav class="tabs" aria-label="Primary">
         <a href="#/overview" data-route="overview" class="tab is-active" aria-current="page">Overview</a>
         <a href="#/memory/atlas" data-route="atlas" class="tab">Memory Atlas</a>
+        <a href="#/config" data-route="config" class="tab">Config</a>
+        <a href="#/profiles" data-route="profiles" class="tab">Profiles</a>
+        <a href="#/dream" data-route="dream" class="tab">Dream</a>
       </nav>
       <div class="topbar-actions">
         <span id="daemon-dot" class="daemon-dot is-unknown" aria-hidden="true"></span>
@@ -402,6 +405,174 @@
         </aside>
       </div>
     </section>
+
+    <!-- ================= CONFIG ================= -->
+    <section id="view-config" class="view" hidden aria-labelledby="config-page-title">
+      <div class="page-head">
+        <h1 id="config-page-title" class="page-title">Config</h1>
+        <p class="page-desc">Edit one key at a time. Every write is validated, versioned, audited, and applied to the running daemon — the settings DB is primary, <code>config.toml</code> is its mirror.</p>
+      </div>
+
+      <div id="config-restart-banner" class="banner banner-warn" hidden role="status">
+        <strong>Restart required</strong> — some keys only take effect after the daemon restarts.
+        <span class="banner-hint" id="config-restart-hint"></span>
+      </div>
+      <div id="config-error-banner" class="banner banner-error" hidden role="alert"></div>
+
+      <div id="config-body" class="cfg-fields"></div>
+      <div id="config-foot" class="foot muted small"></div>
+
+      <article class="card" aria-labelledby="config-versions-title">
+        <div class="card-head">
+          <h2 id="config-versions-title" class="card-title">Version history</h2>
+          <span class="badge badge-muted">GET /api/v1/config/versions</span>
+          <button id="config-versions-refresh" class="btn btn-ghost btn-sm" type="button">Load history</button>
+        </div>
+        <div class="card-body">
+          <p class="config-lead">Every write, rollback, and boot import is a versioned record. Restore turns an earlier value into a new version — nothing is ever deleted.</p>
+          <div id="config-versions-body"></div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ================= PROFILES ================= -->
+    <section id="view-profiles" class="view" hidden aria-labelledby="profiles-page-title">
+      <div class="page-head">
+        <h1 id="profiles-page-title" class="page-title">Profiles</h1>
+        <p class="page-desc">Identity namespaces for memory isolation. The <code>default</code> profile is implicit and needs no row. Archiving never deletes and never unbinds.</p>
+      </div>
+
+      <div id="profiles-error-banner" class="banner banner-error" hidden role="alert"></div>
+      <div id="profiles-archived-banner" class="banner banner-warn" hidden role="status">
+        <strong>Archived never deletes, never unbinds</strong> — archived profiles keep their row and their bindings; they just stop receiving new captures.
+      </div>
+      <div id="profiles-orphan-banner" class="banner banner-warn" hidden role="status">
+        <strong>Orphan bindings</strong> — some agent bindings point to a profile that no longer exists. <span id="profiles-orphan-list" class="banner-hint"></span>
+      </div>
+
+      <article class="card" aria-labelledby="profiles-list-title">
+        <div class="card-head">
+          <h2 id="profiles-list-title" class="card-title">Profile list</h2>
+          <button id="profiles-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+        </div>
+        <div id="profiles-list-body" class="card-body"></div>
+      </article>
+
+      <article class="card" aria-labelledby="profiles-create-title">
+        <div class="card-head">
+          <h2 id="profiles-create-title" class="card-title">Create a profile</h2>
+        </div>
+        <div class="card-body">
+          <form id="profile-create-form" class="row-form" autocomplete="off">
+            <label class="field">
+              <span class="field-label">Profile ID</span>
+              <input id="profile-create-id" class="input" type="text" placeholder="research" required spellcheck="false">
+            </label>
+            <label class="field">
+              <span class="field-label">Display name (optional)</span>
+              <input id="profile-create-name" class="input" type="text" placeholder="Research projects" spellcheck="false">
+            </label>
+            <button class="btn btn-primary" type="submit">Create</button>
+          </form>
+          <p id="profile-create-feedback" class="small muted" role="status" aria-live="polite"></p>
+        </div>
+      </article>
+
+      <article class="card" aria-labelledby="bindings-title">
+        <div class="card-head">
+          <h2 id="bindings-title" class="card-title">Agent bindings</h2>
+          <span class="badge badge-muted">replace semantics</span>
+        </div>
+        <div class="card-body">
+          <p class="config-lead">Map an agent label to the profile whose persona its captures carry. Saving replaces the whole map — removed rows are unbound.</p>
+          <div id="bindings-editor" class="bindings-editor"></div>
+          <div class="action-row">
+            <button id="bindings-add" class="btn btn-ghost btn-sm" type="button">Add binding</button>
+            <button id="bindings-save" class="btn btn-primary btn-sm" type="button">Save bindings</button>
+            <span id="bindings-feedback" class="small muted" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ================= DREAM ================= -->
+    <section id="view-dream" class="view" hidden aria-labelledby="dream-page-title">
+      <div class="page-head">
+        <h1 id="dream-page-title" class="page-title">Dream</h1>
+        <p class="page-desc">Consolidation status and the manual run switch. Automatic dreams fire when the score pool reaches its floor and the profile idles.</p>
+      </div>
+
+      <div id="dream-error-banner" class="banner banner-error" hidden role="alert"></div>
+
+      <div class="overview-grid">
+        <article class="card" aria-labelledby="dream-status-title">
+          <div class="card-head">
+            <h2 id="dream-status-title" class="card-title">Dream status</h2>
+            <span class="badge badge-muted">POST /memory/dream_status</span>
+          </div>
+          <div id="dream-status-body" class="card-body">
+            <div class="skeleton skeleton-line" style="width:70%"></div>
+            <div class="skeleton skeleton-line" style="width:55%"></div>
+          </div>
+          <p id="dream-status-foot" class="card-foot muted"></p>
+        </article>
+
+        <article class="card" aria-labelledby="dream-run-title">
+          <div class="card-head">
+            <h2 id="dream-run-title" class="card-title">Run one dream</h2>
+            <span class="badge">POST /memory/dream_once</span>
+          </div>
+          <div class="card-body">
+            <label class="field">
+              <span class="field-label">Profile</span>
+              <select id="dream-profile" class="select">
+                <option value="default">default</option>
+              </select>
+            </label>
+            <p class="small muted">Runs exactly one manual consolidation cycle now. Cancels cleanly if it takes too long.</p>
+            <div class="action-row">
+              <button id="dream-run" class="btn btn-primary" type="button">Run now</button>
+              <button id="dream-cancel" class="btn btn-ghost" type="button" hidden>Cancel</button>
+            </div>
+            <p id="dream-run-feedback" class="small" role="status" aria-live="polite"></p>
+          </div>
+        </article>
+
+        <article class="card" aria-labelledby="dream-trigger-title">
+          <div class="card-head">
+            <h2 id="dream-trigger-title" class="card-title">Automatic dreams</h2>
+            <span class="badge badge-muted">dream.auto_trigger</span>
+          </div>
+          <div class="card-body">
+            <label class="switch-row">
+              <button id="dream-auto-toggle" class="switch" type="button" role="switch" aria-checked="true"></button>
+              <span class="field-label">Fire dreams automatically</span>
+            </label>
+            <p id="dream-auto-hint" class="small muted">Off holds every trigger as a pending manual run you start here.</p>
+          </div>
+        </article>
+      </div>
+
+      <article class="card" aria-labelledby="dream-pool-title">
+        <div class="card-head">
+          <h2 id="dream-pool-title" class="card-title">Score pool vs floor</h2>
+          <span class="badge badge-muted">pool balance · threshold</span>
+        </div>
+        <div id="dream-pool-body" class="card-body"></div>
+      </article>
+
+      <article class="card" aria-labelledby="dream-reflect-title">
+        <div class="card-head">
+          <h2 id="dream-reflect-title" class="card-title">Batched reflection</h2>
+          <span class="badge badge-restart">restart required</span>
+        </div>
+        <div class="card-body">
+          <p class="config-lead">Oversized backlogs slice into token-capped batches drained over dreams. <code>dream.reflect_batch_max_tokens</code> only applies after a restart.</p>
+          <div id="dream-reflect-body" class="kv-grid"></div>
+          <p class="small muted">Change it in the Config tab — Hardware tier &amp; ensemble group.</p>
+        </div>
+      </article>
+    </section>
   </main>
 
   <!-- Confirm dialogs -->
@@ -432,7 +603,7 @@
   </dialog>
 
   <footer class="foot muted small">
-    MnemoSeed Local — loopback only · no analytics · no outbound fonts · <code>GET /healthz</code> + <code>/health</code> + <code>/api/v1/observability</code> + <code>/api/v1/config</code> + <code>POST /memory/atlas</code>
+    MnemoSeed Local — loopback only · no analytics · no outbound fonts · <code>GET /healthz</code> + <code>/health</code> + <code>/api/v1/observability</code> + <code>/api/v1/config</code> + <code>/api/v1/profiles</code> + <code>POST /memory/atlas</code> + <code>/memory/dream_status</code> + <code>/memory/dream_once</code>
   </footer>
 
   <div id="a11y-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
