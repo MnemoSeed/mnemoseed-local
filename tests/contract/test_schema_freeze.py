@@ -170,9 +170,21 @@ _FROZEN_META_TABLES = (
     "audit_log",
     "dream_runs",
     "dream_token_ledger",
+    "error_events",
 )
-_FROZEN_META_INDEXES = ("idx_tokens_profile", "idx_audit_at", "idx_dream_session", "idx_tokens_hash")
-_FROZEN_TRIGGERS = (("trg_audit_no_update", "UPDATE"), ("trg_audit_no_delete", "DELETE"))
+_FROZEN_META_INDEXES = (
+    "idx_tokens_profile",
+    "idx_audit_at",
+    "idx_dream_session",
+    "idx_tokens_hash",
+    "idx_error_events_profile_time",
+)
+_FROZEN_TRIGGERS = (
+    ("trg_audit_no_update", "UPDATE"),
+    ("trg_audit_no_delete", "DELETE"),
+    ("trg_error_events_no_update", "UPDATE"),
+    ("trg_error_events_no_delete", "DELETE"),
+)
 
 
 def test_meta_schema_freeze_walk() -> None:
@@ -189,7 +201,6 @@ def test_meta_schema_freeze_walk() -> None:
             elif isinstance(op, AddColumn) and op.store == "meta":
                 added_meta_columns.add(op.column.name)
             elif isinstance(op, AddTrigger) and op.store == "meta":
-                assert op.table == "audit_log"
                 triggers.add((op.name, op.event))
     assert set(tables) == set(_FROZEN_META_TABLES)
     assert set(_FROZEN_META_INDEXES) == indexes

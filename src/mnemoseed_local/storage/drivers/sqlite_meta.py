@@ -33,6 +33,11 @@ from mnemoseed_local.storage.ports import (
     DreamRun,
     DreamRunFilter,
     DriverInfo,
+    ErrorEvent,
+    ErrorEventFilter,
+    ErrorSignalType,
+    EvidenceKind,
+    EvidencePointer,
     OwnerConflictError,
     Page,
     PageResult,
@@ -511,6 +516,65 @@ class SqliteMetaDriver:
         items = [_decode_audit(r) for r in rows]
         return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
 
+    # ------------------------------------------- error-event ledger (PRD-B2.13 E1)
+
+    def append_error_event(self, event: ErrorEvent) -> None:
+        """Append one error-event ledger row (deterministic, no model calls).
+
+        ``observed_at`` is stamped at insert time when the caller leaves it at
+        the default; ``profile_id`` is stored verbatim and never guessed. The
+        evidence pointer is stored flat (kind + id) so the row reads as a single
+        evidence pointer without any schema-side reinterpretation. Immutability
+        is enforced at the database level by the append-only triggers.
+        """
+        if not event.profile_id:
+            raise ValueError("error event profile_id is required and never guessed")
+        observed = event.observed_at if event.observed_at else time.time()
+        self._conn.execute(
+            "INSERT INTO error_events (profile_id, signal_type, observed_at, "
+            "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
+            "detector_id, eligibility_tag) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.profile_id,
+                event.signal_type.value,
+                iso8601_utc(observed),
+                event.evidence_ptr.kind.value,
+                event.evidence_ptr.id,
+                event.session_id,
+                event.turn_range.start if event.turn_range is not None else None,
+                event.turn_range.end if event.turn_range is not None else None,
+                event.detector_id,
+                event.eligibility_tag,
+            ),
+        )
+
+    def query_error_events(self, filter: ErrorEventFilter, page: Page) -> PageResult[ErrorEvent]:
+        """Profile-scoped, paginated error-event read in stable append order."""
+        clauses = ["profile_id = ?"]
+        params: list[Any] = [filter.profile_id]
+        if filter.signal_type is not None:
+            clauses.append("signal_type = ?")
+            params.append(filter.signal_type.value)
+        if filter.evidence_kind is not None:
+            clauses.append("evidence_kind = ?")
+            params.append(filter.evidence_kind.value)
+        if filter.since is not None:
+            clauses.append("observed_at >= ?")
+            params.append(iso8601_utc(filter.since))
+        if filter.until is not None:
+            clauses.append("observed_at <= ?")
+            params.append(iso8601_utc(filter.until))
+        where = " AND ".join(clauses)
+        count_row = self._conn.execute(f"SELECT COUNT(*) FROM error_events WHERE {where}", params).fetchone()
+        total = int(count_row[0]) if count_row is not None else 0
+        rows = self._conn.execute(
+            f"SELECT * FROM error_events WHERE {where} ORDER BY id LIMIT ? OFFSET ?",
+            [*params, page.limit, page.offset],
+        ).fetchall()
+        items = [_decode_error_event(r) for r in rows]
+        return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
+
     # ------------------------------------------------------------ dream runs
 
     def record_dream_run(self, run: DreamRun) -> str:
@@ -648,6 +712,23 @@ def _decode_audit(row: sqlite3.Row) -> AuditEntry:
         action=str(row["action"]),
         detail=json.loads(str(row["detail"])),
         at=epoch_from_iso(str(row["at"])),
+        id=int(row["id"]),
+    )
+
+
+def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
+    return ErrorEvent(
+        profile_id=str(row["profile_id"]),
+        signal_type=ErrorSignalType(str(row["signal_type"])),
+        observed_at=epoch_from_iso(str(row["observed_at"])),
+        evidence_ptr=EvidencePointer(
+            kind=EvidenceKind(str(row["evidence_kind"])),
+            id=str(row["evidence_id"]),
+        ),
+        session_id=row["session_id"],
+        turn_range=_turn_range_or_none(row["turn_start"], row["turn_end"]),
+        detector_id=row["detector_id"],
+        eligibility_tag=row["eligibility_tag"],
         id=int(row["id"]),
     )
 

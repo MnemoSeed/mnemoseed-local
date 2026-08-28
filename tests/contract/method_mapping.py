@@ -84,6 +84,9 @@ COVERAGE: dict[str, dict[str, str]] = {
         "token_usage": "test_contract_meta.py::test_dream_token_ledger_atomic_increment",
         "schema_version": "test_contract_meta.py::test_schema_version_and_migrate_forward_only",
         "migrate": "test_contract_meta.py::test_schema_version_and_migrate_forward_only",
+        # error-event ledger (E1 error-experience pipeline, PRD-B2.13)
+        "append_error_event": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
+        "query_error_events": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
         # identity chain (issue #14): owner account + hashed bearer secrets
         "create_user": "test_contract_meta.py::test_users_crud_and_password_rotation",
         "create_owner": "test_contract_meta.py::test_create_owner_atomic_and_conflict",
@@ -115,9 +118,12 @@ COVERAGE: dict[str, dict[str, str]] = {
 # with get_dense (Atlas CHUNKS-ONLY PCA dense projection).
 # GraphStore grew to 23 with set_read_conflict + clear_read_conflict (read-side
 # reversible evidence pointer backing the read-conflict annotation).
+# MetaStore grew to 37 with the E1 error-event ledger surface
+# (append_error_event + query_error_events: the signal-agnostic write seam and
+# profile-scoped paginated read backing PRD-B2.13 E1).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
     "GraphStore": 23,
-    "MetaStore": 35,
+    "MetaStore": 37,
     "Embedder": 3,
 }

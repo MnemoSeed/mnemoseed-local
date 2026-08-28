@@ -291,6 +291,95 @@ class AuditFilter:
     until: float | None = None
 
 
+class ErrorSignalType(StrEnum):
+    """Error-signal family namespace (PRD-B2.13 E1, reserved and extensible).
+
+    These are the registered signal-source families the A/B/composite/published
+    derivation channels nominate into the ledger. Each family still carries the
+    concrete ``detector_id`` per row (the nomination source); the family enum
+    stays stable and is the schema-level discriminator the dream adjudication
+    and the #123 reconciliation channel switch on. Values are reserved: a new
+    family appends a member, never reuses an existing one.
+    """
+
+    USER_CORRECTION = "user_correction"  # A-type: deterministic user-prompt correction markers
+    EVENT_OUTCOME = "event_outcome"  # B-type: exit codes, tracebacks, revert/edit chains
+    COMPOSITE = "composite"  # composite signal: injected-but-unconsumed + later correction
+    PUBLISHED = "published"  # published subset: needs_reconcile conflict events today
+
+
+class EvidenceKind(StrEnum):
+    """The referenced source surface of an evidence pointer.
+
+    The ledger pointer names which store an evidence id lives in, so the
+    dream/#123 adjudicator resolves the source without guessing. Converges with
+    ``read_conflict_id`` (a node id pointer) and the capture ``needs_reconcile``
+    flag: the pointer references a signal observed at a source, never a
+    correctness verdict and never a rewrite.
+    """
+
+    CHUNK = "chunk"  # a verbatim chunk (vector store)
+    SESSION = "session"  # a session (verbatim capture session)
+    NODE = "node"  # a cortical node (graph store)
+
+
+@dataclass(frozen=True)
+class EvidencePointer:
+    """One evidence pointer: the observed source a ledger nomination refers to.
+
+    Single-pointer semantics shared by E2 dream adjudication and the issue #123
+    reconciliation channel: ``kind`` names the surface (chunk/session/node) and
+    ``id`` is the source's own identifier. Referencing only — never a
+    correctness verdict, never a rewrite of the referenced item.
+    """
+
+    kind: EvidenceKind
+    id: str
+
+
+@dataclass(frozen=True)
+class ErrorEvent:
+    """One append-only error-event ledger row (PRD-B2.13 E1).
+
+    ``profile_id`` is always present and never guessed (#109 isomorphism: every
+    layer carries an explicit profile id). ``observed_at`` is a monotonic
+    timestamp set at write time; the autoincrement ``id`` gives the stable
+    append order. ``signal_type`` selects the reserved family namespace and
+    ``evidence_ptr`` references the source without asserting correctness.
+    ``detector_id`` names the concrete (deterministic) detector that nominated
+    the row — NULL until detectors land (gated on #75); ``eligibility_tag``
+    carries the R50 outcome-attribution mark (default ``mark-as-is``). Rows are
+    immutable: never mutated or deleted.
+    """
+
+    profile_id: str
+    signal_type: ErrorSignalType
+    observed_at: float
+    evidence_ptr: EvidencePointer
+    session_id: str | None = None
+    turn_range: TurnRange | None = None
+    detector_id: str | None = None
+    eligibility_tag: str | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class ErrorEventFilter:
+    """Filter for the profile-scoped, paginated error-event read.
+
+    ``profile_id`` is always explicit (D5 isolation, same contract as
+    ChunkFilter/NodeFilter). ``signal_type`` restricts the family namespace;
+    ``evidence_kind`` restricts the referenced source surface; the time window
+    applies to ``observed_at``.
+    """
+
+    profile_id: str
+    signal_type: ErrorSignalType | None = None
+    evidence_kind: EvidenceKind | None = None
+    since: float | None = None
+    until: float | None = None
+
+
 @dataclass(frozen=True)
 class ConfigEntry:
     """One versioned config value."""
@@ -900,6 +989,28 @@ class MetaStore(Protocol):
         raise NotImplementedError
 
     def audit_query(self, filter: AuditFilter, page: Page) -> PageResult[AuditEntry]:
+        raise NotImplementedError
+
+    # ----------------------------------------------- error-event ledger (PRD-B2.13 E1)
+
+    def append_error_event(self, event: ErrorEvent) -> None:
+        """Append one error-event ledger row (the E1 write seam).
+
+        The write is deterministic: no model call, no feedback/correction API.
+        ``observed_at`` is stamped at insert time and the row is immutable the
+        moment it lands (append-only at the database level, like audit_log).
+        The future signal pipeline calls this seam; no production signal source
+        ships in E1 (concrete detectors are #75-gated).
+        """
+        raise NotImplementedError
+
+    def query_error_events(self, filter: ErrorEventFilter, page: Page) -> PageResult[ErrorEvent]:
+        """Profile-scoped, paginated read over appended error events.
+
+        ``profile_id`` is always explicit (D5 isolation). Rows return in stable
+        append order (id asc), ready for E2 dream adjudication and the issue
+        #123 reconciliation channel to consume as evidence pointers.
+        """
         raise NotImplementedError
 
     def record_dream_run(self, run: DreamRun) -> str:
