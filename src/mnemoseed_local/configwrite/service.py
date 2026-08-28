@@ -939,6 +939,7 @@ class ConfigWriteService:
                 },
             },
             "restart_required": {},
+            "generation": self._generation,
         }
 
     def _resolved_role(self, role: str) -> dict[str, Any]:

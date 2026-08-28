@@ -75,6 +75,25 @@ def set_config(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     key_path = body.get("key_path")
     if not isinstance(key_path, str) or not key_path:
         raise HTTPException(status_code=422, detail="body.key_path must be a non-empty string")
+    # Optimistic-lock: If-Match must equal the current generation when present.
+    # The header lookup is case-insensitive (Starlette normalizes), but we check
+    # both casings explicitly so the contract accepts either spelling.
+    if_match = request.headers.get("if-match")
+    if if_match is None:
+        if_match = request.headers.get("If-Match")
+    if if_match is not None:
+        current = _service(request).generation
+        candidate = if_match.strip()
+        # Strip weak validator and quotes (If-Match may be quoted per RFC 7232).
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
+            candidate = candidate[1:-1].strip()
+        if candidate != str(current):
+            raise HTTPException(
+                status_code=409,
+                detail=f"generation mismatch: current generation is {current}",
+            )
     try:
         result = _service(request).set(key_path, body.get("value"), actor=actor)
     except ConfigWriteError as exc:

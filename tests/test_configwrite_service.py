@@ -740,3 +740,91 @@ def test_agent_bindings_concurrent_writes_serialize_without_loss(tmp_path) -> No
     assert service._config.profiles.profile_for("agentX") == "research"
     # the write path helper sees the same map as the persona helper
     assert service._config.profiles.persona_for("agentX") == "research"
+
+
+# ---------------------------------------------------------------- optimistic-lock generation (C-2 #140)
+
+
+def _http_client(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """Minimal FastAPI app mounting the configwrite router for HTTP contract checks."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from mnemoseed_local.configwrite.routes import router as configwrite_router
+
+    path = _config_toml(tmp_path)
+    config = load_config(path)
+    service = ConfigWriteService(config, None, clock=lambda: 1_700_000_000.0)
+    app = FastAPI()
+    app.state.config = config  # type: ignore[attr-defined]
+    app.state.configwrite = service  # type: ignore[attr-defined]
+    app.include_router(configwrite_router)
+    client = TestClient(app)
+    return client, service
+
+
+def test_get_includes_generation(tmp_path) -> None:
+    """GET /api/v1/config exposes the server-authoritative generation."""
+    service, _ = _service(tmp_path)
+    body = service.get()
+    assert "generation" in body, "service.get() must include generation"
+    assert body["generation"] == 0
+    service.set("dream.auto_trigger", True, actor="console")
+    assert service.get()["generation"] == 1
+
+
+def test_http_get_includes_generation(tmp_path) -> None:
+    client, service = _http_client(tmp_path)
+    data = client.get("/api/v1/config").json()
+    assert "generation" in data
+    assert data["generation"] == service.generation == 0
+
+
+def test_http_set_with_correct_if_match_succeeds(tmp_path) -> None:
+    client, _ = _http_client(tmp_path)
+    gen = client.get("/api/v1/config").json()["generation"]
+    resp = client.post(
+        "/api/v1/config/set",
+        json={"key_path": "dream.auto_trigger", "value": True},
+        headers={"If-Match": str(gen)},
+    )
+    assert resp.status_code == 200, resp.text
+    assert client.get("/api/v1/config").json()["generation"] == gen + 1
+
+
+def test_http_set_with_stale_if_match_returns_409(tmp_path) -> None:
+    client, service = _http_client(tmp_path)
+    service.set("dream.auto_trigger", True, actor="console")
+    current = service.generation
+    assert current == 1
+    resp = client.post(
+        "/api/v1/config/set",
+        json={"key_path": "dream.auto_trigger", "value": False},
+        headers={"If-Match": "0"},
+    )
+    assert resp.status_code == 409, resp.text
+    detail = str(resp.json().get("detail", ""))
+    assert str(current) in detail, f"409 detail must contain current generation {current}: {detail!r}"
+
+
+def test_http_set_with_lowercase_if_match_returns_409(tmp_path) -> None:
+    client, service = _http_client(tmp_path)
+    service.set("dream.auto_trigger", True, actor="console")
+    current = service.generation
+    resp = client.post(
+        "/api/v1/config/set",
+        json={"key_path": "dream.auto_trigger", "value": False},
+        headers={"if-match": "0"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert str(current) in str(resp.json().get("detail", ""))
+
+
+def test_http_set_without_if_match_succeeds_backward_compat(tmp_path) -> None:
+    client, _ = _http_client(tmp_path)
+    resp = client.post(
+        "/api/v1/config/set",
+        json={"key_path": "dream.auto_trigger", "value": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
