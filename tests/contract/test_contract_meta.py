@@ -20,6 +20,11 @@ from mnemoseed_local.storage.ports import (
     ConfigEntry,
     DreamRun,
     DreamRunFilter,
+    ErrorEvent,
+    ErrorEventFilter,
+    ErrorSignalType,
+    EvidenceKind,
+    EvidencePointer,
     OwnerConflictError,
     Page,
     PoolState,
@@ -368,14 +373,14 @@ def test_dream_run_finish_completes_the_row(stack) -> None:
 
 
 def test_schema_version_and_migrate_forward_only(stack) -> None:
-    """meta's head is v9 (frozen v1 schema + v3 profile_score_pool + v4
+    """meta's head is v11 (frozen v1 schema + v3 profile_score_pool + v4
     dream_token_ledger + v6 identity users/token_hash + v7 profile archive
-    flag + v8 reserved config.scope + v9 pool filed_points_total ledger);
-    migrate is idempotent and forward-only."""
-    assert stack.meta.schema_version() == 9
-    assert stack.meta.migrate() == 9
-    assert stack.meta.migrate(target=1) == 9  # back-targeting is a no-op at head
-    assert stack.meta.schema_version() == 9
+    flag + v8 reserved config.scope + v9 pool filed_points_total ledger +
+    v11 error-event ledger); migrate is idempotent and forward-only."""
+    assert stack.meta.schema_version() == 11
+    assert stack.meta.migrate() == 11
+    assert stack.meta.migrate(target=1) == 11  # back-targeting is a no-op at head
+    assert stack.meta.schema_version() == 11
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:
@@ -401,3 +406,89 @@ def test_meta_stamp_helpers_used(stack) -> None:
     """The stamp helpers are exercised so ruff never prunes them from the suite."""
     prov = make_prov(session_id="s-meta")
     assert prov.session_id == "s-meta"
+
+
+# ---------------------------------------------------------- error-event ledger (E1)
+
+
+def test_error_event_append_and_query_profile_scoped(stack) -> None:
+    """E1 ledger: append is a deterministic write seam; the read is profile-scoped
+    and paginated. The evidence pointer references a source without asserting
+    correctness."""
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=100.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="chunk-1"),
+            session_id="s1",
+        )
+    )
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.EVENT_OUTCOME,
+            observed_at=200.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.NODE, id="node-9"),
+            turn_range=TurnRange(start=2, end=4),
+        )
+    )
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u2",
+            signal_type=ErrorSignalType.PUBLISHED,
+            observed_at=150.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.SESSION, id="s-u2"),
+        )
+    )
+
+    page = stack.meta.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert page.total == 2
+    assert [e.evidence_ptr.id for e in page.items] == ["chunk-1", "node-9"]
+    for event in page.items:
+        assert event.profile_id == "u1"
+
+    other = stack.meta.query_error_events(ErrorEventFilter(profile_id="u2"), Page(0, 50))
+    assert other.total == 1
+    assert other.items[0].evidence_ptr.kind is EvidenceKind.SESSION
+
+
+def test_error_event_signal_type_filter_and_isolation(stack) -> None:
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=100.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c1"),
+        )
+    )
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.EVENT_OUTCOME,
+            observed_at=200.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.NODE, id="n1"),
+        )
+    )
+    filtered = stack.meta.query_error_events(
+        ErrorEventFilter(profile_id="u1", signal_type=ErrorSignalType.EVENT_OUTCOME), Page(0, 50)
+    )
+    assert filtered.total == 1
+    assert filtered.items[0].evidence_ptr.kind is EvidenceKind.NODE
+
+
+def test_error_event_append_only_enforced_by_db(stack) -> None:
+    """The ledger is append-only at the database level: rows are never mutated
+    or deleted (audit_log precedent)."""
+    stack.meta.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=100.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c1"),
+        )
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        stack.meta._conn.execute("UPDATE error_events SET signal_type = 'tampered'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        stack.meta._conn.execute("DELETE FROM error_events")

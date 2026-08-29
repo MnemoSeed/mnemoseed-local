@@ -17,6 +17,11 @@ from mnemoseed_local.storage.ports import (
     Capability,
     DreamRun,
     DreamRunFilter,
+    ErrorEvent,
+    ErrorEventFilter,
+    ErrorSignalType,
+    EvidenceKind,
+    EvidencePointer,
     Page,
     PoolState,
     StorageError,
@@ -460,6 +465,93 @@ def test_dream_run_finish_completes_the_row(driver):
     driver.finish_dream_run("no-such-run", finished_at=400.0, tokens=1, cost=0.0, dropped_count=0)
 
 
+# ------------------------------------------------------- error-event ledger (E1)
+
+
+def test_error_event_append_requires_profile_id(driver):
+    with pytest.raises(ValueError, match="profile_id is required"):
+        driver.append_error_event(
+            ErrorEvent(
+                profile_id="",
+                signal_type=ErrorSignalType.USER_CORRECTION,
+                observed_at=100.0,
+                evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c1"),
+            )
+        )
+
+
+def test_error_event_roundtrip_evidence_pointer_and_turn_range(driver):
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.EVENT_OUTCOME,
+            observed_at=250.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.NODE, id="node-9"),
+            session_id="s1",
+            turn_range=TurnRange(start=2, end=4),
+            detector_id="event.outcome.exit_code",
+            eligibility_tag="mark-as-is",
+        )
+    )
+    page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert page.total == 1
+    event = page.items[0]
+    assert event.profile_id == "u1"
+    assert event.signal_type is ErrorSignalType.EVENT_OUTCOME
+    assert event.observed_at == 250.0
+    assert event.evidence_ptr == EvidencePointer(kind=EvidenceKind.NODE, id="node-9")
+    assert event.session_id == "s1"
+    assert event.turn_range == TurnRange(start=2, end=4)
+    assert event.detector_id == "event.outcome.exit_code"
+    assert event.eligibility_tag == "mark-as-is"
+
+
+def test_error_event_durability_survives_reopen(tmp_path):
+    """Append-only ledger rows survive a close/reopen — the write seam is
+    durable, not an in-memory mock."""
+    path = tmp_path / "ledger.db"
+    first = SqliteMetaDriver(path=path)
+    first.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.PUBLISHED,
+            observed_at=400.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="conflict-7"),
+        )
+    )
+    asyncio.run(first.close())
+
+    second = SqliteMetaDriver(path=path)
+    try:
+        page = second.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+        assert page.total == 1
+        assert page.items[0].evidence_ptr.id == "conflict-7"
+        assert page.items[0].evidence_ptr.kind is EvidenceKind.CHUNK
+    finally:
+        asyncio.run(second.close())
+
+
+def test_error_event_immutable_rows_via_database(driver):
+    """The ledger refuses UPDATE and DELETE at the database level (audit_log
+    precedent) — the evidence-pointer nomination is never rewritten."""
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.PUBLISHED,
+            observed_at=100.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.NODE, id="n1"),
+        )
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        driver._conn.execute("UPDATE error_events SET signal_type = 'tampered' WHERE profile_id = 'u1'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        driver._conn.execute("DELETE FROM error_events")
+    # the row is still intact after the rejected writes
+    page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert page.total == 1
+    assert page.items[0].signal_type is ErrorSignalType.PUBLISHED
+
+
 # ---------------------------------------------------------------- migrations
 
 
@@ -481,15 +573,15 @@ def test_meta_migration_preserves_data_and_is_forward_only(tmp_path):
         # graph-tagged v2 is not applied to a meta-only file; v3 adds the
         # per-profile score pool, v4 the dream token ledger, v6 the identity
         # users table + hashed token column, v7 the profile archive flag,
-        # v8 the reserved config.scope column and v9 the lifetime filed-points
-        # ledger column, so meta lands at 9 (the legacy singleton score_pool
-        # is neither dropped nor migrated).
-        assert driver.schema_version() == 9
+        # v8 the reserved config.scope column, v9 the lifetime filed-points
+        # ledger column and v11 the error-event ledger, so meta lands at 11
+        # (the legacy singleton score_pool is neither dropped nor migrated).
+        assert driver.schema_version() == 11
         got = driver.get_profile("u1")
         assert got is not None
         assert got.display_name == "survivor"
         driver.migrate()  # idempotent re-run
-        assert driver.schema_version() == 9
+        assert driver.schema_version() == 11
     finally:
         asyncio.run(driver.close())
 
@@ -498,7 +590,7 @@ def test_schema_version_equals_latest_new_install(tmp_path):
     db = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
         assert db.schema_version() == db.migrate()
-        assert db.schema_version() == 9
+        assert db.schema_version() == 11
         # a profile row written after init survives a migrate() no-op
         db.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
         db.migrate()
@@ -521,7 +613,7 @@ def test_v9_backfills_filed_points_born_empty(tmp_path):
 
     driver = SqliteMetaDriver(path=path)
     try:
-        assert driver.schema_version() == 9
+        assert driver.schema_version() == 11
         state = driver.pool_state("u1")
         assert state.balance == 2.5
         assert state.filed_points_total == 0.0

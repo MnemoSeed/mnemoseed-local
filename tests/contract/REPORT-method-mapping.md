@@ -57,12 +57,13 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (35 methods)
+## MetaStore (37 methods)
 
 | Method | Contract test |
 |---|---|
 | add_token_usage | `test_contract_meta.py::test_dream_token_ledger_atomic_increment` |
 | advance_watermark | `test_contract_meta.py::test_pool_watermark_gap_raises` |
+| append_error_event | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
 | archive_profile | `test_contract_meta.py::test_profile_archive_flag` |
 | audit_append | `test_contract_meta.py::test_audit_append_and_query` |
 | audit_query | `test_contract_meta.py::test_audit_append_and_query` |
@@ -87,6 +88,7 @@ Driver family covered by the `stack` fixture:
 | pool_drain | `test_contract_meta.py::test_pool_drain_files_the_lifetime_ledger` |
 | pool_state | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
 | pool_states | `test_contract_meta.py::test_pool_states_returns_all_rows` |
+| query_error_events | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
 | record_dream_run | `test_contract_meta.py::test_dream_runs_roundtrip` |
 | revoke_token | `test_contract_meta.py::test_issue_token_and_revoke` |
 | rollback_config | `test_contract_meta.py::test_config_versioned_get_set_rollback` |

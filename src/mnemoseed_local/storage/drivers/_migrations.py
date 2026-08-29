@@ -502,6 +502,61 @@ _V10_ADD_READ_CONFLICT_ID = AddColumn(
     column=Column("read_conflict_id", "TEXT"),
 )
 
+# v11 (PRD-B2.13 E1): the error-experience ledger — a dedicated append-only
+# table (never mutating graph nodes). One row nominates an error signal the
+# deterministic detectors observed: profile_id (always, never guessed), a
+# monotonic observed_at timestamp, the reserved signal-type family, and an
+# explicit evidence pointer (kind = chunk/session/node surface, id = the
+# source's own identifier) that references without asserting correctness —
+# consumable as-is by E2 dream adjudication and the issue #123 reconciliation
+# channel. Born empty (no backfill): the signal pipeline starts nominating from
+# the upgrade on. Rows are append-only, enforced by BEFORE UPDATE/DELETE
+# triggers exactly like audit_log.
+_ERROR_EVENTS_TABLE = CreateTable(
+    store="meta",
+    name="error_events",
+    columns=(
+        Column("id", "INTEGER", primary_key=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("signal_type", "TEXT", not_null=True),
+        Column("observed_at", "TEXT", not_null=True),
+        Column("evidence_kind", "TEXT", not_null=True),
+        Column("evidence_id", "TEXT", not_null=True),
+        Column("session_id", "TEXT"),
+        Column("turn_start", "INTEGER"),
+        Column("turn_end", "INTEGER"),
+        Column("detector_id", "TEXT"),
+        Column("eligibility_tag", "TEXT"),
+    ),
+)
+
+_ERROR_EVENTS_TIME_INDEX = CreateIndex(
+    store="meta",
+    name="idx_error_events_profile_time",
+    table="error_events",
+    columns=("profile_id", "observed_at"),
+)
+
+_ERROR_EVENTS_UPDATE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_error_events_no_update",
+    timing="BEFORE",
+    event="UPDATE",
+    table="error_events",
+    action="BEGIN SELECT RAISE(ABORT, 'error_events is append-only'); END",
+    pg_action="RAISE EXCEPTION 'error_events is append-only'",
+)
+
+_ERROR_EVENTS_DELETE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_error_events_no_delete",
+    timing="BEFORE",
+    event="DELETE",
+    table="error_events",
+    action="BEGIN SELECT RAISE(ABORT, 'error_events is append-only'); END",
+    pg_action="RAISE EXCEPTION 'error_events is append-only'",
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -599,6 +654,21 @@ MIGRATIONS: tuple[Migration, ...] = (
             "capture or vote)"
         ),
         ops=(_V10_ADD_READ_CONFLICT_ID,),
+    ),
+    Migration(
+        version=11,
+        description=(
+            "error-experience ledger (PRD-B2.13 E1): dedicated append-only "
+            "error_events table carrying profile_id, monotonic observed_at, the "
+            "reserved signal-type family and an explicit evidence pointer; "
+            "append-only UPDATE/DELETE triggers + profile/time index"
+        ),
+        ops=(
+            _ERROR_EVENTS_TABLE,
+            _ERROR_EVENTS_TIME_INDEX,
+            _ERROR_EVENTS_UPDATE_TRIGGER,
+            _ERROR_EVENTS_DELETE_TRIGGER,
+        ),
     ),
 )
 
