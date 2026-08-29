@@ -381,6 +381,7 @@ def _group_session_tails(
                     {
                         "chunk_id": chunk.chunk_id,
                         "text": chunk.text,
+                        "source": chunk.provenance.source,
                         "ingested_at": chunk.ingested_at,
                         "turn_start": chunk.turn_start,
                         "turn_end": chunk.turn_end,
@@ -553,6 +554,9 @@ class MemoryService:
             "kind": entry.kind,
             "id": entry.id,
             "source": entry.source,
+            "asserted_by": entry.asserted_by,
+            "provenance_source": entry.provenance_source,
+            "explicit_pin": entry.explicit_pin,
             "text": entry.text,
             "score": entry.score,
             "tokens": entry.tokens,
@@ -564,6 +568,7 @@ class MemoryService:
             "valid_from": iso8601_utc(entry.valid_from) if entry.valid_from is not None else None,
             "origin_agent": entry.origin_agent,
             "host": entry.host,
+            "needs_reconcile": entry.needs_reconcile,
         }
 
     def _index_residue(self, profile_id: str) -> dict[str, Any]:
@@ -1086,7 +1091,7 @@ class MemoryService:
         # breaks the same-stamp tie in reading order; nodes carry the -1
         # sentinel (they have no turn window) so a chunk always precedes a
         # node on a full tie (chunks first).
-        candidates: list[tuple[float, float, int, str, str, str]] = []
+        candidates: list[tuple[float, float, int, str, str, str, str]] = []
         for chunk in page.items:
             if chunk.provenance.session_id == session_id:
                 continue  # the requesting session never sees its own chunks
@@ -1103,6 +1108,7 @@ class MemoryService:
                     "chunk",
                     chunk.chunk_id,
                     chunk.text,
+                    chunk.provenance.source,
                 )
             )
         node_page = self._stores.graph.list_nodes(
@@ -1119,23 +1125,38 @@ class MemoryService:
             # Sentinel -1: node has no turn_start. -1 and 0 are equivalent for
             # chunks-first (both ≤ any chunk turn_start ≥ 0); -1 is canonical.
             candidates.append(
-                (node.decay_weight, round(node.updated_at, 3), -1, "node", node.node_id, statement)
+                (
+                    node.decay_weight,
+                    round(node.updated_at, 3),
+                    -1,
+                    "node",
+                    node.node_id,
+                    statement,
+                    node.provenance.source,
+                )
             )
         budget = self._config.capture.auto_recall_budget_chars
         items: list[dict[str, str]] = []
         remaining = budget
-        for _decay, _stamp, _turn_start, kind, candidate_id, text in sorted(
+        for _decay, _stamp, _turn_start, kind, candidate_id, text, source in sorted(
             candidates, key=lambda c: (-c[0], -c[1], -c[2])
         ):
             cost = len(text) + 1
             if cost <= remaining:
-                items.append({"kind": kind, "id": candidate_id, "text": text})
+                items.append({"kind": kind, "id": candidate_id, "text": text, "source": source})
                 remaining -= cost
                 continue
             slice_budget = remaining - 2  # the "…" marker and the newline (T1)
             if slice_budget < _MIN_SLICE_CHARS:
                 break  # the boundary item is dropped ALONG WITH everything older
-            items.append({"kind": kind, "id": candidate_id, "text": "…" + text[-slice_budget:]})
+            items.append(
+                {
+                    "kind": kind,
+                    "id": candidate_id,
+                    "text": "…" + text[-slice_budget:],
+                    "source": source,
+                }
+            )
             remaining = 0
             break
         return items, self._non_focal_count(profile_id, session_id, query_folded, seen)
@@ -1410,6 +1431,8 @@ class MemoryService:
                     "text_head": chunk.text[:120],
                     "decay_weight": chunk.decay_weight,
                     "is_explicit_pin": chunk.provenance.source == EXPLICIT_PIN_SOURCE,
+                    "asserted_by": chunk.provenance.asserted_by,
+                    "source": chunk.provenance.source,
                     "node_type": None,
                     "entities": list(chunk.cues.entities),
                     "ingested_at": chunk.ingested_at,
@@ -1418,6 +1441,7 @@ class MemoryService:
                     "flags": {
                         "consolidated": bool(chunk.consolidated),
                         "explicit_pin": chunk.provenance.source == EXPLICIT_PIN_SOURCE,
+                        "needs_reconcile": bool(chunk.needs_reconcile),
                     },
                     "score": chunk.score,
                 }

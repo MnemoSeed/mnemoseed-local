@@ -24,7 +24,7 @@ from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.app import DreamWorker, create_app
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
 from mnemoseed_local.schema.graph import GraphNode, NodeType
-from mnemoseed_local.schema.stamp import Provenance
+from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers._time import iso8601_utc
 from mnemoseed_local.storage.ports import TurnRange
@@ -532,6 +532,59 @@ def test_recall_graph_entries_carry_iso_valid_from_and_null_session(config_path:
         assert graph_entry["ingested_at"] is None
         assert graph_entry["valid_from"] == iso8601_utc(100.0)
         assert _ISO.fullmatch(graph_entry["valid_from"])
+        # Graph entries carry their real provenance source label but never
+        # invent a pin discriminant (honest, not a user-authored pin).
+        assert graph_entry["provenance_source"] == "x"
+        assert graph_entry["explicit_pin"] is False
+
+
+def test_recall_chunk_entries_carry_asserted_by_and_needs_reconcile(config_path: Path) -> None:
+    """R2 provenance-trust recall wire: a chunk entry exposes who asserted it
+    and the storage needs_reconcile flag (additive provenance fields)."""
+    with _boot(config_path) as client:
+        stores = client.app.state.stores  # type: ignore[attr-defined]
+        stamp = ChunkStamp(
+            chunk_id="r-wire",
+            profile_id=PROFILE,
+            text="pinned LanceDb wiring preference",
+            cognitive_tier=CognitiveTier.TIER_1,
+            model_id="test-model",
+            cues=Cues(entities=["LanceDb"]),
+            provenance=Provenance(asserted_by="user", session_id="s-wire", source="memory.remember"),
+            ingested_at=10.0,
+        )
+        emb = stores.embed.embed(stamp.text)
+        stores.vector.upsert_chunk(stamp, emb.dense, emb.sparse)
+        stores.vector.update_chunk_state([stamp.chunk_id], needs_reconcile=True)
+        capture = ChunkStamp(
+            chunk_id="r-captured",
+            profile_id=PROFILE,
+            text="captured LanceDb wiring preference",
+            cognitive_tier=CognitiveTier.TIER_1,
+            model_id="test-model",
+            cues=Cues(entities=["LanceDb"]),
+            provenance=Provenance(asserted_by="test-model", session_id="s-wire", source="x"),
+            ingested_at=20.0,
+        )
+        cap_emb = stores.embed.embed(capture.text)
+        stores.vector.upsert_chunk(capture, cap_emb.dense, cap_emb.sparse)
+        recall = client.post(
+            "/memory/recall", json={"profile_id": PROFILE, "query": "LanceDb wiring", "top_k": 5}
+        ).json()
+        pin = next(e for e in recall["memory"]["entries"] if e["kind"] == "chunk" and e["id"] == "r-wire")
+        assert pin["asserted_by"] == "user"
+        assert pin["needs_reconcile"] is True
+        # The R2 pin discriminant is a distinct field from the retrieval-channel
+        # "source" label, so a recall user can tell a pin from a capture.
+        assert pin["provenance_source"] == "memory.remember"
+        assert pin["explicit_pin"] is True
+        captured = next(
+            e for e in recall["memory"]["entries"] if e["kind"] == "chunk" and e["id"] == "r-captured"
+        )
+        assert captured["provenance_source"] == "x"
+        assert captured["explicit_pin"] is False
+        # NIT-2: a default chunk (no reconcile mark) reports False on the wire.
+        assert captured["needs_reconcile"] is False
 
 
 def _graph_pref(node_id: str) -> GraphNode:

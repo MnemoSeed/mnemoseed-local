@@ -184,6 +184,31 @@ def test_recall_pending_serves_focal_entities_once_and_marks_seen(recall_config_
         assert second["slot_consumed"] is True, "the consumed tombstone survives the serve"
 
 
+def test_recall_pending_items_carry_pin_source_for_injection(recall_config_path: Path) -> None:
+    """R2 provenance-trust injection wire: each served pending item carries its
+    pin/source signal so the T2 injection host can mark pins (source == memory.remember)."""
+    with TestClient(create_app()) as client:
+        store = client.app.state.stores
+        stamp = ChunkStamp(
+            chunk_id="pin-src",
+            profile_id=PROFILE,
+            text="user: 记得用 LanceDb 做向量存储",
+            cognitive_tier=CognitiveTier.TIER_1,
+            model_id="test-model",
+            cues=Cues(entities=["LanceDb"]),
+            provenance=Provenance(asserted_by="user", session_id="sess-a", source="memory.remember"),
+            ingested_at=1.0,
+        )
+        embedded = store.embed.embed(stamp.text)
+        store.vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
+        client.post("/session/end", json={"session_id": "sess-a", "profile_id": PROFILE})
+        _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
+        items = _pull(client, "sess-b")["items"]
+        assert len(items) == 1, items
+        assert items[0]["source"] == "memory.remember"
+        assert items[0]["kind"] == "chunk"
+
+
 def test_recall_pending_consumed_tombstone_survives_until_session_end(recall_config_path: Path) -> None:
     """QA BLOCKER-2: the serve leaves a CONSUMED TOMBSTONE distinct from the
     slot — a retry pull after a lost response answers {enabled:true, items:[],

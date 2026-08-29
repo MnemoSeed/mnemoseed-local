@@ -671,6 +671,20 @@ def test_assembled_entry_defaults_provenance_to_null() -> None:
     assert entry.session_id is None
     assert entry.ingested_at is None
     assert entry.valid_from is None
+    assert entry.asserted_by is None
+    assert entry.needs_reconcile is False
+
+
+def test_chunk_entries_carry_asserted_by_and_needs_reconcile(stack) -> None:
+    """R2 provenance-trust: a chunk entry surfaces who asserted it and the
+    storage needs_reconcile flag (additive provenance on the assembled entry)."""
+    cid = "c_prov"
+    _write(stack, _chunk(cid, "reconcile provenance fact", entities=("LanceDb",), session_id="sess-9"))
+    stack.vector.update_chunk_state([cid], needs_reconcile=True)
+    result = _assemble(stack, _recall(stack, "reconcile provenance fact", _query_cues(("LanceDb",))))
+    entry = next(entry for entry in result.entries if entry.kind == "chunk" and entry.id == cid)
+    assert entry.asserted_by == "test-model"
+    assert entry.needs_reconcile is True
 
 
 # ------------------------------------------------------------ read-side conflict flag
