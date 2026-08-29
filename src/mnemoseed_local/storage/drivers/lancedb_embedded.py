@@ -676,6 +676,7 @@ class LanceDbEmbeddedStore:
             last_reinforced=float(row["last_reinforced"]) if row.get("last_reinforced") is not None else None,
             score=float(score_row.get("total", 0.0)),
             consolidated=bool(row["consolidated"]),
+            needs_reconcile=bool(row.get("needs_reconcile", False)),
             ingested_at=float(row["ingested_at"]),
             turn_start=int(row["turn_start"]) if row.get("turn_start") is not None else None,
             turn_end=int(row["turn_end"]) if row.get("turn_end") is not None else None,

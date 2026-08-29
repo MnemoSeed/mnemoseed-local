@@ -204,6 +204,21 @@ def test_atlas_text_head_truncated(client: TestClient) -> None:
     assert len(items[0]["text_head"]) <= 120
 
 
+def test_atlas_chunk_item_carries_source_asserted_by_and_reconcile_flag(client: TestClient) -> None:
+    """R2 provenance-trust Atlas wire: a chunk item surfaces source/asserted_by
+    and the flags.needs_reconcile signal; the existing explicit_pin flag stays."""
+    c = _make_chunk("default", "reconcile source provenance", [1, 0, 0, 0, 0, 0, 0, 0])
+    _insert_chunk(client, "default", c, [1, 0, 0, 0, 0, 0, 0, 0])
+    client.app.state.stores.vector.update_chunk_state([c.chunk_id], needs_reconcile=True)  # type: ignore[attr-defined]
+    resp = client.post("/memory/atlas", json={"profile_id": "default"})
+    assert resp.status_code == 200, resp.text
+    [item] = [it for it in resp.json()["items"] if it["kind"] == "chunk"]
+    assert item["source"] == "session://s1"
+    assert item["asserted_by"] == "test"
+    assert item["flags"]["needs_reconcile"] is True
+    assert item["flags"]["explicit_pin"] is False
+
+
 def test_get_dense_missing_ids_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _config_path(tmp_path, monkeypatch)
     app = create_app()

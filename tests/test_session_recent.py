@@ -271,6 +271,29 @@ def test_session_recent_items_carry_origin_agent_and_host_end_to_end(config_path
         assert plain_item["host"] == HostId.CLAUDE_CODE.value
 
 
+def test_session_recent_chunks_expose_pin_source(config_path: Path) -> None:
+    """R2 provenance-trust injection wire: each recent tail chunk carries its
+    pin/source signal so the injection host can mark pins (source == memory.remember)."""
+    with TestClient(create_app()) as client:
+        stores = client.app.state.stores
+        stamp = ChunkStamp(
+            chunk_id="src-pin",
+            profile_id=PROFILE,
+            text="user: explicit pin about LanceDb",
+            cognitive_tier=CognitiveTier.TIER_1,
+            model_id="test-model",
+            cues=Cues(entities=[]),
+            provenance=Provenance(asserted_by="user", session_id="s-recent", source="memory.remember"),
+            ingested_at=1.0,
+        )
+        result = stores.embed.embed(stamp.text)
+        stores.vector.upsert_chunk(stamp, result.dense, result.sparse)
+        client.post("/session/end", json={"session_id": "s-recent", "profile_id": PROFILE})
+        body = client.post("/session/recent", json={"profile_id": PROFILE})
+        [group] = body.json()["sessions"]
+        assert [c["source"] for c in group["chunks"]] == ["memory.remember"]
+
+
 def test_blank_agent_ingests_and_serves_as_null(config_path: Path) -> None:
     """Capture success outranks attribution completeness: a whitespace-only
     agent never fails ingest and serves as the honest null."""

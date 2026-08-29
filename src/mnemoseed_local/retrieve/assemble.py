@@ -55,7 +55,7 @@ from typing import Any
 from mnemoseed_local.dream.delta import estimate_tokens
 from mnemoseed_local.retrieve.hybrid import Candidate, HybridRecall
 from mnemoseed_local.schema.graph import GraphNode
-from mnemoseed_local.schema.stamp import ChunkStamp
+from mnemoseed_local.schema.stamp import ChunkStamp, is_explicit_pin
 from mnemoseed_local.storage.ports import (
     ChunkFilter,
     GraphFlag,
@@ -149,6 +149,16 @@ class AssembledEntry:
     # host); graph entries and unlabeled chunks carry None.
     origin_agent: str | None = None
     host: str | None = None
+    # Inert provenance used by the trust surface (read-only): who asserted the
+    # memory ("user" / model id) and the storage conflict flag. Chunks carry
+    # their values; graph entries and unlabeled chunks keep None/False.
+    asserted_by: str | None = None
+    needs_reconcile: bool = False
+    # R2 pin discriminant: the genuine provenance source label (per §2.1 the
+    # pin test is `provenance_source == "memory.remember"`) and its derived
+    # boolean. Never invented for graph entries — sourced from the real stamp.
+    provenance_source: str | None = None
+    explicit_pin: bool = False
 
 
 @dataclass(frozen=True)
@@ -470,9 +480,16 @@ class Assembler:
                 "ingested_at": candidate.item.ingested_at,
                 "origin_agent": candidate.item.origin_agent,
                 "host": candidate.item.cues.host,
+                "asserted_by": candidate.item.provenance.asserted_by,
+                "needs_reconcile": candidate.item.needs_reconcile,
             }
         elif isinstance(candidate.item, GraphNode):
-            provenance = {"valid_from": candidate.item.valid_from}
+            provenance = {
+                "valid_from": candidate.item.valid_from,
+                "asserted_by": candidate.item.provenance.asserted_by,
+            }
+        provenance["provenance_source"] = candidate.item.provenance.source
+        provenance["explicit_pin"] = is_explicit_pin(candidate.item.provenance.source)
         return AssembledEntry(
             kind=candidate.kind,
             id=candidate.id,

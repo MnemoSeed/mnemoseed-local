@@ -104,6 +104,10 @@ class ChunkStamp(BaseModel):
     )
     score: float = 0.0  # capture-time salience score
     consolidated: bool = False  # pinned after dream-engine write-back
+    # R2 trust wire: storage-conflict flag (a conflicting verdict / near-
+    # duplicate marks the chunk needs reconcile; read-only on the recall/Atlas
+    # wire for the console Reconcile badge).
+    needs_reconcile: bool = False
     ingested_at: float = Field(default_factory=time.time)
     turn_start: int | None = None  # capturing turn window (safe purge scoping)
     turn_end: int | None = None  # inclusive; both ends must be set together
