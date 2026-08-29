@@ -227,6 +227,8 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font
 .drawer-sec-danger .drawer-sec-head{color: var(--danger)}
 .d-title{margin:0; font-weight:650; word-break:break-word; line-height:1.4}
 .d-badges{display:flex; gap:6px; flex-wrap:wrap; margin:8px 0 0}
+.d-whysrc{display:flex; gap:6px; flex-wrap:wrap; margin:0 0 8px}
+.statusbar-recall{opacity:.92}
 .decay-big{display:flex; align-items:baseline; gap:8px; margin:6px 0}
 .decay-val{font-size:28px; font-weight:800; letter-spacing:-.03em}
 .edge-list, .timeline-list, .audit-list{list-style:none; padding:0; margin:8px 0 0; display:grid; gap:6px}

@@ -11,6 +11,9 @@ const DAEMON_MSG = `Daemon unreachable at ${DAEMON_URL} — run mnemoseed-local 
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
 const esc = (s) => String(s).replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;","&gt;":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+// R2 trust: the single pin discriminant — a chunk came from the user's own
+// memory.remember, not from auto-capture (stamp.py EXPLICIT_PIN_SOURCE).
+const EXPLICIT_PIN_SOURCE = "memory.remember";
 const fmtRel = (isoOrEpoch) => {
   if (!isoOrEpoch && isoOrEpoch !== 0) return "—";
   let d;
@@ -1139,6 +1142,33 @@ function buildAtlasRequestBody(){
   return body;
 }
 
+// R2 trust §5.2: append a read-only "newest session tail" line to the Atlas
+// statusbar, backed by POST /session/recent (the newest session tails — zero
+// new backend). It does NOT claim an auto-recall event (the bar shows session
+// tails, not injection records), and per §10 gap C /session/recent carries no
+// source, so it counts chunks + sessions only, never pins. Bound to the same
+// abort controller as the fetch that owns the bar: a stale resolve after a
+// profile-switch / re-fetch is discarded, never appended onto new content.
+async function recallSummary(statusbar, profile, signal){
+  if(!statusbar || !profile) return;
+  try{
+    const data = await fetchJson("/session/recent", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({profile_id: profile, per_session: 20, sessions: 2}),
+      signal: signal || undefined,
+    });
+    if(signal?.aborted) return; // a newer fetch owns the bar now
+    const groups = Array.isArray(data.sessions) ? data.sessions : [];
+    const chunks = groups.flatMap(g=> Array.isArray(g.chunks) ? g.chunks : []);
+    if(chunks.length===0) return; // no tails — leave the bar untouched
+    const append = document.createElement("span");
+    append.className = "statusbar-recall muted";
+    append.textContent = ` · Newest session tail: ${fmtNum(chunks.length)} chunk(s) across ${fmtNum(groups.length)} recent session(s) — see Atlas to audit.`;
+    statusbar.appendChild(append);
+  }catch(e){ /* non-fatal: the base statusbar text stands alone */ }
+}
+
 async function fetchAtlas(){
   const countEl = $("#atlas-count"), bannerErr = $("#atlas-banner-error"), bannerTrunc = $("#atlas-banner-truncated");
   const bannerFallback = $("#atlas-banner-fallback"), loading = $("#atlas-loading");
@@ -1228,6 +1258,7 @@ async function fetchAtlas(){
     // statusbar
     if(!bannerTrunc.hidden) statusbar.textContent = ($("#truncated-detail").textContent || "") ;
     else statusbar.textContent = `window_truncated=${atlasState.window_truncated} · ${fmtNum(atlasState.items.length)} shown`;
+    recallSummary(statusbar, atlasState.profile || "default", ac.signal);
 
     pushAtlasHash();
     // render stage
@@ -1706,11 +1737,11 @@ function renderList(){
       if(it.flags?.conflict) flags.push('<span class="badge badge-warn" title="Conflict">●</span>');
       if(it.flags?.pending) flags.push('<span class="badge badge-pending" title="Pending">◍</span>');
       if(it.flags?.needs_reconcile) flags.push('<span class="badge badge-muted">RC</span>');
-      if(it.flags?.explicit_pin) flags.push('<span class="badge badge-pin">PIN</span>');
+      if(it.flags?.explicit_pin) flags.push('<span class="badge badge-pin" aria-label="Pinned — you set this yourself; re-pinning reinforces it." title="Pinned">PIN</span>');
       const hits = it.hit_count ?? (it.score!=null ? Number(it.score).toFixed(2) : "—");
       const kindIcon = it.kind==="chunks"||it.kind==="chunk" ? "⬡" : "●";
       return `<div class="list-row ${isSel?"is-selected":""}" role="row" tabindex="0" data-id="${esc(id)}" data-idx="${absIdx}" aria-selected="${isSel}">
-        <span class="col col-kind" role="cell">${kindIcon} ${esc(it.kind||"")}${it.flags?.explicit_pin?' <span class="badge badge-pin" style="padding:0 4px; font-size:9px">P</span>':""}</span>
+        <span class="col col-kind" role="cell">${kindIcon} ${esc(it.kind||"")}${it.flags?.explicit_pin?' <span class="badge badge-pin" style="padding:0 4px; font-size:9px" aria-label="Pinned — you set this yourself; re-pinning reinforces it." title="Pinned">P</span>':""}</span>
         <span class="col col-title" role="cell" title="${title}">${title}</span>
         <span class="col col-type" role="cell">${type}</span>
         <span class="col col-entities" role="cell" title="${esc((it.entities||[]).join(", "))}">${esc(ents||"—")}</span>
@@ -1780,21 +1811,61 @@ function openDrawer(id){
   $("#d-time").textContent = tVal ? `${fmtISO(tVal)} · ${fmtRel(tVal)}` : "—";
   $("#d-time").title = tVal ? fmtISO(tVal) : "";
 
-  // Provenance
+  // Provenance — the wire now carries asserted_by/source (R2 trust surface).
   const prov = it.provenance || {};
-  $("#d-asserted-by").textContent = prov.asserted_by || it.asserted_by || "—";
-  $("#d-source").textContent = prov.source || it.source || "—";
-  $("#d-confidence").textContent = (prov.confidence ?? it.confidence ?? "—").toString();
-  $("#d-asserted-at").textContent = prov.asserted_at ? fmtISO(prov.asserted_at) : (it.asserted_at?fmtISO(it.asserted_at):"—");
+  const src = it.source || prov.source || "";
+  $("#d-asserted-by").textContent = it.asserted_by || prov.asserted_by || "—";
+  // source: render a Pinned badge for a genuine pin, otherwise the raw label.
+  const srcEl = $("#d-source");
+  if(src===EXPLICIT_PIN_SOURCE){
+    srcEl.innerHTML = '<span class="badge badge-pin" title="Pinned — you set this yourself; re-pinning reinforces it." aria-label="Pinned — you set this yourself; re-pinning reinforces it.">Pinned</span>';
+    srcEl.title = ""; // drop any stale tooltip from a previously-open non-pin item
+  } else {
+    srcEl.textContent = src || "—";
+    srcEl.title = src ? `Source label: ${src}` : "";
+  }
+  // At: the honest capture/valid time — the Atlas item carries ingested_at /
+  // valid_from, not a separate asserted_at. Confidence is never shown (§3.2).
+  const atVal = prov.asserted_at || it.asserted_at || it.ingested_at || it.valid_from || it.updated_at;
+  $("#d-asserted-at").textContent = atVal ? `${fmtRel(atVal)} · ${fmtISO(atVal)}` : "—";
+  $("#d-srcnote").textContent = src ? "Source is shown; certainty is not judged." : "No source info — captured before provenance was recorded.";
+  $("#d-srcnote").title = "Certainty is never shown — feeling sure is not evidence of accuracy.";
   const hist = prov.history || it.history || [];
   const histEl = $("#d-history");
   if(hist.length){
     histEl.innerHTML = hist.slice(0,6).map(h=> `<div class="kv" style="padding:6px 8px"><span class="small muted">${esc(h.at?fmtISO(h.at):"—")} · ${esc(h.action||h.actor||"—")}</span><span class="small">${esc(h.detail||"")}</span></div>`).join("");
   } else {
-    histEl.innerHTML = `<p class="small muted">No history — ${esc(it.source||"—")}</p>`;
+    histEl.innerHTML = `<p class="small muted">No history — ${src?"":esc(src||"—")}</p>`;
   }
   $("#d-gaps").hidden = !it.flags?.peripheral_gaps && !it.peripheral_gaps;
   $("#d-promotion").hidden = !(it.promotion_status==="promoted" || it.flags?.promotion);
+  $("#d-reconcile").hidden = !it.flags?.needs_reconcile;
+
+  // Why this surfaced — per-entry recall trust (pin-vs-captured, relevance,
+  // conflict / pending / reconcile / recovery, honest empty state).
+  // Single pin discriminant (§2.1): a chunk is a user pin iff its provenance
+  // source is the EXPLICIT_PIN_SOURCE label — one comparison, no dual check.
+  const pinned = src===EXPLICIT_PIN_SOURCE;
+  $("#dw-pin").hidden = !pinned;
+  $("#dw-captured").hidden = pinned || !src;
+  $("#dw-relevance").hidden = !(it.score!=null || it.confidence!=null);
+  const dw = it.decay_weight;
+  $("#dw-conflict").hidden = !it.flags?.conflict;
+  $("#dw-readconflict").hidden = !it.flags?.read_conflict;
+  $("#dw-pending").hidden = !(it.flags?.pending || !!it.pending_consolidation);
+  $("#dw-reconcile-s").hidden = !it.flags?.needs_reconcile;
+  $("#dw-recovered").hidden = !(dw!=null && dw>=0.15 && dw<0.4);
+  $("#dw-fading").hidden = !(dw!=null && dw<0.15);
+  const dwAnno = $("#dw-annot");
+  if(pinned){
+    dwAnno.textContent = "You marked this yourself — it carves a preference, not a guess.";
+  } else if(src){
+    dwAnno.textContent = "Captured from conversation, not pinned.";
+  } else {
+    dwAnno.textContent = "";
+  }
+  const dwNone = $("#dw-none");
+  dwNone.hidden = !!(pinned || src || it.flags?.conflict || it.flags?.read_conflict || it.flags?.pending || it.score!=null || it.confidence!=null || (dw!=null && dw<0.15));
 
   // Decay
   const w = it.decay_weight;
@@ -1826,9 +1897,10 @@ function openDrawer(id){
   $("#d-forecast-30").textContent = forecast(30);
   $("#d-forecast-90").textContent = forecast(90);
 
-  // Scores
+  // Scores — a raw confidence value is never shown (§3.2: feeling sure is not
+  // evidence of accuracy). Only the relevance score, or an honest placeholder.
   const scoreEl = $("#d-score");
-  scoreEl.textContent = it.score!=null ? `Score ${Number(it.score).toFixed(2)}` : (it.confidence!=null?`Confidence ${it.confidence}`:"Score —");
+  scoreEl.textContent = it.score!=null ? `Score ${Number(it.score).toFixed(2)}` : "Score —";
   $("#d-rescued").hidden = !(w!=null && w>=0.15 && w<0.4);
   $("#d-pending-note").hidden = !it.flags?.pending && !it.pending_consolidation;
   $("#d-score-note").hidden = it.score!=null;
