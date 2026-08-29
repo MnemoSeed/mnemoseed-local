@@ -116,4 +116,6 @@ Eval harness 复发臂：构造错误材料（context C + 错误动作 A + 纠�
 
 ## 批次执行记录
 
-- **B2.13 体验学习管线**：（占位——批次收口后按房规补记：评审 verdict、TDD 落地链路、gates 与 QA 结论、边界如实记录、下一步衔接。）
+- **E0 里程碑（2026-08-25 立项即收口，squash `2e3b63f`/PR #119 → issue #113 的 E0 部分）**：R49-R53 理论锚入册（Rescorla-Wagner 1972 提升阈值 / Sutton & Barto 1998 eligibility traces 有界归因窗 / Schank 1982+Kolodner 1993 案例推理 lesson 工件 / Gollwitzer 1999 实现意图 INTENTION 节点 / Anderson 1982 知识编译 SKILL_SEQUENCE），全部在线核验引文；明确不入册清单。同 PR 移除 AGENTS.md 手动回忆纪律。
+
+- **E1 ledger 脚手架（2026-08-28 收口，squash PR #150 → issue #113 的 E1 部分；issue 整体保持开放至 E2+）**：架构师判定 E1 信号无关 plumbing 可提前启动（检测器选择仍待 #75 P4 误差类频次）。交付：`ErrorEvent` 行（profile_id 恒存 + 单调时间戳 + 可扩展 `ErrorSignalType` 族 + `EvidencePointer` 仅引用不判定，与 #123 `read_conflict_id` 收敛）；`MetaStore.append_error_event`/`query_error_events`；迁移 v11 独立 `error_events` 表 + append-only 触发器（audit_log 先例）。六条硬红线全守：零模型调用、仅派生信号（无反馈/纠错 API）、无检测器（`detector_id` 预留 NULL）、verbatim/capture 零接触、无 HTTP 暴露。QA CLOSABLE（0 BLOCKER）；遗留 hygiene 项入 #151（单调性强制、0.0/空白 guard 边、COMPOSITE 双源表示、红线 #6 悬空指纹耦合——皆 E2 门控）。门禁 1893 passed / 5 skipped。
