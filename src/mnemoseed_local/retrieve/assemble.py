@@ -706,11 +706,15 @@ def _statement_tokens(statement: str, entities: set[str]) -> tuple[set[str], boo
     registered entity) is KEPT in the content surface so a single predicate
     still forms a shared frame with it — dropping the subject would collapse a
     genuine same-frame value divergence down to one bare predicate token and hide
-    the contradiction.
+    the contradiction. A subject mention whose name collides with a stopword
+    (e.g. the entity "Will") is force-kept by peeling those entity tokens out of
+    the drop set when they appear in the raw surface; only the subject survives,
+    other stopwords still drop so a lone shared subject stays complementary.
     """
     raw = _TOKEN_RE.findall(statement.casefold())
     negated = any(token in _NEGATION for token in raw)
-    drop = _STOPWORDS | _NEGATION
+    subject_mentions = {token for token in entities if token in raw}
+    drop = (_STOPWORDS | _NEGATION) - subject_mentions
     content = {token for token in raw if len(token) > 1 and token not in drop}
     return content, negated
 
