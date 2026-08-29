@@ -49,6 +49,7 @@ from httpx import Timeout
 from pydantic import BaseModel
 
 from mnemoseed_local.rest_client import DaemonClient
+from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE
 from mnemoseed_local.schema.turn import (
     FlushRequest,
     HostId,
@@ -89,6 +90,12 @@ RECALL_DISCLAIMER = (
 
 #: The daemon reports its effective item budget on the wire under this key.
 RECALL_BUDGET_KEY = "budget_chars"
+
+#: R2 provenance affix (design/11 §8 copy deck, byte-identical to the opencode
+#: plugin): a per-line pin marker on an explicitly-pinned recall item; captured
+#: items are NOT annotated (absence is the captured signal). 9 chars including
+#: the leading separator; decoration only, NEVER part of the verbatim text.
+PIN_SUFFIX = " ⟵ pinned"
 
 #: Claude Code hook event that carries the injection (the additionalContext
 #: JSON property, both in our payload and in the decision-control schema).
@@ -324,16 +331,50 @@ def build_t2_context(items: list[dict[str, Any]] | Any, item_budget: int) -> str
     lines: list[str] = [RECALL_FENCE_OPEN, RECALL_DISCLAIMER]
     remaining = item_budget
     committed = False
+    # design/11 §4.3: the per-line affix is the FIRST budget shed under pressure.
+    # `kept_affix` sums the affix cost already committed in `lines`, and
+    # `affix_indices` records the ABSOLUTE `lines` positions of the lines that
+    # carry it — so a later overrun can refund their cost and rebuild exactly
+    # those lines bare instead of dropping a daemon-legal selection (IMPORTANT-1).
+    # Indices (not flags) are tracked so a rebuild can never be mis-indexed
+    # against `lines[2 + i]` when the affix is shed a second time in one call.
+    kept_affix = 0
+    affix_indices: list[int] = []
     for item in items:
         raw = item.get("text") if isinstance(item, dict) else None
         text = sanitize_recall_text(raw if isinstance(raw, str) else "")
         if not text:
             continue
-        line_cost = len(text) + 1
+        # R2 provenance: the affix rides ONLY an explicitly-pinned item; a
+        # captured (other source) or source-less item is NOT annotated —
+        # absence is the captured signal, the most token-lean rendering
+        # (design/11 §4.2).
+        pinned = isinstance(item, dict) and item.get("source") == EXPLICIT_PIN_SOURCE
+        affix_len = len(PIN_SUFFIX) if pinned else 0
+        line_cost = len(text) + 1 + affix_len
         if line_cost > remaining:
+            # design/11 §4.3 drop order: a kept affix must never change item
+            # keep/drop semantics — so on an overrun shed EVERY kept affix (refund
+            # their cost and rebuild the committed lines bare) BEFORE dropping.
+            # Only a line whose BARE cost still exceeds the sheddable-recovered
+            # budget stays fail-closed (whole selection dropped, unchanged).
+            if len(text) + 1 <= remaining + kept_affix:
+                if kept_affix:
+                    remaining += kept_affix
+                    kept_affix = 0
+                    for index in affix_indices:
+                        lines[index] = lines[index][: -len(PIN_SUFFIX)]
+                    affix_indices = []
+                lines.append(text)
+                remaining -= len(text) + 1
+                committed = True
+                continue
             return None
-        lines.append(text)
+        lines.append(text + PIN_SUFFIX if pinned else text)
         remaining -= line_cost
+        kept_affix += affix_len
+        if pinned:
+            affix_indices.append(len(lines) - 1)
         committed = True
     if not committed:
         return None

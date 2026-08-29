@@ -100,6 +100,16 @@ const REINFORCE_BATCH_SIZE = 64
 const RECALL_PULL_TIMEOUT_MS = 300
 const RECALL_PULL_MAX_CHARS = 1200
 
+// ---- R2 provenance trust (design/11): the T2 injected recall carries a
+// per-line provenance affix so the model can tell an explicit user pin from an
+// automatic capture — G5 trust, no new confidence model. Pin ⇔ source ==
+// EXPLICIT_PIN_SOURCE (schema/stamp.py:63, the single comparison). The affix is
+// a decoration on the appended line (never part of the verbatim text) and is
+// the FIRST budget shed under pressure (design/11 §4.3).
+const EXPLICIT_PIN_SOURCE = "memory.remember"
+// design/11 §8 copy deck: ASCII/unicode, 9 chars with the leading separator.
+const PIN_SUFFIX = " ⟵ pinned"
+
 // ---- opt-in observability lane (senior QA finding 12b, 2026-08-19): three
 // silent-failure dogfoods in one day proved console.debug alone is
 // invisible. Arm with MNEMOSEED_LOCAL_DEBUG (any non-empty value): failures
@@ -447,14 +457,53 @@ function buildT2Injection(
   let remaining = itemBudget
   lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
   let committed = false
+  // design/11 §4.3: the per-line affix is the FIRST budget shed under pressure.
+  // `keptAffix` sums the affix cost already committed in `lines`, and
+  // `affixIndices` records the ABSOLUTE `lines` positions of the lines that
+  // carry it — so a later overrun can refund their cost and rebuild exactly
+  // those lines bare instead of dropping a daemon-legal selection (IMPORTANT-1).
+  // Indices (not flags) are tracked so a rebuild can never be mis-indexed
+  // against `lines[2 + i]` when the affix is shed a second time in one call.
+  let keptAffix = 0
+  const affixIndices: number[] = []
   for (const item of items) {
     const text = sanitizeRecallText(typeof item?.text === "string" ? item.text : "")
     if (!text) continue
-    const lineCost = text.length + 1
-    if (lineCost > remaining) return null
-    registerNeedles(registry, text, typeof item?.id === "string" ? item.id : "")
-    lines.push(text)
+    const chunkId = typeof item?.id === "string" ? item.id : ""
+    // R2 provenance: the affix rides ONLY an explicitly-pinned item; a captured
+    // (different source) or source-less item is NOT annotated — absence is the
+    // captured signal, the most token-lean rendering (design/11 §4.2).
+    const pinned = typeof item?.source === "string" && item.source === EXPLICIT_PIN_SOURCE
+    const affixLen = pinned ? PIN_SUFFIX.length : 0
+    const lineCost = text.length + 1 + affixLen
+    if (lineCost > remaining) {
+      // design/11 §4.3 drop order: a kept affix must never change item choice
+      // semantics — so on an overrun shed EVERY kept affix (refund their cost
+      // and rebuild the committed lines bare) BEFORE dropping. Only a line whose
+      // BARE cost still exceeds the sheddable-recovered budget stays fail-closed
+      // (drops the whole selection, unchanged).
+      if (text.length + 1 <= remaining + keptAffix) {
+        if (keptAffix) {
+          remaining += keptAffix
+          keptAffix = 0
+          for (const index of affixIndices) {
+            lines[index] = lines[index].slice(0, -PIN_SUFFIX.length)
+          }
+          affixIndices.length = 0
+        }
+        registerNeedles(registry, text, chunkId)
+        lines.push(text)
+        remaining -= text.length + 1
+        committed = true
+        continue
+      }
+      return null
+    }
+    registerNeedles(registry, text, chunkId)
+    lines.push(pinned ? text + PIN_SUFFIX : text)
     remaining -= lineCost
+    keptAffix += affixLen
+    if (pinned) affixIndices.push(lines.length - 1)
     committed = true
   }
   if (!committed) return null

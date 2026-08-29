@@ -1069,6 +1069,148 @@ def test_injection_fail_open_when_the_daemon_is_down(monkeypatch: pytest.MonkeyP
 # ---- transformer orchestration: ack-gated pull + additionalContext stdout
 
 
+# ---- R2 pin markers: provenance affix on the injected recall (design 11 §11 T2)
+
+
+def test_t2_marker_renders_only_on_pinned_source_items() -> None:
+    """design/11 §4.2 + §11 T2: a served item whose ``source`` is the explicit
+    pin source (``memory.remember``) gains the ``⟵ pinned`` line affix; captured
+    and source-less items are NOT annotated — absence IS the captured signal
+    (most token-lean)."""
+    items = [
+        {"kind": "chunk", "id": "c-pin", "source": "memory.remember", "text": "偏好：零拷贝"},
+        {"kind": "chunk", "id": "c-cap", "source": "capture.auto", "text": "抓取：存储层确认"},
+        {"kind": "chunk", "id": "c-plain", "text": "无溯源：副本"},
+    ]
+    block = events.build_t2_context(items, 1200)
+    assert block is not None
+    lines = block.split("\n")
+    assert lines[2] == "偏好：零拷贝 ⟵ pinned", f"the pinned line must carry the affix: {lines}"
+    assert "抓取：存储层确认" in lines[3] and "pinned" not in lines[3]
+    assert "无溯源：副本" in lines[4] and "pinned" not in lines[4]
+    assert block.count("⟵ pinned") == 1, "exactly one pinned affix in the selection"
+
+
+def test_t2_marker_affix_is_the_spec_deck_string() -> None:
+    """design/11 §8 copy deck pins the affix byte-for-byte as `⟵ pinned`
+    (9 chars with the leading separator); a renamed/misspaced affix fails here."""
+    items = [{"kind": "chunk", "id": "c-pin", "source": "memory.remember", "text": "x"}]
+    block = events.build_t2_context(items, 1200)
+    assert block is not None
+    assert " ⟵ pinned" in block
+    assert len(" ⟵ pinned") == 9
+
+
+def test_t2_marker_budget_pressure_drops_the_affix_not_the_item() -> None:
+    """design/11 §4.3 drop order: under a tight item budget the per-line affix
+    is shed FIRST (the marker is a disposable reinforcement signal), the bare
+    verbatim line still appends, and the block-level fail-closed check holds —
+    the block lands at exactly budget + wrapper."""
+    text = "z" * 149  # bare line cost 150 == budget 150; with affix 159 > 150
+    items = [{"kind": "chunk", "id": "c-pin-bnd", "source": "memory.remember", "text": text}]
+    block = events.build_t2_context(items, 150)
+    assert block is not None, "shedding the affix must keep the item appended"
+    assert "pinned" not in block, "the affix must be shed under pressure"
+    assert text in block, "the bare verbatim line must survive"
+    wrapper = len(events.RECALL_FENCE_OPEN) + 1 + len(events.RECALL_DISCLAIMER) + 1
+    wrapper += len(events.RECALL_FENCE_CLOSE)
+    assert len(block) == 150 + wrapper
+
+
+def test_t2_marker_never_relaxes_the_fail_closed_oversized_drop() -> None:
+    """design/11 §4.3: the affix must never let an otherwise-oversized item in —
+    a line that exceeds the budget even bare still drops the WHOLE selection
+    fail-closed (defense in depth, unchanged)."""
+    text = "w" * 1201  # bare line cost 1202 > budget 1200
+    items = [{"kind": "chunk", "id": "c-over", "source": "memory.remember", "text": text}]
+    assert events.build_t2_context(items, 1200) is None
+
+
+def test_t2_marker_attribution_survives_a_boundary_sliced_item() -> None:
+    """design/11 §4.3: the daemon may tail-slice a boundary item before serving;
+    the hook must keep the affix attribution correct on the received (already
+    sliced) text — source-based, unaffected by the slice."""
+    sliced = "…" + "乙" * 30
+    items = [{"kind": "chunk", "id": "c-slice", "source": "memory.remember", "text": sliced}]
+    block = events.build_t2_context(items, 1200)
+    assert block is not None
+    assert sliced + " ⟵ pinned" in block, f"sliced pinned text must keep its affix: {block}"
+
+
+def test_t2_marker_sheds_kept_affixes_before_a_multi_item_overrun_drop() -> None:
+    """IMPORTANT-1 (QA, exact repro): a kePT affix on an EARLY committed pinned
+    line must NEVER squeeze out a LATER captured line. Budget 100, [pinned A(50)
+    +affix, captured B(41)]: A fits affixed (60<=100, remaining 41→40) then
+    B(42)>40 → the old code returned None (whole drop) even though BARE A+B=93
+    <=100. design/11 §4.3: shed the affix BEFORE dropping an item — the daemon-
+    legal selection must be SERVED with A's affix shed, still fail-closed only
+    when the bare total exceeds budget."""
+    a = "a" * 50  # bare line cost 51; affixed 60
+    b = "b" * 41  # bare line cost 42
+    items = [
+        {"kind": "chunk", "id": "c-pin-a", "source": "memory.remember", "text": a},
+        {"kind": "chunk", "id": "c-cap-b", "source": "capture.auto", "text": b},
+    ]
+    block = events.build_t2_context(items, 100)
+    assert block is not None, "the affix must be shed so the bare selection is served, not dropped"
+    assert "pinned" not in block, f"all kept affixes must be shed under pressure: {block}"
+    assert a in block, f"the bare pinned line must survive: {block}"
+    assert b in block, f"the later captured line must survive: {block}"
+
+
+def test_t2_marker_post_shed_accounting_uses_bare_not_affixed_cost() -> None:
+    """NIT-2 mutation guard for the post-shed accounting: the shed branch MUST
+    decrement `remaining` by the BARE line cost. A mutation to `remaining -=
+    affixed line_cost` (which still carries the shed affix) must fail HERE —
+    Budget 100, [captured Z(89)→rem 10, pinned X(5): affixed 15>10∪bare 6<=10 →
+    shed rem 10-6=4, captured Y(3): cost 4<=4 served]. If the shed branch used
+    the affixed 15, remaining would go -5 and Y(4) would overrun → None."""
+    z = "z" * 89  # bare line cost 90
+    x = "x" * 5  # bare line cost 6; affixed 15
+    y = "y" * 3  # bare line cost 4
+    items = [
+        {"kind": "chunk", "id": "c-cap-z", "source": "capture.auto", "text": z},
+        {"kind": "chunk", "id": "c-pin-x", "source": "memory.remember", "text": x},
+        {"kind": "chunk", "id": "c-cap-y", "source": "capture.auto", "text": y},
+    ]
+    block = events.build_t2_context(items, 100)
+    assert block is not None, "the post-shed bare accounting must fit the trailing item"
+    assert z in block and x in block and y in block, "all three lines must be served"
+
+
+def test_t2_marker_two_sheds_keep_prior_bare_line_intact() -> None:
+    """BLOCKER (QA, verbatim corruption): when the affix is shed a SECOND time in
+    one call, every line that still carried a kept affix is rebuilt bare. The old
+    `affix_flags` reset + re-enumeration (`lines[2 + i]`) sliced 9 chars off the
+    WRONG already-bare committed line after the first shed. Exact repro — Budget
+    2400, [pinned P1("a"*1800), pinned P2("b"*582), pinned P3("c"*6), pinned
+    P4("e"*1)]: P1 (affixed 1810<=2400) commits, P2 (affixed 592>rem 590) sheds
+    P1's affix, P3 (affixed 16<=rem 16) commits a fresh kept affix, then P4
+    (affixed 11>rem 0) sheds it a SECOND time. (a) P1's line must be UNCHANGED at
+    length 1800 (never 1800->1791), (b) P3's freshly-kept affix is shed, (c) the
+    bare selection (total 2393<=2400) is served, not None."""
+    a = "a" * 1800
+    b = "b" * 582
+    c = "c" * 6
+    e = "e" * 1
+    items = [
+        {"kind": "chunk", "id": "c-p1", "source": "memory.remember", "text": a},
+        {"kind": "chunk", "id": "c-p2", "source": "memory.remember", "text": b},
+        {"kind": "chunk", "id": "c-p3", "source": "memory.remember", "text": c},
+        {"kind": "chunk", "id": "c-p4", "source": "memory.remember", "text": e},
+    ]
+    block = events.build_t2_context(items, 2400)
+    assert block is not None, "the bare selection must be served, not dropped"
+    lines = block.split("\n")
+    assert lines[2] == a, (
+        "the earlier committed bare line must be byte-identical (no 1800->1791 "
+        f"corruption) — got length {len(lines[2])}"
+    )
+    assert "pinned" not in block, f"every kept affix must be shed: {block}"
+    assert c in block, "the mid-selection decorated item must be served bare"
+    assert e in block, "the trailing item must be served"
+
+
 def test_transformer_emits_additional_context_only_on_a_served_pull(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -1103,6 +1103,211 @@ async function main() {
       break
     }
 
+    case "recall-pull-pinmarkers": {
+      // R2 provenance (design/11 §11 T2): a served item whose source IS the
+      // explicit pin source (memory.remember) gains the `⟵ pinned` line affix;
+      // captured and source-less items carry NO affix — absence = captured.
+      recallPayload = {
+        enabled: true,
+        items: [
+          {
+            kind: "chunk",
+            id: "c-pin",
+            source: "memory.remember",
+            text: "user: 这条是用户自己钉的偏好，零拷贝数据路径优先于重复",
+          },
+          {
+            kind: "chunk",
+            id: "c-cap",
+            source: "capture.auto",
+            text: "assistant: 存储层确认后就可以继续推进",
+          },
+          {
+            kind: "chunk",
+            id: "c-plain",
+            text: "assistant: 没有 source 字段的抓取项",
+          },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      const p1 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_pin" },
+        { parts: [{ type: "text", text: "偏好的事" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, p1)
+      console.log(
+        JSON.stringify({
+          systems: [p1.system],
+          block: p1.system.length > 1 ? p1.system[1] : "",
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-pin-budget": {
+      // R2 provenance budget discipline (design/11 §4.3): under a tight item
+      // budget the per-line affix is shed FIRST — the bare verbatim line still
+      // appends and the block-level fail-closed check holds; a pinned line that
+      // exceeds the budget even bare drops the WHOLE selection unchanged.
+      const a = { system: ["BASE"] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          {
+            kind: "chunk",
+            id: "c-pin-bnd",
+            source: "memory.remember",
+            text: "z".repeat(149), // bare line cost 150 == budget; with affix 159 > 150
+          },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 150,
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_pinbnd" },
+        { parts: [{ type: "text", text: "紧预算轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      const b = { system: ["BASE2"] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          {
+            kind: "chunk",
+            id: "c-over",
+            source: "memory.remember",
+            text: "w".repeat(1201), // bare line cost 1202 > budget 1200
+          },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_pinover" },
+        { parts: [{ type: "text", text: "超预算轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, b)
+      console.log(
+        JSON.stringify({
+          systems: [a.system, b.system],
+          blockLength: a.system.length > 1 ? a.system[1].length : 0,
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-pin-shed-kept-affix": {
+      // IMPORTANT-1 QA repro (design/11 §4.3): a KEPT affix on an EARLY pinned
+      // line must never squeeze a LATER captured line out. Budget 100, [pinned
+      // A("a"*50)+affix, captured B("b"*41)]: A affixed 60<=100 (rem 40), then
+      // B 42>40 — the old code returned null (whole drop) though BARE A+B=93
+      // <=100. The kept affix is shed first so the daemon-legal selection is
+      // SERVED; fail-closed only when the bare total exceeds budget.
+      const a = { system: ["BASE"] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          { kind: "chunk", id: "c-pin-a", source: "memory.remember", text: "a".repeat(50) },
+          { kind: "chunk", id: "c-cap-b", source: "capture.auto", text: "b".repeat(41) },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 100,
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_shed_a" },
+        { parts: [{ type: "text", text: "紧并排轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      console.log(
+        JSON.stringify({
+          systems: [a.system],
+          block: a.system.length > 1 ? a.system[1] : "",
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-pin-post-shed-bare-accounting": {
+      // NIT-2 mutation guard (TS half): the shed branch must decrement
+      // `remaining` by the BARE line cost. Budget 100, [captured Z("z"*89)→rem
+      // 10, pinned X("x"*5): affixed 15>10∪bare 6<=10 → shed rem 10-6=4,
+      // captured Y("y"*3): cost 4<=4 served]. If the shed branch used the
+      // affixed 15 instead, remaining→-5 and Y(4) overruns → null.
+      const a = { system: ["BASE"] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          { kind: "chunk", id: "c-cap-z", source: "capture.auto", text: "z".repeat(89) },
+          { kind: "chunk", id: "c-pin-x", source: "memory.remember", text: "x".repeat(5) },
+          { kind: "chunk", id: "c-cap-y", source: "capture.auto", text: "y".repeat(3) },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 100,
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_shed_x" },
+        { parts: [{ type: "text", text: "裸计账轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      console.log(
+        JSON.stringify({
+          systems: [a.system],
+          block: a.system.length > 1 ? a.system[1] : "",
+        }),
+      )
+      break
+    }
+
+    case "recall-pull-pin-two-sheds": {
+      // BLOCKER (TS half, verbatim corruption): shedding the affix a SECOND time
+      // in one call must rebuild every kept-affix line by its ABSOLUTE line
+      // index. The old affixFlags reset + `lines[2 + i]` re-enumeration sliced 9
+      // chars off the WRONG already-bare committed line after the first shed.
+      // Budget 2400, [pinned P1("a"*1800), P2("b"*582), P3("c"*6), P4("e"*1)]:
+      // P1 affixed 1810<=2400 commits, P2 affixed 592>rem 590 sheds P1's affix,
+      // P3 (memory.remember) affixed 16<=rem 16 commits a fresh kept affix, P4
+      // affixed 11>rem 0 sheds it a SECOND time → P1 must stay UNCHANGED at
+      // length 1800 and P3's affix must be shed.
+      const a = { system: ["BASE"] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          { kind: "chunk", id: "c-p1", source: "memory.remember", text: "a".repeat(1800) },
+          { kind: "chunk", id: "c-p2", source: "memory.remember", text: "b".repeat(582) },
+          { kind: "chunk", id: "c-p3", source: "memory.remember", text: "c".repeat(6) },
+          { kind: "chunk", id: "c-p4", source: "memory.remember", text: "e".repeat(1) },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 2400,
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_two_sheds" },
+        { parts: [{ type: "text", text: "二次剥离轮" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      console.log(
+        JSON.stringify({
+          systems: [a.system],
+          block: a.system.length > 1 ? a.system[1] : "",
+        }),
+      )
+      break
+    }
+
     case "rules-budget": {
       // B2.7 Task C: the daemon's /session/recent read supplies a rules_budget
       // block — the transform appends the SECOND fence pair (independent of
