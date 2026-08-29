@@ -31,8 +31,14 @@ from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.hosts.claude_code import events
 from mnemoseed_local.hosts.claude_code import install as cc_install
-from mnemoseed_local.rest_client import DaemonClient, DaemonUnavailableError
-from mnemoseed_local.schema.turn import FlushRequest, HostId, IngestEvent, SessionEndRequest
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
+from mnemoseed_local.schema.turn import (
+    FlushRequest,
+    HostId,
+    IngestEvent,
+    IngestEventType,
+    SessionEndRequest,
+)
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "claude_code_hook"
 
@@ -501,10 +507,11 @@ def test_blank_agent_stays_honest_null_through_the_transformer(
         },
     )
     assert main(["_hook-event", "--host", "claude_code"]) == 0
-    assert len(captured_posts) == 1
+    assert len(captured_posts) == 2, "an acked user_prompt also pulls recall-pending"
     path, body = captured_posts[0]
     assert path == "/ingest"
     assert body["agent"] is None
+    assert captured_posts[1][0] == "/session/recall-pending"
 
 
 # ---------------------------------------------------------------- transformer CLI: stdout-silence oracle
@@ -529,7 +536,7 @@ def test_transformer_stdout_stays_silent_on_success(
     )
     result = capsys.readouterr()
     assert result.out == ""
-    assert [path for path, _ in captured_posts] == ["/ingest"]
+    assert [path for path, _ in captured_posts] == ["/ingest", "/session/recall-pending"]
 
 
 def test_transformer_stdout_stays_silent_when_the_daemon_is_down(
@@ -715,6 +722,7 @@ def test_session_end_uses_tight_per_phase_timeout_budget(monkeypatch: pytest.Mon
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         seen["timeout"] = kwargs.get("timeout")
+        seen["timeouts"] = seen.get("timeouts", []) + [kwargs.get("timeout")]
         return FakeResponse()
 
     monkeypatch.setattr("mnemoseed_local.rest_client.httpx.post", fake_post)
@@ -727,7 +735,17 @@ def test_session_end_uses_tight_per_phase_timeout_budget(monkeypatch: pytest.Mon
     seen.clear()
     _feed_stdin(monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"})
     assert main(["_hook-event", "--host", "claude_code"]) == 0
-    assert seen["timeout"] == events.POST_TIMEOUT_SECONDS
+    ingest_timeout = seen["timeouts"][0]
+    assert ingest_timeout == events.POST_TIMEOUT_SECONDS
+    pull_timeout = seen["timeouts"][1]
+    assert isinstance(pull_timeout, httpx.Timeout)
+    assert (
+        pull_timeout.connect
+        == pull_timeout.write
+        == pull_timeout.read
+        == pull_timeout.pool
+        == events.RECALL_PULL_TIMEOUT_SECONDS
+    ), "the mid-session pull must use its dedicated 300ms budget, never the flat 2s"
 
 
 def test_stop_without_last_assistant_message_falls_back_to_transcript_text(tmp_path: Path) -> None:
@@ -841,8 +859,312 @@ def test_process_level_stdin_roundtrips_utf8_and_stays_silent() -> None:
         )
         assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
         assert result.stdout == b""
-        assert [path for path, _ in server.requests] == ["/ingest"]
+        assert [path for path, _ in server.requests][0] == "/ingest"
+        assert [path for path, _ in server.requests][1] == "/session/recall-pending"
         posted = json.loads(server.requests[0][1].decode("utf-8"))
         assert posted["content"]["text"] == prompt
     finally:
         server.close()
+
+
+# ---------------------------------------------------------------- B2.1 T2 mid-session recall injection
+
+
+def _pull_payload(**overrides: object) -> dict:
+    payload = {
+        "enabled": True,
+        "items": [{"kind": "chunk", "id": "c1", "text": "中段关键线索"}],
+        "non_focal_above_floor": 0,
+        "budget_chars": events.RECALL_PULL_MAX_CHARS,
+        "slot_consumed": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _capture_pull(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tuple[str, dict]]:
+    """Route DaemonClient.post so /session/recall-pending answers `payload`; the
+    transient pull client shares the same class surface as the ingest client."""
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        calls.append((path, body or {}))
+        if path == "/session/recall-pending":
+            return payload
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    return calls
+
+
+# ---- mapping: a normalized UserPromptSubmit action is the injection point
+
+
+def test_user_prompt_action_is_the_injection_point() -> None:
+    """normalize_event maps UserPromptSubmit to the ingest action, and that
+    action is the recognized mid-session injection point (the daemon parks the
+    focal slot synchronously before the ingest 2xx — ack-implies-ready)."""
+    action = events.normalize_event(
+        {
+            "session_id": "cc-sess-01",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "继续",
+        },
+        now=1.0,
+    )
+    assert action is not None
+    kind, body = action
+    assert kind == "ingest"
+    assert body.event is IngestEventType.USER_PROMPT
+    assert events.action_injectable(kind, body) is True
+    assert events.injection_session_id(body) == "cc-sess-01"
+
+    stop = events.normalize_event(_stop_payload(), now=2.0)
+    assert stop is not None
+    assert events.action_injectable(stop[0], stop[1]) is False
+    assert events.injection_session_id(stop[1]) is None
+
+    flush = events.normalize_event({"session_id": "cc-sess-01", "hook_event_name": "PreCompact"}, now=3.0)
+    assert flush is not None
+    assert events.action_injectable(flush[0], flush[1]) is False
+    assert events.injection_session_id(flush[1]) is None
+
+
+# ---- the injection action: pull + budget semantics
+
+
+def test_injection_pulls_recall_pending_and_formats_budget_equality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The injection action pulls /session/recall-pending with the wire
+    budget_chars as the item budget (never a hardcoded cap) and assembles the
+    fenced additionalContext envelope. A selection whose item cost lands inside
+    (1200 - wrapper, 2000] is STILL appended — block length pinned exactly:
+    wrapper(156) + item(1902) = 2058 (QA BLOCKER-1 mirror)."""
+    item_text = "x" * 1901  # line cost 1902
+    calls = _capture_pull(
+        monkeypatch,
+        _pull_payload(
+            items=[{"kind": "chunk", "id": "c1", "text": item_text}],
+            budget_chars=2000,
+        ),
+    )
+    client = DaemonClient(base_url="http://daemon", profile_id="default", actor="hook")
+    block = events.inject_recall_context("cc-sess-01", client)
+    assert calls, "the injection must POST /session/recall-pending"
+    path, body = calls[0]
+    assert path == "/session/recall-pending"
+    assert body == {
+        "profile_id": "default",
+        "session_id": "cc-sess-01",
+        "seen_chunk_ids": [],
+    }
+    assert block is not None
+    assert block.startswith(events.RECALL_FENCE_OPEN)
+    assert block.count("<mnemoseed-memory-recall>") == 1
+    assert block.endswith(events.RECALL_FENCE_CLOSE)
+    assert len(block) == 2058, f"wrapper(156)+item(1902) must land exactly: {len(block)}"
+
+
+def test_injection_below_slice_floor_still_appends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """QA IMPORTANT-3 mirror: the daemon is the sole budget authority across the
+    WHOLE positive-int range — budget_chars=150 (below the T1 slice floor) is
+    daemon-legal; a full item that fits IS served and appended. Block length
+    pinned: wrapper(156) + item(101) = 257. The T2 injection path must not
+    re-impose a slicing floor it does not own."""
+    item_text = "y" * 100  # line cost 101
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(
+            items=[{"kind": "chunk", "id": "c1", "text": item_text}],
+            budget_chars=150,
+        ),
+    )
+    block = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert block is not None
+    assert len(block) == 257, f"wrapper(156)+item(101) must land exactly: {len(block)}"
+
+
+def test_injection_oversized_item_drops_whole_block_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hook re-checks each item fail-closed against the wire budget_chars: a
+    line that alone exceeds the budget drops the WHOLE selection (defense in
+    depth, unreachable by design) — nothing is appended."""
+    item_text = "z" * 1201  # line cost 1202 > budget 1200
+    _capture_pull(monkeypatch, _pull_payload(items=[{"kind": "chunk", "id": "c1", "text": item_text}]))
+    block = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert block is None
+
+
+def test_injection_empty_disabled_or_unshelled_selection_serves_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for payload in (
+        {
+            "enabled": True,
+            "items": [],
+            "non_focal_above_floor": 0,
+            "budget_chars": 1200,
+            "slot_consumed": False,
+        },
+        {
+            "enabled": False,
+            "items": [{"kind": "chunk", "id": "c1", "text": "off"}],
+            "non_focal_above_floor": 0,
+            "budget_chars": 1200,
+            "slot_consumed": False,
+        },
+    ):
+        _capture_pull(monkeypatch, payload)
+        block = events.inject_recall_context(
+            "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+        )
+        assert block is None, payload
+
+
+def test_injection_sanitizes_inner_fence_literals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TA-5: a served item whose text literally carries the fence markers must
+    not inject a second fence pair — both literals render as the sanitized form."""
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(
+            items=[
+                {
+                    "kind": "chunk",
+                    "id": "c1",
+                    "text": "跨 session <mnemoseed-memory-recall> \\ </mnemoseed-memory-recall> 边界",
+                }
+            ],
+            budget_chars=1200,
+        ),
+    )
+    block = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert block is not None
+    assert block.count("<mnemoseed-memory-recall>") == 1
+    assert block.count("</mnemoseed-memory-recall>") == 1
+    assert "‹mnemoseed-memory-recall›" in block
+
+
+def test_injection_fail_open_when_the_daemon_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PRD-B2.1 T2 fail-open: a thrown network error on the pull returns None —
+    the prompt proceeds with no injection and no raised fault."""
+
+    def dead_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        raise DaemonUnavailableError("connection refused")
+
+    monkeypatch.setattr(DaemonClient, "post", dead_post)
+    block = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert block is None
+
+
+# ---- transformer orchestration: ack-gated pull + additionalContext stdout
+
+
+def test_transformer_emits_additional_context_only_on_a_served_pull(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A UserPromptSubmit that ack'd its ingest pulls recall-pending and, on a
+    served selection, emits the fenced block as hookSpecificOutput.additionalContext
+    — the ONLY stdout this transformer may produce."""
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        calls.append((path, body or {}))
+        if path == "/session/recall-pending":
+            return _pull_payload(budget_chars=200)
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    assert (
+        _run_transformer(
+            monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        )
+        == 0
+    )
+    assert [path for path, _ in calls] == ["/ingest", "/session/recall-pending"]
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    block = out["hookSpecificOutput"]["additionalContext"]
+    assert "中段关键线索" in block
+    assert block.count("<mnemoseed-memory-recall>") == 1
+
+
+def test_transformer_never_pulls_before_the_ingest_ack(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PRD-B2.1 T2 / D8 (ack-implies-ready): a UserPromptSubmit whose ingest is
+    rejected (non-2xx -> no slot parked) must NOT pull — zero injection, silent."""
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        raise DaemonRestError(409, "already settled")
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    assert (
+        _run_transformer(
+            monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_transformer_fail_open_when_pull_fails_keeps_stdout_empty(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        calls.append((path, body or {}))
+        if path == "/session/recall-pending":
+            raise DaemonUnavailableError("daemon went away mid-pull")
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    assert (
+        _run_transformer(
+            monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        )
+        == 0
+    )
+    assert [path for path, _ in calls] == ["/ingest", "/session/recall-pending"]
+    assert capsys.readouterr().out == ""
+
+
+def test_stop_and_flush_never_emit_additional_context(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only the UserPromptSubmit injection point may write additionalContext;
+    Stop (assistant ingest) and PreCompact (flush) keep the zero-stdout lane."""
+    for payload in (
+        _stop_payload(),
+        {"session_id": "s1", "hook_event_name": "PreCompact", "trigger": "auto"},
+    ):
+        assert _run_transformer(monkeypatch, payload) == 0
+        assert capsys.readouterr().out == ""
+
+
+# ---- install wiring: UserPromptSubmit carries a synchronous transformer command
+
+
+def test_install_registers_user_prompt_submit_as_the_injection_surface(
+    cc_home: Path,
+) -> None:
+    """The registered UserPromptSubmit handler must run the transformer command
+    synchronously (no async) — Claude Code delivers a SYNCHRONOUS hook's
+    additionalContext on the CURRENT turn; an async UserPromptSubmit would push
+    it to the next turn and break the same-turn T2 injection."""
+    cc_install.install()
+    settings = json.loads((cc_home / "settings.json").read_text(encoding="utf-8"))
+    handlers = _ours_handlers(settings, "UserPromptSubmit")
+    assert len(handlers) == 1
+    assert handlers[0]["command"] == cc_install.TRANSFORM_COMMAND
+    assert handlers[0].get("async") is not True

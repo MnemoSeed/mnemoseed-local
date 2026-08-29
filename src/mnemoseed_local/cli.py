@@ -1121,8 +1121,10 @@ def _read_stdin_text() -> str:
 def cmd_hook_event(args: argparse.Namespace) -> int:
     """Hidden transformer: host hook stdin JSON -> normalized daemon POST.
 
-    Zero stdout on EVERY path (UserPromptSubmit stdout leaks into model
-    context); fire-and-forget with a ~2s timeout, failures swallowed into the
+    Zero stdout on EVERY path EXCEPT a served B2.1 T2 mid-session recall pull:
+    an acked UserPromptSubmit emits one JSON ``{hookSpecificOutput.additionalContext}``
+    object so Claude Code injects the pending recall alongside the submitted
+    prompt. Fire-and-forget with a ~2s timeout; failures swallowed into the
     opt-in stderr debug lane.
     """
     from mnemoseed_local.hosts import install as shared
@@ -1153,6 +1155,14 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
     )
     try:
         client.post(events.ENDPOINTS[kind], body.model_dump(mode="json"))
+        # B2.1 T2: only an ACKED user ingest parks the focal slot, so the pull
+        # runs strictly after the 2xx (ack-implies-ready); a served selection is
+        # emitted as additionalContext — the ONE stdout this lane may write.
+        session_id = events.injection_session_id(body)
+        if session_id is not None:
+            block = events.inject_recall_context(session_id, client)
+            if block is not None:
+                print(json.dumps(events.additional_context_payload(block)))
     except Exception as exc:  # noqa: BLE001 - fire-and-forget contract
         events.debug(f"{kind} post failed: {exc}")
     return 0
