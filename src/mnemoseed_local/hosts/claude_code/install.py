@@ -37,7 +37,12 @@ from mnemoseed_local.hosts.install import HookStatus
 #: Reserved command prefix identifying our handler entries.
 MARKER = "mnemoseed-local"
 
-#: The five hook events we register in v1.
+#: The five hook events we register in v1. UserPromptSubmit doubles as the
+#: B2.1 T2 mid-session recall-injection surface: the transformer that runs for
+#: it idempotently ingests AND, on a served pending recall, emits
+#: `additionalContext` to stdout — so the handler MUST stay synchronous (an
+#: async UserPromptSubmit would push additionalContext to the next turn and
+#: break the same-turn injection contract).
 HOOK_EVENTS = ("UserPromptSubmit", "Stop", "PostToolUse", "PreCompact", "SessionEnd")
 
 #: Command each registered handler runs (CC pipes the event JSON via stdin).

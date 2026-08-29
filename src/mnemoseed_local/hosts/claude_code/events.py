@@ -17,9 +17,23 @@ Claude Code pipes one JSON object per hook firing into
 - ``SubagentStart``/``SubagentStop`` are NOT ingested in v1 (the raw payload
   records agent info for later adoption).
 
-RED LINE: stdout stays EMPTY on every path — CC feeds UserPromptSubmit stdout
-back into model context. Failures are swallowed into the opt-in stderr debug
-lane (``MNEMOSEED_LOCAL_DEBUG``), mirroring the shipped opencode plugin.
+B2.1 T2 mid-session recall injection (the claude_code half of the R2 trust
+surface): after a ``UserPromptSubmit`` ingest ACKs (the daemon parked the focal
+slot synchronously before answering 2xx — ack-implies-ready), the transformer
+pulls ``POST /session/recall-pending`` (300ms, fail-open) and, when the daemon
+serves a selection, emits it as ``hookSpecificOutput.additionalContext`` JSON
+stdout. Claude Code injects that string alongside the submitted prompt — the
+SINGLE channel this transformer may write to stdout, and only on a served pull.
+Budget semantics mirror the opencode plugin's ``buildT2Injection``: the daemon's
+wire ``budget_chars`` is the item budget (never a hardcoded cap), the envelope
+re-checks each full item fail-closed (an oversized item drops the WHOLE
+selection), and there is NO slicing floor in this path — the daemon is the sole
+budget authority across the whole positive-int range.
+
+RED LINE: stdout stays EMPTY on every path EXCEPT a served T2 pull, which emits
+one JSON object (CC feeds UserPromptSubmit stdout back into model context, so
+injection rides it deliberately; failures stay swallowed into the opt-in stderr
+debug lane, never stdout).
 """
 
 from __future__ import annotations
@@ -34,6 +48,7 @@ from typing import Any
 from httpx import Timeout
 from pydantic import BaseModel
 
+from mnemoseed_local.rest_client import DaemonClient
 from mnemoseed_local.schema.turn import (
     FlushRequest,
     HostId,
@@ -52,6 +67,32 @@ POST_TIMEOUT_SECONDS = 2.0
 #: clock on SessionEnd hooks while /session/end drains server-side, so the
 #: call must give up fast (residual worst-case noted in the PRD boundary).
 SESSION_END_TIMEOUT_SECONDS = 0.5
+
+#: B2.1 T2 dedicated mid-session pull budget (PRD-B2.1 / design 05): 300ms, a
+#: distinct constant — reusing the flat 2s host budget would be too heavy for
+#: a per-turn pull (re-review issue 9 adopted).
+RECALL_PULL_TIMEOUT_SECONDS = 0.3
+
+#: Fallback item budget when the daemon omits ``budget_chars`` (older daemon, or
+#: a malformed payload). The daemon is the ONLY budget authority in the normal
+#: path; this mirrors the opencode plugin's ``RECALL_PULL_MAX_CHARS``.
+RECALL_PULL_MAX_CHARS = 1200
+
+#: B2.1 T1/T2 injection envelope, byte-identical to the opencode plugin so the
+#: two hosts ship the same memory-replay fence + disclaimer to the model.
+RECALL_FENCE_OPEN = "<mnemoseed-memory-recall>"
+RECALL_FENCE_CLOSE = "</mnemoseed-memory-recall>"
+RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
+RECALL_DISCLAIMER = (
+    "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
+)
+
+#: The daemon reports its effective item budget on the wire under this key.
+RECALL_BUDGET_KEY = "budget_chars"
+
+#: Claude Code hook event that carries the injection (the additionalContext
+#: JSON property, both in our payload and in the decision-control schema).
+INJECTION_HOOK_EVENT = "UserPromptSubmit"
 
 
 def endpoint_budget(kind: str) -> float | Timeout:
@@ -236,3 +277,119 @@ def _pre_compact(payload: dict[str, Any], session_id: str, now: float) -> Action
 @_normalizer("SessionEnd")
 def _session_end(payload: dict[str, Any], session_id: str, now: float) -> Action | None:
     return ("session_end", SessionEndRequest(session_id=session_id, profile_id=profile_id(), ts=now))
+
+
+def action_injectable(kind: str, body: BaseModel) -> bool:
+    """True only for an acked UserPromptSubmit ingest — the T2 injection point.
+
+    Claude Code has no separate ``chat.system.transform``-style hook to pull on:
+    ``UserPromptSubmit`` both ingests AND carries the ``additionalContext``
+    formback, so the injection rides the same normalized action. Every other
+    kind (assistant ingest, flush, session_end) stays a pure capture route.
+    """
+    return kind == "ingest" and isinstance(body, IngestEvent) and body.event is IngestEventType.USER_PROMPT
+
+
+def injection_session_id(body: BaseModel) -> str | None:
+    """The session the served selection belongs to, or ``None`` off the lane."""
+    if isinstance(body, IngestEvent) and body.event is IngestEventType.USER_PROMPT:
+        return body.session_id
+    return None
+
+
+def sanitize_recall_text(text: str) -> str:
+    """Fence integrity (TA-5): served text may literally carry the fence markers
+    (self-dogfood hits this); replace BOTH literals with the ‹› form in one pass
+    so the assembled block carries exactly one open/close fence pair."""
+    return text.replace(RECALL_FENCE_OPEN, RECALL_FENCE_SANITIZED).replace(
+        RECALL_FENCE_CLOSE, RECALL_FENCE_SANITIZED
+    )
+
+
+def build_t2_context(items: list[dict[str, Any]] | Any, item_budget: int) -> str | None:
+    """Assemble the fenced mid-session recall block from a served selection.
+
+    Mirrors opencode's ``buildT2Injection`` byte-for-byte in semantics: the same
+    fence + disclaimer envelope, no group headers (the daemon already shaped the
+    payload), and the daemon's ``budget_chars`` IS the item budget. The envelope
+    re-checks each FULL item fail-closed — an oversized line or assembled block
+    is dropped WHOLE (defense in depth, unreachable by design). There is NO
+    slicing floor in this path: the daemon's ``_MIN_SLICE_CHARS`` governs only
+    its own boundary-item tail cut; full items under any positive budget are
+    served and must append (QA IMPORTANT-3).
+    """
+    if not isinstance(items, list):
+        return None
+    wrapper = len(RECALL_FENCE_OPEN) + 1 + len(RECALL_DISCLAIMER) + 1 + len(RECALL_FENCE_CLOSE)
+    lines: list[str] = [RECALL_FENCE_OPEN, RECALL_DISCLAIMER]
+    remaining = item_budget
+    committed = False
+    for item in items:
+        raw = item.get("text") if isinstance(item, dict) else None
+        text = sanitize_recall_text(raw if isinstance(raw, str) else "")
+        if not text:
+            continue
+        line_cost = len(text) + 1
+        if line_cost > remaining:
+            return None
+        lines.append(text)
+        remaining -= line_cost
+        committed = True
+    if not committed:
+        return None
+    lines.append(RECALL_FENCE_CLOSE)
+    block = "\n".join(lines)
+    if len(block) > item_budget + wrapper:
+        return None
+    return block
+
+
+def pull_pending_recall(session_id: str, client: DaemonClient) -> dict[str, Any] | None:
+    """Bounded ``POST /session/recall-pending`` pull (300ms, fail-open).
+
+    Mirrors opencode's ``pullPendingRecall``: a dedicated await with its own
+    timeout, never the fire-and-forget ``post()`` budget. ``seen_chunk_ids`` is
+    empty — the claude_code host performs no T1 session-start replay, so there
+    is nothing before the T2 pull to de-duplicate against.
+    """
+    pull_client = DaemonClient(
+        base_url=client.base_url,
+        profile_id=client.profile_id,
+        actor=client.actor,
+        timeout=Timeout(RECALL_PULL_TIMEOUT_SECONDS),
+    )
+    try:
+        return pull_client.post(
+            "/session/recall-pending",
+            {"profile_id": client.profile_id, "session_id": session_id, "seen_chunk_ids": []},
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-open pull lane
+        debug(f"recall-pending pull failed: {exc}")
+        return None
+
+
+def inject_recall_context(session_id: str, client: DaemonClient) -> str | None:
+    """The T2 injection action: pull + build, fail-open.
+
+    Runs only after the ingest ACK (the daemon parked the focal slot before the
+    2xx — ``ack-implies-ready``); the daemon's own ``enabled``/``items``/``slot_consumed``
+    semantics are the arm-clearing authority, so a non-empty serve returns the
+    block while an empty/disabled/failed pull returns ``None`` and the prompt
+    proceeds untouched.
+    """
+    served = pull_pending_recall(session_id, client)
+    if served is None or served.get("enabled") is not True:
+        return None
+    budget = served.get(RECALL_BUDGET_KEY)
+    item_budget = budget if isinstance(budget, (int, float)) and budget > 0 else RECALL_PULL_MAX_CHARS
+    return build_t2_context(served.get("items"), int(item_budget))
+
+
+def additional_context_payload(block: str) -> dict[str, Any]:
+    """The UserPromptSubmit JSON-stdout shape Claude Code reads for injection."""
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": INJECTION_HOOK_EVENT,
+            "additionalContext": block,
+        }
+    }
