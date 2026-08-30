@@ -330,9 +330,30 @@
             <section class="drawer-sec is-open" data-sec="provenance">
               <button class="drawer-sec-head" type="button" aria-expanded="true">Provenance</button>
               <div class="drawer-sec-body small">
-                <p><strong>Asserted by</strong> <span id="d-asserted-by">—</span> · <strong>Source</strong> <span id="d-source">—</span> · <strong>Confidence</strong> <span id="d-confidence">—</span> · <strong>At</strong> <span id="d-asserted-at">—</span></p>
+                <p><strong>Asserted by</strong> <span id="d-asserted-by">—</span> · <strong>Source</strong> <span id="d-source">—</span> · <strong>At</strong> <span id="d-asserted-at">—</span></p>
+                <p id="d-srcnote" class="muted">Source is shown; certainty is not judged.</p>
                 <div id="d-history" class="timeline-mini"></div>
-                <p><span id="d-gaps" class="badge badge-muted" hidden>Peripheral gaps</span> <span id="d-promotion" class="badge badge-muted" hidden>Promotion: promoted</span></p>
+                <p><span id="d-gaps" class="badge badge-muted" hidden title="Peripheral gaps — the stored fact is missing nearby context" aria-label="Peripheral gaps — the stored fact is missing nearby context">Peripheral gaps</span> <span id="d-promotion" class="badge badge-muted" hidden>Promotion: promoted</span> <span id="d-reconcile" class="badge badge-muted" hidden title="You revised this and it now conflicts with older wording — review." aria-label="Reconcile — you revised this and it now conflicts with older wording. Review.">Reconcile</span></p>
+              </div>
+            </section>
+
+            <!-- 2b Why this surfaced (recall trust) -->
+            <section class="drawer-sec is-open" data-sec="why">
+              <button class="drawer-sec-head" type="button" aria-expanded="true">Why this surfaced</button>
+              <div class="drawer-sec-body small">
+                <p class="d-whysrc">
+                  <span id="dw-pin" class="badge badge-pin" hidden title="Pinned — you set this yourself; re-pinning reinforces it." aria-label="Pinned — you set this yourself; re-pinning reinforces it.">Pinned</span>
+                  <span id="dw-captured" class="badge badge-muted" hidden title="Captured automatically from conversation — not pinned." aria-label="Captured automatically from conversation — not pinned.">Captured automatically</span>
+                  <span id="dw-relevance" class="badge" hidden title="Returned by relevance — how well it matched your query, not a certainty judgement." aria-label="Related — returned by relevance, not a certainty judgement.">Related · returned by relevance</span>
+                  <span id="dw-conflict" class="badge badge-warn" hidden title="Disagrees with a sibling fact — review." aria-label="Conflict — disagrees with a sibling fact. Review.">Conflict</span>
+                  <span id="dw-readconflict" class="badge badge-warn" hidden title="Read differently across contexts — both sides shown, not judged." aria-label="Read conflict — read differently across contexts; both sides shown, not judged.">Read conflict</span>
+                  <span id="dw-pending" class="badge badge-pending" hidden title="Fresh evidence overlaps this fact — awaiting consolidation." aria-label="Pending consolidation — fresh evidence overlaps this fact; awaiting consolidation.">Pending consolidation</span>
+                  <span id="dw-reconcile-s" class="badge badge-muted" hidden title="You revised this and it now conflicts with older wording — review." aria-label="Reconcile — you revised this and it now conflicts with older wording. Review.">Reconcile</span>
+                  <span id="dw-recovered" class="badge badge-warn" hidden title="Recovered — below the usual floor, but strong cues brought it back." aria-label="Recovered — below the usual floor, but strong cues brought it back.">Recovered</span>
+                  <span id="dw-fading" class="badge badge-fading" hidden title="Fading — rarely re-surfaced." aria-label="Fading — rarely re-surfaced.">Fading</span>
+                </p>
+                <p id="dw-annot" class="muted"></p>
+                <p id="dw-none" class="muted" hidden>No source info — captured before provenance was recorded.</p>
               </div>
             </section>
             <!-- 3 Decay -->
