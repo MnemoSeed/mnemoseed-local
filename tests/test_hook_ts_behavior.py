@@ -484,6 +484,100 @@ def test_recall_pull_clears_the_arm_once_the_slot_was_consumed(tmp_path: Path) -
     assert transcript["pullCount"] == 1, transcript["pullCount"]
 
 
+def test_recall_pull_renders_pin_marker_only_on_explicitly_pinned_items(tmp_path: Path) -> None:
+    """design/11 §11 T2 (opencode half): the T2 injection appends the `⟵ pinned`
+    affix ONLY to a served item whose source is the explicit pin source
+    (``memory.remember``); captured items (a different source) and source-less
+    items carry NO affix — absence IS the captured signal. The affix is a
+    decoration on the appended line, never part of the verbatim text."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-pinmarkers")
+    [p1] = transcript["systems"]
+    assert len(p1) == 2, f"the pinned selection must append: {p1}"
+    block = p1[1]
+    assert block.count("<mnemoseed-memory-recall>") == 1
+    assert "零拷贝数据路径优先于重复" + " ⟵ pinned" in block, (
+        "the pinned item must carry the affix on its line"
+    )
+    assert block.count("⟵ pinned") == 1, f"exactly one pinned affix: {block}"
+    for sentinel in ("存储层确认后就可以继续推进", "没有 source 字段的抓取项"):
+        line = next(ln for ln in block.split("\n") if sentinel in ln)
+        assert "pinned" not in line, f"captured line must not be annotated: {line}"
+    assert "pinned" in block, "the pinned affix text must be present somewhere"
+
+
+def test_recall_pull_pin_budget_sheds_affix_before_dropping_the_item(tmp_path: Path) -> None:
+    """design/11 §4.3:demonstrable in the T2 hook: under a tight item budget the
+    per-line affix is shed FIRST (bare verbatim still appends, block stays at
+    budget + wrapper), while a pinned line exceeding the budget even bare still
+    drops the WHOLE selection fail-closed (the affix never relaxes the drop
+    semantics)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-pin-budget")
+    shed, oversized = transcript["systems"]
+    assert len(shed) == 2, f"the bare item must survive affix shedding: {shed}"
+    assert len(shed[1]) == 150 + 156, f"block must land at budget(150) + wrapper(156): {len(shed[1])}"
+    assert "pinned" not in shed[1], "the affix must be shed under pressure"
+    assert "z" * 149 in shed[1], "the bare verbatim line must survive"
+    assert oversized == ["BASE2"], f"the oversized pinned item must drop whole: {oversized}"
+
+
+def test_recall_pull_pin_sheds_kept_affix_before_multi_item_overrun(tmp_path: Path) -> None:
+    """IMPORTANT-1 (opencode half, QA exact repro): a KEPT affix on an EARLY
+    committed pinned line must never squeeze a LATER captured line out. Budget
+    100, [pinned A("a"*50)+affix, captured B("b"*41)]: A affixed 60<=100 (rem
+    40), then B 42>40 — the old code returned null though BARE A+B=93 <=100.
+    design/11 §4.3: shed the kept affix so the daemon-legal selection is SERVED
+    (fail-closed only when the bare total exceeds budget)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-pin-shed-kept-affix")
+    [b1] = transcript["systems"]
+    assert len(b1) == 2, f"the affix must be shed so the bare selection is served: {b1}"
+    block = b1[1]
+    assert "pinned" not in block, f"all kept affixes must be shed under pressure: {block}"
+    assert "a" * 50 in block, f"the bare pinned line must survive: {block}"
+    assert "b" * 41 in block, f"the later captured line must survive: {block}"
+
+
+def test_recall_pull_pin_post_shed_accounting_uses_bare_cost(tmp_path: Path) -> None:
+    """NIT-2 mutation guard (opencode half): the shed branch MUST decrement
+    `remaining` by the BARE line cost, never the affixed one. Budget 100, [Z
+    ("z"*89)→rem 10, pinned X("x"*5): affixed 15>10∪bare 6<=10 → shed rem 10-6=4,
+    captured Y("y"*3): cost 4<=4 served]. A mutant subtracting the affixed 15
+    drives remaining to -5 and Y overruns → null; that must fail HERE."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-pin-post-shed-bare-accounting")
+    [b1] = transcript["systems"]
+    assert len(b1) == 2, f"the post-shed bare accounting must serve the trailing line: {b1}"
+    block = b1[1]
+    for sentinel in ("z" * 89, "x" * 5, "y" * 3):
+        assert sentinel in block, f"line must be served: {sentinel[:10]}…"
+
+
+def test_recall_pull_pin_two_sheds_keep_prior_bare_line_intact(tmp_path: Path) -> None:
+    """BLOCKER (opencode half, verbatim corruption): shedding the affix a SECOND
+    time in one call must rebuild every kept-affix line by its ABSOLUTE index.
+    The old `affixFlags` reset + `lines[2 + i]` re-enumeration sliced 9 chars off
+    the WRONG already-bare committed line after the first shed. Budget 2400,
+    [pinned P1("a"*1800), P2("b"*582), P3("c"*6), P4("e"*1)]: P1 affixed commits,
+    P2 sheds P1's affix, P3 (memory.remember) commits a fresh kept affix, P4 sheds
+    it a SECOND time. (a) P1's line is UNCHANGED at length 1800, (b) P3's freshly
+    kept affix is shed, (c) the bare selection (2393<=2400) is served, not null."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "recall-pull-pin-two-sheds")
+    [b1] = transcript["systems"]
+    assert len(b1) == 2, f"the bare selection must be served, not dropped: {b1}"
+    block = b1[1]
+    lines = block.split("\n")
+    assert lines[2] == "a" * 1800, (
+        "the earlier committed bare line must be byte-identical (no 1800->1791 "
+        f"corruption) — got length {len(lines[2])}"
+    )
+    assert "pinned" not in block, f"every kept affix must be shed: {block}"
+    assert "c" * 6 in block, "the mid-selection decorated item must be served bare"
+    assert "e" in block, "the trailing item must be served"
+
+
 # ---------------------------------------------------------------- B2.12 debug-lane observability
 
 
