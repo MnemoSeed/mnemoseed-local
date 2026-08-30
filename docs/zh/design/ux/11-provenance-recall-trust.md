@@ -151,12 +151,15 @@ The block below is an automatic memory replay...
 
 **不做新路由**。在 `Atlas` 页面新增一个 **Drawer 区段** 「Where this came from」（并入现有 Provenance 区段或紧随其后），以及一个 **StatusBar 内的最近注入摘要行**。以下 5.2/5.3 均落在 Atlas。
 
-### 5.2 最近注入摘要（StatusBar 行，只读）
+### 5.2 最近会话尾巴摘要（StatusBar 行，只读）
+
+> **诚实化（QA 修正，2026-08）**：本行数据来自 `POST /session/recent`，它读的是**最新会话的尾巴**（session tails），**不是注入记录（injection records）**。因此**不能声称「Last auto-recall served」（自动召回已注入 N 条）**——那是假声明。行内文案改为只描述「会话尾巴里有多少 chunk/多少会话」，并**不数 pinned**（`/session/recent` wire 无 `source`，见 §10 缺口 C，数不了钉速）。
 
 - 位置：`atlas-statusbar`（`index.html:297`）追加一段只读文本，数据来自 `POST /session/recent`（复用 daemon 已有端点，零新增后端）。
-- 文案（示例）：`Last auto-recall served 2 chunks · 1 pinned · 3 sessions ago — see Atlas to audit.`
-- 字段映射：`sessions[].chunks[].{session_id, is_explicit_pin, ingested_at, origin_agent}` —— `is_explicit_pin` 需缺口 C。
-- 目的：把「你被注回的这一批」的可审计性带到控制台一级，是注入事件的可视化镜像。
+- 文案（唯一，非声称）：` · Newest session tail: {n} chunk(s) across {m} recent session(s) — see Atlas to audit.`
+- 字段映射：`sessions[]` 长度 → `m`；`sessions[].chunks[]` 展平长度 → `n`。**不做** pinned 计数（wire 无 `source`）。
+- 目的：把「最近的会话尾巴」带到控制台一级作只读回放；注入事件的逐条审计落在 Drawer「Why this surfaced」（§5.3）。
+- 并发纪律：该行与 `fetchAtlas` 共用同一 `atlasState._fetchAbort` 失效控制器；切换 profile / 重取后，stale 的 resolve 被丢弃，绝不追加到新内容上（F2）。
 
 ### 5.3 召回复原卡（Atlas Drawer 的「Why this surfaced」区段，只读）
 
@@ -208,7 +211,7 @@ The block below is an automatic memory replay...
 - 组头 `flashbulb`（无文案，仅属性标记）
 
 **Atlas StatusBar 摘要**
-- `Last auto-recall served {n} chunk(s) · {p} pinned · {s} session(s) ago — see Atlas to audit.`
+- `Newest session tail: {n} chunk(s) across {m} recent session(s) — see Atlas to audit.`（只描述会话尾巴，**不声称**召回事件、**不数 pinned**——`/session/recent` 无 `source`）
 
 **Drawer「召回来源」块**
 - `Why this surfaced`
@@ -234,7 +237,7 @@ The block below is an automatic memory replay...
 
 ## 9. A11y + 空 / 冲突 / 衰减边界态
 
-1. **屏读**：Pinned / 徽标用 `aria-label` 承载 tooltip 文案（`icon + text` 双通道，不依赖颜色）；`flashbulb` 组头标记在注入面本就无 DOM —— 不涉及。
+1. **屏读**：Pinned / 徽标用 `aria-label` 承载 tooltip 文案（`icon + text` 双通道，不依赖颜色）；`title` 仍是可见悬停通道，两者并存。覆盖：Drawer「Why this surfaced」行（`dw-pin/dw-captured/dw-relevance/dw-conflict/dw-readconflict/dw-pending/dw-reconcile-s/dw-recovered/dw-fading`）、Provenance 区 `d-reconcile`、动态渲染的 List 行 `PIN`/`P` 角标，以及 Drawer `#d-source` 里动态生成的 Pinned 徽标。`#d-source` 在钉速分支须**清空旧的 `title`**（N6），避免上一格非钉项的残留 tooltip 泄漏到当前钉项；`flashbulb` 组头标记在注入面本就无 DOM —— 不涉及。
 2. **对比度**：`badge-pin` `#E07A5F` 上黑字 ≥ 4.5:1 需实测；不满足则加深底/加描边，不换色（沿用 `08 §13`）。
 3. **空 / 无 provenance**：`No source info — captured before provenance was recorded.`（或 `—`），不抛 raw JSON。
 4. **conflict**：`badge-warn` + 上述 tooltip；`conflict_pair/read_conflict` 同徽标注记，**两边都标**，不替用户裁决哪边对（`read_conflict` 从不判对错，`assemble.py:564-592`「under-flag posture」）。
