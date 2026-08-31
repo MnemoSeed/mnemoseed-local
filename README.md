@@ -130,9 +130,9 @@ One-time tips also welcome via Polar (below) or Buy Me a Coffee.
 [![Polar](https://img.shields.io/badge/Donate-Polar-%230066FF?logo=polar&logoColor=white)](https://buy.polar.sh/polar_cl_KoNqAsMI8IQGy5RRE8MLbX7I5TBGUMh9Kn8CC35YfP7)
 [![Buy Me a Coffee](https://img.shields.io/badge/Tip-Buy%20Me%20a%20Coffee-%23FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/mnemoseed)
 
-> **透明度承诺**：月度梦境成本、评估数据、赞助人数/金额将在 Backer 简报与季度 sync 中公开。不锁功能、不卖 License、不透支 Roadmap。
+> **Transparency promise**: monthly dream-cost figures, evaluation data, and sponsor counts/amounts are published in the Backer brief and quarterly sync. No feature gating, no license upsell, no roadmap over-promising.
 
-[![Thanks.dev](https://thanks.dev/badge.svg?package=github%3AMnemoSeed%2Fmnemoseed-local)](https://thanks.dev/github/MnemoSeed/mnemoseed-local)
+[![Thanks.dev](https://img.shields.io/badge/Support-Thanks.dev-%23FF6B35)](https://thanks.dev/github/MnemoSeed/mnemoseed-local)
 
 ## Evaluation (maintainers)
 
