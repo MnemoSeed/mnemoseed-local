@@ -63,6 +63,10 @@ listing captured earlier in the session.
   of the system's core design.
 - Never commit secrets; `opencode.json` lives outside this repo (global user
   config) and must not leak into git.
+- **Test/live isolation (user directive 2026-08-31)**: tests, evals, sweeps,
+  debug runs and console/Playwright checks must use a spare port (never 7788)
+  and an isolated data dir (temp `MNEMOSEED_HOME` / profile). The installed
+  runtime at `~/.mnemoseed-local` is never touched by development or testing.
 
 ## Work queue & capture discipline
 
@@ -84,6 +88,13 @@ listing captured earlier in the session.
   with verified disjoint file surfaces. After merge, clean up leftovers via
   `git worktree list` (remove stale task worktrees) and `git branch --merged main`
   (delete merged batch branches).
+
+## Org pointer
+
+The umbrella multi-agent org protocol lives in the private HQ: `../org/PROTOCOL.md`
+(relative to this repo's parent layout). On session start read `../org/_state.md`
+for in-flight batches and blockers; refresh it when a batch lands. Plans and their
+estimates live in `../org/plans/`.
 
 ## Useful entry points
 
