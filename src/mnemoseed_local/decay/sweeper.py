@@ -49,6 +49,7 @@ from mnemoseed_local.storage.ports import (
     Page,
     WeightUpdate,
 )
+from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 logger = logging.getLogger("mnemoseed_local.decay.sweeper")
 
@@ -91,11 +92,18 @@ class DecaySweeper:
         config: Config,
         *,
         clock: Callable[[], float] | None = None,
+        executor: DaemonExecutor | None = None,
     ) -> None:
         self._stores = stores
         self._config = config
         self._clock = clock if clock is not None else time.time
         self._last_stats: list[SweepStats] = []
+        self._executor = (
+            executor
+            if executor is not None
+            else DaemonExecutor(max_workers=1, thread_name_prefix="mnemoseed-decay")
+        )
+        self._owns_executor = executor is None
 
     @property
     def enabled(self) -> bool:
@@ -143,14 +151,24 @@ class DecaySweeper:
         Ticks once immediately (crash-safe catch-up after downtime), then
         sleeps one interval. The interval and the enabled flag are re-read each
         iteration, so configwrite changes hot-apply to the next tick.
+
+        The sweep itself runs off the event loop on a dedicated daemon worker
+        so a blocking LanceDB commit never wedges the HTTP listener.
         """
         while True:
             try:
                 if self._config.decay.enabled:
-                    self.run_once()
+                    await asyncio.wrap_future(self._executor.submit(self.run_once))
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("decay sweep failed; the next tick retries")
             await asyncio.sleep(self._config.decay.sweep_interval_s)
+
+    def close(self, timeout: float = 0) -> None:
+        """Release the sweep worker; abandon a wedged sweep at the deadline."""
+        if self._owns_executor:
+            self._executor.close(timeout=timeout)
 
     # ------------------------------------------------------------ one profile
 

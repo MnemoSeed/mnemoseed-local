@@ -1035,6 +1035,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await task
             except asyncio.CancelledError:
                 pass
+    decay = getattr(app.state, "decay", None)
+    if decay is not None:
+        try:
+            await asyncio.to_thread(decay.close, 2.0)
+        except Exception:
+            pass
     logger.info("teardown: close memory")
     app.state.memory.close()
     # Stop the dream worker before the drain lane: its in-flight chain releases

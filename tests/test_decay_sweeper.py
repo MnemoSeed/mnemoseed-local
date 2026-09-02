@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -22,7 +24,7 @@ from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Proven
 from mnemoseed_local.storage.drivers import lancedb_embedded, sqlite_graph, sqlite_meta
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 from mnemoseed_local.storage.factory import build_stores
-from mnemoseed_local.storage.ports import AuditFilter, Page, StoredProfile
+from mnemoseed_local.storage.ports import AuditFilter, Page, StoredProfile, WeightUpdate
 from mnemoseed_local.storage.registry import (
     EMBED_DRIVERS,
     GRAPH_DRIVERS,
@@ -146,8 +148,37 @@ def _seed_chunk(stores: object, stamp: ChunkStamp) -> None:
     stores.vector.upsert_chunk(stamp, vector.dense, vector.sparse)
 
 
+def _seed_chunks_batch(stores: object, stamps: list[ChunkStamp]) -> None:
+    """Seed many chunks in ONE merge commit (the capture-drain batch path)."""
+    embed = _embedder()
+    entries = []
+    for stamp in stamps:
+        vector = embed.embed(stamp.text)
+        entries.append((stamp, vector.dense, vector.sparse))
+    stores.vector.upsert_chunks(entries)
+
+
 def _audit_entries(stores: object, action: str) -> list[object]:
     return stores.meta.audit_query(AuditFilter(action=action), Page(limit=100)).items
+
+
+async def _wait_for_audit(stores: object, action: str, budget: float = 0.5) -> None:
+    """Block (wall-clock polling) until the ``action`` audit is visible on the
+    main thread's connection.
+
+    The sweep and its WAL commit run on the decay worker thread; a fresh
+    main-thread connection sees a committed write only after the bounded
+    cross-thread propagation window. The audit is the last write of a pass, so
+    once it is visible every earlier write of the same pass is committed too.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while True:
+        if _audit_entries(stores, action):
+            return
+        if loop.time() >= deadline:
+            raise AssertionError(f"{action} audit not visible within {budget:.0f}s")
+        await asyncio.sleep(0.01)
 
 
 # ---------------------------------------------------------------- sweep behavior
@@ -530,7 +561,14 @@ def test_sweep_audits_one_entry_per_profile_with_stats(
 @pytest.mark.asyncio
 async def test_run_forever_ticks_and_stops_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The daemon-owned loop ticks once immediately, then sleeps; cancellation
-    stops it cleanly with no pending task left behind."""
+    stops it cleanly with no pending task left behind.
+
+    The sweep and its WAL commit run on the decay worker thread, so the audit
+    is only visible to this thread's connection after the bounded cross-thread
+    propagation window. We poll for the audit (the last write of the pass)
+    instead of asserting synchronously — once it is visible the weight write,
+    which precedes it, is guaranteed committed too.
+    """
     config, stores = _stack(tmp_path, monkeypatch)
     _seed_profile(stores)
     now = 1_800_000_000.0
@@ -540,12 +578,219 @@ async def test_run_forever_ticks_and_stops_cleanly(tmp_path: Path, monkeypatch: 
     stores.graph.upsert_node(_pref_node("old", last_reinforced=now - 60 * _DAY))
 
     task = asyncio.create_task(sweeper.run_forever())
-    await asyncio.sleep(0.05)
-    assert stores.graph.get_node("old").decay_weight < 1.0  # a tick ran
-    assert len(_audit_entries(stores, "decay_sweep")) >= 1
+    await asyncio.sleep(0.02)
+    await _wait_for_audit(stores, "decay_sweep")  # proves a full tick completed
+    assert stores.graph.get_node("old").decay_weight < 1.0  # ...and it decayed
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0.0)
     assert task.cancelled() is True
+
+
+# ---------------------------------------------------------------- concurrency (P-003)
+
+
+def test_sweep_weight_updates_complete_under_concurrent_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P-003 regression: a sweep must complete while a concurrent writer
+    (the boot dream/scheduler worker) commits to the same vector table.
+
+    The naive per-row ``table.update`` in ``update_weights`` issued one native
+    commit per chunk, serializing at ~100ms/chunk on Windows and deadlocking
+    LanceDB's background loop once a writer thread interleaved commits. The
+    batched single-commit fix must finish well inside the budget with a live
+    writer driving the same table. A hung sweep surfaced here as a timeout in
+    a dedicated worker thread (never a pytest hang): the deadline fires and
+    the test fails instead of blocking the suite.
+    """
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    clock = [now]
+    sweeper = DecaySweeper(stores, config, clock=lambda: clock[0])
+    # A few hundred unreinforced chunks exceed one read page and force the
+    # write batch through the shared weight port (the >2000-row live case).
+    _seed_chunks_batch(stores, [_chunk(f"c{i:04d}", ingested_at=now - 90 * _DAY) for i in range(240)])
+
+    stop = threading.Event()
+
+    def writer_loop() -> None:
+        idx = 0
+        while not stop.is_set():
+            _seed_chunks_batch(stores, [_chunk(f"w{idx % 20}", ingested_at=now)])
+            idx += 1
+
+    writer = threading.Thread(target=writer_loop, daemon=True)
+    writer.start()
+    done = threading.Event()
+    result: list[object] = []
+
+    def sweep() -> None:
+        try:
+            result.append(sweeper.run_once())
+        finally:
+            done.set()
+
+    sweeper_thread = threading.Thread(target=sweep, daemon=True)
+    sweeper_thread.start()
+    budget = 8.0  # fixed path ~0.2s; the per-row regression burned ~100ms/chunk (240 -> >20s)
+    t0 = time.time()
+    finished = done.wait(budget)
+    elapsed = time.time() - t0
+    stop.set()
+    writer.join(timeout=0.0)
+
+    assert finished, f"sweep did not complete within {budget}s under a concurrent writer (P-003); "
+    f"took {elapsed:.1f}s"
+    assert elapsed < budget
+    assert result[0][0].chunks_updated == 240
+    assert stores.vector.get_chunk("c0000").decay_weight == pytest.approx(math.exp(-0.03 * 90.0), abs=1e-6)
+
+
+# ---------------------------------------------------------------- mutation hardening (BLOCKER-2)
+
+
+def test_update_weights_empty_and_all_none_are_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty or all-None WeightUpdate batches must be a no-op (no commit, no version bump)."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    _seed_chunk(stores, _chunk("c1", ingested_at=now - 60 * _DAY))
+    version_before = stores.vector._table.version  # type: ignore[attr-defined]
+    chunk_before = stores.vector.get_chunk("c1")
+    assert chunk_before is not None
+    stores.vector.update_weights([])
+    stores.vector.update_weights([WeightUpdate(chunk_id="missing")])
+    stores.vector.update_weights(
+        [WeightUpdate(chunk_id="c1", decay_weight=None, last_reinforced=None, reinforce_count=None)]
+    )
+    assert stores.vector._table.version == version_before  # type: ignore[attr-defined]
+    chunk_after = stores.vector.get_chunk("c1")
+    assert chunk_after is not None
+    assert chunk_after.decay_weight == pytest.approx(chunk_before.decay_weight)
+
+
+def test_update_weights_duplicate_chunk_id_last_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Duplicate chunk_ids in one batch resolve to the last entry (parity with sequential updates)."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    _seed_chunk(stores, _chunk("dup", ingested_at=now))
+    stores.vector.update_weights(
+        [
+            WeightUpdate(chunk_id="dup", decay_weight=0.2),
+            WeightUpdate(chunk_id="dup", decay_weight=0.8),
+        ]
+    )
+    assert stores.vector.get_chunk("dup").decay_weight == pytest.approx(0.8)  # type: ignore[union-attr]
+    stores.vector.update_weights(
+        [
+            WeightUpdate(chunk_id="dup", decay_weight=0.9),
+            WeightUpdate(chunk_id="dup", decay_weight=0.1),
+        ]
+    )
+    assert stores.vector.get_chunk("dup").decay_weight == pytest.approx(0.1)  # type: ignore[union-attr]
+
+
+def test_update_weights_preserves_untouched_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A decay-only batch must not null last_reinforced or reinforce_count."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    _seed_chunk(stores, _chunk("c1", ingested_at=now))
+    stores.vector.update_weights(
+        [WeightUpdate(chunk_id="c1", decay_weight=0.5, last_reinforced=12345.0, reinforce_count=7)]
+    )
+    baseline = stores.vector.get_chunk("c1")
+    assert baseline is not None
+    assert baseline.last_reinforced == pytest.approx(12345.0)
+    assert (
+        stores.vector._table.search()
+        .where("chunk_id = 'c1'")
+        .limit(1)
+        .to_list()[0][  # type: ignore[attr-defined]
+            "reinforce_count"
+        ]
+        == 7
+    )
+    stores.vector.update_weights([WeightUpdate(chunk_id="c1", decay_weight=0.1)])
+    after = stores.vector.get_chunk("c1")
+    assert after is not None
+    assert after.decay_weight == pytest.approx(0.1)
+    assert after.last_reinforced == pytest.approx(12345.0)
+    row = stores.vector._table.search().where("chunk_id = 'c1'").limit(1).to_list()[0]  # type: ignore[attr-defined]
+    assert row["reinforce_count"] == 7
+
+
+def test_update_weights_mixed_signatures_split(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixed-signature batches must split into uniform merge tables so no column is nulled."""
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    _seed_chunks_batch(
+        stores,
+        [_chunk("c1", ingested_at=now), _chunk("c2", ingested_at=now), _chunk("c3", ingested_at=now)],
+    )
+    stores.vector.update_weights(
+        [
+            WeightUpdate(chunk_id="c1", decay_weight=0.11),
+            WeightUpdate(chunk_id="c2", last_reinforced=9999.0),
+            WeightUpdate(chunk_id="c3", decay_weight=0.22, last_reinforced=8888.0, reinforce_count=7),
+        ]
+    )
+    c1 = stores.vector.get_chunk("c1")
+    c2 = stores.vector.get_chunk("c2")
+    c3 = stores.vector.get_chunk("c3")
+    assert c1 is not None and c1.decay_weight == pytest.approx(0.11)
+    assert c2 is not None and c2.last_reinforced == pytest.approx(9999.0)
+    assert c2.decay_weight == pytest.approx(1.0)
+    assert c3 is not None and c3.decay_weight == pytest.approx(0.22)
+    assert c3.last_reinforced == pytest.approx(8888.0)
+    row3 = stores.vector._table.search().where("chunk_id = 'c3'").limit(1).to_list()[0]  # type: ignore[attr-defined]
+    assert row3["reinforce_count"] == 7
+    row1 = stores.vector._table.search().where("chunk_id = 'c1'").limit(1).to_list()[0]  # type: ignore[attr-defined]
+    assert row1["reinforce_count"] == 0
+    assert c1.last_reinforced is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_block_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Decay writes must not block the event loop (P-003 class elimination).
+
+    Heartbeats are collected from t=0 (before the sweep task even runs) and the
+    sweep interval is shrunk so the blocking write recurs inside the measured
+    window. Either alone catches the round-1 BLOCKER-1 regression (inline
+    ``run_once`` on the loop wedges the heartbeat cadence); together they make
+    the oracle fail-fast on that exact revert.
+    """
+    config, stores = _stack(tmp_path, monkeypatch)
+    _seed_profile(stores)
+    now = 1_800_000_000.0
+    clock = [now]
+    _seed_chunks_batch(stores, [_chunk(f"c{i:04d}", ingested_at=now - 90 * _DAY) for i in range(5)])
+    config.decay = DecayConfig(sweep_interval_s=0.02)
+    sweeper = DecaySweeper(stores, config, clock=lambda: clock[0])
+    original_update = stores.vector.update_weights
+
+    def blocking_update(updates):  # type: ignore[no-untyped-def]
+        time.sleep(0.35)
+        return original_update(updates)
+
+    monkeypatch.setattr(stores.vector, "update_weights", blocking_update)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    task = asyncio.create_task(sweeper.run_forever())
+    beats: list[float] = []
+    while loop.time() - start < 0.8:
+        beats.append(loop.time())
+        await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    sweeper.close(timeout=0)
+    gaps = [beats[i + 1] - beats[i] for i in range(len(beats) - 1)]
+    assert beats, "heartbeat never ticked"
+    assert max(gaps) < 0.12, f"event loop blocked: max gap {max(gaps):.3f}s (beats={beats[:5]})"

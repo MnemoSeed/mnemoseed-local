@@ -244,17 +244,61 @@ class LanceDbEmbeddedStore:
         return count
 
     def update_weights(self, updates: Sequence[WeightUpdate]) -> None:
-        for update in updates:
-            values: dict[str, Any] = {}
-            if update.decay_weight is not None:
-                values["decay_weight"] = float(update.decay_weight)
-            if update.last_reinforced is not None:
-                values["last_reinforced"] = float(update.last_reinforced)
-            if update.reinforce_count is not None:
-                values["reinforce_count"] = int(update.reinforce_count)
-            if values:
-                with self._write_lock:
-                    self._table.update(where=f"chunk_id = {_escape(update.chunk_id)}", values=values)
+        """Batch weight-column updates in ONE merge commit per field signature.
+
+        The sweep/rebuild paths write only ``decay_weight`` and reinforce writes
+        ``decay_weight`` + ``last_reinforced``, so a production batch is a single
+        uniform signature and lands as exactly ONE ``merge_insert`` — one native
+        commit instead of one per row. The original per-row ``table.update``
+        burst (a commit per chunk) dragged the sweep to ~100ms/chunk on Windows
+        and widened the concurrent-commit window until LanceDB's native writer
+        deadlocked on overlapping enqueues (watchdog stack:
+        background_loop.run -> concurrent.futures.result). Rows whose fields
+        differ from a neighbour's are grouped by signature so ``merge_insert``
+        never NULLs a column another row in the same batch deliberately leaves
+        untouched; nothing is written for all-None rows.
+        """
+        wanted = [
+            update
+            for update in updates
+            if update.decay_weight is not None
+            or update.last_reinforced is not None
+            or update.reinforce_count is not None
+        ]
+        if not wanted:
+            return
+        groups: dict[tuple[bool, bool, bool], dict[str, WeightUpdate]] = {}
+        for update in wanted:
+            signature = (
+                update.decay_weight is not None,
+                update.last_reinforced is not None,
+                update.reinforce_count is not None,
+            )
+            # A repeated chunk_id inside one batch resolves to its LAST member
+            # (later declaration wins), matching the old sequential per-row
+            # ``table.update`` path and the callers that intentionally collapse
+            # two labels onto one carrier chunk. A deduped source also keeps
+            # merge_insert strict — Lance refuses ambiguous multiple-source rows.
+            groups.setdefault(signature, {})[str(update.chunk_id)] = update
+        for signature, members in groups.items():
+            has_decay, has_reinforced, has_count = signature
+            rows = list(members.values())
+            columns: dict[str, Any] = {"chunk_id": pa.array([u.chunk_id for u in rows], pa.string())}
+            if has_decay:
+                columns["decay_weight"] = pa.array(
+                    [float(u.decay_weight) for u in rows if u.decay_weight is not None], pa.float32()
+                )
+            if has_reinforced:
+                columns["last_reinforced"] = pa.array(
+                    [float(u.last_reinforced) for u in rows if u.last_reinforced is not None],
+                    pa.float64(),
+                )
+            if has_count:
+                columns["reinforce_count"] = pa.array(
+                    [int(u.reinforce_count) for u in rows if u.reinforce_count is not None], pa.int64()
+                )
+            with self._write_lock:
+                self._table.merge_insert("chunk_id").when_matched_update_all().execute(pa.table(columns))
 
     def update_chunk_state(
         self,
