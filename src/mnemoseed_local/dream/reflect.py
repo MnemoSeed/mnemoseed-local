@@ -119,6 +119,7 @@ class ReflectionResult:
     conflicts: tuple[tuple[str, str, str], ...] = ()  # dropped contradictory-polarity keys
     overflow_chunk_ids: tuple[str, ...] = ()  # T5: chunks deferred beyond the delta budget.
     consumed_chunk_ids: tuple[str, ...] = ()  # T5: delta ids the model saw; the safe-clear allow-list.
+    batched: bool = False  # whether the covering batches were fully handed to the model
 
 
 @dataclass(frozen=True)
@@ -839,6 +840,7 @@ class ReflectOrchestrator:
             overflow_chunk_ids=uncovered,
             consumed_chunk_ids=tuple(covered),
             model_id=model_id or None,
+            batched=True,
         )
         return ReflectOutcome(
             ok=True,
@@ -1051,6 +1053,7 @@ def _fold_triples(
     overflow_chunk_ids: tuple[str, ...] = (),
     consumed_chunk_ids: tuple[str, ...] = (),
     model_id: str | None = None,
+    batched: bool = False,
 ) -> ReflectionResult:
     """AC-3 dedup fold: repeated mentions of the same canonical triple collapse
     into one entry with reinforced confidence, merged provenance, and the most
@@ -1121,6 +1124,7 @@ def _fold_triples(
         conflicts=tuple(conflicts),
         overflow_chunk_ids=overflow_chunk_ids,
         consumed_chunk_ids=consumed_chunk_ids,
+        batched=batched,
     )
 
 
@@ -1145,6 +1149,7 @@ def _result_to_payload(result: ReflectionResult) -> dict[str, Any]:
         "conflicts": [[s, p, o] for s, p, o in result.conflicts],
         "delta_overflow": list(result.overflow_chunk_ids),
         "consumed_chunk_ids": list(result.consumed_chunk_ids),
+        "batched": bool(result.batched),
         "triples": [
             {
                 "subject": t.subject,
@@ -1191,6 +1196,7 @@ def result_from_payload(payload: dict[str, Any] | None) -> ReflectionResult | No
             conflicts=conflicts,
             overflow_chunk_ids=overflow_chunk_ids,
             consumed_chunk_ids=consumed_chunk_ids,
+            batched=bool(payload.get("batched", False)),
         )
     except (KeyError, TypeError, ValueError):
         logger.warning("ignoring unrecoverable reflect_result payload")

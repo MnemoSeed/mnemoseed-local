@@ -311,7 +311,13 @@ class DreamPipeline:
                 failure_class="journal_unrecoverable",
             )
             return
-        self._merge(snapshot, result, None, counts_toward_parking=counts_toward_parking)
+        self._merge(
+            snapshot,
+            result,
+            None,
+            counts_toward_parking=counts_toward_parking,
+            empty_verdict_commitable=result.batched,
+        )
 
     def _merge(
         self,
@@ -322,7 +328,28 @@ class DreamPipeline:
         counts_toward_parking: bool = True,
         empty_verdict_commitable: bool = False,
     ) -> None:
-        if not result.triples and result.overflow_chunk_ids and not empty_verdict_commitable:
+        batched_commitable = empty_verdict_commitable or result.batched
+        has_batched_key = "batched" in (snapshot.reflect_result or {})
+        # Legacy stale-journal migration applies ONLY at the merge boundary: the
+        # snapshot actually carries a persisted reflect_result from a prior boot
+        # whose payload predates the ``batched`` key. A fresh reflect-boundary
+        # snapshot keeps reflect_result None in-memory (reflect persists to disk
+        # only), so keying off that dict would read a bare pre-persist object and
+        # wrongly treat a fresh non-batched truncated-empty as stale. Gating on
+        # the persisted/merge boundary keeps migration scoped to the legacy file
+        # while every fresh/reflect rebroadcast defers (D1, FR-2.5 never-drop).
+        stale_recovery_commitable = (
+            not counts_toward_parking
+            and bool(result.consumed_chunk_ids)
+            and resume_boundary(snapshot) == "merge"
+            and not has_batched_key
+        )
+        if (
+            not result.triples
+            and result.overflow_chunk_ids
+            and not batched_commitable
+            and not stale_recovery_commitable
+        ):
             # Engine-side insurance (D1, FR-2.5 never-drop invariant): the
             # result is empty BECAUSE the delta was truncated, so committing it
             # would fire the safe-clear and purge source chunks the model never
@@ -389,10 +416,18 @@ class DreamPipeline:
                 report=report,
             )
             return
-        if not result.triples and empty_verdict_commitable:
+        if not result.triples and batched_commitable:
             logger.warning(
                 "batched dream for %s commits an EMPTY extraction verdict over %d covered "
-                "chunk(s); %d unseen overflow chunk(s) stay journaled for a later dream",
+                "chunk(s); %d unseen overflow chunk(s) stay pending for a later dream",
+                snapshot.profile_id,
+                len(result.consumed_chunk_ids),
+                len(result.overflow_chunk_ids),
+            )
+        elif not result.triples and stale_recovery_commitable:
+            logger.warning(
+                "stale journal recovery for %s commits an EMPTY extraction verdict over %d covered "
+                "chunk(s); %d unseen overflow chunk(s) stay pending (migration)",
                 snapshot.profile_id,
                 len(result.consumed_chunk_ids),
                 len(result.overflow_chunk_ids),

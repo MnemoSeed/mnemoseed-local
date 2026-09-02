@@ -136,6 +136,16 @@ def _mock_doctor_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("mnemoseed_local.llm.RoleRouter", _FakeDoctorRouter)
     monkeypatch.setattr("mnemoseed_local.hardware.probe_max_vram_gb", lambda: 0.0)
     monkeypatch.setattr("mnemoseed_local.hardware.probe_ram_gb", lambda: None)
+    monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", cli_home / "no-opencode.json")
+
+    class _UnreachableDaemonClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def get(self, path: str) -> dict[str, int]:
+            raise Exception("daemon unreachable")
+
+    monkeypatch.setattr("mnemoseed_local.cli.DaemonClient", _UnreachableDaemonClient)
 
 
 #: Every doctor fixture carries the mandatory isolated graph instance (AC2): a
