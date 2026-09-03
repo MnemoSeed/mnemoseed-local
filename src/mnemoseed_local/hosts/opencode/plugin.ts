@@ -10,6 +10,7 @@
 //   chat.message                        -> user_prompt       -> POST /ingest
 //   event message.updated (assistant)   -> assistant_message -> POST /ingest
 //   tool.execute.after                  -> tool_use          -> POST /ingest
+//   provider failure (message/session.error) -> provider_error -> POST /ingest
 //   event session.idle|error            -> flush             -> POST /flush
 //   event session.deleted               -> session_end       -> POST /session/end
 //   experimental.session.compacting     -> flush             -> POST /flush
@@ -99,6 +100,137 @@ const REINFORCE_BATCH_SIZE = 64
 // heavy for a per-turn pull (re-review issue 9 adopted).
 const RECALL_PULL_TIMEOUT_MS = 300
 const RECALL_PULL_MAX_CHARS = 1200
+
+// ---- B1 provider-failure nomination (deterministic, zero model calls) --------
+const PROVIDER_ALLOWLIST = new Set<string>([
+  "quota",
+  "rate_limit",
+  "auth",
+  "model_unavailable",
+  "timeout",
+  "overloaded",
+  "other_provider",
+])
+const REASON_RE = /^provider_[a-z0-9_]+$/
+const DEBOUNCE_WINDOW_MS = 60000
+const providerDebounce = new Map<string, number>()
+
+function redactSafeId(value: string | undefined): string {
+  if (!value) return ""
+  const v = String(value).trim()
+  if (!v) return ""
+  const low = v.toLowerCase()
+  if (low.includes("sk-") || low.includes("bearer") || low.includes("authorization") || low.includes("token=") || low.includes("key=") || low.includes("secret")) return ""
+  if (low.includes("http://") || low.includes("https://")) return ""
+  if (!/^[A-Za-z0-9._\/-]+$/.test(v)) return ""
+  if (v.length > 64) return ""
+  return v
+}
+
+function normalizeProviderStatus(raw: unknown, provider: string, model: string): string | null {
+  // raw may be numeric status, string, or object with code/message
+  let s = ""
+  if (typeof raw === "number") s = String(raw)
+  else if (typeof raw === "string") s = raw
+  else if (raw && typeof raw === "object") {
+    const r: any = raw
+    s = String(r.status ?? r.code ?? r.message ?? "")
+  }
+  const low = s.toLowerCase()
+  // 410 Gone -> model_unavailable
+  if (low.includes("410") || low.includes("gone") || low.includes("eol")) return "model_unavailable"
+  if (low.includes("429")) {
+    if (low.includes("quota") || low.includes("usage") || low.includes("402") || low.includes("exceeded")) return "quota"
+    return "rate_limit"
+  }
+  if (low.includes("401") || low.includes("403") && low.includes("auth") || low.includes("invalid key") || low.includes("forbidden")) return "auth"
+  if (low.includes("400") || low.includes("404") || low.includes("409")) return "model_unavailable"
+  if (low.includes("408") || low.includes("504") || low.includes("timeout") || low.includes("timedout") || low.includes("etimedout") || low.includes("abort")) return "timeout"
+  if (low.includes("500") || low.includes("502") || low.includes("503") || low.includes("overloaded") || low.includes("unavailable")) return "overloaded"
+  if (!s) return "timeout" // status-less hang (180s no response) -> timeout via SDK abort
+  if (low.includes("quota")) return "quota"
+  if (low.includes("rate")) return "rate_limit"
+  if (low.includes("auth")) return "auth"
+  if (low.includes("model")) return "model_unavailable"
+  if (low.includes("timeout")) return "timeout"
+  if (low.includes("overload")) return "overloaded"
+  return "other_provider"
+}
+
+function reasonForStatus(status: string): string {
+  const map: Record<string, string> = {
+    quota: "provider_429_quota",
+    rate_limit: "provider_429_rate",
+    auth: "provider_401",
+    model_unavailable: "provider_404",
+    timeout: "provider_timeout_no_status",
+    overloaded: "provider_5xx",
+    other_provider: "provider_transport",
+  }
+  return map[status] ?? "provider_transport"
+}
+
+function shouldDebounce(key: string): boolean {
+  const now = Date.now()
+  const last = providerDebounce.get(key)
+  if (last !== undefined && now - last < DEBOUNCE_WINDOW_MS) return true
+  providerDebounce.set(key, now)
+  if (providerDebounce.size > DEDUP_CAP) {
+    const oldest = providerDebounce.keys().next().value
+    if (oldest !== undefined) providerDebounce.delete(oldest)
+  }
+  return false
+}
+
+function buildErrorId(sessionID: string, provider: string, model: string, rawId: unknown, rawError: unknown): string {
+  if (typeof rawId === "string" && rawId && rawId.length <= 64 && /^[A-Za-z0-9._\/:-]+$/.test(rawId)) {
+    // charset-constrained; secret check
+    const low = rawId.toLowerCase()
+    if (!low.includes("sk-") && !low.includes("bearer") && !low.includes("token=")) return rawId
+  }
+  // fallback: bounded deterministic hash of safe slice
+  const base = `${provider}:${model}:${sessionID}:${String(rawError ?? rawId ?? "").slice(0, 80)}`
+  let h = 0
+  for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0
+  return `err_${h.toString(16).slice(0, 16)}`
+}
+
+function noteProviderFailure(
+  sessionID: string,
+  providerRaw: string | undefined,
+  modelRaw: string | undefined,
+  statusRaw: unknown,
+  rawId: unknown,
+  rawError: unknown,
+): void {
+  const provider = redactSafeId(providerRaw)
+  if (!provider) return
+  const model = redactSafeId(modelRaw) || ""
+  const status = normalizeProviderStatus(statusRaw, provider, model)
+  if (!status || !PROVIDER_ALLOWLIST.has(status)) return
+  const reason = reasonForStatus(status)
+  if (!REASON_RE.test(reason) || reason.length > 64) return
+  const error_id = buildErrorId(sessionID, provider, model, rawId, rawError)
+  // validation: error_id bounded and charset-constrained
+  if (error_id.length > 64 || !/^[A-Za-z0-9._\/:-]+$/.test(error_id)) return
+  const debounceKey = `${PROFILE_ID}:${sessionID}:${provider}:${model}:${error_id}`
+  if (shouldDebounce(debounceKey)) return
+  const body: JsonRecord = {
+    host: HOST_ID,
+    event: "provider_error",
+    session_id: sessionID,
+    profile_id: PROFILE_ID,
+    ts: Date.now() / 1000,
+    content: { provider, model: model || undefined, status, reason, error_id },
+  }
+  const ingestPath = "/ingest"
+  post(
+    ingestPath,
+    body,
+    () => debugLog("provider_error nominated", { sessionID, provider, model, status, reason, error_id }),
+    () => debugLog("provider_error nack (old daemon or failure)", { sessionID, provider, status }),
+  )
+}
 
 // ---- R2 provenance trust (design/11): the T2 injected recall carries a
 // per-line provenance affix so the model can tell an explicit user pin from an
@@ -1218,6 +1350,30 @@ export default async function MnemoSeedLocalPlugin(
         error: info?.metadata?.error ?? info?.error ?? null,
       })
     }
+    // B1 provider-failure nomination gate (message.updated with time.error or metadata.error)
+    const hasProviderError = errorAt !== undefined || !!(info?.metadata?.error ?? info?.error)
+    if (hasProviderError) {
+      const rawError = info?.metadata?.error ?? info?.error ?? null
+      const combined = modelIdOf(info)
+      let provider: string | undefined
+      let model: string | undefined
+      if (combined && combined.includes("/")) {
+        const slash = combined.indexOf("/")
+        provider = combined.slice(0, slash)
+        model = combined.slice(slash + 1)
+      } else if (combined) {
+        model = combined
+        provider = typeof info?.providerID === "string" ? info.providerID : undefined
+      } else {
+        provider = typeof info?.providerID === "string" ? info.providerID : undefined
+        model = typeof info?.modelID === "string" ? info.modelID : undefined
+      }
+      const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? (rawError as any)?.type ?? errorAt ?? rawError
+      const sessionIDForError = String(info?.sessionID ?? "")
+      if (sessionIDForError) {
+        noteProviderFailure(sessionIDForError, provider, model, statusRaw, info?.id, rawError)
+      }
+    }
     if (completedAt === undefined && errorAt === undefined) return
     const sessionID = String(info?.sessionID ?? "")
     const messageID = String(info?.id ?? "")
@@ -1255,6 +1411,32 @@ export default async function MnemoSeedLocalPlugin(
         case "session.idle":
         case "session.error": {
           const sessionID = sessionIdOfEvent(event)
+          // B1: session.error may carry provider failure; nominate before flush
+          if (event?.type === "session.error") {
+            const props: any = (event as any)?.properties ?? {}
+            const info: any = props.info ?? props
+            const rawError = props.error ?? info?.metadata?.error ?? info?.error ?? props
+            const combined = modelIdOf(info)
+            let provider: string | undefined
+            let model: string | undefined
+            if (combined && combined.includes("/")) {
+              const slash = combined.indexOf("/")
+              provider = combined.slice(0, slash)
+              model = combined.slice(slash + 1)
+            } else if (combined) {
+              model = combined
+              provider = typeof info?.providerID === "string" ? info.providerID : undefined
+            } else {
+              provider = typeof info?.providerID === "string" ? info.providerID : (typeof props.providerID === "string" ? props.providerID : undefined)
+              model = typeof info?.modelID === "string" ? info.modelID : (typeof props.modelID === "string" ? props.modelID : undefined)
+            }
+            const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? rawError
+            const rawId = (info as any)?.id ?? (props as any)?.sessionID ?? sessionID
+            if (sessionID) {
+              // fire-and-forget nomination; debounce is hook-local
+              noteProviderFailure(sessionID, provider, model, statusRaw, rawId, rawError)
+            }
+          }
           enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
           await persistWatermarks()
           enqueueForSession(sessionID, () => flushSession(sessionID))

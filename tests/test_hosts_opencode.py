@@ -33,6 +33,7 @@ EXPECTED_MAPPING = {
     "user_prompt": "/ingest",
     "assistant_message": "/ingest",
     "tool_use": "/ingest",
+    "provider_error": "/ingest",
     "session_end": "/session/end",
     "flush": "/flush",
     "session_recall_read": "/session/recent",

@@ -306,6 +306,7 @@ class ErrorSignalType(StrEnum):
     EVENT_OUTCOME = "event_outcome"  # B-type: exit codes, tracebacks, revert/edit chains
     COMPOSITE = "composite"  # composite signal: injected-but-unconsumed + later correction
     PUBLISHED = "published"  # published subset: needs_reconcile conflict events today
+    PROVIDER_FAILURE = "provider_failure"  # B1 provider-error family
 
 
 class EvidenceKind(StrEnum):
@@ -361,6 +362,11 @@ class ErrorEvent:
     detector_id: str | None = None
     eligibility_tag: str | None = None
     id: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    status: str | None = None
+    reason: str | None = None
+    retryable: int | None = None
 
 
 @dataclass(frozen=True)

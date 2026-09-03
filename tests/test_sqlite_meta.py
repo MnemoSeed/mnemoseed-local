@@ -574,14 +574,14 @@ def test_meta_migration_preserves_data_and_is_forward_only(tmp_path):
         # per-profile score pool, v4 the dream token ledger, v6 the identity
         # users table + hashed token column, v7 the profile archive flag,
         # v8 the reserved config.scope column, v9 the lifetime filed-points
-        # ledger column and v11 the error-event ledger, so meta lands at 11
+        # ledger column and v11 the error-event ledger + v12 fingerprint, so meta lands at 12
         # (the legacy singleton score_pool is neither dropped nor migrated).
-        assert driver.schema_version() == 11
+        assert driver.schema_version() == 12
         got = driver.get_profile("u1")
         assert got is not None
         assert got.display_name == "survivor"
         driver.migrate()  # idempotent re-run
-        assert driver.schema_version() == 11
+        assert driver.schema_version() == 12
     finally:
         asyncio.run(driver.close())
 
@@ -590,7 +590,7 @@ def test_schema_version_equals_latest_new_install(tmp_path):
     db = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
         assert db.schema_version() == db.migrate()
-        assert db.schema_version() == 11
+        assert db.schema_version() == 12
         # a profile row written after init survives a migrate() no-op
         db.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
         db.migrate()
@@ -613,7 +613,7 @@ def test_v9_backfills_filed_points_born_empty(tmp_path):
 
     driver = SqliteMetaDriver(path=path)
     try:
-        assert driver.schema_version() == 11
+        assert driver.schema_version() == 12
         state = driver.pool_state("u1")
         assert state.balance == 2.5
         assert state.filed_points_total == 0.0

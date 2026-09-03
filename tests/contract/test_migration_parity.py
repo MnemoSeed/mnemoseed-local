@@ -105,12 +105,12 @@ def _parse_index(sql: str) -> tuple[bool, str, str, tuple[str, ...]]:
 
 
 def test_version_sequences_are_shared_and_forward_only() -> None:
-    """The dialect-agnostic sequence IS the parity baseline (graph 1,2,5,10; meta 1,3,4,6,7,8,9,11)."""
-    assert latest_version() == 11
+    """The dialect-agnostic sequence IS the parity baseline (graph 1,2,5,10; meta 1,3,4,6,7,8,9,11,12)."""
+    assert latest_version() == 12
     graph_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("graph"))
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
     assert graph_versions == [1, 2, 5, 10]
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12]
     assert len(MIGRATIONS) == latest_version()
 
 
@@ -378,15 +378,16 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     assert current_schema_version(graph, "graph") == 1
     assert current_schema_version(meta, "meta") == 1
 
-    # forward migration: graph advances to 10, meta to 11 (v2/v5/v10 are
+    # forward migration: graph advances to 10, meta to 12 (v2/v5/v10 are
     # graph-only; v6 is meta-only: identity users table + hashed token column;
-    # v7 is the profile archive flag; v8 is the reserved nullable config.scope
-    # column; v9 is the lifetime filed-points ledger column on
-    # profile_score_pool; v11 is the append-only error-event ledger)
+    # v7 is the profile archive flag; v8 is the reserved nullable
+    # config.scope column; v9 is the lifetime filed-points ledger column on
+    # profile_score_pool; v11 is the append-only error-event ledger; v12 adds
+    # provider/model/status/reason/retryable)
     assert apply_migrations(graph, "graph") == 10
-    assert apply_migrations(meta, "meta") == 11
+    assert apply_migrations(meta, "meta") == 12
     assert current_schema_version(graph, "graph") == 10
-    assert current_schema_version(meta, "meta") == 11
+    assert current_schema_version(meta, "meta") == 12
 
     assert "pinned" in _column_names(graph, "nodes")
     assert "promotion_status" in _column_names(graph, "nodes")
@@ -406,7 +407,8 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     for table in _META_TABLES:
         # v6 adds the nullable token_hash column, v7 the profiles.archived
         # flag, v8 the reserved nullable config.scope column and v9 the
-        # filed_points_total ledger column; legacy rows are preserved
+        # filed_points_total ledger column; v12 adds provider/model/status/
+        # reason/retryable on error_events; legacy rows are preserved
         # byte-for-byte, projected without the new (empty/NULL) columns.
         rows = [r for r in meta_after[table]]
         if table == "tokens":
@@ -415,6 +417,15 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
             rows = [{k: v for k, v in r.items() if k != "archived"} for r in rows]
         if table == "config":
             rows = [{k: v for k, v in r.items() if k != "scope"} for r in rows]
+        if table == "error_events":
+            rows = [
+                {
+                    k: v
+                    for k, v in r.items()
+                    if k not in ("provider", "model", "status", "reason", "retryable")
+                }
+                for r in rows
+            ]
         assert rows == meta_before[table], f"row drift in {table} across v1->head"
 
     # v8: the reserved scope column exists on config and back-fills NULL on the
@@ -454,11 +465,11 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     user_row = dict(meta.execute("SELECT token_hash FROM tokens WHERE token_id = 'tok-1'").fetchone())
     assert user_row["token_hash"] is None  # pre-v6 tokens hold no hash (blessed empty)
 
-    # tracker advanced one step per graph/meta delta (v2/v5/v10 graph, v4/v6/v8/v9/v11 meta)
+    # tracker advanced one step per graph/meta delta (v2/v5/v10 graph, v4/v6/v8/v9/v11/v12 meta)
     graph_versions = [int(r[0]) for r in graph.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
     meta_versions = [int(r[0]) for r in meta.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
     assert sorted(graph_versions) == [1, 2, 5, 10]
-    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11]
+    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11, 12]
 
     # v11: the append-only error-event ledger is a dedicated meta table (born
     # empty, no backfill) — the E1 signal-agnostic nomination ledger.
@@ -474,11 +485,25 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
         "turn_end",
         "detector_id",
         "eligibility_tag",
+        "provider",
+        "model",
+        "status",
+        "reason",
+        "retryable",
     ]
     assert int(meta.execute("SELECT COUNT(*) FROM error_events").fetchone()[0]) == 0
 
 
 def _project_without_deltas(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Drop the post-v1 migration delta columns (pinned v2, promotion_status v5, read_conflict_id v10)."""
-    deltas = {"pinned", "promotion_status", "read_conflict_id"}
+    """Drop post-v1 deltas (v2 pinned, v5 promotion_status, v10 read_conflict_id, v12 fingerprint)."""
+    deltas = {
+        "pinned",
+        "promotion_status",
+        "read_conflict_id",
+        "provider",
+        "model",
+        "status",
+        "reason",
+        "retryable",
+    }
     return [{k: v for k, v in row.items() if k not in deltas} for row in rows]

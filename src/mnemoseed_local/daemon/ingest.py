@@ -28,9 +28,16 @@ from mnemoseed_local.schema.turn import (
     IngestEvent,
     IngestEventType,
     MessageContent,
+    ProviderErrorContent,
     SessionEndRequest,
 )
-from mnemoseed_local.storage.ports import TurnRange
+from mnemoseed_local.storage.ports import (
+    ErrorEvent,
+    ErrorSignalType,
+    EvidenceKind,
+    EvidencePointer,
+    TurnRange,
+)
 from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 router = APIRouter()
@@ -61,6 +68,97 @@ def _effective_ingest_profile(event: IngestEvent, config: Config | None) -> str:
     return event.profile_id
 
 
+_PROVIDER_ALLOWLIST = frozenset(
+    {"quota", "rate_limit", "auth", "model_unavailable", "timeout", "overloaded", "other_provider"}
+)
+_REASON_RE = __import__("re").compile(r"^provider_[a-z0-9_]+$")
+_STATUS_RETRYABLE: dict[str, int] = {
+    "quota": 0,
+    "rate_limit": 1,
+    "auth": 0,
+    "model_unavailable": 0,
+    "timeout": 1,
+    "overloaded": 1,
+    "other_provider": 0,
+}
+_SECRET_SUBSTRINGS = ("sk-", "Bearer", "Authorization", "token=", "key=", "secret")
+
+
+def _redact_safe_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return ""
+    low = v.lower()
+    for s in _SECRET_SUBSTRINGS:
+        if s.lower() in low:
+            return ""
+    # allow only safe chars; URL or credential shaped -> empty
+    if "://" in v or "/" in v and v.count("/") > 1:
+        # model split contains one slash, provider alone must not contain //
+        # keep simple: if contains url-like, drop
+        if "http" in low:
+            return ""
+    # bare id pattern
+    if not __import__("re").match(r"^[A-Za-z0-9._/-]+$", v):
+        return ""
+    if len(v) > 64:
+        return ""
+    return v
+
+
+def _handle_provider_error(event: IngestEvent, effective_profile: str, request: Request) -> bool:
+    """Validate and persist a provider_error nomination. Returns True if handled."""
+    content = event.content
+    if not isinstance(content, ProviderErrorContent):
+        return False
+    provider = _redact_safe_id(content.provider)
+    if not provider:
+        logger.debug("provider_error dropped: empty provider after redaction")
+        return True
+    status = content.status.strip()
+    if status not in _PROVIDER_ALLOWLIST:
+        logger.debug("provider_error dropped: status %r not in allowlist", status)
+        return True
+    reason = content.reason.strip()
+    if not reason or len(reason) > 64 or _REASON_RE.match(reason) is None:
+        logger.debug("provider_error dropped: invalid reason %r", reason)
+        return True
+    model = _redact_safe_id(content.model) if content.model else None
+    # retryable derived
+    retryable = _STATUS_RETRYABLE.get(status)
+    # build ledger row
+    stores = getattr(request.app.state, "stores", None)
+    meta = getattr(stores, "meta", None) if stores is not None else None
+    if meta is None:
+        meta = getattr(request.app.state, "memory", None)
+        # fallback: try stores via memory
+        if meta is not None and hasattr(meta, "_stores"):
+            meta = meta._stores.meta  # type: ignore[attr-defined]
+        else:
+            logger.warning("provider_error no meta store available")
+            return True
+    evt = ErrorEvent(
+        profile_id=effective_profile,
+        signal_type=ErrorSignalType.PROVIDER_FAILURE,
+        observed_at=event.ts,
+        evidence_ptr=EvidencePointer(kind=EvidenceKind.SESSION, id=event.session_id),
+        session_id=event.session_id,
+        detector_id="provider_error.v1",
+        provider=provider,
+        model=model,
+        status=status,
+        reason=reason,
+        retryable=retryable,
+    )
+    try:
+        meta.append_error_event(evt)  # type: ignore[union-attr]
+    except Exception:
+        logger.warning("provider_error append failed", exc_info=True)
+    return True
+
+
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     segmenter: TurnSegmenter = request.app.state.segmenter
@@ -75,6 +173,15 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         if resolve_actor(request) == "hook":
             observability.note_capture_ingest()
         observability.note_profile_sighting(effective_profile)
+    # B1 provider-error nomination path — never falls into focal scan
+    if event.event is IngestEventType.PROVIDER_ERROR:
+        _handle_provider_error(event, effective_profile, request)
+        return {
+            "status": "accepted",
+            "session_id": event.session_id,
+            "profile_id": event.profile_id,
+            "event": event.event.value,
+        }
     try:
         segmenter.ingest(event)
     except ProfileMismatchError as exc:

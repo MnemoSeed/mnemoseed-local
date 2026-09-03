@@ -197,6 +197,14 @@ class DreamRequest(BaseModel):
     profile_id: ProfileRef
 
 
+class ErrorEventsRequest(BaseModel):
+    """Request body for POST /memory/error_events (B1 read route)."""
+
+    profile_id: ProfileRef
+    limit: int = Field(default=50, ge=0, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
 class SessionRecentRequest(BaseModel):
     """Request body for POST /session/recent (B2 time-ordered resume)."""
 
@@ -1187,6 +1195,29 @@ class MemoryService:
             count += 1
         return count
 
+    # B1 provider-failure allowlist (mirrors ingest)
+    _PROVIDER_ALLOWLIST = frozenset(
+        {"quota", "rate_limit", "auth", "model_unavailable", "timeout", "overloaded", "other_provider"}
+    )
+
+    def _live_provider_event(self, profile_id: str) -> Any | None:
+        """Return the most recent live PROVIDER_FAILURE nomination with allowlist status, or None."""
+        try:
+            from mnemoseed_local.storage.ports import ErrorEventFilter, ErrorSignalType, Page
+
+            page = self._stores.meta.query_error_events(
+                ErrorEventFilter(profile_id=profile_id, signal_type=ErrorSignalType.PROVIDER_FAILURE),
+                Page(offset=0, limit=20),
+            )
+            # filter to allowlist status; newest id is last due to id asc order
+            candidates = [e for e in page.items if e.status in self._PROVIDER_ALLOWLIST]
+            if not candidates:
+                return None
+            # most recent = max id
+            return max(candidates, key=lambda e: e.id or 0)
+        except Exception:
+            return None
+
     def recall_pending(self, profile_id: str, session_id: str, seen_chunk_ids: list[str]) -> dict[str, Any]:
         """Serve the pending slot (D6): the caller's seen ids (its T1-injected
         flat list, <=16) join the daemon's SERVED-ids set as the pull-time
@@ -1210,6 +1241,11 @@ class MemoryService:
         key = (profile_id, session_id)
         enabled = self._config.capture.auto_recall
         budget = self._config.capture.auto_recall_budget_chars
+        # B1 event flags — computed even when disabled (disabled => fired false)
+        live = None
+        if enabled:
+            live = self._live_provider_event(profile_id)
+        detector_fired = live is not None
         if not enabled:
             return {
                 "enabled": False,
@@ -1217,6 +1253,13 @@ class MemoryService:
                 "non_focal_above_floor": 0,
                 "budget_chars": budget,
                 "slot_consumed": False,
+                "detector_fired": False,
+                "rule_served": False,
+                "rule_count": 0,
+                "unresolved": False,
+                "provider": None,
+                "model": None,
+                "status": None,
             }
         with self._pending_lock:
             # session-scoped sweep: pending is parked under effective profile
@@ -1267,12 +1310,33 @@ class MemoryService:
                             break
                 non_focal = 0
                 slot_consumed = self._pending_consumed.get(tomb_key, False)
+        # B1 per-event flags: while a PROVIDER_FAILURE nomination is live,
+        # return explicit unresolved when no typed rule exists; never vanished.
+        rule_served = False
+        rule_count = 0
+        unresolved = False
+        provider = None
+        model = None
+        status = None
+        if detector_fired and live is not None:
+            provider = live.provider
+            model = live.model
+            status = live.status
+            # B1 has no typed standing rule yet -> unresolved
+            unresolved = True
         return {
             "enabled": True,
             "items": items,
             "non_focal_above_floor": non_focal,
             "budget_chars": budget,
             "slot_consumed": slot_consumed,
+            "detector_fired": detector_fired,
+            "rule_served": rule_served,
+            "rule_count": rule_count,
+            "unresolved": unresolved,
+            "provider": provider,
+            "model": model,
+            "status": status,
         }
 
     def end_session(self, profile_id: str, session_id: str) -> None:
@@ -1657,6 +1721,41 @@ class MemoryService:
 
     # ------------------------------------------------------------ plumbing
 
+    def list_error_events(self, *, profile_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """B1 read route: profile-scoped error_events with v12 fingerprint."""
+        from mnemoseed_local.storage.ports import ErrorEventFilter, Page
+
+        page = self._stores.meta.query_error_events(
+            ErrorEventFilter(profile_id=profile_id), Page(offset=offset, limit=limit)
+        )
+        return {
+            "profile_id": profile_id,
+            "items": [
+                {
+                    "id": e.id,
+                    "profile_id": e.profile_id,
+                    "signal_type": e.signal_type.value,
+                    "observed_at": e.observed_at,
+                    "evidence_kind": e.evidence_ptr.kind.value,
+                    "evidence_id": e.evidence_ptr.id,
+                    "session_id": e.session_id,
+                    "turn_start": e.turn_range.start if e.turn_range else None,
+                    "turn_end": e.turn_range.end if e.turn_range else None,
+                    "detector_id": e.detector_id,
+                    "eligibility_tag": e.eligibility_tag,
+                    "provider": e.provider,
+                    "model": e.model,
+                    "status": e.status,
+                    "reason": e.reason,
+                    "retryable": e.retryable,
+                }
+                for e in page.items
+            ],
+            "total": page.total,
+            "offset": page.offset,
+            "limit": page.limit,
+        }
+
     def _audit(self, profile_id: str, action: str, detail: dict[str, Any], *, actor: str = "console") -> None:
         self._stores.meta.audit_append(AuditEntry(actor=actor, action=action, detail=detail, at=time.time()))
 
@@ -1789,6 +1888,13 @@ def memory_reinforce(req: ReinforceRequest, request: Request) -> dict[str, Any]:
         chunk_ids=req.chunk_ids,
         node_ids=req.node_ids,
     )
+
+
+@router.post("/memory/error_events")
+def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, Any]:
+    """B1 read route: profile-scoped error_events with v12 fingerprint."""
+    service: MemoryService = request.app.state.memory
+    return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
 
 
 @router.post("/memory/forget_this")
