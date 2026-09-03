@@ -533,8 +533,8 @@ class SqliteMetaDriver:
         self._conn.execute(
             "INSERT INTO error_events (profile_id, signal_type, observed_at, "
             "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
-            "detector_id, eligibility_tag) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "detector_id, eligibility_tag, provider, model, status, reason, retryable) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.profile_id,
                 event.signal_type.value,
@@ -546,6 +546,11 @@ class SqliteMetaDriver:
                 event.turn_range.end if event.turn_range is not None else None,
                 event.detector_id,
                 event.eligibility_tag,
+                event.provider,
+                event.model,
+                event.status,
+                event.reason,
+                event.retryable,
             ),
         )
 
@@ -559,6 +564,9 @@ class SqliteMetaDriver:
         if filter.evidence_kind is not None:
             clauses.append("evidence_kind = ?")
             params.append(filter.evidence_kind.value)
+        if filter.session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(filter.session_id)
         if filter.since is not None:
             clauses.append("observed_at >= ?")
             params.append(iso8601_utc(filter.since))
@@ -717,6 +725,27 @@ def _decode_audit(row: sqlite3.Row) -> AuditEntry:
 
 
 def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
+    # v12 columns are nullable and may be absent on old DBs; use dict-like access with fallback
+    try:
+        provider = row["provider"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        provider = None
+    try:
+        model = row["model"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        model = None
+    try:
+        status = row["status"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        status = None
+    try:
+        reason = row["reason"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        reason = None
+    try:
+        retryable = row["retryable"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        retryable = None
     return ErrorEvent(
         profile_id=str(row["profile_id"]),
         signal_type=ErrorSignalType(str(row["signal_type"])),
@@ -730,6 +759,11 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         detector_id=row["detector_id"],
         eligibility_tag=row["eligibility_tag"],
         id=int(row["id"]),
+        provider=str(provider) if provider is not None else None,
+        model=str(model) if model is not None else None,
+        status=str(status) if status is not None else None,
+        reason=str(reason) if reason is not None else None,
+        retryable=int(retryable) if retryable is not None else None,
     )
 
 

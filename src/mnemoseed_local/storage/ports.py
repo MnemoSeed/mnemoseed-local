@@ -306,6 +306,7 @@ class ErrorSignalType(StrEnum):
     EVENT_OUTCOME = "event_outcome"  # B-type: exit codes, tracebacks, revert/edit chains
     COMPOSITE = "composite"  # composite signal: injected-but-unconsumed + later correction
     PUBLISHED = "published"  # published subset: needs_reconcile conflict events today
+    PROVIDER_FAILURE = "provider_failure"  # B1 provider-error family
 
 
 class EvidenceKind(StrEnum):
@@ -361,6 +362,11 @@ class ErrorEvent:
     detector_id: str | None = None
     eligibility_tag: str | None = None
     id: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    status: str | None = None
+    reason: str | None = None
+    retryable: int | None = None
 
 
 @dataclass(frozen=True)
@@ -369,13 +375,15 @@ class ErrorEventFilter:
 
     ``profile_id`` is always explicit (D5 isolation, same contract as
     ChunkFilter/NodeFilter). ``signal_type`` restricts the family namespace;
-    ``evidence_kind`` restricts the referenced source surface; the time window
-    applies to ``observed_at``.
+    ``evidence_kind`` restricts the referenced source surface; ``session_id``
+    restricts to one session (B1 serve arm is per-(profile, session)); the
+    time window applies to ``observed_at``.
     """
 
     profile_id: str
     signal_type: ErrorSignalType | None = None
     evidence_kind: EvidenceKind | None = None
+    session_id: str | None = None
     since: float | None = None
     until: float | None = None
 

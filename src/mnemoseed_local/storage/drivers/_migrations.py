@@ -557,6 +557,13 @@ _ERROR_EVENTS_DELETE_TRIGGER = AddTrigger(
     pg_action="RAISE EXCEPTION 'error_events is append-only'",
 )
 
+# v12 (B1 provider-failure nomination carrier): nullable provider/model/status/reason/retryable
+_V12_ADD_PROVIDER = AddColumn(store="meta", table="error_events", column=Column("provider", "TEXT"))
+_V12_ADD_MODEL = AddColumn(store="meta", table="error_events", column=Column("model", "TEXT"))
+_V12_ADD_STATUS = AddColumn(store="meta", table="error_events", column=Column("status", "TEXT"))
+_V12_ADD_REASON = AddColumn(store="meta", table="error_events", column=Column("reason", "TEXT"))
+_V12_ADD_RETRYABLE = AddColumn(store="meta", table="error_events", column=Column("retryable", "INTEGER"))
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -668,6 +675,20 @@ MIGRATIONS: tuple[Migration, ...] = (
             _ERROR_EVENTS_TIME_INDEX,
             _ERROR_EVENTS_UPDATE_TRIGGER,
             _ERROR_EVENTS_DELETE_TRIGGER,
+        ),
+    ),
+    Migration(
+        version=12,
+        description=(
+            "B1 provider-failure nomination carrier: nullable provider/model/status/"
+            "reason/retryable columns on error_events (born NULL; only PROVIDER_FAILURE writes them)"
+        ),
+        ops=(
+            _V12_ADD_PROVIDER,
+            _V12_ADD_MODEL,
+            _V12_ADD_STATUS,
+            _V12_ADD_REASON,
+            _V12_ADD_RETRYABLE,
         ),
     ),
 )

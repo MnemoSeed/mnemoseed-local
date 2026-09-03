@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "note": "Sanitized non-live entry-gate NEGATIVE fixture (brief Section 9.4). Must never nominate: app/build/tool text stays a B-type concern even with providerID/modelID present.",
+    "source": "OpenCode message.updated event shape with a compile/build failure surfaced on info.metadata.error.",
+    "opencode_version": "1.18.21 (local toolchain; shape pinned from shipped plugin.ts read points, not a live capture)",
+    "recorded": "2026-09-03",
+    "case": "unrelated build error negative"
+  },
+  "bus_event": {
+    "type": "message.updated",
+    "properties": {
+      "info": {
+        "id": "msg_example_build",
+        "role": "assistant",
+        "sessionID": "sess_example_build",
+        "providerID": "anthropic",
+        "modelID": "claude-sonnet-4",
+        "time": { "error": 222 },
+        "metadata": { "error": "Compilation failed: exit status 1 (tool build error, not provider)" }
+      },
+      "sessionID": "sess_example_build"
+    }
+  },
+  "pinned_contract": {
+    "expected": "no nomination (detector returns null; zero provider_error POSTs)"
+  }
+}

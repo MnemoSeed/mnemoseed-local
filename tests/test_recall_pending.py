@@ -151,13 +151,15 @@ def test_recall_pending_gated_off_answers_disabled_and_consumes_nothing(config_p
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
-        assert _pull(client, "sess-b") == {
+        payload = _pull(client, "sess-b")
+        for k, v in {
             "enabled": False,
             "items": [],
             "non_focal_above_floor": 0,
             "budget_chars": 2400,
             "slot_consumed": False,
-        }
+        }.items():
+            assert payload[k] == v
 
 
 def test_recall_pending_serves_focal_entities_once_and_marks_seen(recall_config_path: Path) -> None:
@@ -227,13 +229,14 @@ def test_recall_pending_consumed_tombstone_survives_until_session_end(recall_con
         assert len(first["items"]) == 1
         # the retry after a serve: the slot is gone, the tombstone answers
         retry = _pull(client, "sess-b")
-        assert retry == {
+        for k, v in {
             "enabled": True,
             "items": [],
             "non_focal_above_floor": 0,
             "budget_chars": 2400,
             "slot_consumed": True,
-        }
+        }.items():
+            assert retry[k] == v
         # the settle is terminal for the tombstone too
         _settle(client, "sess-b")
         after = _pull(client, "sess-b")

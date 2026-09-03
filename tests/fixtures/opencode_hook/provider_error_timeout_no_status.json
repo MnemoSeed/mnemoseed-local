@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "note": "Sanitized non-live entry-gate fixture (brief Section 9.4). Synthetic values only; no secrets, no live data.",
+    "source": "OpenCode session.error event shape; provider/model read points at plugin.ts session.error branch (properties.info.providerID/modelID, properties.error). No numeric status exists for this class.",
+    "opencode_version": "1.18.21 (local toolchain; shape pinned from shipped plugin.ts read points, not a live capture)",
+    "recorded": "2026-09-03",
+    "case": "status-less hang (180s no-response class) carried as SDK abort text"
+  },
+  "bus_event": {
+    "type": "session.error",
+    "properties": {
+      "sessionID": "sess_example_timeout",
+      "info": { "providerID": "openai", "modelID": "gpt-4o" },
+      "error": "The operation was aborted due to timeout after 180s with no response"
+    }
+  },
+  "pinned_contract": {
+    "provider": "properties.info.providerID",
+    "model": "properties.info.modelID",
+    "status_text": "properties.error (abort/no-response wording; no numeric status)",
+    "expected_status_token": "timeout",
+    "expected_reason": "provider_timeout_no_status"
+  }
+}

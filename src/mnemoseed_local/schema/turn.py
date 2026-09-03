@@ -39,6 +39,7 @@ class IngestEventType(StrEnum):
     USER_PROMPT = "user_prompt"  # Claude Code/Codex UserPromptSubmit
     ASSISTANT_MESSAGE = "assistant_message"  # CC Stop / Cursor afterAgentResponse / Gemini Stop
     TOOL_USE = "tool_use"  # CC/Cursor PostToolUse / OpenCode tool.execute.after
+    PROVIDER_ERROR = "provider_error"  # B1 provider-failure nomination
 
 
 class TurnRole(StrEnum):
@@ -54,6 +55,16 @@ class MessageContent(BaseModel):
 
     text: str
     model_id: str | None = None  # producing model; assistant replies only
+
+
+class ProviderErrorContent(BaseModel):
+    """Provider-failure nomination content (provider_error)."""
+
+    provider: str
+    model: str | None = None
+    status: str
+    reason: str
+    error_id: str | None = None
 
 
 class ToolContent(BaseModel):
@@ -79,7 +90,7 @@ class IngestEvent(BaseModel):
     session_id: str
     profile_id: ProfileRef
     ts: float
-    content: MessageContent | ToolContent
+    content: MessageContent | ToolContent | ProviderErrorContent
     importance_hint: float | None = Field(default=None, ge=0.0, le=1.0)  # FR-1.9
     # Origin-agent attribution reported by the host (additive, wire-compatible
     # both directions); absent means unknown, never a guess.
@@ -91,6 +102,11 @@ class IngestEvent(BaseModel):
         if self.event is IngestEventType.TOOL_USE:
             if not isinstance(self.content, ToolContent):
                 raise ValueError("event 'tool_use' requires content as {tool_name, input, output}")
+        elif self.event is IngestEventType.PROVIDER_ERROR:
+            if not isinstance(self.content, ProviderErrorContent):
+                raise ValueError(
+                    "event 'provider_error' requires content as {provider, model, status, reason}"
+                )
         elif not isinstance(self.content, MessageContent):
             raise ValueError(f"event '{self.event.value}' requires content as {{text, model_id}}")
         return self
