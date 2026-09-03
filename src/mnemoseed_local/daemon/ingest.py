@@ -72,14 +72,15 @@ _PROVIDER_ALLOWLIST = frozenset(
     {"quota", "rate_limit", "auth", "model_unavailable", "timeout", "overloaded", "other_provider"}
 )
 _REASON_RE = __import__("re").compile(r"^provider_[a-z0-9_]+$")
-_STATUS_RETRYABLE: dict[str, int] = {
+_STATUS_RETRYABLE: dict[str, int | None] = {
     "quota": 0,
     "rate_limit": 1,
     "auth": 0,
     "model_unavailable": 0,
     "timeout": 1,
     "overloaded": 1,
-    "other_provider": 0,
+    # other_provider is honest unknown: never a fabricated 0/1.
+    "other_provider": None,
 }
 _SECRET_SUBSTRINGS = ("sk-", "Bearer", "Authorization", "token=", "key=", "secret")
 

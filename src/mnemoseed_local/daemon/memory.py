@@ -452,6 +452,17 @@ class MemoryService:
         # B2.7: per-session daemon-side T2 char count (served items), reported
         # as ``rules_budget.budget_consumed`` — the hook only reads it.
         self._budget_consumed: dict[tuple[str, str], int] = {}
+        # B1 provider-failure event arm: per-(profile, session) consumed event
+        # ids. A live nomination arms exactly one serve; the serve marks the
+        # event id consumed under the same lock, so an unresolved row can
+        # never stay permanently armed. Cleared on /session/end with the
+        # rest of the lifecycle state.
+        self._provider_event_consumed: set[tuple[str, str, int]] = set()
+        # B1 settled-session cutoff: /session/end records its timestamp per
+        # (profile, session); rows observed at or before the settle never
+        # re-arm (the ledger stays append-only — the arm reads around old
+        # rows instead of deleting them). Bounded like the hook debounce.
+        self._provider_event_settled: dict[tuple[str, str], float] = {}
 
     @property
     def retriever(self) -> HybridRetriever:
@@ -1199,24 +1210,57 @@ class MemoryService:
     _PROVIDER_ALLOWLIST = frozenset(
         {"quota", "rate_limit", "auth", "model_unavailable", "timeout", "overloaded", "other_provider"}
     )
+    # B1 event-arm liveness window (seconds): a nomination older than this no
+    # longer arms the serve, so an unresolved append-only row expires instead
+    # of staying armed forever. Session-end and per-serve consumption clear
+    # it sooner.
+    _PROVIDER_EVENT_WINDOW_S = 1800.0
 
-    def _live_provider_event(self, profile_id: str) -> Any | None:
-        """Return the most recent live PROVIDER_FAILURE nomination with allowlist status, or None."""
+    def _live_provider_event(self, profile_id: str, session_id: str, now: float | None = None) -> Any | None:
+        """Return the newest live PROVIDER_FAILURE nomination for this session.
+
+        Scoped strictly to (profile_id, session_id) through the storage
+        filter; armed only when the row carries an allowlist status, falls
+        inside the liveness window, and has not been consumed by an earlier
+        serve of the same session.
+        """
         try:
             from mnemoseed_local.storage.ports import ErrorEventFilter, ErrorSignalType, Page
 
+            at = time.time() if now is None else now
             page = self._stores.meta.query_error_events(
-                ErrorEventFilter(profile_id=profile_id, signal_type=ErrorSignalType.PROVIDER_FAILURE),
+                ErrorEventFilter(
+                    profile_id=profile_id,
+                    session_id=session_id,
+                    signal_type=ErrorSignalType.PROVIDER_FAILURE,
+                ),
                 Page(offset=0, limit=20),
             )
-            # filter to allowlist status; newest id is last due to id asc order
-            candidates = [e for e in page.items if e.status in self._PROVIDER_ALLOWLIST]
-            if not candidates:
+            settled_at = self._provider_event_settled.get((profile_id, session_id))
+            # filter to allowlist status + liveness window + unconsumed +
+            # post-settle only; newest id is last due to id asc order
+            fresh = [
+                e
+                for e in page.items
+                if e.status in self._PROVIDER_ALLOWLIST
+                and e.observed_at is not None
+                and 0 <= at - e.observed_at <= self._PROVIDER_EVENT_WINDOW_S
+                and (settled_at is None or e.observed_at > settled_at)
+                and (profile_id, session_id, e.id) not in self._provider_event_consumed
+            ]
+            if not fresh:
                 return None
             # most recent = max id
-            return max(candidates, key=lambda e: e.id or 0)
+            return max(fresh, key=lambda e: e.id or 0)
         except Exception:
             return None
+
+    def _consume_provider_event(self, profile_id: str, session_id: str, event_id: int | None) -> None:
+        """Mark one served nomination consumed so it never re-arms."""
+        if event_id is None:
+            return
+        with self._pending_lock:
+            self._provider_event_consumed.add((profile_id, session_id, event_id))
 
     def recall_pending(self, profile_id: str, session_id: str, seen_chunk_ids: list[str]) -> dict[str, Any]:
         """Serve the pending slot (D6): the caller's seen ids (its T1-injected
@@ -1244,7 +1288,7 @@ class MemoryService:
         # B1 event flags — computed even when disabled (disabled => fired false)
         live = None
         if enabled:
-            live = self._live_provider_event(profile_id)
+            live = self._live_provider_event(profile_id, session_id)
         detector_fired = live is not None
         if not enabled:
             return {
@@ -1322,8 +1366,10 @@ class MemoryService:
             provider = live.provider
             model = live.model
             status = live.status
-            # B1 has no typed standing rule yet -> unresolved
+            # B1 has no typed standing rule yet -> unresolved; the serve
+            # consumes this nomination so it arms exactly once per session.
             unresolved = True
+            self._consume_provider_event(profile_id, session_id, live.id)
         return {
             "enabled": True,
             "items": items,
@@ -1361,6 +1407,17 @@ class MemoryService:
             self._pending_consumed.pop(key, None)
             self._budget_consumed.pop(key, None)
             self._scan_seq.pop(key, None)
+            # B1: a settled session drops its consumed provider-event marks —
+            # the arm never survives /session/end.
+            for done in [k for k in self._provider_event_consumed if k[:2] == key or k[1] == session_id]:
+                self._provider_event_consumed.discard(done)
+            # B1: record the settle cutoff so pre-end rows never re-arm; a
+            # later genuine error in the same session id still arms (its
+            # observed_at is newer than the cutoff). Bounded: drop oldest.
+            self._provider_event_settled[key] = time.time()
+            if len(self._provider_event_settled) > 512:
+                oldest = min(self._provider_event_settled, key=lambda k: self._provider_event_settled[k])
+                del self._provider_event_settled[oldest]
             # orphan pending slots parked under the effective profile (bound
             # agent's wire vs effective mismatch) — sweep any other profile
             # keys for the same session_id

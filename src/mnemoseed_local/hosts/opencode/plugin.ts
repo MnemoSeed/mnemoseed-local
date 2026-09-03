@@ -128,7 +128,9 @@ function redactSafeId(value: string | undefined): string {
 }
 
 function normalizeProviderStatus(raw: unknown, provider: string, model: string): string | null {
-  // raw may be numeric status, string, or object with code/message
+  // Fail-closed: app/build/tool text never nominates, unknown text never
+  // nominates. Only an explicit provider taxonomy signal (status code or
+  // provider/transport wording) yields a token.
   let s = ""
   if (typeof raw === "number") s = String(raw)
   else if (typeof raw === "string") s = raw
@@ -137,6 +139,29 @@ function normalizeProviderStatus(raw: unknown, provider: string, model: string):
     s = String(r.status ?? r.code ?? r.message ?? "")
   }
   const low = s.toLowerCase()
+  // App / build / tool failures are B-type candidates, never provider failure —
+  // even when a providerID/modelID happens to be present on the message.
+  if (
+    low.includes("exit status") ||
+    low.includes("exit code") ||
+    low.includes("traceback") ||
+    low.includes("compilation failed") ||
+    low.includes("build error") ||
+    low.includes("build failed") ||
+    low.includes("build failure") ||
+    low.includes("tool failure") ||
+    low.includes("tool failed") ||
+    low.includes("tool error") ||
+    low.includes("command failed") ||
+    low.includes("tests failed") ||
+    low.includes("test failed") ||
+    low.includes("enoent") ||
+    low.includes("eacces") ||
+    low.includes("npm err") ||
+    low.includes("tsc ") ||
+    low.includes("eslint")
+  )
+    return null
   // 410 Gone -> model_unavailable
   if (low.includes("410") || low.includes("gone") || low.includes("eol")) return "model_unavailable"
   if (low.includes("429")) {
@@ -144,17 +169,36 @@ function normalizeProviderStatus(raw: unknown, provider: string, model: string):
     return "rate_limit"
   }
   if (low.includes("401") || low.includes("403") && low.includes("auth") || low.includes("invalid key") || low.includes("forbidden")) return "auth"
+  if (low.includes("402") || low.includes("quota") || low.includes("usage-limit") || low.includes("usage limit")) return "quota"
   if (low.includes("400") || low.includes("404") || low.includes("409")) return "model_unavailable"
   if (low.includes("408") || low.includes("504") || low.includes("timeout") || low.includes("timedout") || low.includes("etimedout") || low.includes("abort")) return "timeout"
   if (low.includes("500") || low.includes("502") || low.includes("503") || low.includes("overloaded") || low.includes("unavailable")) return "overloaded"
-  if (!s) return "timeout" // status-less hang (180s no response) -> timeout via SDK abort
-  if (low.includes("quota")) return "quota"
+  if (!s) return null // blank/ambiguous: fail closed, never a nomination
   if (low.includes("rate")) return "rate_limit"
   if (low.includes("auth")) return "auth"
   if (low.includes("model")) return "model_unavailable"
-  if (low.includes("timeout")) return "timeout"
   if (low.includes("overload")) return "overloaded"
-  return "other_provider"
+  // other_provider only for provable provider/transport failures, never for
+  // unknown or ambiguous text.
+  if (
+    low.includes("transport") ||
+    low.includes("connection") ||
+    low.includes("socket") ||
+    low.includes("network") ||
+    low.includes("econn") ||
+    low.includes("enotfound") ||
+    low.includes("eai_again") ||
+    low.includes("epipe") ||
+    low.includes("fetch failed") ||
+    low.includes("upstream") ||
+    low.includes("gateway") ||
+    low.includes("proxy") ||
+    low.includes("ssl") ||
+    low.includes("tls") ||
+    low.includes("certificate")
+  )
+    return "other_provider"
+  return null
 }
 
 function reasonForStatus(status: string): string {
@@ -1350,10 +1394,13 @@ export default async function MnemoSeedLocalPlugin(
         error: info?.metadata?.error ?? info?.error ?? null,
       })
     }
-    // B1 provider-failure nomination gate (message.updated with time.error or metadata.error)
-    const hasProviderError = errorAt !== undefined || !!(info?.metadata?.error ?? info?.error)
+    // B1 provider-failure nomination gate (message.updated with time.error or metadata.error).
+    // Fail-closed: a bare numeric time.error with no error payload never
+    // nominates — the actual error payload must be present. The classifier
+    // drops app/build/tool text and unknown status (returns null).
+    const rawError = info?.metadata?.error ?? info?.error ?? null
+    const hasProviderError = rawError != null
     if (hasProviderError) {
-      const rawError = info?.metadata?.error ?? info?.error ?? null
       const combined = modelIdOf(info)
       let provider: string | undefined
       let model: string | undefined
@@ -1368,7 +1415,9 @@ export default async function MnemoSeedLocalPlugin(
         provider = typeof info?.providerID === "string" ? info.providerID : undefined
         model = typeof info?.modelID === "string" ? info.modelID : undefined
       }
-      const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? (rawError as any)?.type ?? errorAt ?? rawError
+      // The actual error payload/text leads; the numeric time.error stamp is
+      // consulted last so it can never shadow a real 429/timeout message.
+      const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? (rawError as any)?.type ?? rawError ?? errorAt
       const sessionIDForError = String(info?.sessionID ?? "")
       if (sessionIDForError) {
         noteProviderFailure(sessionIDForError, provider, model, statusRaw, info?.id, rawError)

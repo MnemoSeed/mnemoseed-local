@@ -1517,6 +1517,96 @@ async function main() {
       break
     }
 
+    case "provider-error-nomination": {
+      // B1 joined seam: the REAL bundled plugin sees canned provider-failure
+      // bus events; the transcript carries the exact POST bodies the daemon
+      // must accept. True 429 (with a numeric time.error stamp present, so a
+      // timestamp-shadowing mutant misreads it) must nominate quota; a
+      // status-less hang on session.error must nominate timeout; a build
+      // failure with providerID present must emit NOTHING.
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m-b1-429",
+              role: "assistant",
+              sessionID: "sess-b1-429",
+              providerID: "anthropic",
+              modelID: "claude-sonnet-4",
+              time: { error: 123 },
+              metadata: { error: "429 quota exceeded for model claude-sonnet-4" },
+            },
+            sessionID: "sess-b1-429",
+          },
+        },
+      })
+      await delay(100)
+      await hooks.event({
+        event: {
+          type: "session.error",
+          properties: {
+            sessionID: "sess-b1-timeout",
+            info: { providerID: "openai", modelID: "gpt-4o" },
+            error: "The operation was aborted due to timeout after 180s with no response",
+          },
+        },
+      })
+      await delay(100)
+      const beforeBuild = posts.filter((post) => post.body.event === "provider_error").length
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m-b1-build",
+              role: "assistant",
+              sessionID: "sess-b1-build",
+              providerID: "anthropic",
+              modelID: "claude-sonnet-4",
+              time: { error: 456 },
+              metadata: { error: "Compilation failed: exit status 1 (tool build error, not provider)" },
+            },
+            sessionID: "sess-b1-build",
+          },
+        },
+      })
+      await delay(100)
+      const afterBuild = posts.filter((post) => post.body.event === "provider_error").length
+      console.log(JSON.stringify({ posts, buildErrorPosts: afterBuild - beforeBuild }))
+      break
+    }
+
+    case "provider-error-secret": {
+      // B1 M4: secret-bearing raw hook input must reach the plugin
+      // normalization/redaction and leave NO secret bytes in the POST body.
+      // The message still carries a real 429 signal so it nominates.
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m-b1-secret",
+              role: "assistant",
+              sessionID: "sess-b1-secret",
+              providerID: "openai",
+              modelID: "gpt-4o",
+              time: { error: 789 },
+              metadata: {
+                error:
+                  "HTTP 429: rate limit exceeded for key sk-live-abcdef1234567890 " +
+                  "(Bearer abcdef, token=hunter2, see https://api.provider.example/v1/keys)",
+              },
+            },
+            sessionID: "sess-b1-secret",
+          },
+        },
+      })
+      await delay(100)
+      console.log(JSON.stringify({ posts }))
+      break
+    }
+
     default:
       console.error(`unknown scenario: ${scenario}`)
       process.exit(64)

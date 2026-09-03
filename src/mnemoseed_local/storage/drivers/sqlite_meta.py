@@ -564,6 +564,9 @@ class SqliteMetaDriver:
         if filter.evidence_kind is not None:
             clauses.append("evidence_kind = ?")
             params.append(filter.evidence_kind.value)
+        if filter.session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(filter.session_id)
         if filter.since is not None:
             clauses.append("observed_at >= ?")
             params.append(iso8601_utc(filter.since))
