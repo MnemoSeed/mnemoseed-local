@@ -136,3 +136,53 @@ while ($true) {
 - **测试增量**：**13 钉**：翻转 pin（join-hang 文档 → bounded-abandon 实证）、daemon/unregistered 注册表 pin、subprocess 红绿对（DaemonExecutor wedged 子进程 rc=0 ∥ TPE wedged 子进程必挂——机制级直接证据）、retriever close 有界、recall-after-close RuntimeError、ingest scan 上 daemon 池且无 AnyIO worker、fire dump 全线程帧、dump 失败/ debug 失败皆不挡 exit、close 弃队不迟跑、提交竞态 lock-ordered。
 - **如实边界**：(i) dump 目标盘的 BLOCKING open（停摆网络 share）可推迟 exit——band 外边界；(ii) 卡死的调用本体保持卡死（abandoned 线程+被占的 `_write_lock` 至重启；D4-变体 = 有界 `_write_lock.acquire(timeout=...)` 挂起，等 D5 堆栈证据命名 wedge 层）；(iii) daemon.log 每次 fire 追加全线程 dump（百行级，fire 稀少可承受）；(iv) anyio scan 池永不关闭是刻意单例；(v) dump 判帧用函数名（Windows faulthandler 不打印线程名）——实现偏离如实记。
 - **生效前提**：`uv tool install --force` + daemon 重启；之后每次 watchdog fire 自带全线程堆栈取证。
+
+## 附录 Rev 3 · watchdog 诊断批次（solution-architect + senior QA 终审 CLOSABLE）
+
+> 范围冻结：仅 `daemon/watchdog.py`、`daemon/runner.py`、`tests/test_daemon_watchdog.py`；
+> D1-D8 一字不改。WATCHDOG 常量、wall-clock 宽限判定、`boot-grace`/`refused-grace`
+> 字符串、fire exit code 1、`create_app`/TestClient 永不武装、`up` 不 spawn 子进程
+> 均不变；不新增 scheduler/guard/supervisor/restart/retry/self-heal。
+> 本批是纯诊断取证批次——**9/3 listener 丢失根因仍未知**，外部自动重启已移除，
+> 本批未部署前不改变任何现网行为。
+
+- **R1 探针结果类型**：`ProbeKind = Literal[success, refused, timeout, other_oserror]`，
+  frozen `ProbeResult(alive, kind, latency_ms)`；`probe` 接受
+  `Callable[[], bool | ProbeResult]`，`_run` 每轮恰调用一次（bool False→REFUSED、
+  True→SUCCESS 归一化，fire 只看 `alive`）；生产 `default_probe_result` 单
+  `create_connection`（捕获顺序 ConnectionRefusedError → timeout/TimeoutError →
+  其他 OSError，含 WinError 64 → alive/other_oserror），`default_probe` 保留 bool
+  wrapper 与原 B6 日志行；latency 由 `_run` 单次调用前后 monotonic 计量并覆盖，
+  `default_probe_result` 不二次计时。
+- **R2 有界统计**：Watchdog 内固定标量 `probe_total`、四 kind counts、
+  `last/max_latency_ms`、`refused_window_start`、`snapshot_errors`、
+  `instrumentation_errors`；禁 list/deque/p50/全量 latency；仅 refused 窗口
+  start/end transition 与 fire 记日志（B6 行格式不变）。
+  > **日志边界澄清（QA 收口）**：这里"edge-only"特指本次 Rev 3 **新增**的
+  > transition 行（refused 窗口 start/end）与 fire summary 行——它们只在
+  > 状态边沿触发。**预先存在的 per-probe B6 行（timeout 与 other_oserror
+  > 的"stalled; treating as alive (B6 domain)"）并非 edge-only**：它们本就
+  > 在每次 stall 探针时照常逐行出现，格式与频率保持 Rev 3 之前一致，未改动。
+- **R3 双 stop 检查**：`_run` 顺序 单 probe → stats → 第一 `_stop.is_set()` →
+  alive/refused bookkeeping/transition → 达宽限后 snapshot+summary（失败只计数/debug）
+  → 第二 `_stop.is_set()` 紧贴 `_fire` → fire；`fire: Callable[[str], NoReturn]`
+  签名不变，summary 暂存实例，旧 reason 单参注入测试零改。
+- **R4 纯读快照**：`runner._snapshot_server(server) -> tuple[dict, int]`，
+  读 should_exit/started 与至多 2 servers × 4 sockets，逐项封套；仅输出
+  bool/int fd/TCP host+port/error type+errno（单字段 ≤200B、总值 ≤2KB，超限降级并
+  计错；非 TCP 地址不记 path）；禁 `import json` 与 socket/server repr；
+  helper 不共享 Watchdog 可变 counter，`run_server` 以 optional
+  `server_snapshot` callable 接入。
+- **R5 故障计数纪律**：新观测代码禁裸 except/pass；外层先增 `snapshot_errors` 或
+  `instrumentation_errors` 再调永不抛 `_safe_debug`；仅 `_safe_debug` 最内层允许
+  bare pass 且不再触 stats/time/IO/log（防递归）。
+- **R6 fire 顺序**：critical 末语+summary → logger 链 flush → with open
+  daemon.log append 写 header+summary → `dump.flush()` → faulthandler all_threads
+  → with close → finally exit(1)；禁 fsync；直接 `_default_fire` 旧测试无 summary
+  时走最小安全 summary。
+- **R7 日志白名单**：transition/fire schema 仅 host/port、reason、monotonic
+  elapsed、kind counts、last/max latency、armed、snapshot 安全字段、error
+  counters；新日志禁 text/content/chunk/header/ssl/path/payload/profile/session/turn。
+- **门禁与证据**：12 个 Rev3 新钉（RED 先行，10 红 2 回归 pin）→ 全绿；
+  双 stop-check mutant 各自杀死对应测试；`uv run pytest -q` 全量通过；
+  ruff check / format / mypy 全净。
