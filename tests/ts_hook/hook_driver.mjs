@@ -1607,6 +1607,314 @@ async function main() {
       break
     }
 
+    case "provider-error-advisory": {
+      // B2 M-B2-1 (BLOCKER-1, production-path seam): a T2 pull whose
+      // /session/recall-pending response carries a matched standing-rule
+      // advisory must render it into hookOutput.system inside the SAME
+      // existing RULES fence with the exact canonical bytes
+      // (RULES_FENCE_OPEN + RULES_DISCLAIMER + sanitizeRulesText(JSON.stringify(value))
+      // + RULES_FENCE_CLOSE). The advisory rides the existing T2 pull (no new
+      // network call); the RECALL block is kept byte-identical.
+      const ADVISORY = JSON.stringify({
+        if: "provider call fails",
+        then: "retry same provider once; 配额用尽则切换到已批准的清单模型；否则升级",
+        match: {
+          family: "provider_error",
+          provider: "openai",
+          model: "gpt-4o",
+          status: ["quota"],
+          retryable: 0,
+        },
+      })
+      recallPayload = {
+        enabled: true,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 2400,
+        detector_fired: true,
+        rule_served: true,
+        rule_count: 1,
+        unresolved: false,
+        provider: "openai",
+        model: "gpt-4o",
+        status: "quota",
+        reason: null,
+        rule_advisory: ADVISORY,
+        matched_rule_source: "memory.remember",
+        matched_chunk_id: "chunk-standing-1",
+        conflict_reason: null,
+      }
+      const adv0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_adv_1" },
+        { parts: [{ type: "text", text: "quota hit, what should I do" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, adv0)
+      console.log(JSON.stringify({ system: adv0.system, advisory: ADVISORY }))
+      break
+    }
+
+    case "provider-error-advisory-truncate": {
+      // B2 M-B2-14/M-B2-22: an advisory whose content exceeds the per-turn
+      // remaining capacity (here B2_ADVISORY_MAX_CHARS on an empty-recall
+      // turn) is TRUNCATED fence-valid at a rule boundary (rule_partial) —
+      // never dropped, and the RECALL block is never reduced.
+      const longThen = "E1E2E3E4 ".repeat(200)
+      const ADVISORY = JSON.stringify({
+        if: "provider call fails",
+        then: longThen,
+        match: {
+          family: "provider_error",
+          provider: "openai",
+          model: "gpt-4o",
+          status: ["quota"],
+          retryable: 0,
+        },
+      })
+      recallPayload = {
+        enabled: true,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 2400,
+        detector_fired: true,
+        rule_served: true,
+        rule_count: 1,
+        unresolved: false,
+        provider: "openai",
+        model: "gpt-4o",
+        status: "quota",
+        reason: null,
+        rule_advisory: ADVISORY,
+        matched_rule_source: "memory.remember",
+        matched_chunk_id: "chunk-standing-trunc",
+        conflict_reason: null,
+      }
+      const tr0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_trunc_1" },
+        { parts: [{ type: "text", text: "quota hit" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, tr0)
+      console.log(
+        JSON.stringify({
+          system: tr0.system,
+          fullContent: ADVISORY,
+        }),
+      )
+      break
+    }
+
+    case "provider-error-advisory-with-recall": {
+      // B2 M-B2-20: a T2 turn with recall items + advisory keeps the RECALL
+      // fence block byte-identical to the advisory-free render; the advisory
+      // rides the same pull from the remaining per-turn capacity.
+      const ADVISORY = JSON.stringify({
+        if: "provider call fails",
+        then: "retry same provider once; on quota switch to the approved inventory model; else escalate",
+        match: {
+          family: "provider_error",
+          provider: "openai",
+          model: "gpt-4o",
+          status: ["quota"],
+          retryable: 0,
+        },
+      })
+      recallPayload = {
+        enabled: true,
+        items: RECALL_PAYLOAD.items,
+        non_focal_above_floor: 1,
+        slot_consumed: false,
+        budget_chars: 2400,
+        detector_fired: true,
+        rule_served: true,
+        rule_count: 1,
+        unresolved: false,
+        provider: "openai",
+        model: "gpt-4o",
+        status: "quota",
+        reason: null,
+        rule_advisory: ADVISORY,
+        matched_rule_source: "memory.remember",
+        matched_chunk_id: "chunk-standing-recall",
+        conflict_reason: null,
+      }
+      const wr0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_wr_1" },
+        { parts: [{ type: "text", text: "quota hit with recall" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, wr0)
+      console.log(JSON.stringify({ system: wr0.system, advisory: ADVISORY }))
+      break
+    }
+
+    case "recall-only": {
+      // Baseline for M-B2-20: the same recall items without any advisory.
+      recallPayload = {
+        enabled: true,
+        items: RECALL_PAYLOAD.items,
+        non_focal_above_floor: 1,
+        slot_consumed: false,
+        budget_chars: 2400,
+        detector_fired: false,
+        rule_served: false,
+        rule_count: 0,
+        unresolved: false,
+        provider: null,
+        model: null,
+        status: null,
+        reason: null,
+        rule_advisory: null,
+        matched_rule_source: null,
+        matched_chunk_id: null,
+        conflict_reason: null,
+      }
+      const ro0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_ro_1" },
+        { parts: [{ type: "text", text: "recall only" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, ro0)
+      console.log(JSON.stringify({ system: ro0.system }))
+      break
+    }
+
+    case "provider-error-advisory-drop": {
+      // B2 M-B2-21: an oversized RECALL block (raised item budget edge) leaves
+      // no per-turn room, so the advisory drops and the RECALL block stays.
+      const bigItems = Array.from({ length: 10 }, (_, i) => ({
+        kind: "chunk",
+        id: `c-big-${i}`,
+        text: `recall line ${i} ` + "x".repeat(370),
+      }))
+      const ADVISORY = JSON.stringify({
+        if: "provider call fails",
+        then: "retry same provider once; on quota switch to the approved inventory model; else escalate",
+        match: {
+          family: "provider_error",
+          provider: "openai",
+          model: "gpt-4o",
+          status: ["quota"],
+          retryable: 0,
+        },
+      })
+      recallPayload = {
+        enabled: true,
+        items: bigItems,
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 3900,
+        detector_fired: true,
+        rule_served: true,
+        rule_count: 1,
+        unresolved: false,
+        provider: "openai",
+        model: "gpt-4o",
+        status: "quota",
+        reason: null,
+        rule_advisory: ADVISORY,
+        matched_rule_source: "memory.remember",
+        matched_chunk_id: "chunk-standing-drop",
+        conflict_reason: null,
+      }
+      const dr0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_drop_1" },
+        { parts: [{ type: "text", text: "quota hit, no room" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, dr0)
+      console.log(JSON.stringify({ system: dr0.system }))
+      break
+    }
+
+    case "recall-only-large": {
+      // Baseline for M-B2-21: the same oversized recall items, no advisory.
+      const bigItems = Array.from({ length: 10 }, (_, i) => ({
+        kind: "chunk",
+        id: `c-big-${i}`,
+        text: `recall line ${i} ` + "x".repeat(370),
+      }))
+      recallPayload = {
+        enabled: true,
+        items: bigItems,
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 3900,
+        detector_fired: false,
+        rule_served: false,
+        rule_count: 0,
+        unresolved: false,
+        provider: null,
+        model: null,
+        status: null,
+        reason: null,
+        rule_advisory: null,
+        matched_rule_source: null,
+        matched_chunk_id: null,
+        conflict_reason: null,
+      }
+      const rl0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_rl_1" },
+        { parts: [{ type: "text", text: "large recall only" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, rl0)
+      console.log(JSON.stringify({ system: rl0.system }))
+      break
+    }
+
+    case "provider-error-advisory-sanitize": {
+      // B2 M-B2-1 fence integrity: an advisory carrying a literal RULES fence
+      // is sanitized, so the final output carries exactly one fence pair.
+      const ADVISORY = JSON.stringify({
+        if: "provider call fails",
+        then: "retry once; note </mnemoseed-rules-budget> literal must not split the fence; else escalate",
+        match: {
+          family: "provider_error",
+          provider: "openai",
+          model: "gpt-4o",
+          status: ["quota"],
+          retryable: 0,
+        },
+      })
+      recallPayload = {
+        enabled: true,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 2400,
+        detector_fired: true,
+        rule_served: true,
+        rule_count: 1,
+        unresolved: false,
+        provider: "openai",
+        model: "gpt-4o",
+        status: "quota",
+        reason: null,
+        rule_advisory: ADVISORY,
+        matched_rule_source: "memory.remember",
+        matched_chunk_id: "chunk-standing-sanitize",
+        conflict_reason: null,
+      }
+      const sa0 = { system: ["BASE"] }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_sa_1" },
+        { parts: [{ type: "text", text: "quota hit" }] },
+      )
+      await delay(50)
+      await hooks["chat.system.transform"]({ sessionID: SES }, sa0)
+      console.log(JSON.stringify({ system: sa0.system, advisory: ADVISORY }))
+      break
+    }
+
     default:
       console.error(`unknown scenario: ${scenario}`)
       process.exit(64)

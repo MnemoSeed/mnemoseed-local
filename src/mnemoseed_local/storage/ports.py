@@ -35,7 +35,9 @@ class RecallRule(BaseModel):
     (>0); 0 means permanent. ``scope`` selects the aggregation surface.
     """
 
-    kind: Literal["focal_floor", "budget_chars", "exclude_entities", "entity_boost", "time_window"]
+    kind: Literal[
+        "focal_floor", "budget_chars", "exclude_entities", "entity_boost", "time_window", "standing_rule"
+    ]
     value: float | str | list[str]
     ttl_turns: int = 0
     scope: Literal["profile", "session", "global"] = "session"

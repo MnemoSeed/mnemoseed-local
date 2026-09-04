@@ -39,6 +39,7 @@ usage-event ``last_hit_at``); no randomness; no network.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -122,6 +123,18 @@ class MemoryNotFoundError(Exception):
 # ---------------------------------------------------------------- wire models
 
 NonBlankText = Annotated[str, Field(min_length=1, pattern=r".*\S.*")]
+
+
+@dataclass(frozen=True)
+class _StandingCandidate:
+    """One deterministic standing-rule match candidate for the event arm."""
+
+    kind: str
+    chunk_id: str
+    ingested_at: float
+    provenance_source: str | None
+    specificity: int
+    value: str
 
 
 class RecallRequest(BaseModel):
@@ -975,9 +988,16 @@ class MemoryService:
                 try:
                     rule = RecallRule(**rule_dict)
                 except (ValidationError, TypeError, ValueError):
-                    logger.warning("skipping malformed rules_json entry", exc_info=True)
+                    kind_label = rule_dict.get("kind", "<unknown>")
+                    logger.warning("rules_budget skipping malformed/unknown-kind rule (kind=%s)", kind_label)
+                    logger.debug("rules_budget malformed/unknown kind", extra={"kind": kind_label})
                     continue
                 if not self._rule_in_scope(rule, session_id):
+                    continue
+                if rule.kind == "standing_rule":
+                    # B2 S2: a procedural standing rule never rides the T1/T2
+                    # semantic budget and does not set ``found`` — it serves
+                    # only through the deterministic event arm.
                     continue
                 found = True
                 if rule.kind == "exclude_entities":
@@ -1262,6 +1282,178 @@ class MemoryService:
         with self._pending_lock:
             self._provider_event_consumed.add((profile_id, session_id, event_id))
 
+    def _select_standing_rule(
+        self,
+        *,
+        profile_id: str,
+        session_id: str,
+        provider: str | None,
+        model: str | None,
+        status: str | None,
+        retryable: int | None,
+    ) -> dict[str, Any]:
+        """Deterministically select the serving standing rule for a live event.
+
+        Scoped strictly to the queried profile (no cross-profile channel); only
+        permanent (ttl_turns == 0) standing rules participate. A malformed or
+        non-matching payload is a no-match for that rule, never a crash or a
+        false serve. A full tuple tie resolves fail-closed to a conflict, never
+        a silent first-row pick.
+        """
+        try:
+            page = self._stores.vector.list_chunks(
+                ChunkFilter(profile_id=profile_id, rules_not_null=True),
+                Page(offset=0, limit=1000),
+            )
+        except Exception:
+            logger.warning("standing_rule selection list failed; degrading to no-rule", exc_info=True)
+            return self._no_standing_disposition()
+        candidates = self._candidate_standing_rules(
+            page.items,
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            status=status,
+            retryable=retryable,
+        )
+        if not candidates:
+            return self._no_standing_disposition()
+        return self._pick_standing_winner(candidates)
+
+    def _candidate_standing_rules(
+        self,
+        chunks: Sequence[ChunkStamp],
+        *,
+        session_id: str | None,
+        provider: str | None,
+        model: str | None,
+        status: str | None,
+        retryable: int | None,
+    ) -> list[_StandingCandidate]:
+        out: list[_StandingCandidate] = []
+        for chunk in chunks:
+            for rule_dict in chunk.rules:
+                try:
+                    rule = RecallRule(**rule_dict)
+                except (ValidationError, TypeError, ValueError):
+                    continue
+                if rule.kind != "standing_rule":
+                    continue
+                if rule.ttl_turns != 0:
+                    continue
+                if not self._rule_in_scope(rule, session_id):
+                    continue
+                payload = self._parse_standing_value(rule.value)
+                if payload is None:
+                    continue
+                specificity = self._evaluate_standing_match(payload, provider, model, status, retryable)
+                if specificity < 0:
+                    continue
+                provenance_source = chunk.provenance.source if chunk.provenance is not None else None
+                out.append(
+                    _StandingCandidate(
+                        kind="standing_rule",
+                        chunk_id=chunk.chunk_id,
+                        ingested_at=chunk.ingested_at,
+                        provenance_source=provenance_source,
+                        specificity=specificity,
+                        value=str(rule.value),
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _parse_standing_value(value: float | str | list[str]) -> dict[str, Any] | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _evaluate_standing_match(
+        payload: dict[str, Any],
+        provider: str | None,
+        model: str | None,
+        status: str | None,
+        retryable: int | None,
+    ) -> int:
+        """Return the candidate's specificity (>=0) if it matches, else -1."""
+        match = payload.get("match")
+        if not isinstance(match, dict):
+            return -1
+        if match.get("family") != "provider_error":
+            return -1
+        specificity = 0
+        rule_provider = match.get("provider")
+        if rule_provider is not None:
+            if rule_provider != provider:
+                return -1
+            specificity += 1
+        rule_model = match.get("model")
+        if rule_model is not None:
+            if rule_model != model:
+                return -1
+            specificity += 1
+        rule_status = match.get("status")
+        if rule_status is not None:
+            if not isinstance(rule_status, list) or status not in rule_status:
+                return -1
+            specificity += 1
+        rule_retryable = match.get("retryable")
+        if rule_retryable is not None:
+            # wildcard only via null; a non-null rule NEVER matches a NULL event.
+            # bool is not a valid retryable bound (JSON true/false must not
+            # alias 1/0): reject by exact int type, fail-closed.
+            if retryable is None or type(rule_retryable) is not int or rule_retryable != retryable:
+                return -1
+            specificity += 1
+        return specificity
+
+    @staticmethod
+    def _pick_standing_winner(candidates: list[_StandingCandidate]) -> dict[str, Any]:
+        ordered = sorted(candidates, key=lambda c: (-c.specificity, -c.ingested_at, c.chunk_id))
+        top = ordered[0]
+        if len(ordered) > 1:
+            second = ordered[1]
+            if (
+                second.specificity == top.specificity
+                and second.ingested_at == top.ingested_at
+                and second.chunk_id == top.chunk_id
+            ):
+                return {
+                    "rule_served": False,
+                    "unresolved": True,
+                    "reason": "conflict",
+                    "rule_advisory": None,
+                    "matched_rule_source": None,
+                    "matched_chunk_id": None,
+                    "conflict_reason": f"ambiguous top tie: {top.chunk_id}, {second.chunk_id}",
+                }
+        return {
+            "rule_served": True,
+            "unresolved": False,
+            "reason": None,
+            "rule_advisory": top.value,
+            "matched_rule_source": top.provenance_source,
+            "matched_chunk_id": top.chunk_id,
+            "conflict_reason": None,
+        }
+
+    @staticmethod
+    def _no_standing_disposition() -> dict[str, Any]:
+        return {
+            "rule_served": False,
+            "unresolved": True,
+            "reason": "no-rule",
+            "rule_advisory": None,
+            "matched_rule_source": None,
+            "matched_chunk_id": None,
+            "conflict_reason": None,
+        }
+
     def recall_pending(self, profile_id: str, session_id: str, seen_chunk_ids: list[str]) -> dict[str, Any]:
         """Serve the pending slot (D6): the caller's seen ids (its T1-injected
         flat list, <=16) join the daemon's SERVED-ids set as the pull-time
@@ -1304,6 +1496,11 @@ class MemoryService:
                 "provider": None,
                 "model": None,
                 "status": None,
+                "reason": "disabled",
+                "rule_advisory": None,
+                "matched_rule_source": None,
+                "matched_chunk_id": None,
+                "conflict_reason": None,
             }
         with self._pending_lock:
             # session-scoped sweep: pending is parked under effective profile
@@ -1362,13 +1559,33 @@ class MemoryService:
         provider = None
         model = None
         status = None
+        reason: str | None = None
+        rule_advisory: str | None = None
+        matched_rule_source: str | None = None
+        matched_chunk_id: str | None = None
+        conflict_reason: str | None = None
         if detector_fired and live is not None:
             provider = live.provider
             model = live.model
             status = live.status
-            # B1 has no typed standing rule yet -> unresolved; the serve
-            # consumes this nomination so it arms exactly once per session.
-            unresolved = True
+            # B2: deterministically select a serving standing rule for this
+            # live nomination; consume-once (B1) preserves the one-shot arm.
+            selection = self._select_standing_rule(
+                profile_id=profile_id,
+                session_id=session_id,
+                provider=live.provider,
+                model=live.model,
+                status=live.status,
+                retryable=live.retryable,
+            )
+            rule_served = bool(selection["rule_served"])
+            unresolved = bool(selection["unresolved"])
+            reason = selection["reason"]
+            rule_advisory = selection["rule_advisory"]
+            matched_rule_source = selection["matched_rule_source"]
+            matched_chunk_id = selection["matched_chunk_id"]
+            conflict_reason = selection["conflict_reason"]
+            rule_count = 1 if rule_served else 0
             self._consume_provider_event(profile_id, session_id, live.id)
         return {
             "enabled": True,
@@ -1383,6 +1600,11 @@ class MemoryService:
             "provider": provider,
             "model": model,
             "status": status,
+            "reason": reason,
+            "rule_advisory": rule_advisory,
+            "matched_rule_source": matched_rule_source,
+            "matched_chunk_id": matched_chunk_id,
+            "conflict_reason": conflict_reason,
         }
 
     def end_session(self, profile_id: str, session_id: str) -> None:

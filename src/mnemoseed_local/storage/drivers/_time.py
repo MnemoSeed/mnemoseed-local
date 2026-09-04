@@ -14,9 +14,15 @@ _ZSUFFIX = "Z"
 
 
 def iso8601_utc(epoch: float) -> str:
-    """Render an epoch float as an ISO8601 UTC timestamp, e.g. 2026-08-08T01:02:03.456Z."""
+    """Render an epoch float as an ISO8601 UTC timestamp, e.g. 2026-08-08T01:02:03.456Z.
+
+    The sub-second fraction is floored, never rounded up, so a rendered time
+    never represents a point in the future of ``epoch``. Rounding up allowed a
+    freshly-stamped row to be read back with ``observed_at`` slightly ahead of
+    ``time.time()``, which the event-arm liveness window then rejected.
+    """
     secs = int(epoch)
-    millis = int(round((epoch - secs) * 1000.0))
+    millis = int((epoch - secs) * 1000.0)
     if millis >= 1000:
         secs += 1
         millis = 0
