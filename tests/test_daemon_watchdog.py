@@ -846,3 +846,751 @@ def test_armed_stalled_probe_never_fires() -> None:
         assert fired == []
     finally:
         watchdog.stop()
+
+
+# ------------------------------------------- Rev 3 diagnostics (TDD RED batch)
+
+
+def test_rev3_probe_result_single_call_and_bool_compat(monkeypatch) -> None:
+    """Rev3-A: _run calls the probe callable exactly once per round; the
+    production default_probe_result issues exactly one socket.create_connection
+    per call; legacy bool fakes keep their semantics (False dead, True alive)."""
+    from mnemoseed_local.daemon import watchdog as wd
+
+    calls: list[int] = []
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+
+    def _counting_probe():
+        calls.append(1)
+        return False
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=_counting_probe,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not fired:
+            time.sleep(0.01)
+        assert fired == ["refused-grace"]
+        total = watchdog.probe_total
+        assert total >= 1
+        assert len(calls) == total, "each round must call the probe exactly once"
+    finally:
+        watchdog.stop()
+
+    connect_calls: list[tuple] = []
+
+    def _spy(*args: object, **kwargs: object):
+        connect_calls.append((args, kwargs))
+        raise ConnectionRefusedError("rev3 refused")
+
+    monkeypatch.setattr(socket, "create_connection", _spy)
+    result = wd.default_probe_result("127.0.0.1", 1)
+    assert result.alive is False
+    assert result.kind == "refused"
+    assert len(connect_calls) == 1, "production probe must connect exactly once"
+
+    assert wd.default_probe("127.0.0.1", 1) is False
+    assert len(connect_calls) == 2
+
+
+def test_rev3_winerror64_classified_alive_other_oserror(monkeypatch) -> None:
+    """Rev3-A: WinError 64 reads as alive/other_oserror; refused stays dead;
+    timeout stays alive/timeout."""
+    from mnemoseed_local.daemon import watchdog as wd
+
+    def _win64(*args: object, **kwargs: object):
+        del args, kwargs
+        exc = OSError("network name deleted")
+        exc.winerror = 64  # type: ignore[attr-defined]
+        raise exc
+
+    monkeypatch.setattr(socket, "create_connection", _win64)
+    result = wd.default_probe_result("127.0.0.1", 1)
+    assert result.alive is True
+    assert result.kind == "other_oserror"
+
+    def _refused(*args: object, **kwargs: object):
+        del args, kwargs
+        raise ConnectionRefusedError("gone")
+
+    monkeypatch.setattr(socket, "create_connection", _refused)
+    result = wd.default_probe_result("127.0.0.1", 1)
+    assert result.alive is False
+    assert result.kind == "refused"
+
+    def _timeout(*args: object, **kwargs: object):
+        del args, kwargs
+        raise TimeoutError("stalled")
+
+    monkeypatch.setattr(socket, "create_connection", _timeout)
+    result = wd.default_probe_result("127.0.0.1", 1)
+    assert result.alive is True
+    assert result.kind == "timeout"
+
+
+def test_rev3_dump_header_flush_before_traceback(log_home: Path, monkeypatch) -> None:
+    """Rev3-RB1: _default_fire writes header then flush() then
+    faulthandler.dump_traceback (buffer order pin); no fsync is issued."""
+    import faulthandler as _fh
+
+    order: list[str] = []
+    real_dump = _fh.dump_traceback
+
+    def _spy_dump(*args: object, **kwargs: object) -> None:
+        order.append("traceback")
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(_fh, "dump_traceback", _spy_dump)
+    monkeypatch.setattr(os, "fsync", lambda *a, **k: (_ for _ in ()).throw(AssertionError("fsync forbidden")))
+
+    orig_open = open
+
+    class _SpyFile:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def write(self, data):
+            order.append("write")
+            return self._raw.write(data)
+
+        def flush(self):
+            order.append("flush")
+            return self._raw.flush()
+
+        def __enter__(self):
+            self._raw.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._raw.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._raw, name)
+
+    def _spy_open(*args: object, **kwargs: object):
+        raw = orig_open(*args, **kwargs)
+        if isinstance(raw, str):
+            return raw
+        try:
+            if getattr(raw, "writable", lambda: False)():
+                return _SpyFile(raw)
+        except Exception:
+            pass
+        return raw
+
+    import builtins
+
+    monkeypatch.setattr(builtins, "open", _spy_open)
+    exit_calls: list[int] = []
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+    watchdog._default_fire("boot-grace")
+    assert exit_calls == [1]
+    assert "write" in order and "flush" in order and "traceback" in order
+    assert order.index("write") < order.index("flush") < order.index("traceback")
+
+
+def test_rev3_dump_flush_failure_still_exits_once(log_home: Path, monkeypatch) -> None:
+    """Rev3 flush-bomb: a raising dump.flush() must (a) still let the
+    faulthandler traceback execute (the flush failure is contained to the
+    inner flush — it must not skip the dump), (b) bump instrumentation_errors,
+    and (c) still exit(1) exactly once. A mutant that lets the flush raise
+    escape, or that skips the dump on flush failure, fails (a)/(c)."""
+    import builtins
+    import faulthandler as _fh
+
+    dump_calls: list[bool] = []
+    real_dump = _fh.dump_traceback
+
+    def _spy_dump(*args: object, **kwargs: object) -> None:
+        dump_calls.append(True)
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(_fh, "dump_traceback", _spy_dump)
+
+    orig_open = open
+
+    class _FlushBomb:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def write(self, data):
+            return self._raw.write(data)
+
+        def flush(self):
+            raise OSError("simulated flush failure")
+
+        def __enter__(self):
+            self._raw.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._raw.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._raw, name)
+
+    def _bomb_open(*args: object, **kwargs: object):
+        raw = orig_open(*args, **kwargs)
+        try:
+            if getattr(raw, "writable", lambda: False)():
+                return _FlushBomb(raw)
+        except Exception:
+            pass
+        return raw
+
+    monkeypatch.setattr(builtins, "open", _bomb_open)
+    exit_calls: list[int] = []
+    watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+    watchdog._default_fire("boot-grace")
+    assert dump_calls, "faulthandler.traceback must still run after the flush failure"
+    assert watchdog.instrumentation_errors >= 1, "the flush failure must bump instrumentation_errors"
+    assert exit_calls == [1]
+
+
+def test_rev3_snapshot_shapes_and_caps() -> None:
+    """Rev3-RB1/D: not-started/None/empty/closed/error envelopes; at most
+    2 servers x 4 sockets; only safe primitives; field <=200B; total <=2KB."""
+    from mnemoseed_local.daemon.runner import _snapshot_server
+
+    class _FakeSock:
+        def __init__(self, fd=7, name=("127.0.0.1", 9999)):
+            self._fd = fd
+            self._name = name
+
+        def fileno(self):
+            return self._fd
+
+        def getsockname(self):
+            return self._name
+
+    class _FakeServer:
+        def __init__(self, servers):
+            self.servers = servers
+            self.should_exit = False
+            self.started = False
+
+    class _FakeListener:
+        """One listening object exposing .sockets like asyncio.Server."""
+
+        def __init__(self, sockets):
+            self.sockets = sockets
+
+    class _NoAttr:
+        pass
+
+    snap, errors = _snapshot_server(_NoAttr())
+    assert snap.get("state") == "not-started"
+
+    class _NoneServers:
+        servers = None
+
+    snap, _ = _snapshot_server(_NoneServers())
+    assert snap.get("state") == "not-started"
+
+    class _Empty:
+        servers = []
+
+    snap, _ = _snapshot_server(_Empty())
+    assert snap.get("state") == "empty"
+
+    # There (1): the cap pin must use legitimate server objects (each carrying
+    # should_exit/started) so the error accounting is exactly the SLICING caps —
+    # nothing from absent attributes. 3 servers x 6 sockets each: exactly 2
+    # servers are kept, each listing exactly 4 sockets, and errors == 3
+    # (1 server cap + 2 socket caps). Removing the socket slicing (would emit
+    # 6 sockets) or the server slicing (would emit 3 servers) fails below.
+    servers = [_FakeListener([_FakeSock(fd=i) for i in range(6)]) for _ in range(3)]
+    snap, errors = _snapshot_server(_FakeServer(servers))
+    listed = snap.get("servers")
+    assert isinstance(listed, list) and len(listed) == 2
+    assert all(len(entry.get("sockets", [])) == 4 for entry in listed)
+    assert sum(len(e.get("sockets", [])) for e in listed) == 8  # 2 x 4
+    assert errors == 3, f"1 server cap + 2 socket caps must total 3, got {errors}"
+
+    class _ClosedSock:
+        def fileno(self):
+            raise OSError("closed")
+
+        def getsockname(self):
+            raise OSError("closed")
+
+    snap, errors = _snapshot_server(_FakeServer([_FakeListener([_ClosedSock()])]))
+    assert errors >= 1
+    text = repr(snap)
+    for banned in ("ssl", "config", "keyfile", "header", "payload", "profile", "session"):
+        assert banned not in text.lower()
+
+    class _UnixSock:
+        def fileno(self):
+            return 9
+
+        def getsockname(self):
+            return "/tmp/secret-user.sock"
+
+    snap, _ = _snapshot_server(_FakeServer([_FakeListener([_UnixSock()])]))
+    assert "secret-user" not in repr(snap), "unix paths must never be recorded"
+
+    def _sizes(value) -> int:
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        if isinstance(value, dict):
+            return sum(_sizes(k) + _sizes(v) for k, v in value.items())
+        if isinstance(value, list):
+            return sum(_sizes(v) for v in value)
+        return 8
+
+    big_servers = [_FakeListener([_FakeSock(fd=3, name=("x" * 5000, 1))])]
+    snap, _ = _snapshot_server(_FakeServer(big_servers))
+    assert _sizes(snap) <= 2048
+
+
+def test_rev3_snapshot_raise_counts_and_fire_survives() -> None:
+    """Rev3-RB2: a raising snapshot callable bumps snapshot_errors, emits a
+    debug line, and the fire still happens."""
+    records: list[logging.LogRecord] = []
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+
+    class _Rec(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Rec()
+    daemon_logger.addHandler(handler)
+    old_level = daemon_logger.level
+    daemon_logger.setLevel(logging.DEBUG)
+    fired: list[str] = []
+    fired_event = threading.Event()
+
+    def _boom():
+        raise RuntimeError("snapshot exploded")
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.05,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        server_snapshot=_boom,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "fire must survive a snapshot failure"
+        assert fired == ["boot-grace"]
+        assert watchdog.snapshot_errors >= 1
+        assert any("snapshot" in r.getMessage().lower() for r in records), "a debug line is required"
+    finally:
+        daemon_logger.setLevel(old_level)
+        daemon_logger.removeHandler(handler)
+        handler.close()
+        watchdog.stop()
+
+
+def test_rev3_stats_bounded_no_unbounded_latency() -> None:
+    """Rev3-RB3: stats are fixed bounded scalars; NO instance attribute may be a
+    list or deque regardless of its field name, and the module source contains NO
+    deque/p50/history import or field. The collection-scan predicate must ALSO
+    catch an arbitrary ``self._history = []`` mutant (applied here to a synthetic
+    object carrying the mutant, since the live watchdog must stay clean)."""
+    import collections
+    import inspect
+
+    from mnemoseed_local.daemon import watchdog as wd
+
+    def _unbounded(items: dict[str, object]) -> list[str]:
+        return [name for name, value in items.items() if isinstance(value, (list, collections.deque))]
+
+    fired: list[str] = []
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=5.0,
+        interval=0.01,
+        probe=lambda: True,
+        fire=lambda reason: fired.append(reason),
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.3)
+        assert fired == []
+        assert watchdog.probe_total >= 3
+        assert watchdog.success_count == watchdog.probe_total
+        assert watchdog.last_latency_ms >= 0.0
+        assert watchdog.max_latency_ms >= watchdog.last_latency_ms
+        for name in ("probe_total", "last_latency_ms", "max_latency_ms"):
+            assert isinstance(getattr(watchdog, name), (int, float)), name
+        # The live watchdog carries no unbounded collection attr at all.
+        assert _unbounded(vars(watchdog)) == [], f"unbounded collection attr: {_unbounded(vars(watchdog))}"
+        # The same scan must reject an arbitrary _history=[] mutant, whatever
+        # its field name: a synthetic instance carrying that mutant is caught.
+        mutant = {"_history": [0.0, 1.0]}
+        assert _unbounded(mutant) == ["_history"], "the scan failed to flag an arbitrary list-attr mutant"
+        # A deque carrying a latency history is likewise caught (name-independent).
+        mutant_deque = {"deque_latencies": collections.deque([1.0])}
+        assert _unbounded(mutant_deque), "a deque attr must be flagged too"
+    finally:
+        watchdog.stop()
+    # Module source: no deque/p50/history import or field anywhere.
+    src = inspect.getsource(wd)
+    for banned in ("deque", "p50", "history"):
+        assert banned not in src, f"watchdog module references {banned!r}"
+
+
+def test_rev3_blocked_probe_disarm_never_fires() -> None:
+    """Rev3-B2 first stop-check: disarm while the probe is blocked; the
+    released False reading past grace must not fire."""
+    release = threading.Event()
+    entered = threading.Event()
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+
+    def _blocked():
+        entered.set()
+        assert release.wait(5.0), "probe was never released"
+        return False
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=0.0,
+        interval=0.02,
+        probe=_blocked,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+    )
+    watchdog.start()
+    try:
+        assert entered.wait(3.0)
+        watchdog.disarm()
+        time.sleep(0.1)  # let the stop event land while the probe is blocked
+        release.set()
+        time.sleep(0.4)  # well past refused_grace
+        assert fired == []
+        assert watchdog.refused_window_start is None, "no refused bookkeeping may run after disarm"
+    finally:
+        release.set()
+        watchdog.stop()
+
+
+def test_rev3_disarm_during_snapshot_never_fires() -> None:
+    """Rev3-B2 second stop-check: the snapshot callable disarms (stop lands
+    between the grace decision and _fire); the fire must be skipped."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+    holder: dict[str, Watchdog] = {}
+
+    def _disarming_snapshot():
+        holder["wd"].disarm()
+        return ({"state": "empty"}, 0)
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=0.0,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+        server_snapshot=_disarming_snapshot,
+    )
+    holder["wd"] = watchdog
+    watchdog.start()
+    try:
+        time.sleep(0.5)
+        assert fired == [], "a stop arriving before _fire must suppress the fire"
+    finally:
+        watchdog.stop()
+
+
+def test_rev3_grace_reasons_are_exact() -> None:
+    """Rev3: the fire reason strings are exact (==), and the PRE_BIND and
+    ARMED reasons differ."""
+    fired: list[str] = []
+    fired_event = threading.Event()
+
+    def _record(reason: str) -> None:
+        fired.append(reason)
+        fired_event.set()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.05,
+        interval=0.01,
+        probe=lambda: False,
+        fire=_record,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0)
+        assert fired[0] == "boot-grace"
+    finally:
+        watchdog.stop()
+
+    fired2: list[str] = []
+    armed = threading.Event()
+    armed.set()
+    watchdog2 = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.01,
+        probe=lambda: False,
+        fire=lambda reason: fired2.append(reason),
+        armed=armed,
+    )
+    watchdog2.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not fired2:
+            time.sleep(0.01)
+        assert fired2 and fired2[0] == "refused-grace"
+    finally:
+        watchdog2.stop()
+
+
+def test_rev3_wall_clock_grace_not_probe_count(monkeypatch) -> None:
+    """Rev3 (9): the grace is WALL-CLOCK, not probe-count — proven deterministically
+    with a controlled monotonic clock and event-paced probes, no long sleeps.
+    The clock advances far past grace across only a FEW refused probes; a
+    probe-count mutant (which fires after ~grace/interval probes) could never
+    have fired, so the fire assertion fails it."""
+    from mnemoseed_local.daemon import watchdog as wd
+
+    clock = {"t": 0.0}
+
+    def _mono() -> float:
+        clock["t"] += 0.5
+        return clock["t"]
+
+    monkeypatch.setattr(wd.time, "monotonic", _mono)
+
+    release = threading.Event()
+    entered = threading.Event()
+    released: dict[str, int] = {"n": 0}
+
+    def _paced_probe() -> bool:
+        entered.set()  # signal: the loop is about to run a probe
+        assert release.wait(5.0), "probe never released by the test"
+        release.clear()
+        released["n"] += 1
+        return False  # always refused
+
+    fired: list[str] = []
+    watchdog = Watchdog(
+        "127.0.0.1",
+        1,
+        boot_grace=0.25,
+        refused_grace=5.0,  # the ARMED grace is irrelevant here (PRE_BIND)
+        interval=0.001,
+        probe=_paced_probe,
+        fire=lambda reason: fired.append(reason),
+    )
+    watchdog.start()
+    try:
+        # Pace a handful of probes; monotonic jumps 0.5s per read, so the wall
+        # clock crosses boot_grace (0.25s) after just two refused probes.
+        for _ in range(20):
+            if fired:
+                break
+            assert entered.wait(3.0), "probe never entered"
+            release.set()
+            entered.clear()
+            time.sleep(0.02)  # let the fire decision complete on the thread
+        assert fired and fired[0] == "boot-grace", "wall-clock grace must fire"
+        # A probe-count mutant needs ~grace/interval probes; only the paced few
+        # have run, so it could not have fired yet.
+        assert released["n"] <= 5, f"probe-count mutant killed at {released['n']} probes"
+    finally:
+        release.set()  # unblock any in-flight probe so stop() can join
+        watchdog.stop()
+
+
+def test_rev3_fire_summary_complete_and_private(log_home: Path) -> None:
+    """Rev3-G: the fire summary carries host/port/reason/elapsed/counts/
+    latencies/armed/counters and never privacy words."""
+    exit_calls: list[int] = []
+    watchdog = Watchdog("127.0.0.1", 7711, exit_func=lambda code: exit_calls.append(code))
+    try:
+        watchdog._default_fire("refused-grace")
+    except TypeError:
+        pass
+    assert exit_calls == [1]
+    text = (log_home / DAEMON_LOG_NAME).read_text(encoding="utf-8")
+    summary_lines = [line for line in text.splitlines() if "watchdog summary" in line]
+    assert summary_lines, "the fire must log a summary line"
+    summary = summary_lines[-1]
+    for required in ("127.0.0.1", "7711", "refused-grace", "probe_total", "snapshot_errors"):
+        assert required in summary, f"summary missing {required}"
+    lowered = summary.lower()
+    for banned in (
+        "text",
+        "content",
+        "chunk",
+        "header",
+        "ssl",
+        "path",
+        "payload",
+        "profile",
+        "session",
+        "turn",
+    ):
+        assert banned not in lowered, f"summary leaks {banned}"
+
+
+def test_rev3_run_fire_path_fault_composition_exits_once(log_home: Path, monkeypatch) -> None:
+    """Rev3 (4): the REAL fire path driven through _run — a raising snapshot
+    callable AND a raising dump-traceback together must bump snapshot_errors and
+    instrumentation_errors, emit a debug line for the snapshot failure, and still
+    end in exactly one exit(1). The exit() comes from the actual _run fire loop
+    (not a direct _default_fire call), pinning the whole sequence."""
+    import faulthandler as _fh
+
+    records: list[logging.LogRecord] = []
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+
+    class _Rec(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Rec()
+    daemon_logger.addHandler(handler)
+    old_level = daemon_logger.level
+    daemon_logger.setLevel(logging.DEBUG)
+
+    def _dump_boom(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("simulated dump failure")
+
+    def _snap_boom() -> tuple[dict[str, object], int]:
+        raise RuntimeError("snapshot exploded")
+
+    monkeypatch.setattr(_fh, "dump_traceback", _dump_boom)
+    exit_calls: list[int] = []
+    try:
+        # Use the REAL default fire path (no injected `fire`); inject only the
+        # exit function so the thread's fire lands in a recording recorder.
+        watchdog = Watchdog(
+            "127.0.0.1",
+            1,
+            boot_grace=0.05,
+            refused_grace=0.05,
+            interval=0.01,
+            probe=lambda: False,
+            server_snapshot=_snap_boom,
+            exit_func=lambda code: exit_calls.append(code),
+        )
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not exit_calls:
+                time.sleep(0.01)
+            assert exit_calls == [1], "the full-fire composition must exit exactly once"
+            assert watchdog.snapshot_errors >= 1, "the snapshot raise must be counted"
+            assert watchdog.instrumentation_errors >= 1, "the dump failure must be counted"
+            assert any("snapshot" in r.getMessage().lower() for r in records), (
+                "a snapshot-failure debug line is required"
+            )
+        finally:
+            watchdog.stop()
+    finally:
+        daemon_logger.setLevel(old_level)
+        daemon_logger.removeHandler(handler)
+        handler.close()
+
+
+def test_rev3_invalid_snapshot_shape_through_run_exits_once(log_home: Path) -> None:
+    """Rev3 (5): a server_snapshot returning an INVALID SHAPE (([not-dict],
+    not-int)) must, through the real _run fire loop, land in a safe error state
+    (snapshot == {'state': 'error'}), bump snapshot_errors, emit the shape-invalid
+    debug line, and still reach exactly one fire/exit — the probe thread must
+    NOT die silently."""
+    records: list[logging.LogRecord] = []
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+
+    class _Rec(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Rec()
+    daemon_logger.addHandler(handler)
+    old_level = daemon_logger.level
+    daemon_logger.setLevel(logging.DEBUG)
+
+    def _bad_shape() -> tuple[list[object], str]:
+        return ([{"not": "a dict"}], "not-an-int")
+
+    exit_calls: list[int] = []
+    try:
+        watchdog = Watchdog(
+            "127.0.0.1",
+            1,
+            boot_grace=0.05,
+            refused_grace=0.05,
+            interval=0.01,
+            probe=lambda: False,
+            server_snapshot=_bad_shape,
+            exit_func=lambda code: exit_calls.append(code),
+        )
+        watchdog.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not exit_calls:
+                time.sleep(0.01)
+            assert exit_calls == [1], "an invalid snapshot shape must not block the exit"
+            assert watchdog.snapshot_errors >= 1, "the invalid shape must bump snapshot_errors"
+            assert watchdog._last_summary.get("snapshot") == {"state": "error"}, (
+                "the invalid shape must degrade to a safe error state"
+            )
+            assert any("shape invalid" in r.getMessage() for r in records), (
+                "a shape-invalid debug line is required"
+            )
+        finally:
+            watchdog.stop()
+    finally:
+        daemon_logger.setLevel(old_level)
+        daemon_logger.removeHandler(handler)
+        handler.close()
+
+
+def test_rev3_snapshot_rejects_bool_fd_and_errno() -> None:
+    """Rev3 (7): safe-integer handling in runner must use `type(x) is int`, so
+    a bool fd (isinstance True, but not an int) or a bool errno is rejected,
+    never recorded."""
+    from mnemoseed_local.daemon.runner import _error_token, _snapshot_socket
+
+    class _BoolFilenoSock:
+        def fileno(self) -> bool:
+            return True  # a bool masquerading as fd
+
+        def getsockname(self):
+            return ("127.0.0.1", 9999)
+
+    entry, errors = _snapshot_socket(_BoolFilenoSock())
+    assert entry.get("fd") == "?", "a bool fileno must be rejected, not recorded as int"
+    assert entry.get("host") == "127.0.0.1", "a rejected fd must not lose the rest of the envelope"
+    assert errors == 0, "rejecting a bool fd is not an error, just a drop"
+
+    err = OSError("boom")
+    err.errno = True  # type: ignore[assignment]  # bool errno
+    token = _error_token(err)
+    assert "errno" not in token, f"a bool errno must not be recorded: {token}"
+    assert token == "OSError", token
