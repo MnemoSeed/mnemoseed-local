@@ -10,6 +10,7 @@ clobber them).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from _support import DIMENSION, PROFILE, make_stamp, raw_chunk
@@ -30,6 +31,32 @@ _RULE_B = {"kind": "exclude_entities", "value": ["b"], "ttl_turns": 2, "scope": 
 _RULE_PROF = {
     "kind": "exclude_entities",
     "value": ["z"],
+    "ttl_turns": 0,
+    "scope": "profile",
+    "session_id": None,
+}
+
+
+def _standing_value_obj() -> dict:
+    return {
+        "if": "provider call fails",
+        "then": "retry same provider once; on quota escalate to the approved inventory model",
+        "match": {
+            "family": "provider_error",
+            "provider": "openai",
+            "model": "gpt-4o",
+            "status": ["quota"],
+            "retryable": 0,
+        },
+    }
+
+
+_STANDING_VALUE_A = json.dumps(_standing_value_obj(), sort_keys=True)
+_STANDING_VALUE_B = json.dumps({"then": "b", "match": _standing_value_obj()["match"]}, sort_keys=True)
+
+_RULE_STANDING = {
+    "kind": "standing_rule",
+    "value": _STANDING_VALUE_A,
     "ttl_turns": 0,
     "scope": "profile",
     "session_id": None,
@@ -192,3 +219,49 @@ def test_origin_agent_column_migrates_and_legacy_rows_stay_null(tmp_path: Path) 
     stored = store.get_chunk("labeled-1")
     assert stored is not None
     assert stored.origin_agent == "build"
+
+
+# ---------------------------------------------------------------- B2 standing_rule contract
+
+
+def test_upsert_chunk_persists_standing_rule(stack) -> None:
+    """A standing_rule (kind + JSON-object value string) reads back after write."""
+    emb = stack.embed.embed("standing directive pin")
+    stack.vector.upsert_chunk(
+        _with_rules(stack, "sr1", "standing directive pin", [_RULE_STANDING]), emb.dense, emb.sparse
+    )
+    got = stack.vector.get_chunk("sr1")
+    assert got is not None
+    assert got.rules == [_RULE_STANDING]
+    assert got.rules[0]["value"] == _STANDING_VALUE_A
+
+
+def test_upsert_chunk_merges_standing_rule_identical_identity_single(stack) -> None:
+    """Byte-same standing_rule re-upsert on the same chunk -> one artifact (union-dedup)."""
+    emb = stack.embed.embed("standing directive pin")
+    stack.vector.upsert_chunk(
+        _with_rules(stack, "sr2", "standing directive pin", [_RULE_STANDING]), emb.dense, emb.sparse
+    )
+    stack.vector.upsert_chunk(
+        _with_rules(stack, "sr2", "standing directive pin", [_RULE_STANDING]), emb.dense, emb.sparse
+    )
+    got = stack.vector.get_chunk("sr2")
+    assert got is not None
+    assert len(got.rules) == 1
+    assert got.rules[0]["value"] == _STANDING_VALUE_A
+
+
+def test_upsert_chunk_merges_standing_rule_edited_value_new_identity(stack) -> None:
+    """An edited standing_rule value yields a distinct identity (appended, not merged)."""
+    edited = {**_RULE_STANDING, "value": _STANDING_VALUE_B}
+    emb = stack.embed.embed("standing directive pin")
+    stack.vector.upsert_chunk(
+        _with_rules(stack, "sr3", "standing directive pin", [_RULE_STANDING]), emb.dense, emb.sparse
+    )
+    stack.vector.upsert_chunk(
+        _with_rules(stack, "sr3", "standing directive pin", [edited]), emb.dense, emb.sparse
+    )
+    got = stack.vector.get_chunk("sr3")
+    assert got is not None
+    values = {r["value"] for r in got.rules if r["kind"] == "standing_rule"}
+    assert values == {_STANDING_VALUE_A, _STANDING_VALUE_B}

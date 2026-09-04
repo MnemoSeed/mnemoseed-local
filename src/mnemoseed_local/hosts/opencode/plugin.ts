@@ -100,6 +100,13 @@ const REINFORCE_BATCH_SIZE = 64
 // heavy for a per-turn pull (re-review issue 9 adopted).
 const RECALL_PULL_TIMEOUT_MS = 300
 const RECALL_PULL_MAX_CHARS = 1200
+// B2: the standing-rule advisory content cap (a NEW local constant, NOT config,
+// no registry key). Independent of the daemon's pending-recall ITEM budget
+// (capture.auto_recall_budget_chars / budget_chars). The advisory is rendered
+// into the RULES fence only from the remaining per-turn capacity under
+// MAX_INJECT_CHARS=4000 after the byte-identical RECALL block, so on the
+// default 2400 item budget the advisory always has room.
+const B2_ADVISORY_MAX_CHARS = 1200
 
 // ---- B1 provider-failure nomination (deterministic, zero model calls) --------
 const PROVIDER_ALLOWLIST = new Set<string>([
@@ -464,6 +471,56 @@ function buildRulesBudgetInjection(rulesBudget: unknown): string | null {
   if (typeof rulesBudget !== "object") return null
   const content = sanitizeRulesText(JSON.stringify(rulesBudget))
   return [RULES_FENCE_OPEN, RULES_DISCLAIMER, content, RULES_FENCE_CLOSE].join("\n")
+}
+
+// B2: build one existing-RULES-fence advisory block from the daemon's
+// rule_advisory — a JSON-OBJECT STRING. The hook parses it and serializes the
+// object exactly ONCE (JSON.stringify), so the fence carries the canonical
+// object form, never an outer-quoted/backslash-escaped JSON string. Bounded to
+// the remaining per-turn capacity under MAX_INJECT_CHARS=4000 and capped by
+// B2_ADVISORY_MAX_CHARS. The advisory may be truncated (rule_partial) or
+// dropped; the RECALL block is never reduced. Malformed (unparseable/non-object)
+// advisory strings fail closed: nothing renders.
+function buildAdvisoryInjection(
+  advisoryValue: string,
+  remaining: number,
+): { block: string | null; truncated: boolean } {
+  const wrapper =
+    RULES_FENCE_OPEN.length + 1 + RULES_DISCLAIMER.length + 1 + RULES_FENCE_CLOSE.length
+  const cap = Math.min(B2_ADVISORY_MAX_CHARS, remaining - wrapper)
+  if (cap <= 0) return { block: null, truncated: false }
+  let object: unknown = null
+  try {
+    object = JSON.parse(advisoryValue)
+  } catch {
+    object = null
+  }
+  if (object === null || typeof object !== "object" || Array.isArray(object)) {
+    // malformed advisory -> fail closed, never render an escaped/garbled form.
+    debugLog("rules advisory malformed: dropped (fail-closed)", {})
+    return { block: null, truncated: false }
+  }
+  const full = sanitizeRulesText(JSON.stringify(object))
+  let text = full
+  let truncated = false
+  if (full.length > cap) {
+    const cut = truncateAdvisoryContent(full, cap)
+    text = cut.text
+    truncated = cut.truncated
+  }
+  const block = [RULES_FENCE_OPEN, RULES_DISCLAIMER, text, RULES_FENCE_CLOSE].join("\n")
+  if (block.length > remaining) return { block: null, truncated }
+  return { block, truncated }
+}
+
+// rule-boundary then fence-boundary truncation: prefer the last top-level comma
+// within the cap so the advisory JSON stays field-granular; fall back to the
+// hard cap. The RULES fence pair is always emitted intact.
+function truncateAdvisoryContent(content: string, cap: number): { text: string; truncated: boolean } {
+  if (content.length <= cap) return { text: content, truncated: false }
+  let cut = content.lastIndexOf(",", cap - 1)
+  if (cut < cap / 2) cut = cap
+  return { text: content.slice(0, cut), truncated: true }
 }
 
 function sessionTailId(group: any): string {
@@ -873,6 +930,23 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         // enabled:false — the daemon owns the switch; zero append, and the
         // (consumed) slot clears the flag so the next prompt's arm is fresh.
         pendingPull.delete(sessionID)
+      }
+      // B2 event advisory: render the matched standing-rule advisory into the
+      // SAME existing RULES fence, drawn ONLY from the remaining per-turn
+      // capacity (MAX_INJECT_CHARS minus the RECALL block bytes this turn).
+      // The RECALL block is never truncated; the advisory may be truncated or
+      // dropped (redacted local reason), never round-tripped to the daemon.
+      if (served.rule_served === true && typeof served.rule_advisory === "string") {
+        const remaining = MAX_INJECT_CHARS - injectedChars
+        const advisory = buildAdvisoryInjection(served.rule_advisory, remaining)
+        if (advisory.block === null) {
+          debugLog("rules advisory dropped: remaining capacity exhausted", { sessionID, remaining })
+        } else {
+          hookOutput.system.push(advisory.block)
+          if (advisory.truncated) {
+            debugLog("rules advisory truncated (rule_partial=true)", { sessionID })
+          }
+        }
       }
       // items empty ∧ enabled ∧ not consumed: keep the arm — a fresh pull can
       // still consume the surviving slot (D8).
