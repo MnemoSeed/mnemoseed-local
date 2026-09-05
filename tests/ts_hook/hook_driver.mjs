@@ -4,7 +4,7 @@
 // to assert on. No daemon, no network, no LLM — everything is canned.
 
 import { pathToFileURL } from "node:url"
-import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -313,11 +313,34 @@ function messageUpdatedAssistant(id, completed) {
 }
 
 async function readWatermarks() {
+  // Merged legacy+shard view (max per key): new code keeps the legacy file
+  // read-only and converges through per-process shards, so the ack-clock
+  // oracle must read the merged maxima, not the legacy bytes alone.
+  const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+  const merged = {}
+  let entries = []
   try {
-    return JSON.parse(await readFile(WATERMARKS, "utf8"))
+    entries = await readdir(dataDir)
   } catch {
     return null
   }
+  const isValid = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0
+  for (const name of entries) {
+    if (!name.startsWith("hook-watermarks") || !name.endsWith(".json")) continue
+    if (name.includes(".tmp.")) continue
+    let parsed = null
+    try {
+      parsed = JSON.parse(await readFile(join(dataDir, name), "utf8"))
+    } catch {
+      continue
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!isValid(v)) continue
+      if (merged[k] === undefined || v > merged[k]) merged[k] = v
+    }
+  }
+  return merged
 }
 
 async function main() {
@@ -1912,6 +1935,340 @@ async function main() {
       await delay(50)
       await hooks["chat.system.transform"]({ sessionID: SES }, sa0)
       console.log(JSON.stringify({ system: sa0.system, advisory: ADVISORY }))
+      break
+    }
+
+    case "watermark-overlap": {
+      // P1: same-process overlapping persists through the real persist path.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-overlap" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const keys = Array.from({ length: 6 }, (_, i) => `wm-test-overlap-${i}`)
+      keys.forEach((k, i) => seam.note(k, 1000 + i))
+      const tasks = []
+      for (let i = 0; i < 12; i += 1) {
+        keys.forEach((k, j) => seam.note(k, 1000 + j + i))
+        tasks.push(seam.persist())
+      }
+      for (let i = 0; i < 12; i += 1) {
+        keys.forEach((k, j) => seam.note(k, 2000 + j))
+        void seam.persist().catch(() => {})
+      }
+      let uncaught = 0
+      try {
+        await Promise.all(tasks)
+        await delay(300)
+      } catch {
+        uncaught = 1
+      }
+      const merged = await seam.load()
+      const expected = {}
+      keys.forEach((k, j) => {
+        expected[k] = 2000 + j
+      })
+      const lostKeys = keys.filter((k) => merged[k] !== expected[k])
+      let shardValid = true
+      try {
+        JSON.parse(await readFile(seam.shardPath(), "utf8"))
+      } catch {
+        shardValid = false
+      }
+      const files = await readdir(dataDir)
+      const legacyTmpOrphans = files.filter(
+        (f) => f.startsWith("hook-watermarks.json.") && f.endsWith(".tmp"),
+      ).length
+      const ownTmpLeftovers = files.filter((f) => f.includes(".tmp.")).length
+      console.log(
+        JSON.stringify({
+          persistCount: 24,
+          uncaught,
+          shardValid,
+          lostKeys,
+          legacyTmpOrphans,
+          ownTmpLeftovers,
+          merged,
+          maxConcurrency: seam.maxConcurrency(),
+        }),
+      )
+      break
+    }
+
+    case "watermark-eperm": {
+      // P3: owned-target rename EPERM injection then bounded recovery.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-eperm" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      let uncaught = 0
+      seam.note("wm-test-eperm-a", 1000)
+      try {
+        await seam.persist()
+      } catch {
+        uncaught += 1
+      }
+      let before = null
+      try {
+        before = JSON.parse(await readFile(seam.shardPath(), "utf8"))
+      } catch {
+        before = null
+      }
+      seam.setRenameFault("once")
+      seam.note("wm-test-eperm-a", 2000)
+      try {
+        await seam.persist()
+      } catch {
+        uncaught += 1
+      }
+      let singleFaultRecovered = false
+      try {
+        const cur = JSON.parse(await readFile(seam.shardPath(), "utf8"))
+        singleFaultRecovered = cur["wm-test-eperm-a"] === 2000
+      } catch {
+        singleFaultRecovered = false
+      }
+      seam.setRenameFault("always")
+      seam.note("wm-test-eperm-b", 3000)
+      try {
+        await seam.persist()
+      } catch {
+        uncaught += 1
+      }
+      let duringContinuous = null
+      try {
+        duringContinuous = JSON.parse(await readFile(seam.shardPath(), "utf8"))
+      } catch {
+        duringContinuous = null
+      }
+      const keptGoodDuringFailure =
+        duringContinuous !== null && duringContinuous["wm-test-eperm-a"] === 2000
+      seam.setRenameFault("off")
+      try {
+        await seam.persist()
+      } catch {
+        uncaught += 1
+      }
+      let continuousFaultRecovered = false
+      let targetValidAfter = false
+      try {
+        const cur = JSON.parse(await readFile(seam.shardPath(), "utf8"))
+        targetValidAfter = true
+        continuousFaultRecovered =
+          cur["wm-test-eperm-a"] === 2000 && cur["wm-test-eperm-b"] === 3000
+      } catch {
+        targetValidAfter = false
+      }
+      const files = await readdir(dataDir)
+      const ownTmpLeftovers = files.filter((f) => f.includes(".tmp.")).length
+      console.log(
+        JSON.stringify({
+          uncaught,
+          singleFaultRecovered,
+          keptGoodDuringFailure,
+          continuousFaultRecovered,
+          targetValidAfter,
+          ownTmpLeftovers,
+          beforeKeys: before ? Object.keys(before) : [],
+        }),
+      )
+      break
+    }
+
+    case "watermark-merge": {
+      // P6: legacy read-only + peer shard maxima fold into the own shard.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-merge" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const legacyPath = join(dataDir, "hook-watermarks.json")
+      const legacyPayload = { "wm-test-m-a": 100, "wm-test-m-b": 50 }
+      await writeFile(legacyPath, JSON.stringify(legacyPayload), "utf8")
+      const legacyBefore = await readFile(legacyPath, "utf8")
+      const peerPath = join(dataDir, "hook-watermarks.999998.11111111-1111-4111-8111-111111111111.json")
+      await writeFile(
+        peerPath,
+        JSON.stringify({ "wm-test-m-a": 80, "wm-test-m-b": 200, "wm-test-m-c": 300 }),
+        "utf8",
+      )
+      seam.note("wm-test-m-a", 90)
+      seam.note("wm-test-m-d", 400)
+      await seam.persist()
+      const merged = await seam.load()
+      const mergedOk =
+        merged["wm-test-m-a"] === 100 &&
+        merged["wm-test-m-b"] === 200 &&
+        merged["wm-test-m-c"] === 300 &&
+        merged["wm-test-m-d"] === 400
+      const legacyAfter = await readFile(legacyPath, "utf8")
+      console.log(
+        JSON.stringify({ mergedOk, legacyUnchanged: legacyBefore === legacyAfter, merged }),
+      )
+      break
+    }
+
+    case "watermark-corrupt": {
+      // P4: corrupt files/keys skipped and preserved; good keys converge.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-corrupt" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const badJsonPath = join(
+        dataDir,
+        "hook-watermarks.999997.22222222-2222-4222-8222-222222222222.json",
+      )
+      const badJsonBytes = "{ not valid json {{{"
+      await writeFile(badJsonPath, badJsonBytes, "utf8")
+      const badKeysPath = join(
+        dataDir,
+        "hook-watermarks.999996.33333333-3333-4333-8333-333333333333.json",
+      )
+      const badKeysPayload = JSON.stringify({
+        "wm-test-good": 500,
+        "wm-test-bad-str": "oops",
+        "wm-test-bad-neg": -5,
+        "wm-test-bad-null": null,
+      })
+      await writeFile(badKeysPath, badKeysPayload, "utf8")
+      seam.note("wm-test-good", 400)
+      seam.note("wm-test-local", 600)
+      await seam.persist()
+      const merged = await seam.load()
+      const corruptPreserved =
+        (await readFile(badJsonPath, "utf8")) === badJsonBytes &&
+        (await readFile(badKeysPath, "utf8")) === badKeysPayload
+      const badKeysExcluded =
+        merged["wm-test-bad-str"] === undefined &&
+        merged["wm-test-bad-neg"] === undefined &&
+        merged["wm-test-bad-null"] === undefined
+      const goodKeysConverged =
+        merged["wm-test-good"] === 500 && merged["wm-test-local"] === 600
+      console.log(
+        JSON.stringify({ corruptPreserved, badKeysExcluded, goodKeysConverged, merged }),
+      )
+      break
+    }
+
+    case "watermark-gc": {
+      // P5: GC dead/alive/EPERM/unknown rules and fold-before-delete.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-gc" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const oldDate = new Date(Date.now() - 25 * 3600 * 1000)
+      const deadPath = join(
+        dataDir,
+        "hook-watermarks.999990.44444444-4444-4444-8444-444444444444.json",
+      )
+      await writeFile(deadPath, JSON.stringify({ "wm-test-gc-dead": 777 }), "utf8")
+      await utimes(deadPath, oldDate, oldDate)
+      const alivePid = process.pid
+      const alivePath = join(
+        dataDir,
+        `hook-watermarks.${alivePid}.55555555-5555-4555-8555-555555555555.json`,
+      )
+      await writeFile(alivePath, JSON.stringify({ "wm-test-gc-alive": 111 }), "utf8")
+      await utimes(alivePath, oldDate, oldDate)
+      const epermPath = join(
+        dataDir,
+        "hook-watermarks.4.66666666-6666-4666-8666-666666666666.json",
+      )
+      await writeFile(epermPath, JSON.stringify({ "wm-test-gc-eperm": 222 }), "utf8")
+      await utimes(epermPath, oldDate, oldDate)
+      const unknownPath = join(dataDir, "hook-watermarks.notapid.77777777-7777-4777-8777-777777777777.json")
+      await writeFile(unknownPath, JSON.stringify({ "wm-test-gc-unknown": 333 }), "utf8")
+      await utimes(unknownPath, oldDate, oldDate)
+      const corruptGcPath = join(
+        dataDir,
+        "hook-watermarks.999998.88888888-8888-4888-8888-888888888888.json",
+      )
+      const corruptBytes = "{ broken"
+      await writeFile(corruptGcPath, corruptBytes, "utf8")
+      await utimes(corruptGcPath, oldDate, oldDate)
+      const exists = async (p) => {
+        try {
+          await stat(p)
+          return true
+        } catch {
+          return false
+        }
+      }
+      // create >20 extra eligible dead shards to pin the <=20 bound
+      const extraPaths = []
+      for (let i = 0; i < 25; i += 1) {
+        const uuid = `99999999-9999-4999-8999-9999999999${String(i).padStart(2, "0")}`
+        const p = join(dataDir, `hook-watermarks.999995.${uuid}.json`)
+        await writeFile(p, JSON.stringify({ [`wm-test-gc-extra-${i}`]: 10 + i }), "utf8")
+        await utimes(p, oldDate, oldDate)
+        extraPaths.push(p)
+      }
+      seam.note("wm-test-gc-local", 50)
+      await seam.persist()
+      const merged = await seam.load()
+      const deadDeleted = !(await exists(deadPath))
+      const foldedBeforeDelete = merged["wm-test-gc-dead"] === 777
+      const alivePreserved = await exists(alivePath)
+      const epermPreserved = await exists(epermPath)
+      const unknownPreserved = await exists(unknownPath)
+      const corruptPreserved =
+        (await exists(corruptGcPath)) && (await readFile(corruptGcPath, "utf8")) === corruptBytes
+      let deletedExtras = 0
+      for (const p of extraPaths) {
+        if (!(await exists(p))) deletedExtras += 1
+      }
+      const totalDeleted = (deadDeleted ? 1 : 0) + deletedExtras
+      console.log(
+        JSON.stringify({
+          deadDeleted,
+          foldedBeforeDelete,
+          alivePreserved,
+          epermPreserved,
+          unknownPreserved,
+          corruptPreserved,
+          deleteBound: totalDeleted <= 20,
+          totalDeleted,
+          merged,
+        }),
+      )
+      break
+    }
+
+    case "watermark-mixed": {
+      // Mixed-version: an old whole-map legacy write folds forward; new code
+      // never overwrites the legacy file.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-mixed" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const legacyPath = join(dataDir, "hook-watermarks.json")
+      seam.note("wm-test-mix-new", 900)
+      await seam.persist()
+      // simulate an old-version process whole-map overwriting the legacy file
+      const legacyMixed = { "wm-test-mix-old": 800, "wm-test-mix-new": 100 }
+      await writeFile(legacyPath, JSON.stringify(legacyMixed), "utf8")
+      const legacyBeforeNewPersist = await readFile(legacyPath, "utf8")
+      seam.note("wm-test-mix-new", 950)
+      await seam.persist()
+      const merged = await seam.load()
+      const legacyAfter = await readFile(legacyPath, "utf8")
+      console.log(
+        JSON.stringify({
+          foldedOk: merged["wm-test-mix-old"] === 800 && merged["wm-test-mix-new"] === 950,
+          legacyNotOverwritten: legacyAfter === legacyBeforeNewPersist,
+          merged,
+        }),
+      )
       break
     }
 

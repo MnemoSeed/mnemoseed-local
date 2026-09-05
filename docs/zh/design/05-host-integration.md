@@ -163,7 +163,7 @@ flowchart TB
 
 **per-session FIFO 任务链**（plugin.ts:907-916）：该 session 的全部内容投递经一条 promise 链串行（重放段队首、先于 live），保证 daemon 端到达序即正确 turn 序；handler 自身仍不 await 热路径。
 
-**B2.2 reconcile 回放（一句话，机制不展开）**：hook 侧有崩溃重放水印（`hook-watermarks.json`，ack 钟、tmp+rename 原子写）与 FIFO 回放机制——语义与失效边界归口 **07**。
+**B2.2 reconcile 回放（一句话，机制不展开）**：hook 侧有崩溃重放水印（文件族 `hook-watermarks*.json`：legacy 只读 + per-process 独占分片，ack 钟、逐 key 取 max、自有 tmp+rename 原子写）与 FIFO 回放机制——语义与失效边界归口 **07**。
 
 **注入面 transport 事实（一句话级，载荷语义归 06）**：`chat.system.transform` 是注入载体（`output.system` 字符串数组追加）；T1 起始回放注入存在 attempt-once 闸门（同步置位先于首个 await；空 sessionID/非数组 system 不消耗闸门；响应 `sessions` 非数组视为失败且闸门已消耗）。载荷语义（预算/围栏/自锚/排除/needle）归口 `design/06-session-continuity.md`。
 

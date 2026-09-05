@@ -21,10 +21,11 @@
 
 ## 范围（批次任务）
 
-- **T1 hook 水位线（ack 钟，非发送钟）**：`~/.mnemoseed-local/hook-watermarks.json`（`{session_id: last_acked_ts}`）——推钟只发生在 POST 收到 daemon **2xx** 的回执里（fire-and-forget 的 `.then` 链），发出≠到达；宕机期间水位停摆在最后被确认的轮次，重叠窗口绝不会吞掉未达内容。刷写 = 各 cadence 点（idle/error/deleted/compacting）**原子落盘**（tmp+rename，崩溃撕文件不毁上一好版本），读写故障一律吞没降级，绝不侵入主链路。
+- **T1 hook 水位线（ack 钟，非发送钟）**：水位文件族 `hook-watermarks*.json`（`{session_id: last_acked_ts}`，仍算**单一可删除机制**：删掉整个文件族即回到无回放原型）——推钟只发生在 POST 收到 daemon **2xx** 的回执里（fire-and-forget 的 `.then` 链），发出≠到达；宕机期间水位停摆在最后被确认的轮次，重叠窗口绝不会吞掉未达内容。Legacy `hook-watermarks.json` 对新代码**只读**（旧版本的全量覆写文件，原样保留、纳入每次合并、永不覆写）；新代码只写自己的独占分片 `hook-watermarks.<pid>.<uuid>.json`（进程自有 tmp 名 `.<分片>.tmp.<uuid>.<counter>` 原子 write+rename，Windows 瞬态 `EPERM/EACCES/EBUSY` 有界重试 N≤5，失败只记 debug，主 lane 永不阻塞/抛错；进程内 persist 串行化，调用永不 reject）。每次刷写（含初次加载）先枚举 legacy + 全部分片完整快照、只接受**有限非负数**值、逐 key 取 max 与内存缓存合并，再落盘自己分片（原子替换保证单文件完整，源分片保留至安全 GC，故并发读写不丢 key）。刷写点 = 各 cadence 点（idle/error/deleted/compacting），读写故障一律吞没降级，绝不侵入主链路。
+- **T1-补充 腐坏冻结与保守 GC（安全门）**：非法 JSON / 非对象 / 非法 key（非有限非负数）→ 跳过该文件/key，腐坏文件原样保留、仅记 debug 元数据（路径/size/mtime），本批不覆写、不隔离、不删除。GC 仅当分片年龄 >24h **且**文件名 PID 经 `ESRCH` 确认已死才合规（存活/`EPERM`/未知/PID 复用歧义一律跳过，宁可泄漏不误删）；先把全局每 key 最大值落盘进自己分片并成功 persist，再删最多 20 个合规分片；永不删 legacy、腐坏文件、存活/不确定分片或他进程 tmp。旧版 `Date.now` legacy tmp 的清理记为后续跟进，不在本批删除范围内。
 - **T2 会话级重生回放**：hook 进程内**每个 session 首次见到其事件时**（惰性，不扫全宿主）执行一次对账：`client.session.messages` 拉该 session 宿主侧消息史 → 映射为既有 ingest 载荷（ts 取 `info.time.created`/`completed`）→ **只重放 `ts > 水位 - 30s` 的尾部** → 按时间序逐条 POST。**到达序保证 = 每 session 一条 FIFO promise 链**：replay 段插队在该 session 一切 live 内容之前（分片器按到达序切 turn，乱序即错绑），replay 成功才标 reconciled（失败留待下次事件重试）；replay 的 assistant 与 live 通道共用指纹守卫 + 成功即解 pending。**无水位 session 跳过回放**（特性前历史本就不可重放；跳过决策进 debug lane）。
 - **T3 回放幂等性钉死（双层测试）**：daemon 侧 e2e——crash 前的尾部在 daemon 重启后重放**零新增 chunk**（近重复吸收），live 新轮照常入库；hook 侧 node 行为挂架——esbuild 打包真插件 + node 驱动假 SDK/假 fetch，钉死 ack 钟（拒收不推钟、到达才推钟）、replay-先于-live 到达序、同消息跨通道只入一次。
-- **T4 工程约束钉死**：(a) **token 红线**：回放路径全程无 LLM（静态 pin）；(b) **热路径零新增**：chat.message/ingest 同步段无任何 await 的新增 I/O（队列入队为内存操作，静态 pin + 行为挂架验证 void 形态）；(c) **环境可复原**：全部新增物 = 单水位文件（POSIX 安全根：`MNEMOSEED_LOCAL_DATA_DIR` > 平台 home），删除后行为回到无回放原型。
+- **T4 工程约束钉死**：(a) **token 红线**：回放路径全程无 LLM（静态 pin）；(b) **热路径零新增**：chat.message/ingest 同步段无任何 await 的新增 I/O（队列入队为内存操作，静态 pin + 行为挂架验证 void 形态）；(c) **环境可复原**：全部新增物 = 水位文件族（`hook-watermarks*.json`：legacy + 分片 + 自有 tmp，POSIX 安全根：`MNEMOSEED_LOCAL_DATA_DIR` > 平台 home），删除整个文件族后行为回到无回放原型。
 
 ## 边界（如实）
 
@@ -33,6 +34,7 @@
 - **吸收界限（如实）**：近重复吸收对"切分一致的字节级重放"是确定性的；切分不同的重放（compacting 中途 flush 的 user-only chunk vs 回放合成的 user+assistant chunk）可能落一条内容重复的 chunk——容忍（噪声非丢失），召回面代价有限，不设计去重加强。
 - **无水位 session 的降级方向（如实）**：跳过 = 该类 session 在"特性启用后、首次成功持久水位前"的 crash 尾巴不可回放，损失以最后一次成功持久为界；与"全量重放"相比判定为 KISS 可承受。
 - **回放尾巴会作为最新内容浮在 `/session/recent` 尾部**（按 ingested_at 排序）——但窗口本就 ≤ 一轮 + 重叠，误导面有限；更严格的按事件 ts 重排不做（成本）。
+- **混跑降级（已知残留，如实）**：旧进程全量覆写 legacy、新进程分片收敛，两者互不可见对方全量，直到**所有宿主重启**才收敛（旧写 legacy 会被新进程每次合并折叠进自己分片，但旧进程看不见新分片）。此为已知残留，不得宣称混跑已修。
 - 多 opencode 实例并发同一 session 不设计（单用户桌面现实），冲突由近重复吸收兜底，如实记录。
 
 ## 门禁（不变）
