@@ -43,7 +43,8 @@
 // injection). Probe-confirmed on this version: the options tuple reaches the
 // plugin and config-hook cfg.mcp mutations stick (B2.6 probe rounds 1+2).
 
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -969,25 +970,255 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
 
 // ---- B2.2 crash durability (PRD-B2.2, single mechanism): the host persists
 // the full session history itself, so crash recovery = replay the missing
-// tail from client.session.messages into the same ingest lane. The only new
-// artifact is one watermark file; the overlap margin feeds the daemon's
-// near-dup absorb (repeats are absorbed by design: 宁可重复不丢).
-const WATERMARKS_PATH: string = join(DATA_DIR, "hook-watermarks.json")
+// tail from client.session.messages into the same ingest lane. Watermarks live
+// in one deletable file family `hook-watermarks*.json`: the legacy
+// `hook-watermarks.json` (read-only for new code) plus one exclusive
+// per-process shard `hook-watermarks.<pid>.<uuid>.json`. The overlap margin
+// feeds the daemon's near-dup absorb (repeats are absorbed by design).
+const WATERMARKS_LEGACY_BASENAME = "hook-watermarks.json"
 const REPLAY_OVERLAP_MS = 30000
+const WATERMARK_SHARD_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const WATERMARK_SHARD_GC_MAX_DELETE = 20
+const WATERMARK_TMP_GC_MAX_DELETE = 20
+const WATERMARK_PERSIST_RETRY_MAX = 5
+const WATERMARK_PERSIST_RETRY_BASE_MS = 10
+// Bounded follow-up writes when a note lands mid-cycle (IMPORTANT-5): the
+// same serialized persist re-snapshots at most this many extra times. Notes
+// arriving during the final write stay cached for the next cadence persist
+// (the existing at-most-one-turn boundary).
+const WATERMARK_DIRTY_FOLLOWUP_MAX = 2
+
+const WATERMARK_SHARD_UUID: string = (() => {
+  try {
+    return randomUUID()
+  } catch {
+    return `${Date.now()}-${Math.floor(Math.random() * 1000000000)}`
+  }
+})()
+const WATERMARK_SHARD_PID: number =
+  typeof process !== "undefined" && typeof process.pid === "number" ? process.pid : 0
+const WATERMARK_SHARD_BASENAME = `hook-watermarks.${WATERMARK_SHARD_PID}.${WATERMARK_SHARD_UUID}.json`
+const WATERMARK_SHARD_PATH: string = join(DATA_DIR, WATERMARK_SHARD_BASENAME)
+let watermarkTmpCounter = 0
+let watermarkRenameFault: "off" | "once" | "always" = "off"
+let watermarkUnlinkFault: "off" | "once" | "always" = "off"
+let watermarkLivenessFault: "off" | "dead" = "off"
+let persistInnerActive = 0
+let persistInnerMaxActive = 0
+// Monotonic edit counter: every accepted watermark advance bumps it, so a
+// persist parked inside its write window can detect a newer value.
+let watermarkRevision = 0
+// One-shot test barrier parked between payload snapshot and write.
+let watermarkIoBarrierArmed = false
+let watermarkIoBarrierHit = false
+let watermarkIoBarrierWaiters: Array<() => void> = []
+let watermarkIoBarrierRelease: () => void = () => {}
+let watermarkIoBarrierGate: Promise<void> = Promise.resolve()
 
 const reconciledSessions = new Map<string, true>()
 let watermarksCache: Record<string, number> | null = null
+// Pre-load accumulation: ack callbacks may fire before the first lazy load.
+// Valid early notes wait here in a null-prototype map; the first load folds
+// disk maxima into this same map instead of replacing it, so no acked turn
+// is ever dropped by load ordering.
+let pendingWatermarks: Record<string, number> | null = null
+let persistChain: Promise<void> = Promise.resolve()
+
+function isValidWatermarkValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+}
+
+function parseShardPid(basename: string): number | null {
+  const match = /^hook-watermarks\.(\d+)\.([0-9a-fA-F-]{8,})\.json$/.exec(basename)
+  if (!match) return null
+  const pid = Number(match[1])
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  return pid
+}
+
+function isShardBasename(basename: string): boolean {
+  return parseShardPid(basename) !== null
+}
+
+function classifyPid(pid: number): "dead" | "alive" | "unknown" {
+  if (watermarkLivenessFault === "dead") return "dead"
+  try {
+    process.kill(pid, 0)
+    return "alive"
+  } catch (error: any) {
+    const code = error?.code
+    if (code === "ESRCH") return "dead"
+    if (code === "EPERM") return "alive"
+    return "unknown"
+  }
+}
+
+function isTransientPersistError(error: any): boolean {
+  const code = error?.code
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY" || code === "ENOENT"
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function watermarkOwnedTmpPath(): string {
+  watermarkTmpCounter += 1
+  return join(
+    DATA_DIR,
+    `.${WATERMARK_SHARD_BASENAME}.tmp.${WATERMARK_SHARD_UUID}.${watermarkTmpCounter}`,
+  )
+}
+
+function watermarkOwnedTmpPrefix(): string {
+  return `.${WATERMARK_SHARD_BASENAME}.tmp.`
+}
+
+// Exact-format stale tmp from any crashed instance:
+// .hook-watermarks.<pid>.<uuid>.json.tmp.<uuid>.<counter>
+const WATERMARK_CRASH_TMP_RE =
+  /^\.hook-watermarks\.([0-9]+)\.[0-9a-fA-F-]{8,}\.json\.tmp\.[0-9a-fA-F-]{8,}\.[0-9]+$/
+
+async function watermarkUnlink(path: string): Promise<void> {
+  if (watermarkUnlinkFault === "once" || watermarkUnlinkFault === "always") {
+    if (watermarkUnlinkFault === "once") watermarkUnlinkFault = "off"
+    const fault: any = new Error(`EPERM: operation not permitted, unlink '${path}'`)
+    fault.code = "EPERM"
+    throw fault
+  }
+  await unlink(path)
+}
+
+async function sweepOwnedTmps(limit: number): Promise<number> {
+  // Same-instance recovery: a failed immediate unlink leaves an owned tmp
+  // behind; the next serialized persist sweeps the exact own prefix. Bounded
+  // and best-effort — failures stay for the persist after next.
+  let entries: string[]
+  try {
+    entries = await readdir(DATA_DIR)
+  } catch {
+    return 0
+  }
+  const prefix = watermarkOwnedTmpPrefix()
+  let removed = 0
+  for (const name of entries) {
+    if (removed >= limit) break
+    if (!name.startsWith(prefix)) continue
+    try {
+      await watermarkUnlink(join(DATA_DIR, name))
+      removed += 1
+    } catch {
+      // best-effort cleanup only
+    }
+  }
+  if (removed > 0) debugLog("watermark own tmp sweep", { removed })
+  return removed
+}
+
+function armWatermarkIoBarrier(): void {
+  watermarkIoBarrierArmed = true
+  watermarkIoBarrierHit = false
+  watermarkIoBarrierGate = new Promise<void>((resolve) => {
+    watermarkIoBarrierRelease = resolve
+  })
+}
+
+async function maybeHoldWatermarkIoBarrier(): Promise<void> {
+  if (!watermarkIoBarrierArmed) return
+  watermarkIoBarrierArmed = false
+  watermarkIoBarrierHit = true
+  for (const waiter of watermarkIoBarrierWaiters.splice(0)) waiter()
+  await watermarkIoBarrierGate
+}
+
+async function readMergedWatermarksFromDisk(prelisted?: string[]): Promise<Record<string, number>> {
+  const merged: Record<string, number> = {}
+  let entries: string[]
+  if (prelisted !== undefined) {
+    entries = [...prelisted]
+  } else {
+    try {
+      entries = await readdir(DATA_DIR)
+    } catch {
+      return merged
+    }
+  }
+  entries.sort()
+  for (const name of entries) {
+    if (name.includes(".tmp.")) continue
+    if (name !== WATERMARKS_LEGACY_BASENAME && !isShardBasename(name)) continue
+    const full = join(DATA_DIR, name)
+    let raw: string
+    try {
+      raw = await readFile(full, "utf8")
+    } catch {
+      continue
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      let mtime: number | null = null
+      try {
+        mtime = (await stat(full)).mtimeMs
+      } catch {
+        mtime = null
+      }
+      debugLog("watermark snapshot skipped: invalid file", {
+        path: full,
+        size: raw.length,
+        mtime,
+      })
+      continue
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      let mtime: number | null = null
+      try {
+        mtime = (await stat(full)).mtimeMs
+      } catch {
+        mtime = null
+      }
+      debugLog("watermark snapshot skipped: invalid file", {
+        path: full,
+        size: raw.length,
+        mtime,
+      })
+      continue
+    }
+    let invalidKeys = 0
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!isValidWatermarkValue(value)) {
+        invalidKeys += 1
+        continue
+      }
+      const prev = merged[key] ?? 0
+      if (value > prev) merged[key] = value
+    }
+    if (invalidKeys > 0) {
+      debugLog("watermark snapshot skipped invalid keys", { path: full, invalidKeys })
+    }
+  }
+  return merged
+}
 
 async function loadWatermarks(): Promise<Record<string, number>> {
   if (watermarksCache !== null) return watermarksCache
+  let disk: Record<string, number> = {}
   try {
-    const raw = await readFile(WATERMARKS_PATH, "utf8")
-    const parsed: unknown = JSON.parse(raw)
-    watermarksCache =
-      parsed !== null && typeof parsed === "object" ? (parsed as Record<string, number>) : {}
+    disk = await readMergedWatermarksFromDisk()
   } catch {
-    // Missing/corrupt file degrades to "no marks" — never a main-lane fault.
-    watermarksCache = {}
+    // Missing/corrupt files degrade to "no marks" — never a main-lane fault.
+    disk = {}
+  }
+  if (pendingWatermarks !== null) {
+    for (const [key, value] of Object.entries(disk)) {
+      const prev = pendingWatermarks[key] ?? 0
+      if (value > prev) pendingWatermarks[key] = value
+    }
+    watermarksCache = pendingWatermarks
+    pendingWatermarks = null
+  } else {
+    watermarksCache = disk
   }
   return watermarksCache
 }
@@ -995,22 +1226,260 @@ async function loadWatermarks(): Promise<Record<string, number>> {
 function noteWatermark(sessionID: string, tsSeconds: number): void {
   // ACK-clock only (B2.2 BLOCKER): callers reach here exclusively through
   // post()'s 2xx branch, so the mark can never outrun the daemon's receipt.
-  if (!sessionID || typeof tsSeconds !== "number") return
-  if (watermarksCache === null || typeof watermarksCache !== "object") return
+  // Only finite nonnegative timestamps advance the clock — NaN, Infinity and
+  // negatives are rejected at the entry, matching the merge-time value gate.
+  if (!sessionID || !isValidWatermarkValue(tsSeconds)) return
+  if (watermarksCache === null || typeof watermarksCache !== "object") {
+    if (pendingWatermarks === null) pendingWatermarks = Object.create(null)
+    const prev = pendingWatermarks[sessionID] ?? 0
+    if (tsSeconds > prev) {
+      pendingWatermarks[sessionID] = tsSeconds
+      watermarkRevision += 1
+    }
+    return
+  }
   const prev = watermarksCache[sessionID] ?? 0
-  if (tsSeconds > prev) watermarksCache[sessionID] = tsSeconds
+  if (tsSeconds > prev) {
+    watermarksCache[sessionID] = tsSeconds
+    watermarkRevision += 1
+  }
+}
+
+async function watermarkRenameWithFault(tmp: string, target: string): Promise<void> {
+  if (watermarkRenameFault === "once" || watermarkRenameFault === "always") {
+    if (watermarkRenameFault === "once") watermarkRenameFault = "off"
+    const fault: any = new Error(`EPERM: operation not permitted, rename '${tmp}' -> '${target}'`)
+    fault.code = "EPERM"
+    throw fault
+  }
+  await rename(tmp, target)
+}
+
+async function collectWatermarkGarbage(prelisted?: string[]): Promise<void> {
+  let entries: string[]
+  if (prelisted !== undefined) {
+    entries = [...prelisted]
+  } else {
+    try {
+      entries = await readdir(DATA_DIR)
+    } catch {
+      return
+    }
+  }
+  entries.sort()
+  const now = Date.now()
+  const candidates: string[] = []
+  const tmpCandidates: string[] = []
+  for (const name of entries) {
+    if (name.includes(".tmp.")) {
+      // Cross-instance stale tmp recovery only: exact crash-tmp format older
+      // than 24h whose encoded PID is conclusively ESRCH-dead. Legacy
+      // Date.now tmps, unrelated names, and live/ambiguous tmps are never
+      // touched here — same-instance leftovers are swept by sweepOwnedTmps.
+      if (!WATERMARK_CRASH_TMP_RE.test(name)) continue
+      if (tmpCandidates.length >= WATERMARK_TMP_GC_MAX_DELETE) continue
+      const pidMatch = /^\.hook-watermarks\.([0-9]+)\./.exec(name)
+      const pid = pidMatch ? Number(pidMatch[1]) : NaN
+      if (!Number.isInteger(pid) || pid <= 0) continue
+      const full = join(DATA_DIR, name)
+      let mtimeMs: number
+      try {
+        mtimeMs = (await stat(full)).mtimeMs
+      } catch {
+        continue
+      }
+      if (now - mtimeMs <= WATERMARK_SHARD_GC_MAX_AGE_MS) continue
+      if (classifyPid(pid) !== "dead") continue
+      tmpCandidates.push(full)
+      continue
+    }
+    if (name === WATERMARKS_LEGACY_BASENAME) continue
+    if (name === WATERMARK_SHARD_BASENAME) continue
+    if (!isShardBasename(name)) continue
+    const full = join(DATA_DIR, name)
+    let mtimeMs: number
+    try {
+      mtimeMs = (await stat(full)).mtimeMs
+    } catch {
+      continue
+    }
+    if (now - mtimeMs <= WATERMARK_SHARD_GC_MAX_AGE_MS) continue
+    const pid = parseShardPid(name)
+    if (pid === null) continue
+    if (classifyPid(pid) !== "dead") continue
+    let raw: string
+    try {
+      raw = await readFile(full, "utf8")
+    } catch {
+      continue
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      debugLog("watermark GC skipped corrupt file", { path: full })
+      continue
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      debugLog("watermark GC skipped corrupt file", { path: full })
+      continue
+    }
+    let hasInvalid = false
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (!isValidWatermarkValue(value)) {
+        hasInvalid = true
+        break
+      }
+    }
+    if (hasInvalid) {
+      debugLog("watermark GC skipped file with invalid keys", { path: full })
+      continue
+    }
+    candidates.push(full)
+    if (candidates.length >= WATERMARK_SHARD_GC_MAX_DELETE) break
+  }
+  let deleted = 0
+  for (const full of candidates.slice(0, WATERMARK_SHARD_GC_MAX_DELETE)) {
+    try {
+      await unlink(full)
+      deleted += 1
+    } catch (error) {
+      debugLog("watermark GC delete failed", { path: full, error: String(error) })
+    }
+  }
+  let tmpDeleted = 0
+  for (const full of tmpCandidates.slice(0, WATERMARK_TMP_GC_MAX_DELETE)) {
+    try {
+      await unlink(full)
+      tmpDeleted += 1
+    } catch (error) {
+      debugLog("watermark tmp GC delete failed", { path: full, error: String(error) })
+    }
+  }
+  if (deleted > 0) debugLog("watermark GC deleted", { deleted })
+  if (tmpDeleted > 0) debugLog("watermark tmp GC deleted", { tmpDeleted })
+}
+
+async function persistWatermarksInner(): Promise<void> {
+  // No null-cache drop here: early notes may wait in the pending map and the
+  // body loads (folding them) before writing.
+  persistInnerActive += 1
+  if (persistInnerActive > persistInnerMaxActive) persistInnerMaxActive = persistInnerActive
+  try {
+    await persistWatermarksBody()
+  } finally {
+    persistInnerActive -= 1
+  }
+}
+
+async function writeOwnShardWithRetry(payload: string): Promise<boolean> {
+  for (let attempt = 0; attempt < WATERMARK_PERSIST_RETRY_MAX; attempt += 1) {
+    const tmp = watermarkOwnedTmpPath()
+    try {
+      await writeFile(tmp, payload, "utf8")
+    } catch (error) {
+      try {
+        await watermarkUnlink(tmp)
+      } catch {
+        // best-effort cleanup only
+      }
+      if (!isTransientPersistError(error) || attempt === WATERMARK_PERSIST_RETRY_MAX - 1) {
+        console.debug("mnemoseed-local: watermark persist failed:", error)
+        debugLog("watermark persist failed", { error: String(error) })
+        return false
+      }
+      debugLog("watermark persist retry", { attempt: attempt + 1 })
+      await delayMs(Math.min(100, WATERMARK_PERSIST_RETRY_BASE_MS * 2 ** attempt))
+      continue
+    }
+    try {
+      await watermarkRenameWithFault(tmp, WATERMARK_SHARD_PATH)
+      return true
+    } catch (error) {
+      try {
+        await watermarkUnlink(tmp)
+      } catch {
+        // best-effort cleanup only
+      }
+      if (!isTransientPersistError(error) || attempt === WATERMARK_PERSIST_RETRY_MAX - 1) {
+        console.debug("mnemoseed-local: watermark persist failed:", error)
+        debugLog("watermark persist failed", { error: String(error) })
+        return false
+      }
+      debugLog("watermark persist retry", { attempt: attempt + 1 })
+      await delayMs(Math.min(100, WATERMARK_PERSIST_RETRY_BASE_MS * 2 ** attempt))
+    }
+  }
+  return false
+}
+
+async function persistWatermarksBody(): Promise<void> {
+  if (watermarksCache === null) {
+    try {
+      await loadWatermarks()
+    } catch {
+      // fail-open: without a cache there is nothing to write
+    }
+  }
+  if (watermarksCache === null) return
+  try {
+    await mkdir(DATA_DIR, { recursive: true })
+  } catch (error) {
+    console.debug("mnemoseed-local: watermark persist failed:", error)
+    debugLog("watermark persist failed", { error: String(error) })
+    return
+  }
+  let entries: string[] = []
+  try {
+    entries = await readdir(DATA_DIR)
+  } catch {
+    entries = []
+  }
+  try {
+    await sweepOwnedTmps(WATERMARK_SHARD_GC_MAX_DELETE)
+  } catch (error) {
+    console.debug("mnemoseed-local: watermark tmp sweep failed:", error)
+  }
+  for (let cycle = 0; ; cycle += 1) {
+    try {
+      entries = await readdir(DATA_DIR)
+    } catch {
+      // keep the previous listing on failure
+    }
+    try {
+      const disk = await readMergedWatermarksFromDisk(entries)
+      for (const [key, value] of Object.entries(disk)) {
+        const prev = watermarksCache[key] ?? 0
+        if (value > prev) watermarksCache[key] = value
+      }
+    } catch (error) {
+      console.debug("mnemoseed-local: watermark merge failed:", error)
+    }
+    const revision = watermarkRevision
+    const payload = JSON.stringify(watermarksCache)
+    try {
+      await maybeHoldWatermarkIoBarrier()
+    } catch {
+      // barrier wait is best-effort; a fault must not lose the write
+    }
+    if (!(await writeOwnShardWithRetry(payload))) return
+    if (watermarkRevision === revision || cycle >= WATERMARK_DIRTY_FOLLOWUP_MAX) break
+    debugLog("watermark follow-up flush", { cycle: cycle + 1 })
+  }
+  try {
+    await collectWatermarkGarbage(entries)
+  } catch (error) {
+    console.debug("mnemoseed-local: watermark GC failed:", error)
+  }
 }
 
 async function persistWatermarks(): Promise<void> {
-  if (watermarksCache === null) return
+  const run = persistChain.then(() => persistWatermarksInner())
+  persistChain = run.catch((error: unknown) => {
+    console.debug("mnemoseed-local: watermark persist chain failed:", error)
+  })
   try {
-    await mkdir(dirname(WATERMARKS_PATH), { recursive: true })
-    // crash-atomic: a torn write must never corrupt the last good marks; the
-    // unique suffix keeps concurrent cadence persists from clobbering each
-    // other's temp file (re-review NIT-6).
-    const tempPath = `${WATERMARKS_PATH}.${Date.now()}.tmp`
-    await writeFile(tempPath, JSON.stringify(watermarksCache), "utf8")
-    await rename(tempPath, WATERMARKS_PATH)
+    await run
   } catch (error) {
     console.debug("mnemoseed-local: watermark persist failed:", error)
     debugLog("watermark persist failed", { error: String(error) })
@@ -1660,5 +2129,53 @@ export default async function MnemoSeedLocalPlugin(
     "tool.execute.after": async (hookInput: any, hookOutput: any) =>
       onToolExecuteAfter(hookInput, hookOutput),
     "experimental.session.compacting": async (hookInput: any) => onSessionCompacting(hookInput),
+    ...(process.env.MNEMOSEED_LOCAL_WATERMARK_TEST === "1"
+      ? {
+          __watermarkTest: {
+            shardPath: () => WATERMARK_SHARD_PATH,
+            shardBasename: () => WATERMARK_SHARD_BASENAME,
+            // Delegates straight to the production entry (no cache
+            // pre-initialization) so pre-load accumulation is exercised.
+            note: (sessionID: string, tsSeconds: number) => {
+              noteWatermark(sessionID, tsSeconds)
+            },
+            persist: () => persistWatermarks(),
+            load: async () => {
+              if (watermarksCache === null) await loadWatermarks()
+              const disk = await readMergedWatermarksFromDisk()
+              const view: Record<string, number> = { ...(watermarksCache ?? {}) }
+              for (const [key, value] of Object.entries(disk)) {
+                const prev = view[key] ?? 0
+                if (value > prev) view[key] = value
+              }
+              watermarksCache = view
+              return { ...view }
+            },
+            setRenameFault: (mode: string) => {
+              watermarkRenameFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
+            },
+            setUnlinkFault: (mode: string) => {
+              watermarkUnlinkFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
+            },
+            setLivenessFault: (mode: string) => {
+              watermarkLivenessFault = mode === "dead" ? "dead" : "off"
+            },
+            runGc: () => collectWatermarkGarbage(),
+            maxConcurrency: () => persistInnerMaxActive,
+            armIoBarrier: () => {
+              armWatermarkIoBarrier()
+            },
+            whenPaused: () => {
+              if (watermarkIoBarrierHit) return Promise.resolve()
+              return new Promise<void>((resolve) => {
+                watermarkIoBarrierWaiters.push(resolve)
+              })
+            },
+            releaseBarrier: () => {
+              watermarkIoBarrierRelease()
+            },
+          },
+        }
+      : {}),
   }
 }
