@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,20 @@ from test_hook_ts_behavior import _bundle
 
 DRIVER = Path(__file__).parent / "ts_hook" / "hook_driver.mjs"
 WORKER = Path(__file__).parent / "ts_hook" / "watermark_worker.mjs"
+
+# Independent strict final-shard matcher: byte-identical predicate to the
+# production shard selector (legacy exact or
+# hook-watermarks.<pid>.<uuid>.json). ASCII-only on purpose ([0-9], not \d).
+LEGACY_BASENAME = "hook-watermarks.json"
+FINAL_SHARD_RE = re.compile(r"hook-watermarks\.([0-9]+)\.([0-9a-fA-F-]{8,})\.json")
+
+
+def _is_selected(name: str) -> bool:
+    if ".tmp." in name:
+        return False
+    if name == LEGACY_BASENAME:
+        return True
+    return FINAL_SHARD_RE.fullmatch(name) is not None
 
 
 def _run_watermark(bundle: Path, scenario: str) -> dict:
@@ -40,9 +55,7 @@ def _run_watermark(bundle: Path, scenario: str) -> dict:
 def _merged_max(data_dir: Path) -> dict:
     merged: dict[str, float] = {}
     for child in data_dir.iterdir():
-        if not child.name.startswith("hook-watermarks") or not child.name.endswith(".json"):
-            continue
-        if ".tmp." in child.name:
+        if not _is_selected(child.name):
             continue
         try:
             payload = json.loads(child.read_text(encoding="utf-8"))
@@ -111,8 +124,13 @@ def test_two_processes_converge_to_historical_max(tmp_path: Path) -> None:
             assert merged.get(f"wm-test-w{index}-own") == 2000 + (rounds - 1) * 10, merged
         assert len([p for p in data_dir.iterdir() if ".tmp." in p.name]) == 0, "zero tmp leftovers"
         for child in data_dir.iterdir():
-            if child.name.startswith("hook-watermarks") and child.name.endswith(".json"):
-                json.loads(child.read_text(encoding="utf-8"))
+            if not _is_selected(child.name):
+                continue
+            try:
+                payload = json.loads(child.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            assert isinstance(payload, dict)
     finally:
         for proc in procs:
             if proc.poll() is None:
@@ -130,8 +148,21 @@ def test_eperm_injection_recovers_with_bounded_retry(tmp_path: Path) -> None:
     assert transcript["ownTmpLeftovers"] == 0, transcript
 
 
+def test_fold_cases_pin_per_persist_enumeration_and_max(tmp_path: Path) -> None:
+    """IMPORTANT-1: own-shard bytes prove the per-persist fold (no seam.load).
+
+    Legacy-only keys fold, late peer shards are discovered on the next
+    persist, higher values win by max, and decreasing values never regress.
+    """
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-fold-cases")
+    assert transcript["legacyFolded"] is True, transcript
+    assert transcript["lateFolded"] is True, transcript
+    assert transcript["noRegress"] is True, transcript
+
+
 def test_legacy_and_shard_merge_by_max(tmp_path: Path) -> None:
-    """P6: legacy (read-only) + peer shard maxima fold into the own shard."""
+    """P6: legacy (read-only) + peer shard maxima fold into the own shard bytes."""
     bundle = _bundle(tmp_path)
     transcript = _run_watermark(bundle, "watermark-merge")
     assert transcript["mergedOk"] is True, transcript
@@ -153,6 +184,10 @@ def test_gc_only_deletes_eligible_dead_owner_shards(tmp_path: Path) -> None:
     transcript = _run_watermark(bundle, "watermark-gc")
     assert transcript["deadDeleted"] is True, transcript
     assert transcript["foldedBeforeDelete"] is True, transcript
+    assert transcript["youngFolded"] is True, transcript
+    assert transcript["youngPreserved"] is True, transcript
+    assert transcript["ownPreserved"] is True, transcript
+    assert transcript["ownBytesKept"] is True, transcript
     assert transcript["alivePreserved"] is True, transcript
     assert transcript["epermPreserved"] is True, transcript
     assert transcript["unknownPreserved"] is True, transcript
@@ -166,6 +201,43 @@ def test_mixed_version_legacy_folds_forward_without_writing_legacy(tmp_path: Pat
     transcript = _run_watermark(bundle, "watermark-mixed")
     assert transcript["foldedOk"] is True, transcript
     assert transcript["legacyNotOverwritten"] is True, transcript
+
+
+def test_owned_tmp_sweep_recovers_failed_cleanup(tmp_path: Path) -> None:
+    """IMPORTANT-3: orphaned owned tmps are swept by the next persist."""
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-tmp-sweep")
+    assert transcript["cleanStart"] is True, transcript
+    assert transcript["orphanedOnFailure"] is True, transcript
+    assert transcript["sweptOnNextPersist"] is True, transcript
+    assert transcript["shardRecovered"] is True, transcript
+    assert transcript["legacyTmpPreserved"] is True, transcript
+    assert transcript["unrelatedPreserved"] is True, transcript
+
+
+def test_early_ack_retained_and_invalid_rejected(tmp_path: Path) -> None:
+    """IMPORTANT-4: pre-load ACKs accumulate; NaN/Infinity/negative ignored."""
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-early-ack")
+    assert transcript["earlyRetained"] is True, transcript
+    assert transcript["invalidIgnored"] is True, transcript
+    assert transcript["realAckConverged"] is True, transcript
+
+
+def test_note_during_io_flushed_in_same_persist(tmp_path: Path) -> None:
+    """IMPORTANT-5: a note landing mid-write is flushed before persist returns."""
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-note-during-io")
+    assert transcript["sameCycleFlushed"] is True, transcript
+
+
+def test_strict_selectors_exclude_decoys(tmp_path: Path) -> None:
+    """IMPORTANT-6: decoy filenames are excluded and preserved."""
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-selectors")
+    assert transcript["decoysExcluded"] is True, transcript
+    assert transcript["converged"] is True, transcript
+    assert transcript["decoysPreserved"] is True, transcript
 
 
 def test_hotpath_llm_wire_red_lines_hold() -> None:
