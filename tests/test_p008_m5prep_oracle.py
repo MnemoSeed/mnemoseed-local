@@ -576,6 +576,8 @@ class TestCorpusShape:
             path = ROOT / rel
             assert path.is_file(), rel
             data = path.read_bytes()
+            # Pinned OIDs are Git text blobs (LF); undo CRLF smudge from autocrlf checkouts.
+            data = data.replace(b"\r\n", b"\n")
             header = b"blob " + str(len(data)).encode("ascii") + b"\x00"
             assert hashlib.sha1(header + data).hexdigest() == want, rel
 
