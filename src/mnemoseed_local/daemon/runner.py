@@ -10,9 +10,12 @@ Ctrl+C still shuts the lifespan down cleanly (stores close) on the main thread.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sys
 import threading
 import time
+from collections.abc import Callable
 
 import httpx
 import uvicorn
@@ -29,6 +32,20 @@ _SNAPSHOT_MAX_SERVERS = 2
 _SNAPSHOT_MAX_SOCKETS = 4
 _SNAPSHOT_FIELD_BUDGET_B = 200
 _SNAPSHOT_TOTAL_BUDGET_B = 2048
+
+
+def _windows_selector_loop_factory() -> asyncio.AbstractEventLoop:
+    """Build a fresh selector event loop (uvicorn calls this with zero args)."""
+    return asyncio.SelectorEventLoop()
+
+
+def select_uvicorn_loop() -> Callable[[], asyncio.AbstractEventLoop] | str:
+    """Loop value for ``uvicorn.Config``: the selector factory on Windows
+    (whose accept path keeps the listener armed), uvicorn's ``auto`` default
+    everywhere else."""
+    if sys.platform == "win32":
+        return _windows_selector_loop_factory
+    return "auto"
 
 
 class MnemoseedServer(uvicorn.Server):
@@ -218,6 +235,8 @@ def run_server(host: str, port: int) -> int:
         port=port,
         log_level="info",
         access_log=False,
+        # Uvicorn >=0.36 resolves direct factories although its annotation still accepts strings only.
+        loop=select_uvicorn_loop(),  # type: ignore[arg-type]
     )
     server = MnemoseedServer(config)
     announcer = threading.Thread(

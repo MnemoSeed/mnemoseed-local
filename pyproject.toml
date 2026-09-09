@@ -28,7 +28,7 @@ dependencies = [
     # daemon surface: FastAPI app + uvicorn runner (the A2 daemon ships the
     # capture/recall/dream/config HTTP endpoints; localhost-only by default).
     "fastapi>=0.110",
-    "uvicorn>=0.29",
+    "uvicorn>=0.36",
 ]
 
 [dependency-groups]
