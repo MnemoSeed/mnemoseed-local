@@ -14,7 +14,7 @@
 | 进程吊死 / 监听消失 | 进程内 watchdog 自检测 + 快退 + 法医 dump | B2.3 + F2 根治 |
 | 用户可控启停（on/off） | 哨兵文件持久禁用 + 优雅关停端点 | B2.5 |
 
-三块共享的顶层语义：**"检测 + 快退 + 可复原"，不是"自愈"**。shipped 代码只负责把失效形态转化为干净的退出（exit code 1 + 末语日志 + 法医 dump），退出之后的拉起归用户侧（手点 `up`，或 README 文档化的登录计划任务 / watcher 一行命令）。数据丢失包络 = 普通崩溃同款，由 B2.2 的 ack 水位 + 会话级重生回放兜底；源头（宿主会话史）持久，视图即可重建。
+三块共享的顶层语义：**"检测 + 快退 + 可复原"，不是"自愈"**。shipped 代码只负责把失效形态转化为干净的退出（exit code 1 + 末语日志 + 法医 dump），退出之后的拉起归用户侧（手点 `up`，或 README 文档化的 AtLogOn + waiting bounded wrapper）。数据丢失包络 = 普通崩溃同款，由 B2.2 的 ack 水位 + 会话级重生回放兜底；源头（宿主会话史）持久，视图即可重建。
 
 边界（诚实）：
 
@@ -186,7 +186,7 @@ flowchart TD
 - `docs/zh/prd/PRD-B2.3-daemon-reliability.md`（仓库 PRD，B2.3 daemon 可靠性 + F2 根治；同主仓 Rxx 状态：本仓库自己）
 - `docs/zh/prd/PRD-B2.5-daemon-onoff.md`（仓库 PRD，B2.5 on/off；同主仓 Rxx 状态：本仓库自己）
 - `docs/zh/prd/PRD-B2-roadmap.md`（仓库 PRD，Phase B 总路线图与批次记录，含 F2 根治批次；同主仓 Rxx 状态：本仓库自己）
-- `README.md` §Daemon supervision（仓库文档，Task Scheduler AtLogOn + RestartCount、ExecutionTimeLimit=0、watchdog exit code 1 语义、watcher 一行命令；工程形态一段，可引用为运维形态）
+- `README.md` §Daemon supervision（仓库文档，Task Scheduler AtLogOn + 用户侧 bounded wrapper、ExecutionTimeLimit=0、disabled marker 与最多三次重试语义；工程形态一段，可引用为运维形态）
 - 工程性事实（非文献条目，注明）：OpenCode 宿主自身持久化完整会话史（`client.session.messages` 可读回），daemon 捕获为派生视图——源头不丢，视图即可重建。
 
 实现代码取证源（均在仓库 `src/mnemoseed_local/` 与 `hosts/opencode/` 下）：`daemon/watchdog.py`、`daemon/runner.py`、`util/daemon_executor.py`、`mcp_gateway/reliable_client.py`、`daemon_state.py`、`cli.py`、`hosts/opencode/plugin.ts`。

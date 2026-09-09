@@ -24,7 +24,7 @@
 
 ## 设计决定（decided design questions，全部钉死）
 
-- **D1 形态**：只 ship **进程内自检测 + 快退** + 持久日志。不 ship supervisor（KISS 减法，表见下）；拉起归用户侧（README 文档化 Task Scheduler + watcher 一行命令，P3 交付物 B 原文）。
+- **D1 形态**：只 ship **进程内自检测 + 快退** + 持久日志。不 ship supervisor（KISS 减法，表见下）；拉起归用户侧（README 当前文档化 AtLogOn + bounded wrapper；本节后续旧 RestartCount 方案为历史记录，已被 2026-09-09 增补取代）。
 - **D2 watchdog（唯一新增进程内机制）**：daemon 线程（非 asyncio——循环死时 asyncio 任务同死，侦察定案）裸 TCP connect 探测 `127.0.0.1:7788`，间隔 1s；两态机：**PRE_BIND**（首连成功前；超过 `WATCHDOG_BOOT_GRACE_S = 300` 仍 refused → 退出——覆盖 boot dream 恢复吊死变体）→ **ARMED**（首连成功后；连续 refused ≥ `WATCHDOG_REFUSED_GRACE_S = 10` → 退出——正常关停 teardown 远快于 10s，吊死关停被宽限兜住后处死）。**退出 = 写末语日志行后 `os._exit(1)`**（跳过卡死的 join 与 atexit；数据丢失包络 = 普通崩溃同款，B2.2 水印 + 会话级回放兜底，ack 钟语义不变）。**ARM 纪律**：只经 `run_server` 路径武装（`runner.py` 在 `server.run()` 前起线程）；`create_app()`/模块 import/TestClient 永不武装（`app.py:714` 模块级 boot 纪律）；正常关停时线程随解释器退出（daemon thread 绝不阻塞退出），teardown 期间保持 ARMED 生效（`memory.close`/`dream_worker.stop` 正是要守的悬挂点）。
 - **D3 no-response 边界**：探测语义只管 **refused（监听消失）**与 **boot 超宽限**；connect 成功即视为存活（bound-but-stalled 的事件循环饥饿属 B6 域，本批不治——stalled 只记日志行不退出，诚实边界）。
 - **D4 持久日志**：lifespan startup 时给 `mnemoseed_local` logger 挂 `FileHandler` → `CONFIG_DIR/daemon.log`（`config.py:24` 根，与 hook-watermarks 同根）；捕获 boot 行（pid/version/port）、teardown 行（各阶段进入）、watchdog 末语（fire 原因+时间戳，fire 后立即 flush）。uvicorn 自身日志仍走 stderr（如实）。
@@ -38,14 +38,18 @@
 | 候选机制 | 判定 | 理由 |
 |---|---|---|
 | **(a) 无监护（本批基线，排第 1）** | **做（shipped 形态）** | 本批 shipped = 进程内自检测 + 快退：daemon 线程 socket 探活，宽限期后 `os._exit(1)` + 末语日志。零新增进程树、零 pidfile/锁、零双 daemon 碰撞面，test_cli.py 的"`up` 绝不 spawn 子进程"钉（`tests/test_cli.py:582-601`）不被触碰。自诊断成立的前提是**末语落盘到持久文件**（现状 daemon 日志只走 stderr，无 FileHandler——见文末事实 5，本批需补 `CONFIG_DIR/daemon.log` 式落点）。退出码 1 + 末语 = 交给用户或下方 (b) 一行命令接手，语义清晰、可复原 |
-| **(b) 用户侧 Task Scheduler / watcher 一行命令（排第 2）** | **文档（README/PRD 数行，不 shipped）** | 零代码成本、环境可复原（删任务即回原状）；与 (a) 是**互补而非替代**——调度器只认"进程退出且非零码"，而"进程存活但 7788 消失"（2026-08-19 实锤形态）在调度器眼里是 Running、永不重启；(a) 的 exit-fast 恰好把吊死转化为非零退出，才让 (b) 的 RestartCount 变得有效。仓库已有同族先例：`install.ps1` 给 ollama serve 注册的登录任务（`install.ps1:281-285`，RestartCount 3 / 1min）。具体定义见文末"交付物 B" |
+| **(b) 用户侧 Task Scheduler wrapper（排第 2）** | **文档（README/PRD，不 shipped）** | 零产品代码成本、环境可复原（删任务与用户侧脚本即回原状）；与 (a) 是**互补而非替代**——进程存活但 7788 消失时 task 仍是 Running，(a) 先 exit-fast，wrapper 同步观察子进程退出后才按 60s / 最多 3 次重拉。原“非零退出会触发 Task Scheduler RestartCount”推断已由 2026-09-09 `exit 7` 实测证伪，见文末增补。 |
 | **(c) shipped 独立 supervisor verb（`up --supervised` / 兄弟 wrapper）** | **不做（减法 OUT）** | 完整代价：新的进程树管理（谁等谁、孤儿收养）、pidfile + 锁文件（Windows 上需 job object 才可靠回收子进程——`CreateJobObject` 是新增的 ctypes/win32 依赖面）、**双 daemon 绑定碰撞**（supervisor 与自愈后重拉起的实例抢 7788）、测试面（新增一个常驻进程生命周期测试族）。收益只是"免手点一次 `up`"，与 (b) 的文档化一行命令等价——成本收益不成比例。且 pin 死：`up` 路径绝不 spawn 子进程（`tests/test_cli.py:586-596`），shipped supervisor 只能走旁路 verb，等于再造半个"服务管理"产品 |
 | 进程内 **asyncio-task 看门狗** | **不做（已否决）** | 自身与业务跑同一事件循环：循环卡死（uvicorn 吊死的主因场景）时看门狗任务也永远不被调度——**测不到自己要守的死**。这正是 shipped 形态选 daemon **线程** + 阻塞 socket 探测的原因：OS 线程独立于事件循环，循环死了它照常探测、照常退出 |
 | **OS 服务管理器（`sc.exe` / NSSM）** | **不做** | `sc.exe` 建服务需管理员提权，NSSM 是第三方二进制、仓库不打包；二者都绑定"注册到系统"的安装形态，与 CLI-first + `uv tool install`（`README.md:30-31`）的用户可移植哲学相悖。安装器已克制到"只 hint、不 relocate"（`install.ps1:186-187` 同型原则），服务注册是同一类越界。真需要常驻监督时，(b) 的登录任务已是当前用户零提权替代 |
 
 **排位逻辑**：(a) 先立 shipped 最小面 → (b) 文档补足"死了有人拉" → (c) 被 (b) 覆盖且引入全部新风险面 → 两个已否决项是形态原因（asyncio 测不到自身循环 / 系统服务不用户可移植）。
 
-## 交付物 B —— 实际可粘的文档化监督定义（本批仅落文档，供 README 引用）
+## 交付物 B —— 历史监督定义（2026-09-09 已取代）
+
+> **勿按本段旧代码新建任务**：以下保留 2026-08-19 的决策原貌；原生
+> `RestartCount` 对已启动动作的非零退出没有完成重拉。当前可执行定义以 README 的
+> AtLogOn + waiting bounded wrapper 为准，实测证据见文末 2026-09-09 增补。
 
 **登录计划任务（推荐；对齐 `install.ps1` 的 ollama 先例）**
 
@@ -78,7 +82,7 @@ while ($true) {
 
 ## 边界（如实）
 
-> **边界（如实）**：本批 shipped 的监督语义是"**自检测 + 快退**"，不是"自愈"——daemon 只负责把'吊死（进程存活、7788 监听消失，2026-08-19 实锤形态）'和'监听丢失'检测出来，宽限期后带末语日志 `os._exit(1)` 干净退场；**退出之后的拉起归用户侧**：手点 `mnemoseed-local up`，或按 README 文档化的登录计划任务 / watcher 一行命令重启（RestartCount 只认非零退出的失败——exit-fast 正是让调度器监督变得有效的另一半）。shipped 代码**不新增 supervisor、不 spawn 子进程**（test_cli.py 钉死）、不落 pidfile、不做端口预检（双 daemon 由端口绑定自排除）。Windows 无 SIGTERM 语义：`os._exit` / 任务管理器结束任务都是硬杀，**不触发 lifespan teardown**——capture drain（`app.py:610-633`）不跑，内存状态机直接全灭；这正是 B2.2 的 ack 水位 + 会话级重生回放兜底的存在理由（源头宿主会话史持久，视图可重建），硬杀缺口以'最后一次成功持久为界'如实接受。opencode MCP 网关是宿主的 stdio 子进程，其 respawn 生命周期归 opencode 自己（README:53-62 只承诺握手在 daemon 下线时照常、工具调用报 isError），**在本仓库边界之外**，不归本批。
+> **边界（如实）**：本批 shipped 的监督语义是"**自检测 + 快退**"，不是"自愈"——daemon 只负责把'吊死（进程存活、7788 监听消失，2026-08-19 实锤形态）'和'监听丢失'检测出来，宽限期后带末语日志 `os._exit(1)` 干净退场；**退出之后的拉起归用户侧**：手点 `mnemoseed-local up`，或按 README 文档化的 AtLogOn + waiting bounded wrapper 重启。shipped 代码**不新增 supervisor、不 spawn 子进程**（test_cli.py 钉死）、不落 pidfile、不做端口预检（双 daemon 由端口绑定自排除）。Windows 无 SIGTERM 语义：`os._exit` / 任务管理器结束任务都是硬杀，**不触发 lifespan teardown**——capture drain（`app.py:610-633`）不跑，内存状态机直接全灭；这正是 B2.2 的 ack 水位 + 会话级重生回放兜底的存在理由（源头宿主会话史持久，视图可重建），硬杀缺口以'最后一次成功持久为界'如实接受。opencode MCP 网关是宿主的 stdio 子进程，其 respawn 生命周期归 opencode 自己（README:53-62 只承诺握手在 daemon 下线时照常、工具调用报 isError），**在本仓库边界之外**，不归本批。
 
 ## 门禁
 
@@ -95,7 +99,7 @@ while ($true) {
 - **探针超时实战修正**：`_PROBE_TIMEOUT_S = 3.0`（开发中发现：本机类过滤 Windows 主机 loopback refused 延迟 ~2s 才送达，1s 预算会把死监听错判为 stalled=alive——实测钉死，S1 三修随批），docstring 记证。
 - **持久日志**：lifespan startup 挂 FileHandler（`CONFIG_DIR/daemon.log`，utf-8、double-attach guard、call-time 解析 CONFIG_DIR 让测试 fixture 可重定向——QA I-1 修复的定案形态）；boot 行（pid/version/preset/port）+ teardown 各阶段 ENTER 行 + watchdog 末语同链落盘。
 - **网关 retry**（`mcp_gateway/reliable_client.py`）：`GatewayClient` 薄包装、`serve()` 单点注入；至多一次快重试且仅当首败为 `DaemonUnavailableError.__cause__` 是 `httpx.ConnectError`（refused=重启窗，证 pre-request 不会双重作用）；重试腿 `RETRY_TIMEOUT_SECONDS=1.5`（真 DaemonClient 走 `dataclasses.replace(timeout=...)`，stub 回退同 client 并如实记注）；RestError/Timeout/无 cause 零重试；诚实报错保 pin：refused 双败 → "daemon is not running (start it with 'mnemoseed-local up')"、timeout → "daemon timed out after 30s (busy or hung; try again shortly)"、"cannot reach"/"422" 既有 pin 不动。
-- **README**：`Daemon supervision (optional)` 一节（Task Scheduler 登录任务块 + watcher 一行命令 + 4 条诚实坑），bind 失败如实记为"未捕获 EADDRINUSE → 非零退出"（曾误写"码 3"，QA N-1 修正）。AGENTS.md 增补并行化执行条款（2026-08-19 用户指令，随批入仓）。
+- **README（历史交付，已修订）**：2026-08-19 曾交付 Task Scheduler 原生 RestartCount + watcher 示例；2026-09-09 实测证伪其非零退出重拉前提后，当前 README 已替换为 AtLogOn + waiting bounded wrapper。AGENTS.md 并行化执行条款不变。
 
 **QA 修复轮（IMPORTANT 随批修净）**：I-1 测试套件向真 `~/.mnemoseed-local/daemon.log` 灌垃圾 → call-time 解析 + 8 个 booting suite 全部补 `config.CONFIG_DIR` fixture 补丁 + LastWriteTime 不变实证（9 个 booting 文件全枚举，stragglers=0）；I-2 `default_probe` 任意 OSError→死 的变异体原可过绿 → B6 双钉（probe 级 monkeypatch TimeoutError→True+B6 日志、状态机级 always-alive 无 fire）。NIT：N-1 文档事实修正、N-2 SYNs 静默丢弃主机的惰性边界、N-3 PRE_BIND 时钟起点、N-5 stop-then-start 文档、N-7 boot 行针加严；N-4（双武装生产不可达）/N-6（时序面）/N-8（日志级）如实记为边界。
 
@@ -186,3 +190,41 @@ while ($true) {
 - **门禁与证据**：12 个 Rev3 新钉（RED 先行，10 红 2 回归 pin）→ 全绿；
   双 stop-check mutant 各自杀死对应测试；`uv run pytest -q` 全量通过；
   ruff check / format / mypy 全净。
+
+## 2026-09-08 增补 · Windows Proactor listener 丢失根治
+
+- **新现场（与旧 F2 teardown 僵尸机制不同）**：现网 daemon 两次在正常服务中触发
+  `watchdog refused-grace`；快照均为 `should_exit=False`、`started=True`，唯一 listener
+  已变成 `fd=-1` / `errno=10038`。同期 stderr 留下 `IocpProactor.accept` /
+  `accept_coro` 的 `ConnectionResetError [WinError 64]` 与 `Accept failed on a socket`；
+  没有 teardown 前行或 worker join 的证据。
+- **根因**：Windows CPython 3.12 默认 Proactor loop 的 `IocpProactor.accept` 可在对端
+  abortive close 时交付 WinError 64；`BaseProactorEventLoop._start_serving` 捕获该
+  `OSError` 后关闭 listening socket，且不重新挂 accept。于是 uvicorn 主循环与 lifespan
+  仍存活，但端口永久消失，精确解释上述 `started=True + should_exit=False + fd=-1`。
+  该行为已直接核验本机 CPython 3.12.13 的
+  `Lib/asyncio/proactor_events.py::BaseProactorEventLoop._start_serving`；不引用尚未确认
+  与本次 WinError 64 形状一致的上游 issue 编号。
+- **修复决定**：仅 Windows 的 `run_server()` 给 uvicorn 传零参数 factory，显式创建
+  `asyncio.SelectorEventLoop`；其他平台继续用 uvicorn `auto`。这是单 daemon 的局部选择，
+  不调用进程全局且已弃用的 `WindowsSelectorEventLoopPolicy`。uvicorn callable loop factory
+  自 0.36 才存在，故依赖下限由 `>=0.29` 诚实收紧为 `>=0.36`（lock 仍为 0.52.3）。
+- **取舍**：Windows Selector loop 的并发 socket 上限低于 IOCP，但本产品是 localhost、
+  单用户、低并发 daemon，该上限远离正常负载；避开会永久关闭唯一 listener 的 AcceptEx
+  路径优先级更高。watchdog 不改，继续作为 listener 消失时的取证与 `exit(1)` 兜底。
+- **拉起边界不变**：仓内仍不 ship supervisor；用户侧 Task Scheduler 保持
+  `AtLogOn + ExecutionTimeLimit 0 + MultipleInstances IgnoreNew`，action 调用户 home 下的
+  bounded wrapper；wrapper 同步等待 `mnemoseed-local up`，不得用会清除 disabled marker
+  的 `on`。
+- **验收钉**：Windows factory 实例必须是 SelectorEventLoop；非 Windows 必须保持
+  `auto`；`run_server()` 必须把所选值真实接入 `uvicorn.Config`；测试不得启动真实 daemon、
+  watchdog 或写用户 home。部署后另做 abortive-close 压测与健康检查，确认 listener 保持。
+- **监督实测修订（2026-09-09，覆盖本文早期 `RestartCount` 推断）**：同机一次性任务
+  自然 `exit 7` 后，Task Scheduler 只记录 `LastTaskResult=7`，超过 90 秒仍不执行
+  `<RestartOnFailure Count=2 Interval=PT1M>`；强杀 daemon 子进程得到 `0xFFFFFFFF` 同样
+  不重试。故“watchdog `exit(1)` 可直接触发 Task Scheduler RestartCount”被实测证伪。
+  现机改用**用户侧、非 shipped** 的 PowerShell wrapper：每次 launch 前后检查
+  `daemon.off`，同步等待 `up`，失败后 60 秒重试，最多 3 次；单次稳定运行 >=10 分钟后
+  重置预算。真实演练中 PID 12544 被强制结束后，wrapper 记录 `code=-1`，60 秒后拉起
+  PID 71264，`status`/`doctor` 全绿。仓内仍不新增 supervisor verb/process tree API；
+  README 的旧原生 RestartCount 示例由该已验证 wrapper 注册方式取代。

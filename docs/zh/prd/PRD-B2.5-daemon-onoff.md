@@ -57,7 +57,7 @@ app.state.shutdown_hook = _intentional_shutdown
 
 ### Supervision / README
 
-- Task Scheduler 登录任务（RestartCount 3）在 disabled 下每次 `up` 即 rc 1 结束 → 无害短命 no-op；watcher 一行命令 15s 轮询监听 → 同样 no-op（略噪）。README 监督段加一句：关闭服务后请移除计划任务/watcher，或接受无害 exit-1；动词表加 `on`/`off` 两行。
+- **2026-09-09 修订**：Task Scheduler 登录任务改调用户侧 bounded wrapper；wrapper 每次 launch 前后检查 `daemon.off`，disabled 时不调用 `up`、直接 rc 0 退出，故不再产生周期 watcher / rc-1 噪声。原生 `RestartCount` 不负责已启动动作的非零退出（实测见 PRD-B2.3 增补）。
 
 ### KISS 削减
 
@@ -68,7 +68,7 @@ app.state.shutdown_hook = _intentional_shutdown
 1. off 收敛 best-effort：shutdown POST 应答 200 即 respond-then-exit，daemon 在 drain；CLI ≤15s 轮询，超时后再探一次 /healthz：存活 → 报 "daemon is still running"（复活/拒停，附手工停止指引）；不可达 → 报 "may still be shutting down"（drain 中）。数据包络 = 正常优雅关停（QA-4 drain 在位），非崩溃包络。
 2. disarm 摘网 tradeoff（见上，已记档）。
 3. gateway hint 陈旧窗（启动读一次）。
-4. supervision 在 disabled 下产无害 rc-1 进程（略噪；文档指引移除）。
+4. supervision wrapper 在 disabled 下零启动、rc 0 退出；重新启用后需由 `on` 或下一次登录启动服务。
 5. 哨兵文件非 config：`config get` 不可见、无版本化、无 DB 镜像——设计使然（必须在 daemon 缺席时存活）。
 6. 默认开 = 哨兵缺席，装机零改动。
 

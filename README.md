@@ -153,50 +153,146 @@ MIT.
 
 The daemon supervises itself: a watchdog thread probes the served listener
 and, when the listener is lost beyond a grace window, writes its last words to
-`daemon.log` (under `MNEMOSEED_LOCAL_HOME`) and exits with code 1; relaunching
-stays user-side. For automatic relaunch, register a logon scheduled task
-(mirrors the installer's ollama precedent):
+`daemon.log` (under `MNEMOSEED_LOCAL_HOME`) and exits with code 1. Relaunching
+stays user-side.
+
+Windows Task Scheduler records a non-zero action result but does not reliably
+treat it as a launch failure, so `RestartCount` alone does not relaunch a daemon
+that exits after it started. Use a user-side wrapper that waits for `up`, checks
+the explicit `daemon.off` marker, and bounds rapid failures to three restarts:
 
 ```powershell
-$shim = Join-Path $env:USERPROFILE ".local\bin\mnemoseed-local.exe"
-$action   = New-ScheduledTaskAction -Execute $shim -Argument "up"
-$trigger  = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
-  -RestartInterval (New-TimeSpan -Minutes 1) `
+$configHome = if ($env:MNEMOSEED_LOCAL_HOME) {
+  $env:MNEMOSEED_LOCAL_HOME
+} else {
+  Join-Path $env:USERPROFILE ".mnemoseed-local"
+}
+New-Item -ItemType Directory -Force -Path $configHome | Out-Null
+$supervisor = Join-Path $configHome "supervise.ps1"
+@'
+param(
+    [ValidateRange(0, 100)]
+    [int]$MaxRestarts = 3,
+
+    [ValidateRange(0, 3600)]
+    [int]$RestartDelaySeconds = 60,
+
+    [ValidateRange(1, 86400)]
+    [int]$StableRunSeconds = 600,
+
+    [string]$ConfigHome = "",
+
+    [string]$ShimPath = "",
+
+    [string[]]$ShimArguments = @("up")
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$configHome = if (-not [string]::IsNullOrWhiteSpace($ConfigHome)) {
+    $ConfigHome
+} elseif ([string]::IsNullOrWhiteSpace($env:MNEMOSEED_LOCAL_HOME)) {
+    Join-Path $env:USERPROFILE ".mnemoseed-local"
+} else {
+    $env:MNEMOSEED_LOCAL_HOME
+}
+$disabledMarker = Join-Path $configHome "daemon.off"
+$logPath = Join-Path $configHome "supervisor.log"
+$shim = if ([string]::IsNullOrWhiteSpace($ShimPath)) {
+    Join-Path $env:USERPROFILE ".local\bin\mnemoseed-local.exe"
+} else {
+    $ShimPath
+}
+
+function Write-SupervisorLog {
+    param([string]$Message)
+
+    try {
+        if (-not (Test-Path -LiteralPath $configHome)) {
+            New-Item -ItemType Directory -Path $configHome -Force | Out-Null
+        }
+        Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format o) $Message" -Encoding utf8
+    } catch {
+        # Logging must never block daemon recovery.
+    }
+}
+
+$restartCount = 0
+while ($true) {
+    if (Test-Path -LiteralPath $disabledMarker) {
+        Write-SupervisorLog "disabled marker present; supervisor exiting"
+        exit 0
+    }
+    if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
+        Write-SupervisorLog "mnemoseed-local shim missing; supervisor exiting"
+        exit 127
+    }
+
+    $startedAt = Get-Date
+    $exitCode = 1
+    Write-SupervisorLog "starting daemon (restart_count=$restartCount)"
+    try {
+        $process = Start-Process -FilePath $shim -ArgumentList $ShimArguments -PassThru -Wait -WindowStyle Hidden
+        $exitCode = $process.ExitCode
+    } catch {
+        Write-SupervisorLog "daemon launch failed ($($_.Exception.GetType().Name))"
+    }
+
+    $runtimeSeconds = ((Get-Date) - $startedAt).TotalSeconds
+    Write-SupervisorLog "daemon exited (code=$exitCode runtime_seconds=$([math]::Round($runtimeSeconds, 1)))"
+
+    if (Test-Path -LiteralPath $disabledMarker) {
+        Write-SupervisorLog "disabled marker present after exit; supervisor exiting"
+        exit 0
+    }
+    if ($exitCode -eq 0) {
+        Write-SupervisorLog "daemon exited cleanly; supervisor exiting"
+        exit 0
+    }
+    if ($runtimeSeconds -ge $StableRunSeconds) {
+        $restartCount = 0
+        Write-SupervisorLog "stable-run threshold reached; restart budget reset"
+    }
+    if ($restartCount -ge $MaxRestarts) {
+        Write-SupervisorLog "restart budget exhausted; supervisor exiting"
+        exit $exitCode
+    }
+
+    $restartCount += 1
+    Write-SupervisorLog "retrying in $RestartDelaySeconds seconds (restart_count=$restartCount)"
+    Start-Sleep -Seconds $RestartDelaySeconds
+}
+'@ | Set-Content -LiteralPath $supervisor -Encoding utf8
+
+$pwsh = (Get-Command pwsh).Source
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute $pwsh `
+  -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$supervisor`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$settings = New-ScheduledTaskSettingsSet `
   -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+  -MultipleInstances IgnoreNew -StartWhenAvailable `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId $identity `
+  -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName "MnemoSeedLocalDaemon" `
-  -Action $action -Trigger $trigger -Settings $settings -Force
+  -Action $action -Trigger $trigger -Settings $settings `
+  -Principal $principal -Force
 ```
 
 Honest caveats:
 
-- Use **AtLogOn + RestartCount, never a periodic trigger** — a "run every X
-  minutes" trigger would start a second `up` next to a healthy daemon; restart
-  on failure only fires when the action is not running and exited non-zero.
+- Use **AtLogOn + one waiting wrapper, never a periodic trigger**. The task stays
+  running with the daemon, and `IgnoreNew` rejects duplicate task instances.
 - **`-ExecutionTimeLimit` must be 0 (unlimited)** — the Task Scheduler default
   3-day cap would hard-kill a healthy long-running daemon.
-- The watchdog's exit code 1 is what makes RestartCount effective — the
-  scheduler only sees "not running + non-zero exit" as a failure, and the
-  watchdog converts a hung daemon into exactly that.
-- The watcher checks the **LISTEN state, not /healthz** — a hung-but-bound
-  daemon would make /healthz time out and spuriously relaunch.
+- The wrapper launches **`up`, never `on`**. `up` respects `daemon.off`; `on`
+  clears it and would revive a service the user deliberately disabled.
+- Three rapid restarts are allowed at 60-second intervals. A run lasting at
+  least ten minutes resets that budget, so sparse failures remain recoverable
+  without creating an infinite crash loop.
 
-Or run the watcher one-liner when you do not want a scheduled task:
-
-```powershell
-while ($true) {
-  if (-not (Get-NetTCPConnection -LocalPort 7788 -State Listen -ErrorAction SilentlyContinue)) {
-    Start-Process -WindowStyle Hidden mnemoseed-local -ArgumentList 'up'
-  }
-  Start-Sleep -Seconds 15
-}
-```
-
-The watchdog releases the port within its grace window, so the next loop
-naturally relaunches; a bind race with a still-releasing port is absorbed by
-the new `up` failing fast with a non-zero exit (the uncaught bind error
-propagates, not a custom code).
-
-With the service off (`mnemoseed-local off`), `up` exits 1 immediately (a
-harmless no-op) — remove the scheduled task / watcher, or accept the no-op.
+The watchdog releases the port before exiting, then the waiting wrapper delays
+for 60 seconds and relaunches. With the service off (`mnemoseed-local off`), the
+wrapper observes `daemon.off` and exits 0 without launching or retrying `up`.
