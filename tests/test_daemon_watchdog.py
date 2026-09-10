@@ -2055,3 +2055,55 @@ def test_rev4_empty_socket_list_is_false_not_unknown() -> None:
     # no servers key at all (truncated/error/unknown shapes): still None
     for shape in ({"state": "truncated"}, {"state": "error"}, {"state": "unknown"}, {}):
         assert _snapshot_socket_alive(shape, "127.0.0.1", 7788) is None, shape
+
+
+def test_rev4_localhost_probe_vetoes_numeric_loopback_recording() -> None:
+    """Rev 4 QA NEW-1 (closeout pass): a ``--host localhost`` daemon probes
+    ``localhost`` but getsockname records the numeric ``127.0.0.1``; an
+    exact-match-only comparison makes the veto inert there and the 9-09
+    misfire recurs on that flag. A numeric-loopback recording must veto a
+    loopback-alias probe host (port still exact); a NON-loopback probe host
+    must not be vetoed by a loopback recording."""
+    from mnemoseed_local.daemon.watchdog import _snapshot_socket_alive
+
+    numeric = {
+        "should_exit": False,
+        "started": True,
+        "servers": [{"sockets": [{"fd": 1340, "host": "127.0.0.1", "port": 7788}]}],
+    }
+    assert _snapshot_socket_alive(numeric, "localhost", 7788) is True, (
+        "a numeric-loopback recording must veto a localhost probe"
+    )
+    assert _snapshot_socket_alive(numeric, "::1", 7788) is True, (
+        "a numeric IPv4 loopback recording must veto an ::1 probe (dual-stack"
+        " loopback: the same listener serves both on a loopback bind)"
+    )
+    # a non-loopback probe host is never vetoed by a loopback recording
+    assert _snapshot_socket_alive(numeric, "192.168.1.5", 7788) is False
+
+    # through the full loop: --host localhost, snapshot records 127.0.0.1
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+
+    def _numeric_snapshot() -> tuple[dict[str, object], int]:
+        return (numeric, 0)
+
+    watchdog = Watchdog(
+        "localhost",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+        server_snapshot=_numeric_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.5)
+        assert fired == [], "a --host localhost daemon must not be killed on a healthy listener"
+        assert watchdog.veto_count >= 1
+    finally:
+        watchdog.stop()

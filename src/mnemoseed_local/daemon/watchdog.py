@@ -60,6 +60,7 @@ ProbeKind = Literal["success", "refused", "timeout", "other_oserror"]
 
 
 _WILDCARD_HOSTS = ("0.0.0.0", "::", "::0")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) -> bool | None:
@@ -68,16 +69,21 @@ def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) ->
     Returns True only when at least one server entry carries a listener
     socket whose recorded fd is a true int (bools rejected) and whose
     recorded host:port serves the probed endpoint — either an exact host
-    match or a wildcard bind (``0.0.0.0``/``::``) when the probe host is
-    loopback, mirroring ``runner._PROBE_HOSTS``. Returns False when the
-    snapshot is readable but shows no such socket (server entries whose
-    socket lists were read: empty/closed/mismatched). Returns None when
-    the snapshot cannot support a decision (no server entries, or nothing
-    readable) — the caller must treat None as "no veto" (fail-closed).
+    match, or a wildcard bind (``0.0.0.0``/``::``) when the probe host is
+    loopback (mirroring ``runner._PROBE_HOSTS``), or a numeric-loopback
+    recording when the probe host is a loopback alias (``localhost``:
+    ``getsockname`` records the numeric form, so an exact-match-only
+    comparison makes the veto inert on ``--host localhost`` daemons).
+    Returns False when the snapshot is readable but shows no such socket
+    (server entries whose socket lists were read: empty/closed/mismatched).
+    Returns None when the snapshot cannot support a decision (no server
+    entries, or nothing readable) — the caller must treat None as "no veto"
+    (fail-closed).
     """
     servers = snapshot.get("servers")
     if not isinstance(servers, list) or not servers:
         return None
+    probe_is_loopback = host in _LOOPBACK_HOSTS
     any_readable = False
     for single in servers:
         if not isinstance(single, dict):
@@ -99,7 +105,7 @@ def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) ->
             if sock_port != port:
                 continue
             if sock_host == host or (
-                sock_host in _WILDCARD_HOSTS and host in ("127.0.0.1", "localhost", "::1")
+                probe_is_loopback and (sock_host in _WILDCARD_HOSTS or sock_host in _LOOPBACK_HOSTS)
             ):
                 return True
     if any_readable:
