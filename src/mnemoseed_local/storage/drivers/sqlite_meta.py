@@ -521,15 +521,34 @@ class SqliteMetaDriver:
     def append_error_event(self, event: ErrorEvent) -> None:
         """Append one error-event ledger row (deterministic, no model calls).
 
-        ``observed_at`` is stamped at insert time when the caller leaves it at
-        the default; ``profile_id`` is stored verbatim and never guessed. The
-        evidence pointer is stored flat (kind + id) so the row reads as a single
-        evidence pointer without any schema-side reinterpretation. Immutability
-        is enforced at the database level by the append-only triggers.
+        ``observed_at`` is stored verbatim — including an explicit epoch-0
+        ``0.0``, which is a caller-chosen value, not a "stamp it for me"
+        sentinel (#151 F: only a runtime-None value falls back to insert
+        time); ``profile_id`` is stored verbatim and never guessed (empty
+        and whitespace-only ids are rejected). The evidence pointer is
+        stored flat (kind + id) so the row reads as a single evidence
+        pointer without any schema-side reinterpretation. Within one
+        (profile_id, session_id) stream, ``observed_at`` must not move
+        backwards (#151 E: reads order by id, so an out-of-order timestamp
+        inside a session would make time-window queries disagree with
+        id-order pagination; cross-session and cross-profile timestamps are
+        never compared). Immutability is enforced at the database level by
+        the append-only triggers.
         """
-        if not event.profile_id:
+        if not (event.profile_id or "").strip():
             raise ValueError("error event profile_id is required and never guessed")
-        observed = event.observed_at if event.observed_at else time.time()
+        observed = event.observed_at if event.observed_at is not None else time.time()
+        if event.session_id is not None and event.session_id != "":
+            row = self._conn.execute(
+                "SELECT observed_at FROM error_events "
+                "WHERE profile_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1",
+                (event.profile_id, event.session_id),
+            ).fetchone()
+            if row is not None and observed < epoch_from_iso(str(row["observed_at"])):
+                raise ValueError(
+                    "error event observed_at must not move backwards within "
+                    f"(profile_id, session_id) = ({event.profile_id!r}, {event.session_id!r})"
+                )
         self._conn.execute(
             "INSERT INTO error_events (profile_id, signal_type, observed_at, "
             "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
