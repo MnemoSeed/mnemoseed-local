@@ -47,6 +47,7 @@ from mnemoseed_local.storage.registry import (
 
 PROFILE = "default"
 DRIVER = Path(__file__).parent / "ts_hook" / "hook_driver.mjs"
+FIXTURES = Path(__file__).parent / "fixtures" / "opencode_hook"
 
 _DRIVERS = (
     (VECTOR_DRIVERS, lancedb_embedded.LanceDbEmbeddedStore),
@@ -237,11 +238,14 @@ def _bundle(tmp_path: Path) -> Path:
     return out
 
 
-def _run(bundle: Path, scenario: str) -> dict:
+def _run(bundle: Path, scenario: str, *, fixture_dir: Path | None = None) -> dict:
     env = dict(os.environ)
     env.pop("MNEMOSEED_LOCAL_DEBUG", None)
+    cmd = ["node", str(DRIVER), str(bundle), scenario]
+    if fixture_dir is not None:
+        cmd.append(str(fixture_dir))
     result = subprocess.run(
-        ["node", str(DRIVER), str(bundle), scenario],
+        cmd,
         shell=False,
         capture_output=True,
         encoding="utf-8",
@@ -252,19 +256,42 @@ def _run(bundle: Path, scenario: str) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _load_fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _bus_info(fx: dict) -> dict:
+    """The message.updated bus_event's info record, verbatim from the fixture."""
+    return fx["bus_event"]["properties"]["info"]
+
+
+def _provider_bodies(transcript: dict) -> list[dict]:
+    return [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
+
+
 def test_plugin_true_429_nominates_quota_not_other(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
-    transcript = _run(bundle, "provider-error-nomination")
-    bodies = [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
+    transcript = _run(bundle, "provider-error-nomination", fixture_dir=FIXTURES)
+    bodies = _provider_bodies(transcript)
     assert bodies, "real plugin emitted no provider_error POST for the 429 fixture"
-    quota = [b for b in bodies if b["content"]["status"] == "quota"]
-    assert quota, f"true 429 misclassified: {[b['content']['status'] for b in bodies]}"
+    fx = _load_fixture("provider_error_429.json")
+    info = _bus_info(fx)
+    expected = {
+        "provider": info["providerID"],
+        "model": info["modelID"],
+        "status": fx["pinned_contract"]["expected_status_token"],
+        "reason": fx["pinned_contract"]["expected_reason"],
+        "error_id": info["id"],
+    }
+    assert expected in [b["content"] for b in bodies], (
+        f"429 fixture drift or misclassification: {[b['content'] for b in bodies]}"
+    )
 
 
 def test_plugin_build_error_never_nominates(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
-    transcript = _run(bundle, "provider-error-nomination")
-    bodies = [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
+    transcript = _run(bundle, "provider-error-nomination", fixture_dir=FIXTURES)
+    bodies = _provider_bodies(transcript)
     for body in bodies:
         blob = json.dumps(body["content"])
         assert "exit status" not in blob
@@ -274,16 +301,55 @@ def test_plugin_build_error_never_nominates(tmp_path: Path) -> None:
 
 def test_plugin_timeout_no_status_nominates_timeout(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
-    transcript = _run(bundle, "provider-error-nomination")
-    bodies = [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
-    timeouts = [b for b in bodies if b["content"]["status"] == "timeout"]
-    assert timeouts, f"timeout/no-status hang not nominated: {[b['content'] for b in bodies]}"
+    transcript = _run(bundle, "provider-error-nomination", fixture_dir=FIXTURES)
+    bodies = _provider_bodies(transcript)
+    fx = _load_fixture("provider_error_timeout_no_status.json")
+    props = fx["bus_event"]["properties"]
+    expected = {
+        "provider": props["info"]["providerID"],
+        "model": props["info"]["modelID"],
+        "status": fx["pinned_contract"]["expected_status_token"],
+        "reason": fx["pinned_contract"]["expected_reason"],
+    }
+    assert expected in [{k: v for k, v in b["content"].items() if k != "error_id"} for b in bodies], (
+        f"timeout fixture drift or misclassification: {[b['content'] for b in bodies]}"
+    )
+    assert props["sessionID"] in [b["session_id"] for b in bodies], (
+        "timeout fixture session never nominated: the driver did not consume the fixture bus_event"
+    )
+
+
+def test_plugin_storm_same_error_debounced_distinct_error_independent(tmp_path: Path) -> None:
+    """Issue #167 behavioral storm oracle through the REAL bundled plugin.
+
+    Same profile/session/provider/model/error_id with an alternate normalized
+    status is debounced to ONE nomination; a distinct error_id in the same
+    storm is INDEPENDENTLY nominated — exactly two provider_error POSTs total.
+    Kills a removed-debounce mutant (three posts), a key missing error_id
+    (one post), and a key incorrectly including status (three posts).
+    """
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "provider-error-storm", fixture_dir=FIXTURES)
+    bodies = _provider_bodies(transcript)
+    assert len(bodies) == 2, f"storm must nominate exactly twice: {[b['content'] for b in bodies]}"
+    fx = _load_fixture("provider_error_429.json")
+    alternate_fx = _load_fixture("provider_error_timeout_no_status.json")
+    info = _bus_info(fx)
+    base_error_id = info["id"]
+    ids = [b["content"]["error_id"] for b in bodies]
+    assert sorted(ids) == sorted([base_error_id, "msg_storm_b"]), ids
+    statuses = {b["content"]["error_id"]: b["content"]["status"] for b in bodies}
+    assert statuses[base_error_id] == fx["pinned_contract"]["expected_status_token"]
+    assert statuses["msg_storm_b"] == alternate_fx["pinned_contract"]["expected_status_token"]
+    assert [b["session_id"] for b in bodies] == [info["sessionID"]] * 2
+    assert [b["content"]["provider"] for b in bodies] == [info["providerID"]] * 2
+    assert [b["content"]["model"] for b in bodies] == [info["modelID"]] * 2
 
 
 def test_joined_hook_body_through_ingest_persists_row(tmp_path: Path, b1_config: Path) -> None:
     bundle = _bundle(tmp_path)
-    transcript = _run(bundle, "provider-error-nomination")
-    bodies = [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
+    transcript = _run(bundle, "provider-error-nomination", fixture_dir=FIXTURES)
+    bodies = _provider_bodies(transcript)
     assert bodies, "no captured hook POST to join through the daemon"
     body = dict(bodies[0])
     body["profile_id"] = PROFILE
@@ -308,7 +374,7 @@ def test_secret_bearing_hook_input_leaves_no_secret_anywhere(
 ) -> None:
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "provider-error-secret")
-    bodies = [p["body"] for p in transcript["posts"] if p["body"].get("event") == "provider_error"]
+    bodies = _provider_bodies(transcript)
     assert bodies, "secret scenario emitted no provider_error POST"
     secrets = ("sk-live-", "Bearer ", "token=hunter2")
     with TestClient(create_app()) as client:
