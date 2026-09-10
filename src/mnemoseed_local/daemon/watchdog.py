@@ -22,6 +22,15 @@ alive: the bound-but-stalled loop is B6 domain, logged as a line, never a fire
 reason. Firing writes a last-words line through the daemon logger, flushes the
 handler chain, dumps every thread's stack into daemon.log as a forensic
 artifact, then calls ``os._exit(1)`` — skipping the very joins that hung.
+
+Rev 4 (socket-alive veto, the 2026-09-09 19:32 incident): before firing, the
+optional server snapshot is consulted as a VETO. A snapshot showing at least
+one listener socket bound to the probed host:port (a true-int fd plus a
+matching getsockname) means the listener is alive — a transient loopback
+stall, not listener loss — so the fire is suppressed, the refused window is
+reset, and monitoring continues. Any unreadable snapshot (missing, raising,
+or error-shaped) never vetoes: the kill decision conservatively keeps the old
+refused-grace semantics.
 """
 
 from __future__ import annotations
@@ -48,6 +57,60 @@ _WATCHDOG_THREAD_NAME = "mnemoseed-watchdog"
 _STOP_JOIN_TIMEOUT_S = 5.0
 
 ProbeKind = Literal["success", "refused", "timeout", "other_oserror"]
+
+
+_WILDCARD_HOSTS = ("0.0.0.0", "::", "::0")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) -> bool | None:
+    """Read a server snapshot as a liveness veto.
+
+    Returns True only when at least one server entry carries a listener
+    socket whose recorded fd is a true int (bools rejected) and whose
+    recorded host:port serves the probed endpoint — either an exact host
+    match, or a wildcard bind (``0.0.0.0``/``::``) when the probe host is
+    loopback (mirroring ``runner._PROBE_HOSTS``), or a numeric-loopback
+    recording when the probe host is a loopback alias (``localhost``:
+    ``getsockname`` records the numeric form, so an exact-match-only
+    comparison makes the veto inert on ``--host localhost`` daemons).
+    Returns False when the snapshot is readable but shows no such socket
+    (server entries whose socket lists were read: empty/closed/mismatched).
+    Returns None when the snapshot cannot support a decision (no server
+    entries, or nothing readable) — the caller must treat None as "no veto"
+    (fail-closed).
+    """
+    servers = snapshot.get("servers")
+    if not isinstance(servers, list) or not servers:
+        return None
+    probe_is_loopback = host in _LOOPBACK_HOSTS
+    any_readable = False
+    for single in servers:
+        if not isinstance(single, dict):
+            continue
+        sockets = single.get("sockets")
+        if not isinstance(sockets, list):
+            continue
+        any_readable = True  # a read socket list (even empty) supports a no-veto verdict
+        for sock in sockets:
+            if not isinstance(sock, dict):
+                continue
+            fd = sock.get("fd")
+            if type(fd) is not int:
+                continue  # "?" (closed/foreign) or a non-int: not a live fd
+            sock_host = sock.get("host")
+            sock_port = sock.get("port")
+            if not isinstance(sock_host, str) or type(sock_port) is not int:
+                continue
+            if sock_port != port:
+                continue
+            if sock_host == host or (
+                probe_is_loopback and (sock_host in _WILDCARD_HOSTS or sock_host in _LOOPBACK_HOSTS)
+            ):
+                return True
+    if any_readable:
+        return False
+    return None
 
 
 @dataclass(frozen=True)
@@ -176,6 +239,7 @@ class Watchdog:
         self.refused_window_start: float | None = None
         self.snapshot_errors = 0
         self.instrumentation_errors = 0
+        self.veto_count = 0
         self._last_summary: dict[str, object] = {}
 
     @property
@@ -367,6 +431,27 @@ class Watchdog:
                 self._last_summary = self._build_summary(reason, refused_since, self._collect_snapshot())
                 if self._stop.is_set():
                     return
+                # Rev 4: a snapshot showing a live bound socket vetoes the
+                # fire — a transient loopback stall must not kill a healthy
+                # daemon (the 2026-09-09 19:32 incident). The window resets
+                # and monitoring continues; any unreadable snapshot (None)
+                # keeps the old fire semantics.
+                snapshot = self._last_summary.get("snapshot")
+                if (
+                    isinstance(snapshot, dict)
+                    and _snapshot_socket_alive(snapshot, self._host, self._port) is True
+                ):
+                    self.veto_count += 1
+                    refused_since = None
+                    self.refused_window_start = None
+                    logger.info(
+                        "watchdog fire vetoed on %s:%s: server snapshot shows a live "
+                        "bound socket; treating refusals as a transient stall (veto #%d)",
+                        self._host,
+                        self._port,
+                        self.veto_count,
+                    )
+                    continue
                 self._fire(reason)
                 return
 
