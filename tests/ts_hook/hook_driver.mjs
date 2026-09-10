@@ -8,10 +8,18 @@ import { mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "nod
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const [bundle, scenario] = process.argv.slice(2)
+const [bundle, scenario, fixtureDirArg] = process.argv.slice(2)
 if (!bundle || !scenario) {
-  console.error("usage: node hook_driver.mjs <bundle> <scenario>")
+  console.error("usage: node hook_driver.mjs <bundle> <scenario> [fixture_dir]")
   process.exit(64)
+}
+
+// provider-failure scenarios consume the committed synthetic bus_event
+// fixtures; the runner passes the directory explicitly so nothing depends on
+// cwd or machine paths.
+async function loadFixture(name) {
+  if (!fixtureDirArg) throw new Error(`scenario ${scenario} needs a fixture_dir argument`)
+  return JSON.parse(await readFile(join(fixtureDirArg, name), "utf8"))
 }
 
 // isolation: the plugin roots its artifacts under MNEMOSEED_LOCAL_DATA_DIR
@@ -1557,62 +1565,51 @@ async function main() {
     }
 
     case "provider-error-nomination": {
-      // B1 joined seam: the REAL bundled plugin sees canned provider-failure
-      // bus events; the transcript carries the exact POST bodies the daemon
-      // must accept. True 429 (with a numeric time.error stamp present, so a
-      // timestamp-shadowing mutant misreads it) must nominate quota; a
+      // B1 joined seam: the REAL bundled plugin sees the committed synthetic
+      // bus_event fixtures; the transcript carries the exact POST bodies the
+      // daemon must accept. True 429 (with a numeric time.error stamp present,
+      // so a timestamp-shadowing mutant misreads it) must nominate quota; a
       // status-less hang on session.error must nominate timeout; a build
       // failure with providerID present must emit NOTHING.
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m-b1-429",
-              role: "assistant",
-              sessionID: "sess-b1-429",
-              providerID: "anthropic",
-              modelID: "claude-sonnet-4",
-              time: { error: 123 },
-              metadata: { error: "429 quota exceeded for model claude-sonnet-4" },
-            },
-            sessionID: "sess-b1-429",
-          },
-        },
-      })
+      const fx429 = await loadFixture("provider_error_429.json")
+      const fxTimeout = await loadFixture("provider_error_timeout_no_status.json")
+      const fxBuild = await loadFixture("provider_build_error_negative.json")
+      await hooks.event({ event: fx429.bus_event })
       await delay(100)
-      await hooks.event({
-        event: {
-          type: "session.error",
-          properties: {
-            sessionID: "sess-b1-timeout",
-            info: { providerID: "openai", modelID: "gpt-4o" },
-            error: "The operation was aborted due to timeout after 180s with no response",
-          },
-        },
-      })
+      await hooks.event({ event: fxTimeout.bus_event })
       await delay(100)
       const beforeBuild = posts.filter((post) => post.body.event === "provider_error").length
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m-b1-build",
-              role: "assistant",
-              sessionID: "sess-b1-build",
-              providerID: "anthropic",
-              modelID: "claude-sonnet-4",
-              time: { error: 456 },
-              metadata: { error: "Compilation failed: exit status 1 (tool build error, not provider)" },
-            },
-            sessionID: "sess-b1-build",
-          },
-        },
-      })
+      await hooks.event({ event: fxBuild.bus_event })
       await delay(100)
       const afterBuild = posts.filter((post) => post.body.event === "provider_error").length
       console.log(JSON.stringify({ posts, buildErrorPosts: afterBuild - beforeBuild }))
+      break
+    }
+
+    case "provider-error-storm": {
+      // Issue #167 behavioral storm oracle over the REAL bundled plugin: the
+      // same profile/session/provider/model/error_id replayed with an
+      // ALTERNATE normalized status (quota vs the committed timeout payload) is
+      // debounced to ONE nomination, while a DISTINCT error_id in the same
+      // storm is independently nominated — exactly two provider_error POSTs.
+      // Kills a removed-debounce mutant (three posts), a key missing error_id
+      // (one post), and a key incorrectly including status (three posts).
+      const fx429 = await loadFixture("provider_error_429.json")
+      const fxTimeout = await loadFixture("provider_error_timeout_no_status.json")
+      const alternateError = fxTimeout.bus_event.properties.error
+      const base = JSON.parse(JSON.stringify(fx429.bus_event))
+      const alt = JSON.parse(JSON.stringify(fx429.bus_event))
+      alt.properties.info.metadata.error = alternateError
+      const distinct = JSON.parse(JSON.stringify(fx429.bus_event))
+      distinct.properties.info.id = "msg_storm_b"
+      distinct.properties.info.metadata.error = alternateError
+      await hooks.event({ event: base })
+      await delay(100)
+      await hooks.event({ event: alt })
+      await delay(100)
+      await hooks.event({ event: distinct })
+      await delay(150) // let the fire-and-forget provider_error POSTs land
+      console.log(JSON.stringify({ posts }))
       break
     }
 
