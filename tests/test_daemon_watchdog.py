@@ -1594,3 +1594,253 @@ def test_rev3_snapshot_rejects_bool_fd_and_errno() -> None:
     token = _error_token(err)
     assert "errno" not in token, f"a bool errno must not be recorded: {token}"
     assert token == "OSError", token
+
+
+# ------------------------------------------- Rev 4: socket-alive veto (D2)
+
+# The 2026-09-09 19:32 incident (daemon.log, runtime 5ea84b5): an ARMED
+# watchdog saw 4 consecutive refused probes (max_latency 3219ms) while the
+# server snapshot showed a HEALTHY bound listener (fd=1340, 127.0.0.1:7788,
+# snapshot_errors=0) — transient loopback stall, not listener loss — and
+# killed a healthy daemon. Rev 4: before firing, the server snapshot is a
+# VETO: a live bound socket means no kill.
+
+
+def _veto_snapshot() -> tuple[dict[str, object], int]:
+    """A snapshot shaped exactly like the 9-09 incident: one server, one
+    healthy bound listener socket."""
+    return (
+        {
+            "should_exit": False,
+            "started": True,
+            "servers": [{"sockets": [{"fd": 1340, "host": "127.0.0.1", "port": 7788}]}],
+        },
+        0,
+    )
+
+
+def _dead_snapshot() -> tuple[dict[str, object], int]:
+    """A snapshot with servers but zero listener sockets (uvicorn closed
+    them: the teardown/liveness-truth shape)."""
+    return ({"should_exit": True, "started": True, "servers": [{"sockets": []}]}, 0)
+
+
+def test_rev4_veto_live_socket_prevents_armed_refused_grace_fire() -> None:
+    """Rev 4 ARMED veto: 4+ consecutive refusals past the refused grace with
+    a snapshot showing a healthy bound socket must NEVER fire — the refused
+    window resets and monitoring continues (the exact 9-09 19:32 incident
+    shape). A mutant without the veto kills the healthy daemon and fails."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+    veto_calls: list[int] = []
+
+    def _snapshot() -> tuple[dict[str, object], int]:
+        veto_calls.append(1)
+        return _veto_snapshot()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,  # every probe refused, forever (the stall)
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+        server_snapshot=_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.6)  # ~30 refused probes: far past the 0.05s grace
+        assert fired == [], "the veto must prevent the fire on a healthy bound socket"
+        assert veto_calls, "the snapshot must have been consulted before the fire decision"
+        assert watchdog.is_alive, "monitoring must continue after the veto"
+    finally:
+        watchdog.stop()
+
+
+def test_rev4_veto_live_socket_prevents_boot_grace_fire() -> None:
+    """Rev 4 PRE_BIND veto: refusals past the boot grace with a snapshot
+    showing a healthy bound socket must not fire either — a bound listener
+    is alive regardless of the armed state."""
+    fired: list[str] = []
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=0.05,
+        refused_grace=5.0,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: fired.append(reason),
+        server_snapshot=_veto_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.5)  # far past boot_grace=0.05
+        assert fired == [], "the veto must prevent a boot-grace fire on a healthy bound socket"
+    finally:
+        watchdog.stop()
+
+
+def test_rev4_dead_socket_still_fires_past_refused_grace() -> None:
+    """Rev 4 red line: the veto must NOT neuter the watchdog — a snapshot
+    with zero listener sockets (the true dead-listener shape) still fires
+    past the refused grace."""
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+    armed.set()
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        armed=armed,
+        server_snapshot=_dead_snapshot,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "a dead listener must still fire past the grace"
+        assert fired == ["refused-grace"]
+    finally:
+        watchdog.stop()
+
+
+def test_rev4_snapshot_error_still_fires_conservative() -> None:
+    """Rev 4 fail-closed: an unreadable snapshot (raise / state=error /
+    unknown) must never veto — the watchdog keeps its old semantics and
+    fires (conservative: the kill decision never depends on a broken
+    diagnostic)."""
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+    armed.set()
+
+    def _boom() -> tuple[dict[str, object], int]:
+        raise RuntimeError("snapshot exploded")
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        armed=armed,
+        server_snapshot=_boom,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "a snapshot failure must never veto the fire"
+        assert fired == ["refused-grace"]
+        assert watchdog.snapshot_errors >= 1
+    finally:
+        watchdog.stop()
+
+    # unknown snapshot state (no server_snapshot wired): same conservative fire
+    fired2: list[str] = []
+    fired2_event = threading.Event()
+    armed2 = threading.Event()
+    armed2.set()
+    watchdog2 = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired2.append(reason), fired2_event.set()),
+        armed=armed2,
+    )
+    watchdog2.start()
+    try:
+        assert fired2_event.wait(3.0), "no snapshot wired must never veto the fire"
+        assert fired2 == ["refused-grace"]
+    finally:
+        watchdog2.stop()
+
+
+def test_rev4_veto_resets_refused_window_and_logs() -> None:
+    """Rev 4 bookkeeping: a veto resets the refused window (the accumulator
+    never drifts into a fire on the next stall), logs an INFO line (the
+    incident is observable in daemon.log), and counts vetoes."""
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+    records: list[logging.LogRecord] = []
+    daemon_logger = logging.getLogger("mnemoseed_local.daemon")
+
+    class _Rec(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Rec()
+    daemon_logger.addHandler(handler)
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+        server_snapshot=_veto_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.4)
+        assert fired == []
+        # The window may re-open on the next refused probe (monitoring
+        # continues), so the reset pin is behavioral: vetoes happened and
+        # NO fire ever landed despite ~20 past-grace windows.
+        assert watchdog.veto_count >= 1, "vetoes must be counted"
+        assert any("veto" in r.getMessage().lower() for r in records), "a veto INFO line is required"
+    finally:
+        daemon_logger.removeHandler(handler)
+        handler.close()
+        watchdog.stop()
+
+
+def test_rev4_veto_requires_bound_port_match() -> None:
+    """Rev 4 precision: a snapshot whose socket is bound to a DIFFERENT port
+    must NOT veto (a foreign socket is not this listener). Only an fd that is
+    a true int and a host:port match of the probed endpoint counts."""
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+    armed.set()
+
+    def _other_port_snapshot() -> tuple[dict[str, object], int]:
+        return (
+            {
+                "should_exit": False,
+                "started": True,
+                "servers": [{"sockets": [{"fd": 55, "host": "127.0.0.1", "port": 9999}]}],
+            },
+            0,
+        )
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        armed=armed,
+        server_snapshot=_other_port_snapshot,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "a foreign-port socket must not veto the fire"
+        assert fired == ["refused-grace"]
+    finally:
+        watchdog.stop()
