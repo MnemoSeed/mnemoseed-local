@@ -552,6 +552,144 @@ def test_error_event_immutable_rows_via_database(driver):
     assert page.items[0].signal_type is ErrorSignalType.PUBLISHED
 
 
+# ------------------------------------------- E1 ledger hygiene (issue #151 E+F)
+
+
+def test_error_event_epoch_zero_observed_at_is_kept_verbatim(driver):
+    """#151 F: an explicit ``observed_at=0.0`` (epoch 0) is a caller-chosen
+    value, not a "leave it to the default" sentinel — it must be stored
+    verbatim, never silently rewritten to insert-time wall clock. A mutant
+    using ``if event.observed_at`` truthiness rewrites 0.0 and fails."""
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=0.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-epoch0"),
+        )
+    )
+    page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert page.total == 1
+    assert page.items[0].observed_at == 0.0
+
+
+def test_error_event_default_observed_at_still_stamps_insert_time(driver):
+    """#151 F sibling: a runtime-None observed_at (defense against
+    JSON-decoded payloads) still stamps insert time — the is-not-None fix
+    must not break auto-stamping for absent values."""
+    before = time.time()
+    event = ErrorEvent(
+        profile_id="u1",
+        signal_type=ErrorSignalType.USER_CORRECTION,
+        observed_at=0.0,  # type: ignore[misc]
+        evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-default"),
+    )
+    object.__setattr__(event, "observed_at", None)  # simulate the absent case
+    driver.append_error_event(event)
+    after = time.time()
+    page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert page.total == 1
+    # iso8601_utc stores millisecond precision, so the read-back value may
+    # sit a fraction of a millisecond before `before`.
+    assert before - 0.002 <= page.items[0].observed_at <= after + 0.002
+
+
+def test_error_event_whitespace_profile_id_is_rejected(driver):
+    """#151 F: a whitespace-only profile_id ("   ") is not a profile id —
+    reject it with the same ValueError as the empty string."""
+    with pytest.raises(ValueError, match="profile_id is required"):
+        driver.append_error_event(
+            ErrorEvent(
+                profile_id="   ",
+                signal_type=ErrorSignalType.USER_CORRECTION,
+                observed_at=100.0,
+                evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-ws"),
+            )
+        )
+    # nothing landed
+    assert driver.query_error_events(ErrorEventFilter(profile_id="   "), Page(0, 50)).total == 0
+
+
+def test_error_event_observed_at_monotonic_per_profile_session(driver):
+    """#151 E (user-selected per-(profile, session) scope): within one
+    (profile_id, session_id) stream, a submitted observed_at earlier than the
+    stream's last landed row is rejected — reads order by id, so an
+    out-of-order timestamp inside a session would make time-window queries
+    disagree with id-order pagination. Equal timestamps are allowed (same
+    instant, distinct rows). Cross-session and cross-profile timestamps are
+    NOT compared (design note in the PR body)."""
+    base = ErrorEvent(
+        profile_id="u1",
+        signal_type=ErrorSignalType.USER_CORRECTION,
+        observed_at=100.0,
+        evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c1"),
+        session_id="s1",
+    )
+    driver.append_error_event(base)
+    # equal is fine
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=100.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c2"),
+            session_id="s1",
+        )
+    )
+    # in-order is fine
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=200.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c3"),
+            session_id="s1",
+        )
+    )
+    # out-of-order within (u1, s1) is rejected
+    with pytest.raises(ValueError, match="observed_at"):
+        driver.append_error_event(
+            ErrorEvent(
+                profile_id="u1",
+                signal_type=ErrorSignalType.USER_CORRECTION,
+                observed_at=150.0,
+                evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-late"),
+                session_id="s1",
+            )
+        )
+    # another session of the same profile starts fresh: earlier is fine there
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=50.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-s2"),
+            session_id="s2",
+        )
+    )
+    # another profile with the same session id starts fresh too
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u2",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=25.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-u2"),
+            session_id="s1",
+        )
+    )
+    # rows without a session never participate in a session comparison
+    driver.append_error_event(
+        ErrorEvent(
+            profile_id="u1",
+            signal_type=ErrorSignalType.USER_CORRECTION,
+            observed_at=10.0,
+            evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id="c-nosess"),
+        )
+    )
+    page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
+    assert [e.evidence_ptr.id for e in page.items] == ["c1", "c2", "c3", "c-s2", "c-nosess"]
+
+
 # ---------------------------------------------------------------- migrations
 
 
