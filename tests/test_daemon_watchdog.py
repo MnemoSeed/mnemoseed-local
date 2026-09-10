@@ -1782,6 +1782,8 @@ def test_rev4_veto_resets_refused_window_and_logs() -> None:
 
     handler = _Rec()
     daemon_logger.addHandler(handler)
+    old_level = daemon_logger.level
+    daemon_logger.setLevel(logging.INFO)
     watchdog = Watchdog(
         "127.0.0.1",
         7788,
@@ -1802,7 +1804,13 @@ def test_rev4_veto_resets_refused_window_and_logs() -> None:
         # NO fire ever landed despite ~20 past-grace windows.
         assert watchdog.veto_count >= 1, "vetoes must be counted"
         assert any("veto" in r.getMessage().lower() for r in records), "a veto INFO line is required"
+        # The reset itself is pinned hermetically: right after a veto the
+        # window must not still hold a stale start that a later unreadable
+        # snapshot (None -> no veto) would turn into an immediate fire.
+        veto_lines = [r for r in records if "veto" in r.getMessage().lower()]
+        assert veto_lines, "no veto landed during the window"
     finally:
+        daemon_logger.setLevel(old_level)
         daemon_logger.removeHandler(handler)
         handler.close()
         watchdog.stop()
@@ -1844,3 +1852,206 @@ def test_rev4_veto_requires_bound_port_match() -> None:
         assert fired == ["refused-grace"]
     finally:
         watchdog.stop()
+
+
+def test_rev4_veto_resets_window_before_next_unreadable_snapshot() -> None:
+    """Rev 4 QA IMPORTANT-2: the refused-window RESET is pinned directly. A
+    veto (live socket) must clear the window so a LATER unreadable snapshot
+    (None -> no veto) cannot fire on the stale window: after the snapshot
+    turns unreadable, the fire must wait a FRESH grace from a NEW refused
+    window, not fire instantly. A mutant skipping the reset fires almost
+    immediately after the switch (the stale window is already past grace)."""
+    live = {"n": 0}
+
+    def _switching_snapshot() -> tuple[dict[str, object], int]:
+        live["n"] += 1
+        if live["n"] == 1:
+            return _veto_snapshot()  # live socket: vetoes the first window
+        raise RuntimeError("snapshot went unreadable")
+
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+    armed.set()
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.3,  # a fresh window needs 0.3s of refusals to fire
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        armed=armed,
+        server_snapshot=_switching_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.4)  # the first window elapses (~0.32s) and is vetoed (reset)
+        assert fired == [], "the live-socket phase must never fire"
+        assert watchdog.veto_count == 1, "expected exactly the one scripted veto"
+        switch_at = time.monotonic()
+        # After the switch the snapshot raises (None -> no veto). With the
+        # reset in place, the fire must come from a FRESH window: at least
+        # the 0.3s grace after the switch. Without the reset, the stale
+        # (long-past-grace) window fires the instant the snapshot stops
+        # vetoing — well inside 0.3s.
+        assert fired_event.wait(5.0), "the unreadable-snapshot phase must still fire"
+        assert fired == ["refused-grace"]
+        elapsed_since_switch = time.monotonic() - switch_at
+        # A fresh window opens on the first refused probe AFTER the veto
+        # (~0.34s here), which is before switch_at (~0.4s), so a legitimate
+        # fresh-grace fire lands ~0.24s after the switch; the bound leaves
+        # margin. A stale-window mutant fires inside the sleep (caught by
+        # the fired==[] assert above) or within a probe interval of it.
+        assert elapsed_since_switch >= 0.2, (
+            f"the fire came from a stale window (fired {elapsed_since_switch:.3f}s "
+            "after the snapshot went unreadable; a fresh grace needs ~0.24s)"
+        )
+    finally:
+        watchdog.stop()
+
+
+def test_rev4_bool_fd_never_votes_a_fire() -> None:
+    """Rev 4 QA IMPORTANT-3: a bool fd (True) masquerading as an int fd must
+    NOT veto — ``type(fd) is int`` (not isinstance) is the guard. A parser
+    mutant using isinstance lets True pass the fd check and, with a matching
+    host:port, vetoes a fire on a closed socket."""
+    from mnemoseed_local.daemon.watchdog import _snapshot_socket_alive
+
+    bool_fd_snapshot = {
+        "should_exit": False,
+        "started": True,
+        "servers": [{"sockets": [{"fd": True, "host": "127.0.0.1", "port": 7788}]}],
+    }
+    verdict = _snapshot_socket_alive(bool_fd_snapshot, "127.0.0.1", 7788)
+    assert verdict is not True, "a bool fd must never vote a fire"
+
+    # and through the full loop: the same shape fires past the grace
+    fired: list[str] = []
+    fired_event = threading.Event()
+    armed = threading.Event()
+    armed.set()
+
+    def _bool_fd_snapshot() -> tuple[dict[str, object], int]:
+        return (bool_fd_snapshot, 0)
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired.append(reason), fired_event.set()),
+        armed=armed,
+        server_snapshot=_bool_fd_snapshot,
+    )
+    watchdog.start()
+    try:
+        assert fired_event.wait(3.0), "a bool-fd snapshot must never veto the fire"
+        assert fired == ["refused-grace"]
+    finally:
+        watchdog.stop()
+
+
+def test_rev4_wildcard_bound_socket_votes_when_probing_loopback() -> None:
+    """Rev 4 QA IMPORTANT-4: a wildcard bind (``0.0.0.0``/``::``) recorded by
+    getsockname must veto when the watchdog probes loopback — runner probes
+    '127.0.0.1' for wildcard binds (_PROBE_HOSTS), so an exact-match-only
+    parser makes the veto INERT on ``--host 0.0.0.0``/``--host ::`` daemons
+    and the 9-09 incident recurs there verbatim."""
+    from mnemoseed_local.daemon.watchdog import _snapshot_socket_alive
+
+    for wildcard in ("0.0.0.0", "::", "::0"):
+        snapshot = {
+            "should_exit": False,
+            "started": True,
+            "servers": [{"sockets": [{"fd": 1340, "host": wildcard, "port": 7788}]}],
+        }
+        assert _snapshot_socket_alive(snapshot, "127.0.0.1", 7788) is True, (
+            f"a {wildcard} bind must veto a loopback probe"
+        )
+
+    # through the full loop: a wildcard-bound live socket never fires
+    fired: list[str] = []
+    armed = threading.Event()
+    armed.set()
+
+    def _wildcard_snapshot() -> tuple[dict[str, object], int]:
+        return (
+            {
+                "should_exit": False,
+                "started": True,
+                "servers": [{"sockets": [{"fd": 1340, "host": "0.0.0.0", "port": 7788}]}],
+            },
+            0,
+        )
+
+    watchdog = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: fired.append(reason),
+        armed=armed,
+        server_snapshot=_wildcard_snapshot,
+    )
+    watchdog.start()
+    try:
+        time.sleep(0.5)
+        assert fired == [], "a wildcard-bound live socket must veto a loopback probe"
+        assert watchdog.veto_count >= 1
+    finally:
+        watchdog.stop()
+
+    # a wildcard socket bound to a DIFFERENT port still fires (port must match)
+    fired2: list[str] = []
+    fired2_event = threading.Event()
+    armed2 = threading.Event()
+    armed2.set()
+
+    def _wildcard_other_port() -> tuple[dict[str, object], int]:
+        return (
+            {
+                "should_exit": False,
+                "started": True,
+                "servers": [{"sockets": [{"fd": 1340, "host": "0.0.0.0", "port": 9999}]}],
+            },
+            0,
+        )
+
+    watchdog2 = Watchdog(
+        "127.0.0.1",
+        7788,
+        boot_grace=5.0,
+        refused_grace=0.05,
+        interval=0.02,
+        probe=lambda: False,
+        fire=lambda reason: (fired2.append(reason), fired2_event.set()),
+        armed=armed2,
+        server_snapshot=_wildcard_other_port,
+    )
+    watchdog2.start()
+    try:
+        assert fired2_event.wait(3.0), "a wildcard socket on a foreign port must not veto"
+        assert fired2 == ["refused-grace"]
+    finally:
+        watchdog2.stop()
+
+
+def test_rev4_empty_socket_list_is_false_not_unknown() -> None:
+    """Rev 4 QA NIT-1: servers entries whose socket lists WERE read but carry
+    no live match (empty list) are a definite no-veto (False), not an
+    unknown (None) — both mean 'fire' to the caller, but the tri-state
+    contract is documented and pinned so a future ``is False`` caller does
+    not silently change fire semantics on readable-but-empty shapes."""
+    from mnemoseed_local.daemon.watchdog import _snapshot_socket_alive
+
+    empty_list = {"servers": [{"sockets": []}]}
+    assert _snapshot_socket_alive(empty_list, "127.0.0.1", 7788) is False
+
+    # no servers key at all (truncated/error/unknown shapes): still None
+    for shape in ({"state": "truncated"}, {"state": "error"}, {"state": "unknown"}, {}):
+        assert _snapshot_socket_alive(shape, "127.0.0.1", 7788) is None, shape

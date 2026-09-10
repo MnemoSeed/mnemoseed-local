@@ -59,17 +59,21 @@ _STOP_JOIN_TIMEOUT_S = 5.0
 ProbeKind = Literal["success", "refused", "timeout", "other_oserror"]
 
 
+_WILDCARD_HOSTS = ("0.0.0.0", "::", "::0")
+
+
 def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) -> bool | None:
     """Read a server snapshot as a liveness veto.
 
     Returns True only when at least one server entry carries a listener
-    socket whose recorded fd is a true int and whose recorded host:port
-    matches the probed endpoint — the snapshot shape a healthy bound
-    listener produces (``runner._snapshot_server``). Returns False when
-    the snapshot is readable but shows no such socket (servers present
-    with empty/closed/mismatched socket lists). Returns None when the
-    snapshot cannot support a decision (missing/unknown/error state) — the
-    caller must treat None as "no veto" (fail-closed).
+    socket whose recorded fd is a true int (bools rejected) and whose
+    recorded host:port serves the probed endpoint — either an exact host
+    match or a wildcard bind (``0.0.0.0``/``::``) when the probe host is
+    loopback, mirroring ``runner._PROBE_HOSTS``. Returns False when the
+    snapshot is readable but shows no such socket (server entries whose
+    socket lists were read: empty/closed/mismatched). Returns None when
+    the snapshot cannot support a decision (no server entries, or nothing
+    readable) — the caller must treat None as "no veto" (fail-closed).
     """
     servers = snapshot.get("servers")
     if not isinstance(servers, list) or not servers:
@@ -81,6 +85,7 @@ def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) ->
         sockets = single.get("sockets")
         if not isinstance(sockets, list):
             continue
+        any_readable = True  # a read socket list (even empty) supports a no-veto verdict
         for sock in sockets:
             if not isinstance(sock, dict):
                 continue
@@ -89,14 +94,14 @@ def _snapshot_socket_alive(snapshot: dict[str, object], host: str, port: int) ->
                 continue  # "?" (closed/foreign) or a non-int: not a live fd
             sock_host = sock.get("host")
             sock_port = sock.get("port")
-            if (
-                isinstance(sock_host, str)
-                and sock_host == host
-                and type(sock_port) is int
-                and sock_port == port
+            if not isinstance(sock_host, str) or type(sock_port) is not int:
+                continue
+            if sock_port != port:
+                continue
+            if sock_host == host or (
+                sock_host in _WILDCARD_HOSTS and host in ("127.0.0.1", "localhost", "::1")
             ):
                 return True
-            any_readable = True
     if any_readable:
         return False
     return None
