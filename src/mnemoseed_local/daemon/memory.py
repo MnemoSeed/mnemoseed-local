@@ -2044,8 +2044,11 @@ class MemoryService:
                     "observed_at": e.observed_at,
                     "evidence_kind": e.evidence_ptr.kind.value,
                     "evidence_id": e.evidence_ptr.id,
-                    "evidence_retired": e.evidence_ptr.kind is EvidenceKind.CHUNK
-                    and e.evidence_ptr.id not in live_ids,
+                    "evidence_retired": (
+                        None
+                        if e.evidence_ptr.kind is not EvidenceKind.CHUNK
+                        else e.evidence_ptr.id not in live_ids
+                    ),
                     "session_id": e.session_id,
                     "turn_start": e.turn_range.start if e.turn_range else None,
                     "turn_end": e.turn_range.end if e.turn_range else None,
@@ -2201,7 +2204,7 @@ def memory_reinforce(req: ReinforceRequest, request: Request) -> dict[str, Any]:
 
 @router.post("/memory/error_events")
 def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, Any]:
-    """B1 read route: profile-scoped error_events with v12 fingerprint."""
+    """B1 read route: profile-scoped error_events with evidence-fate resolution."""
     service: MemoryService = request.app.state.memory
     return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
 

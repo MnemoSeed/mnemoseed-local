@@ -264,6 +264,66 @@ def test_read_route_marks_live_chunk_evidence_not_retired(e0_config: Path) -> No
         assert data["items"][0]["evidence_retired"] is False
 
 
+def test_composite_read_resolves_live_and_gone_in_one_page(e0_config: Path) -> None:
+    """Two ledger rows in one composite group — one chunk live, the other never
+    created — resolve independently in the same read page, proving the
+    chunk_ids IN-clause is actively narrowing (not just a no-op)."""
+    from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance
+
+    with TestClient(create_app()) as client:
+        stores = client.app.state.stores
+        embed = stores.embed.embed("dummy").dense
+        stores.vector.upsert_chunk(
+            ChunkStamp(
+                chunk_id="live-src",
+                profile_id=PROFILE,
+                text="live evidence",
+                cognitive_tier=CognitiveTier.TIER_1,
+                model_id="stub",
+                provenance=Provenance(asserted_by="stub", source="manual"),
+            ),
+            embed,
+        )
+        stores.vector.upsert_chunk(
+            ChunkStamp(
+                chunk_id="distractor-a",
+                profile_id=PROFILE,
+                text="distractor a",
+                cognitive_tier=CognitiveTier.TIER_1,
+                model_id="stub",
+                provenance=Provenance(asserted_by="stub", source="manual"),
+            ),
+            embed,
+        )
+        stores.vector.upsert_chunk(
+            ChunkStamp(
+                chunk_id="distractor-b",
+                profile_id=PROFILE,
+                text="distractor b",
+                cognitive_tier=CognitiveTier.TIER_1,
+                model_id="stub",
+                provenance=Provenance(asserted_by="stub", source="manual"),
+            ),
+            embed,
+        )
+        for src_id in ("live-src", "gone-src"):
+            stores.meta.append_error_event(
+                ErrorEvent(
+                    profile_id=PROFILE,
+                    signal_type=ErrorSignalType.COMPOSITE,
+                    observed_at=100.0,
+                    evidence_ptr=EvidencePointer(kind=EvidenceKind.CHUNK, id=src_id),
+                    session_id="s1",
+                    composite_group_id="composite-oracle",
+                )
+            )
+
+        data = client.post("/memory/error_events", json={"profile_id": PROFILE}).json()
+        items = {item["evidence_id"]: item for item in data["items"]}
+        assert items["live-src"]["evidence_retired"] is False
+        assert items["gone-src"]["evidence_retired"] is True
+
+
 def test_read_route_retires_only_after_the_chunk_is_deleted(e0_config: Path) -> None:
     """The marker flips true only once the referenced chunk is physically gone
     (forget_this deletes chunk rows), never by rewriting the ledger."""
