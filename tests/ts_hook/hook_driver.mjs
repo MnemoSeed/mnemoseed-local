@@ -1555,6 +1555,53 @@ async function main() {
       break
     }
 
+    case "hook-debug-rotate-concurrent": {
+      // Two debug emissions launched against an oversized sink WITHOUT awaiting
+      // between them must serialize through the sink chain: exactly one rotation, both
+      // lines land in the fresh file, and no .2 generation is invented. A dropped
+      // chain would let both observes see the oversized file and double-rotate — the
+      // second rename clobbers the archive with the freshly-truncated file.
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const logPath = join(dataDir, "hook-debug.jsonl")
+      const archivePath = join(dataDir, "hook-debug.jsonl.1")
+      const secondArchive = join(dataDir, "hook-debug.jsonl.2")
+      await mkdir(dataDir, { recursive: true })
+      const cap = 10 * 1024 * 1024
+      const oversized = "x".repeat(cap + 4096)
+      await writeFile(logPath, oversized, "utf8")
+      const e1 = messageUpdatedAssistant("m_conc_1", 1000)
+      const e2 = messageUpdatedAssistant("m_conc_2", 2000)
+      await Promise.all([
+        hooks.event({ event: e1 }),
+        hooks.event({ event: e2 }),
+      ])
+      await delay(200)
+      const archiveBytes = await readFile(archivePath, "utf8").catch(() => "")
+      const archiveHoldsPreRotation = archiveBytes.length === oversized.length && archiveBytes === oversized
+      const secondExists = await stat(secondArchive).then(
+        () => true,
+        () => false,
+      )
+      const fresh = await readFile(logPath, "utf8").catch(() => "")
+      const shapeLines = fresh
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((l) => l.tag === "assistant completion shape" || (l.payload && l.payload.tag === "assistant completion shape"))
+      const bothLines = shapeLines.length >= 2
+      console.log(
+        JSON.stringify({
+          rotated: archiveHoldsPreRotation,
+          bothLines,
+          noSecondGeneration: !secondExists,
+          freshStillSmall: fresh.length < cap,
+          shapeCount: shapeLines.length,
+        }),
+      )
+      break
+    }
+
     case "config-inject": {
       // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
       // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual

@@ -838,6 +838,40 @@ def test_daemon_log_boot_rotation_still_records_the_boot_line(log_home: Path) ->
     assert (log_home / "daemon.log.1").read_bytes() == oversized
 
 
+def test_daemon_log_rotation_failure_emits_warning_and_does_not_block_attach(
+    log_home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """IMPORTANT-2 (QA mutation M2): a rotation failure (e.g. PermissionError on
+    Path.replace) must emit a warning via the daemon logger for boot-time
+    observability, AND must not block the handler attach — the boot proceeds
+    against whatever file is present."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES, _attach_daemon_log_handler
+
+    log_file = log_home / DAEMON_LOG_NAME
+    oversized = b"p" * (_DAEMON_LOG_MAX_BYTES + 1)
+    log_file.write_bytes(oversized)
+
+    def _failing_replace(_self: Path, _target: Path) -> None:
+        raise PermissionError("simulated rotation failure")
+
+    monkeypatch.setattr(Path, "replace", _failing_replace)
+    caplog.set_level(logging.WARNING, logger="mnemoseed_local.daemon")
+    _attach_daemon_log_handler()
+    try:
+        assert any("rotation skipped" in r.message for r in caplog.records), (
+            "the failed rotation must log a warning"
+        )
+        target = logging.getLogger("mnemoseed_local")
+        attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
+        assert len(attached) == 1, "the handler must still be attached after a rotation failure"
+        # the oversized file is still in place (rotation failed)
+        assert log_file.read_bytes() == oversized
+        # No .1 generation was created
+        assert not (log_home / "daemon.log.1").exists()
+    finally:
+        _detach_daemon_log_handler()
+
+
 def test_watchdog_fire_appends_after_a_boot_rotation(log_home: Path) -> None:
     """The watchdog fire path opens daemon.log by NAME and appends, so
     it keeps landing in the fresh file after a boot rotation (the rotation must

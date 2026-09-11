@@ -323,10 +323,13 @@ async function rotateDebugLogIfOversized(): Promise<void> {
   }
 }
 
-// Serialize the sink so two concurrent debug lines cannot both observe the
-// oversized file and double-rotate (the second rename would clobber the
-// archive with the freshly-truncated file). Fail-open by construction: a
-// rejected link is swallowed and the next line retries.
+// Serialize the sink within the process so two concurrent debug lines cannot
+// both observe the oversized file and double-rotate (the second rename would
+// clobber the archive with the freshly-truncated file). Concurrent processes
+// sharing DATA_DIR can still interleave on the stat/rename; the on-disk bound
+// itself is unaffected since the max cap is still ~2x per process rotation.
+// Fail-open by construction: a rejected link is swallowed and the next line
+// retries.
 let debugSinkChain: Promise<void> = Promise.resolve()
 
 function debugLog(tag: string, payload: unknown): void {
@@ -1165,13 +1168,14 @@ function isWatermarkTmpArtifact(name: string): boolean {
 
 async function sweepStaleWatermarkArtifacts(force: boolean): Promise<number> {
   // Age-based cleanup of watermark artifacts a crashed/killed
-  // instance left behind. Unlike collectWatermarkGarbage (dead PID + 24h for
-  // shards and crash-tmps), this catches the legacy `hook-watermarks.json.*.tmp`
-  // family that the own-prefix and crash-tmp sweeps never match, plus a coarse
-  // 7-day backstop for tmp artifacts whose owner PID can no longer be
-  // classified (a live atomic write never spans 7 days). Best-effort and
-  // bounded. The interval guard makes the directory scan at most hourly
-  // (the first persist of a process, last=0, sweeps immediately).
+  // instance left behind. This is a weaker-coverage backstop relative to
+  // collectWatermarkGarbage (dead PID + 24h + valid-content for shards and
+  // crash-tmps): it catches the legacy `hook-watermarks.json.*.tmp` family that
+  // the own-prefix and crash-tmp sweeps never match, plus a coarse 7-day
+  // backstop for tmp artifacts whose owner PID can no longer be classified
+  // (a live atomic write never spans 7 days). Best-effort and bounded. The per-process interval guard makes the directory scan at most
+  // hourly per process (the first persist of a process, last=0, sweeps
+  // immediately).
   const now = Date.now()
   if (
     !force &&

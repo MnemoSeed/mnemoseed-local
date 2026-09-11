@@ -702,3 +702,16 @@ def test_debug_sink_rotation_replaces_the_existing_generation(tmp_path: Path) ->
     assert transcript["replaced"] is True, transcript
     assert transcript["noSecondGeneration"] is True, transcript
     assert transcript["freshHasLine"] is True, transcript
+
+
+def test_debug_sink_serializes_concurrent_emissions_correctly(tmp_path: Path) -> None:
+    """Two concurrent debug emissions against an oversized sink must
+    serialize through the promise chain: exactly one rotation (archive holds the
+    pre-rotation bytes, not a clobbered fresh file's bytes), both lines land in
+    the fresh file, and no .2 generation is invented. A dropped serialization
+    chain would let both emissions observe the oversized file and double-rotate."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "hook-debug-rotate-concurrent")
+    assert transcript["rotated"] is True, transcript
+    assert transcript["bothLines"] is True, transcript
+    assert transcript["noSecondGeneration"] is True, transcript
