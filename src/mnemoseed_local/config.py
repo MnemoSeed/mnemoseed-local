@@ -108,6 +108,11 @@ DEFAULT_DREAM_DELTA_BUDGET_CEILING_TOKENS: int = 32000
 DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS: int = 8000
 DEFAULT_DREAM_POOL_FORCED_CAP: float = 50.0
 
+#: E0 (PRD-B2.13): the experience channel flag is born OFF — the channel's
+#: pipeline is not wired yet, so the default must be a no-op (zero overhead,
+#: nothing reads the flag on any hot path in this batch).
+DEFAULT_EXPERIENCE_CHANNEL_ENABLED: bool = False
+
 #: B2.1 T2 mid-session auto-recall (PRD-B2.1): the focal decay floor and the
 #: pending-recall selection budget (design/01 §4.6). Values landed by the T4b
 #: live calibration (ACCEPTED: all gate bars pass at 0.5/2400; the floor axis
@@ -132,6 +137,18 @@ DEFAULT_RECALL_RESCUE_CUE_MIN: float = 0.2
 #: (a drift between the two is a validation split — one source, both consumers).
 DREAM_HARDWARE_TIERS: frozenset[str] = frozenset({"standard", "lite", "advanced"})
 DREAM_ENSEMBLE_MODES: frozenset[str] = frozenset({"off", "verify", "vote"})
+
+
+@dataclass(frozen=True)
+class ExperienceChannelConfig:
+    """Experience-channel flag (PRD-B2.13 E0).
+
+    The dream-side distillation pass over the derived error-event ledger,
+    behind one default-off switch: nothing consumes the flag in this batch,
+    so the shipped default is a strict no-op.
+    """
+
+    enabled: bool = DEFAULT_EXPERIENCE_CHANNEL_ENABLED
 
 
 @dataclass(frozen=True)
@@ -173,6 +190,8 @@ class DreamConfig:
     # 0 (the default) keeps the legacy single-pack reflect; a positive cap
     # slices the backlog into model-sized batches drained over dreams.
     reflect_batch_max_tokens: int = DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS
+    # E0 (PRD-B2.13): default-off experience channel (see ExperienceChannelConfig).
+    experience_channel: ExperienceChannelConfig = field(default_factory=ExperienceChannelConfig)
 
 
 #: Decay sweep cadence (NFR-4.1: the batch runs once daily).
@@ -643,6 +662,15 @@ def load_config(path: Path | None = None) -> Config:
                 "dream.pool_forced_cap",
                 "must be >= dream.core_confidence_floor",
             )
+        # E0 (PRD-B2.13): the default-off experience channel switch.
+        channel_raw = dream_table.get("experience_channel")
+        channel_enabled = DEFAULT_EXPERIENCE_CHANNEL_ENABLED
+        if channel_raw is not None:
+            channel_table = _require_table(channel_raw, "dream.experience_channel")
+            enabled_raw = channel_table.get("enabled", DEFAULT_EXPERIENCE_CHANNEL_ENABLED)
+            if not isinstance(enabled_raw, bool):
+                raise ConfigError("dream.experience_channel.enabled", "must be a boolean")
+            channel_enabled = enabled_raw
         # T3b (design/01 §4.8): the isolated graph instance is mandatory for a
         # non-zero floor — the downgrade target must exist or a merge would fail
         # (the Merger refuses a downgrade with no isolated instance). Rejected
@@ -668,6 +696,7 @@ def load_config(path: Path | None = None) -> Config:
             delta_budget_ceiling_tokens=int(ceiling_raw),
             pool_forced_cap=float(forced_raw),
             reflect_batch_max_tokens=int(batch_raw),
+            experience_channel=ExperienceChannelConfig(enabled=channel_enabled),
         )
 
         # T6 (FR-2.14): [dream.llm.<role>] overrides per role. Only structural
@@ -883,6 +912,12 @@ baseurl = "http://localhost:7788"
 # delta_budget_ceiling_tokens = 32000
 # pool_forced_cap = 50.0
 # reflect_batch_max_tokens = 8000
+
+# Experience channel (PRD-B2.13 E0): the dream-side distillation pass over the
+# derived error-event ledger. Reserved and OFF by default — nothing consumes
+# the flag yet; a future batch wires the pipeline behind it.
+# [dream.experience_channel]
+# enabled = false
 
 # Per-layer overrides (required under the custom preset):
 # [storage.vector]

@@ -127,6 +127,10 @@ class ChunkFilter:
     turn_start: int | None = None
     turn_end: int | None = None
     entities: tuple[str, ...] = ()
+    # Restrict to these chunk ids (additive; read-side existence resolution).
+    # Empty means unrestricted; drivers render one IN (...) clause so a caller
+    # checks N ids in one query.
+    chunk_ids: tuple[str, ...] = ()
     consolidated: bool | None = None
     needs_reconcile: bool | None = None  # console reconcile-queue filter (PRD-07)
     entities_allow_missing: bool = False
@@ -351,8 +355,11 @@ class ErrorEvent:
     ``evidence_ptr`` references the source without asserting correctness.
     ``detector_id`` names the concrete (deterministic) detector that nominated
     the row — NULL until detectors land (gated on #75); ``eligibility_tag``
-    carries the R50 outcome-attribution mark (default ``mark-as-is``). Rows are
-    immutable: never mutated or deleted.
+    carries the R50 outcome-attribution mark (default ``mark-as-is``). A
+    composite signal is one ledger ROW PER SOURCE: the rows share a
+    deterministic ``composite_group_id`` (sha256 of
+    profile|session|turn window|detected-at); single-source rows keep
+    NULL. Rows are immutable: never mutated or deleted.
     """
 
     profile_id: str
@@ -369,6 +376,7 @@ class ErrorEvent:
     status: str | None = None
     reason: str | None = None
     retryable: int | None = None
+    composite_group_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -379,7 +387,9 @@ class ErrorEventFilter:
     ChunkFilter/NodeFilter). ``signal_type`` restricts the family namespace;
     ``evidence_kind`` restricts the referenced source surface; ``session_id``
     restricts to one session (B1 serve arm is per-(profile, session)); the
-    time window applies to ``observed_at``.
+    time window applies to ``observed_at``; ``composite_group_id`` restricts
+    to the rows of one composite signal (verbatim match; legacy single-source
+    rows carry NULL and match no group value).
     """
 
     profile_id: str
@@ -388,6 +398,7 @@ class ErrorEventFilter:
     session_id: str | None = None
     since: float | None = None
     until: float | None = None
+    composite_group_id: str | None = None
 
 
 @dataclass(frozen=True)

@@ -797,6 +797,9 @@ class LanceDbEmbeddedStore:
             parts.append(f"ingested_at <= {_escape(filter.ingested_before)}")
         if filter.session_id is not None:
             parts.append(f"session_id = {_escape(filter.session_id)}")
+        if filter.chunk_ids:
+            ids = ", ".join(_escape(chunk_id) for chunk_id in filter.chunk_ids)
+            parts.append(f"chunk_id IN ({ids})")
         if filter.turn_start is not None:
             parts.append(f"turn_start IS NOT NULL AND turn_start >= {_escape(filter.turn_start)}")
         if filter.turn_end is not None:

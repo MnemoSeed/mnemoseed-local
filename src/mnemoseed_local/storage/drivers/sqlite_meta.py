@@ -532,7 +532,10 @@ class SqliteMetaDriver:
         backwards (#151 E: reads order by id, so an out-of-order timestamp
         inside a session would make time-window queries disagree with
         id-order pagination; cross-session and cross-profile timestamps are
-        never compared). Immutability is enforced at the database level by
+        never compared). ``composite_group_id`` marks the row as one source
+        of a composite signal; a blank value normalizes to NULL so the
+        "NULL means single-source" contract cannot be broken by whitespace.
+        Immutability is enforced at the database level by
         the append-only triggers.
         """
         if not (event.profile_id or "").strip():
@@ -549,11 +552,17 @@ class SqliteMetaDriver:
                     "error event observed_at must not move backwards within "
                     f"(profile_id, session_id) = ({event.profile_id!r}, {event.session_id!r})"
                 )
+        composite_group = (
+            event.composite_group_id.strip()
+            if event.composite_group_id and event.composite_group_id.strip()
+            else None
+        )
         self._conn.execute(
             "INSERT INTO error_events (profile_id, signal_type, observed_at, "
             "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
-            "detector_id, eligibility_tag, provider, model, status, reason, retryable) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "detector_id, eligibility_tag, provider, model, status, reason, "
+            "retryable, composite_group_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.profile_id,
                 event.signal_type.value,
@@ -570,6 +579,7 @@ class SqliteMetaDriver:
                 event.status,
                 event.reason,
                 event.retryable,
+                composite_group,
             ),
         )
 
@@ -592,6 +602,9 @@ class SqliteMetaDriver:
         if filter.until is not None:
             clauses.append("observed_at <= ?")
             params.append(iso8601_utc(filter.until))
+        if filter.composite_group_id is not None:
+            clauses.append("composite_group_id = ?")
+            params.append(filter.composite_group_id)
         where = " AND ".join(clauses)
         count_row = self._conn.execute(f"SELECT COUNT(*) FROM error_events WHERE {where}", params).fetchone()
         total = int(count_row[0]) if count_row is not None else 0
@@ -765,6 +778,10 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         retryable = row["retryable"]  # type: ignore[index]
     except (KeyError, IndexError, ValueError):
         retryable = None
+    try:
+        composite_group = row["composite_group_id"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        composite_group = None
     return ErrorEvent(
         profile_id=str(row["profile_id"]),
         signal_type=ErrorSignalType(str(row["signal_type"])),
@@ -783,6 +800,7 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         status=str(status) if status is not None else None,
         reason=str(reason) if reason is not None else None,
         retryable=int(retryable) if retryable is not None else None,
+        composite_group_id=str(composite_group) if composite_group is not None else None,
     )
 
 
