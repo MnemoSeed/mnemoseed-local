@@ -38,7 +38,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -52,6 +52,7 @@ from mnemoseed_local.config import (
     Config,
     DecayConfig,
     DreamConfig,
+    ExperienceChannelConfig,
     ProfilesConfig,
     RoleLLMConfig,
     validate_agent_bindings,
@@ -347,6 +348,8 @@ def _dream_apply(config: Config, field: str, value: Any) -> None:
         "core_confidence_floor": current.core_confidence_floor,
         "delta_budget_ceiling_tokens": current.delta_budget_ceiling_tokens,
         "pool_forced_cap": current.pool_forced_cap,
+        "reflect_batch_max_tokens": current.reflect_batch_max_tokens,
+        "experience_channel": current.experience_channel,
     }
     if value is not None:
         fields[field] = value
@@ -356,6 +359,17 @@ def _dream_apply(config: Config, field: str, value: Any) -> None:
         raw_dream.pop(field, None)
     else:
         raw_dream[field] = value
+
+
+def _experience_channel_apply(config: Config, value: Any) -> None:
+    """Flip the experience-channel flag on the frozen DreamConfig and mirror
+    the change into config.raw (nested ``[dream.experience_channel]`` table).
+
+    ``replace`` carries every other dream field over, so a channel write can
+    never reset the sibling keys.
+    """
+    config.dream = replace(config.dream, experience_channel=ExperienceChannelConfig(enabled=bool(value)))
+    config.raw.setdefault("dream", {}).setdefault("experience_channel", {})["enabled"] = value
 
 
 def _decay_apply(config: Config, field: str, value: Any) -> None:
@@ -603,6 +617,17 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         apply=lambda config, value: _dream_apply(config, "reflect_batch_max_tokens", value),
         live_apply=False,
         cross_validate=_cross_validate_batch_cap_vs_ceiling,
+    ),
+    # E0 (PRD-B2.13): the experience channel switch. Default off; nothing
+    # consumes it yet, so the write path only needs to keep the flag itself
+    # correct (loader + registry validation share the boolean contract).
+    "dream.experience_channel.enabled": ConfigKey(
+        key_path="dream.experience_channel.enabled",
+        value_type="boolean",
+        validate=_validate_bool,
+        read=lambda config: config.dream.experience_channel.enabled,
+        apply=_experience_channel_apply,
+        live_apply=True,
     ),
     # Decay engine (PRD-04 FR-4.1 / design/01 stage ⑤): the sweep's tunables
     # are live-applied — a λ edit reaches the NEXT sweep without a restart.
@@ -933,6 +958,9 @@ class ConfigWriteService:
                     "core_confidence_floor": self._config.dream.core_confidence_floor,
                     "delta_budget_ceiling_tokens": self._config.dream.delta_budget_ceiling_tokens,
                     "pool_forced_cap": self._config.dream.pool_forced_cap,
+                    "experience_channel": {
+                        "enabled": self._config.dream.experience_channel.enabled,
+                    },
                     "llm": {role: self._resolved_role(role) for role in LLM_ROLES},
                 },
                 "decay": {

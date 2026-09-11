@@ -82,6 +82,7 @@ from mnemoseed_local.storage.ports import (
     AuditFilter,
     ChunkFilter,
     DreamRunFilter,
+    EvidenceKind,
     NodeFilter,
     Page,
     RecallRule,
@@ -2000,12 +2001,38 @@ class MemoryService:
 
     # ------------------------------------------------------------ plumbing
 
+    def _live_chunk_ids(self, profile_id: str, chunk_ids: Sequence[str]) -> set[str]:
+        """Which of these chunk ids still exist in the vector store.
+
+        ONE profile-scoped query for the whole batch: evidence-fate
+        resolution stays a single round-trip per read page, never a per-id
+        probe. Empty input short-circuits without touching the store.
+        """
+        ids = tuple(dict.fromkeys(chunk_ids))
+        if not ids:
+            return set()
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id, chunk_ids=ids), Page(offset=0, limit=len(ids))
+        )
+        return {chunk.chunk_id for chunk in page.items}
+
     def list_error_events(self, *, profile_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        """B1 read route: profile-scoped error_events with v12 fingerprint."""
-        from mnemoseed_local.storage.ports import ErrorEventFilter, Page
+        """Profile-scoped error_events read with evidence-fate resolution.
+
+        The ledger is append-only, but purge/forget delete the chunk rows the
+        pointers reference — so every CHUNK pointer resolves against the live
+        store on READ and surfaces ``evidence_retired`` instead of dangling
+        (ledger pointers share fate with their evidence). The ledger row
+        itself is never rewritten.
+        """
+        from mnemoseed_local.storage.ports import ErrorEventFilter
 
         page = self._stores.meta.query_error_events(
             ErrorEventFilter(profile_id=profile_id), Page(offset=offset, limit=limit)
+        )
+        live_ids = self._live_chunk_ids(
+            profile_id,
+            [e.evidence_ptr.id for e in page.items if e.evidence_ptr.kind is EvidenceKind.CHUNK],
         )
         return {
             "profile_id": profile_id,
@@ -2017,11 +2044,17 @@ class MemoryService:
                     "observed_at": e.observed_at,
                     "evidence_kind": e.evidence_ptr.kind.value,
                     "evidence_id": e.evidence_ptr.id,
+                    "evidence_retired": (
+                        None
+                        if e.evidence_ptr.kind is not EvidenceKind.CHUNK
+                        else e.evidence_ptr.id not in live_ids
+                    ),
                     "session_id": e.session_id,
                     "turn_start": e.turn_range.start if e.turn_range else None,
                     "turn_end": e.turn_range.end if e.turn_range else None,
                     "detector_id": e.detector_id,
                     "eligibility_tag": e.eligibility_tag,
+                    "composite_group_id": e.composite_group_id,
                     "provider": e.provider,
                     "model": e.model,
                     "status": e.status,
@@ -2171,7 +2204,7 @@ def memory_reinforce(req: ReinforceRequest, request: Request) -> dict[str, Any]:
 
 @router.post("/memory/error_events")
 def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, Any]:
-    """B1 read route: profile-scoped error_events with v12 fingerprint."""
+    """B1 read route: profile-scoped error_events with evidence-fate resolution."""
     service: MemoryService = request.app.state.memory
     return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
 

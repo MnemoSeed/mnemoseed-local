@@ -564,6 +564,16 @@ _V12_ADD_STATUS = AddColumn(store="meta", table="error_events", column=Column("s
 _V12_ADD_REASON = AddColumn(store="meta", table="error_events", column=Column("reason", "TEXT"))
 _V12_ADD_RETRYABLE = AddColumn(store="meta", table="error_events", column=Column("retryable", "INTEGER"))
 
+# v13 (PRD-B2.13 composite representation): a composite signal is one
+# ledger ROW PER SOURCE; the rows of one signal share a deterministic
+# composite_group_id (sha256 of profile|session|turn window|detected-at) so
+# the group can be re-assembled on read without a join table and without
+# overloading evidence_id. Born NULL: single-source rows (and every legacy
+# row) keep NULL — NULL means "this row is its own signal".
+_V13_ADD_COMPOSITE_GROUP = AddColumn(
+    store="meta", table="error_events", column=Column("composite_group_id", "TEXT")
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -690,6 +700,15 @@ MIGRATIONS: tuple[Migration, ...] = (
             _V12_ADD_REASON,
             _V12_ADD_RETRYABLE,
         ),
+    ),
+    Migration(
+        version=13,
+        description=(
+            "composite signal carrier: nullable shared composite_group_id on "
+            "error_events (one row per source, deterministic group id; born "
+            "NULL — single-source and legacy rows stay NULL)"
+        ),
+        ops=(_V13_ADD_COMPOSITE_GROUP,),
     ),
 )
 
