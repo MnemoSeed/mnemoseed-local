@@ -7,7 +7,24 @@ fallback driver kept). No accounts, no console: profile is hardcoded to
 ``default`` at the application boundary.
 """
 
-__version__ = "0.0.1"
+
+def __getattr__(name: str) -> str:
+    """Resolve ``__version__`` lazily from the installed distribution metadata.
+
+    ``pyproject.toml`` is the single authoring source; packaging writes it into
+    the installed metadata, so bumping the project version is one edit. The
+    lookup is deferred to first access because ``importlib.metadata`` imports
+    ``socket``/``urllib``, which the eval isolation tests forbid on plain
+    ``import mnemoseed_local``.
+    """
+    if name == "__version__":
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("mnemoseed-local")
+        except PackageNotFoundError:  # pragma: no cover - source tree without an install
+            return "0.0.0+unknown"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def health() -> bool:

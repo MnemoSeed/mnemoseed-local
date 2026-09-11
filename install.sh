@@ -12,7 +12,8 @@
 #      print an install hint and exit non-zero)
 #   2. detect / install uv       (official installer; well-known install dir is
 #      prepended to the current process PATH)
-#   3. install / upgrade the CLI (uv tool install | uv tool upgrade)
+#   3. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
+#      to the exact mnemoseed-local==<version> spec; never a floating latest)
 #   4. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
 #   5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
 #      the script never changes config keys itself
@@ -44,6 +45,9 @@ CONFIG_HOME="${MNEMOSEED_LOCAL_HOME:-$HOME/.mnemoseed-local}"
 CONFIG_PATH="$CONFIG_HOME/config.toml"
 UV_BIN_DIR="$HOME/.local/bin"
 DEFAULT_MODEL='qwen3.5:9b'
+# The exact wheel spec: a floating `latest` would silently track main. Keep in
+# lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
+CLI_PIN='mnemoseed-local==0.2.0'
 OLLAMA_URL='https://ollama.com/install.sh'
 UV_URL='https://astral.sh/uv/install.sh'
 
@@ -234,10 +238,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' '[3] mnemoseed-local CLI'
     if have mnemoseed-local; then
         printf '%s\n' "    probe: mnemoseed-local command FOUND at $(command -v mnemoseed-local)"
-        printf '%s\n' '    plan:  would run `uv tool upgrade mnemoseed-local`'
+        printf '%s\n' "    plan:  would run \`uv tool upgrade $CLI_PIN\`"
     else
         printf '%s\n' '    probe: mnemoseed-local command NOT FOUND'
-        printf '%s\n' '    plan:  would run `uv tool install mnemoseed-local`'
+        printf '%s\n' "    plan:  would run \`uv tool install $CLI_PIN\`"
     fi
     printf '%s\n' '[4] init'
     printf '%s\n' "    plan:  would run \`mnemoseed-local init\` when $CONFIG_PATH does not exist; skipped when present"
@@ -304,14 +308,14 @@ prepend_path "$UV_BIN_DIR"
 
 printf '%s\n' '[3/8] mnemoseed-local CLI'
 if have mnemoseed-local; then
-    printf '%s\n' '      found - upgrading via uv tool...'
-    if ! uv tool upgrade mnemoseed-local; then
-        die "'uv tool upgrade mnemoseed-local' failed"
+    printf '%s\n' "      found - upgrading via uv tool ($CLI_PIN)..."
+    if ! uv tool upgrade "$CLI_PIN"; then
+        die "'uv tool upgrade $CLI_PIN' failed"
     fi
 else
-    printf '%s\n' '      not found - installing via uv tool...'
-    if ! uv tool install mnemoseed-local; then
-        die "'uv tool install mnemoseed-local' failed"
+    printf '%s\n' "      not found - installing via uv tool ($CLI_PIN)..."
+    if ! uv tool install "$CLI_PIN"; then
+        die "'uv tool install $CLI_PIN' failed"
     fi
 fi
 have mnemoseed-local || die "mnemoseed-local was installed but is not on PATH; add $UV_BIN_DIR to PATH and re-run"
@@ -387,7 +391,7 @@ if [ "$DOCTOR_RC" -ne 0 ]; then
     printf '%s\n' 'install.sh: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`' >&2
 fi
 printf '\n'
-printf '%s\n' 'installation complete.'
+printf '%s\n' "installation complete: $CLI_PIN"
 printf '%s\n' 'next steps:'
 printf '%s\n' '  mnemoseed-local up            # start the daemon'
 printf '%s\n' '  (hook already installed; register MCP gateway in opencode.json if needed)'
