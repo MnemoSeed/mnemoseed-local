@@ -3,14 +3,15 @@
 **A local, single-user AI memory layer for coding agents.**
 
 MnemoSeed Local is the local-first edition of MnemoSeed: one machine,
-CLI-first, no accounts, no console, no cloud defaults. Memory lives in
-isolated per-profile namespaces: the conventional `default` namespace works
-out of the box, and extra profiles can be registered for other agents
+CLI-first, no accounts, no cloud defaults, with a local web console served at
+the daemon root. Memory lives in isolated per-profile namespaces: the
+conventional `default` namespace works out of the box, and extra profiles can
+be registered for other agents
 (`mnemoseed-local profile {create|list|archive|unarchive}`, bound via the
 `profiles.agent_bindings` config key). The core loop is capture -> dream ->
-decay -> retrieve, with dream
-inference running against a local model (ollama by default, with an
-OpenAI-compatible fallback driver). Both automations ship ON by default:
+decay -> retrieve, with dream inference running against a local model (ollama
+by default, with an OpenAI-compatible fallback driver). Both automations ship
+ON by default:
 dream consolidation fires on its own under its schedule triggers (`--once`
 is the manual fallback), and the focal recall scan runs on every prompt —
 each rolls back with a single config switch
@@ -27,16 +28,54 @@ lancedb_embedded / bge_m3_onnx / synthetic_embedder), schema, migrations,
 capture/retrieve/dream/decay pipelines with a config-driven dream scheduler
 (pool-score floor + idle window + 24h hard deadline), no-accounts loopback
 daemon, the `mnemoseed-local` CLI, install orchestration, the OpenCode host
-hook adapter, and the MCP gateway.
+hook adapter, the MCP gateway, and the local web console.
 
-Phase B is well underway and landed through main: dream ensemble verification
-(B1); cross-session time awareness (`session_windows`), an OpenCode capture
-hook that ingests every turn with consumption-evidence reinforcement, crash
-durability, daemon reliability (TCP-probe watchdog, durable `daemon.log`),
-persistent daemon on/off, an agent recall redesign, and plugin bundling (B2.x);
-plus the eval harness and T4b live calibration with thresholds locked at
-focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23). Multi-session
-mutual awareness is in pre-PRD research; it is not a feature yet.
+Phase B has landed through main:
+
+- **Session continuity** (T1/T2/T3): start-of-session replay injection, mid-turn
+  focal auto-recall, and consumption-evidence reinforcement (cited memories are
+  reinforced; injection alone is not).
+- **Two Tier-1 hosts**: the OpenCode plugin plus a first-class Claude Code hook
+  adapter (B2.10), both capturing every turn.
+- **origin_agent attribution** (B2.9): memories record which in-host agent
+  produced them (`ingest -> turn -> stamp -> recall/recent`), as inert
+  provenance that never affects scoring or ranking.
+- **Score-pool split** (B2.11): `balance` is a true pending gauge while
+  `filed_points_total` is the lifetime ledger, so "how far to the next dream"
+  is honest across restarts.
+- **Retention redesign**: one retention dynamic with cue-based rescue and
+  fade-to-index instead of a promise of immortality.
+- **Provenance trust surface**: recall/Atlas expose pinned-vs-captured signals
+  (`provenance_source` / `explicit_pin` / `needs_reconcile`), and injection
+  marks pinned lines.
+- **Observability beacons** (B2.12): MCP handshake beacon, doctor warnings for
+  registered-but-never-connected gateways, and an `/api/v1/observability`
+  snapshot.
+- **Error-event ledger** (B2.13 E0/E1): append-only `error_events` table and
+  query primitives — plumbing only, no detectors yet.
+- **Daemon reliability**: TCP-probe watchdog with forensic dump, durable
+  `daemon.log`, persistent on/off, and a socket-alive veto against spurious
+  watchdog kills.
+
+The eval harness ships with T4b live calibration, thresholds locked at
+focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23).
+
+### What it does NOT do yet
+
+- **Dream emits structured facts, not typed lessons.** Consolidation produces
+  `prefers` / `has_habit` / `decided` / `believes` triples; it does not yet
+  learn from mistakes or produce the typed lesson artifacts sketched for later
+  experience-learning phases. It is not claimed to.
+- **Experience learning is under construction and off.** The error-event ledger
+  and scoping work (B2.13 E0/E1) is scaffolding; no detector decides anything,
+  and none of it is on by default.
+- **Hosts are OpenCode and Claude Code only.** Those are the two integrations
+  that ship.
+- **No auto-restart.** Nothing relaunches the daemon for you; see below.
+- **Platform coverage is uneven.** Windows is the primary tested platform,
+  Linux runs in CI, and macOS requires manual ollama setup.
+
+Multi-session mutual awareness is in pre-PRD research; it is not a feature yet.
 
 ## Install
 
@@ -72,6 +111,15 @@ re-enables it and starts the daemon again. Hook lifecycle:
 Profile namespaces are managed on the running daemon:
 `mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
 deletes data and does not unbind agents).
+
+> **Install availability.** The one-command installer pins `mnemoseed-local`
+> from the default package index, which must first publish the package there.
+> Publishing is planned but not yet done: `mnemoseed-local` is not on PyPI
+> today and origin has no release tag, so the installer fails cleanly at its
+> package-install step until that lands. From a source checkout, install the
+> current work and the CLI without a package index:
+> `uv tool install --force .` (then `mnemoseed-local up`). The one-command
+> installers pick this up automatically once the release is published.
 
 ### Claude Code
 
@@ -111,7 +159,7 @@ Gates: `uv run pytest -q`, `ruff check`, `ruff format --check`, `mypy src`.
 **One memory under all your coding agents.**  
 MnemoSeed Local is an MIT, single-machine MVP that proves the core pipeline: capture → dream → decay → retrieve. Every prompt and response is stored verbatim, scored for importance, distilled by an offline dream pass, and forgotten on an Ebbinghaus curve — so the next session starts with what matters, not a blank slate.
 
-Your sponsorship keeps the dream model running (Opus-class inference), covers domain/infra for cloud TEE validation, and funds the daily burn of building in public.
+Your sponsorship covers domain/infra for cloud TEE validation and funds the daily burn of building in public. The shipped dream route is a local small model via ollama; pointing it at a larger cloud model is optional user configuration, not a default.
 
 ### Tiers
 
@@ -149,150 +197,32 @@ checkout:
 
 MIT.
 
-## Daemon supervision (optional)
+## Daemon lifecycle
 
-The daemon supervises itself: a watchdog thread probes the served listener
-and, when the listener is lost beyond a grace window, writes its last words to
-`daemon.log` (under `MNEMOSEED_LOCAL_HOME`) and exits with code 1. Relaunching
-stays user-side.
+The daemon does not auto-restart. There is no supervisor process, scheduled
+task, or restart chain — MnemoSeed Local intentionally ships none. If the
+daemon dies, start it again yourself:
 
-Windows Task Scheduler records a non-zero action result but does not reliably
-treat it as a launch failure, so `RestartCount` alone does not relaunch a daemon
-that exits after it started. Use a user-side wrapper that waits for `up`, checks
-the explicit `daemon.off` marker, and bounds rapid failures to three restarts:
-
-```powershell
-$configHome = if ($env:MNEMOSEED_LOCAL_HOME) {
-  $env:MNEMOSEED_LOCAL_HOME
-} else {
-  Join-Path $env:USERPROFILE ".mnemoseed-local"
-}
-New-Item -ItemType Directory -Force -Path $configHome | Out-Null
-$supervisor = Join-Path $configHome "supervise.ps1"
-@'
-param(
-    [ValidateRange(0, 100)]
-    [int]$MaxRestarts = 3,
-
-    [ValidateRange(0, 3600)]
-    [int]$RestartDelaySeconds = 60,
-
-    [ValidateRange(1, 86400)]
-    [int]$StableRunSeconds = 600,
-
-    [string]$ConfigHome = "",
-
-    [string]$ShimPath = "",
-
-    [string[]]$ShimArguments = @("up")
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-$configHome = if (-not [string]::IsNullOrWhiteSpace($ConfigHome)) {
-    $ConfigHome
-} elseif ([string]::IsNullOrWhiteSpace($env:MNEMOSEED_LOCAL_HOME)) {
-    Join-Path $env:USERPROFILE ".mnemoseed-local"
-} else {
-    $env:MNEMOSEED_LOCAL_HOME
-}
-$disabledMarker = Join-Path $configHome "daemon.off"
-$logPath = Join-Path $configHome "supervisor.log"
-$shim = if ([string]::IsNullOrWhiteSpace($ShimPath)) {
-    Join-Path $env:USERPROFILE ".local\bin\mnemoseed-local.exe"
-} else {
-    $ShimPath
-}
-
-function Write-SupervisorLog {
-    param([string]$Message)
-
-    try {
-        if (-not (Test-Path -LiteralPath $configHome)) {
-            New-Item -ItemType Directory -Path $configHome -Force | Out-Null
-        }
-        Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format o) $Message" -Encoding utf8
-    } catch {
-        # Logging must never block daemon recovery.
-    }
-}
-
-$restartCount = 0
-while ($true) {
-    if (Test-Path -LiteralPath $disabledMarker) {
-        Write-SupervisorLog "disabled marker present; supervisor exiting"
-        exit 0
-    }
-    if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
-        Write-SupervisorLog "mnemoseed-local shim missing; supervisor exiting"
-        exit 127
-    }
-
-    $startedAt = Get-Date
-    $exitCode = 1
-    Write-SupervisorLog "starting daemon (restart_count=$restartCount)"
-    try {
-        $process = Start-Process -FilePath $shim -ArgumentList $ShimArguments -PassThru -Wait -WindowStyle Hidden
-        $exitCode = $process.ExitCode
-    } catch {
-        Write-SupervisorLog "daemon launch failed ($($_.Exception.GetType().Name))"
-    }
-
-    $runtimeSeconds = ((Get-Date) - $startedAt).TotalSeconds
-    Write-SupervisorLog "daemon exited (code=$exitCode runtime_seconds=$([math]::Round($runtimeSeconds, 1)))"
-
-    if (Test-Path -LiteralPath $disabledMarker) {
-        Write-SupervisorLog "disabled marker present after exit; supervisor exiting"
-        exit 0
-    }
-    if ($exitCode -eq 0) {
-        Write-SupervisorLog "daemon exited cleanly; supervisor exiting"
-        exit 0
-    }
-    if ($runtimeSeconds -ge $StableRunSeconds) {
-        $restartCount = 0
-        Write-SupervisorLog "stable-run threshold reached; restart budget reset"
-    }
-    if ($restartCount -ge $MaxRestarts) {
-        Write-SupervisorLog "restart budget exhausted; supervisor exiting"
-        exit $exitCode
-    }
-
-    $restartCount += 1
-    Write-SupervisorLog "retrying in $RestartDelaySeconds seconds (restart_count=$restartCount)"
-    Start-Sleep -Seconds $RestartDelaySeconds
-}
-'@ | Set-Content -LiteralPath $supervisor -Encoding utf8
-
-$pwsh = (Get-Command pwsh).Source
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action = New-ScheduledTaskAction -Execute $pwsh `
-  -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$supervisor`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
-$settings = New-ScheduledTaskSettingsSet `
-  -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
-  -MultipleInstances IgnoreNew -StartWhenAvailable `
-  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-$principal = New-ScheduledTaskPrincipal -UserId $identity `
-  -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName "MnemoSeedLocalDaemon" `
-  -Action $action -Trigger $trigger -Settings $settings `
-  -Principal $principal -Force
+```sh
+mnemoseed-local up
 ```
 
-Honest caveats:
+`up` respects the `daemon.off` marker, so it will not revive a service you
+deliberately disabled with `mnemoseed-local off`; use `mnemoseed-local on` to
+re-enable the service and start the daemon.
 
-- Use **AtLogOn + one waiting wrapper, never a periodic trigger**. The task stays
-  running with the daemon, and `IgnoreNew` rejects duplicate task instances.
-- **`-ExecutionTimeLimit` must be 0 (unlimited)** — the Task Scheduler default
-  3-day cap would hard-kill a healthy long-running daemon.
-- The wrapper launches **`up`, never `on`**. `up` respects `daemon.off`; `on`
-  clears it and would revive a service the user deliberately disabled.
-- Three rapid restarts are allowed at 60-second intervals. A run lasting at
-  least ten minutes resets that budget, so sparse failures remain recoverable
-  without creating an infinite crash loop.
+Health is observable rather than silently "handled":
 
-The watchdog releases the port before exiting, then the waiting wrapper delays
-for 60 seconds and relaunches. With the service off (`mnemoseed-local off`), the
-wrapper observes `daemon.off` and exits 0 without launching or retrying `up`.
+- `mnemoseed-local status` reports whether the daemon is reachable and the
+  resolved config.
+- `mnemoseed-local doctor` runs the self-check checklist (stores, migrations,
+  gate, host hook, gateway connectivity).
+- The daemon runs an in-process watchdog: it probes the served listener, and
+  when the listener is lost beyond a grace window it writes its last words and a
+  forensic thread dump to `daemon.log` (under `MNEMOSEED_LOCAL_HOME`) before
+  exiting. That leaves evidence for diagnosis — it does not bring the daemon
+  back.
+
+Because nothing restarts the daemon, do not build a restart wrapper around it.
+An unattended restart loop masks crashes and can fight the `daemon.off` marker;
+run `up` explicitly after checking `status` / `doctor`.

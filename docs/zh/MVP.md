@@ -8,11 +8,13 @@
 mnemoseed-local = **本地单用户 MVP 守护进程**：
 
 - 无账号：localhost 隐式信任，无 identity/owner gate
-- profile 硬编码为 `default`（框架内部保留）
-- CLI 优先（无 console）
+- CLI 优先（本机 Web 控制台随 daemon 在根路径提供）
 - dream 走**本地模型**（ollama 默认；保留 openai-compatible 回退驱动）
-- 核心闭环：capture → dream --once（手动）→ decay → retrieve
-- 一键安装属后续阶段（A3）
+- 核心闭环：capture → dream → decay → retrieve
+
+> **存档与现状**：以上是立项时锁定的意图。后续批次已超过冻结范围：profile 不再是
+> 单值硬编码，多命名空间经 `mnemoseed-local profile` 管理；自动做梦与自动回忆自
+> 2026-08-23 起出厂默认开启（`dream --once` 降为手动兜底）；一键安装器（A3）已交付。
 
 ## A1 范围（本轮，仅地基，无用户可见表面）
 
@@ -21,6 +23,7 @@ mnemoseed-local = **本地单用户 MVP 守护进程**：
    最小依赖集；uv 管理；`src/mnemoseed_local/__init__.py`
    （`__version__`；2026-08-18 用户拍板：开发期版本线归位 `0.0.1`，原 A1 记录
    `0.1.0` 作废）。
+   > **存档与现状**：开发期版本线现已随 B2.x 推进至 `0.2.0`。
 2. **config**：`config.py` + `configwrite/`（注册表裁剪到 MVP 实际使用：
    storage + dream + decay + llm 路由键；不含 registry/providers）。
    单 profile `default` 硬编码（只参考主仓库 identity 理解签名，不移植账号）。

@@ -23,7 +23,8 @@
        own installers (systemd), so install.sh needs no such step)
     3. detect / install uv       (official installer; well-known install dir is
        prepended to the current process PATH)
-    4. install / upgrade the CLI (uv tool install | uv tool upgrade)
+    4. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
+       to the exact mnemoseed-local==<version> spec; never a floating latest)
     5. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
     6. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
        the script never changes config keys itself
@@ -77,6 +78,9 @@ $OllamaBinDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
 $OllamaServeTaskName = 'OllamaHeadlessServe'
 $OllamaTrayStartupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk'
 $DefaultModel = 'qwen3.5:9b'
+# The exact wheel spec: a floating `latest` would silently track main. Keep in
+# lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
+$CliPin = 'mnemoseed-local==0.2.0'
 
 # --- helpers ---------------------------------------------------------------
 
@@ -210,10 +214,10 @@ if ($DryRun) {
     $cliCmd = Get-Command mnemoseed-local -ErrorAction SilentlyContinue
     if ($null -ne $cliCmd) {
         Write-Host "    probe: mnemoseed-local command FOUND at $($cliCmd.Source)"
-        Write-Host '    plan:  would run `uv tool upgrade mnemoseed-local`'
+        Write-Host "    plan:  would run ``uv tool upgrade $CliPin``"
     } else {
         Write-Host '    probe: mnemoseed-local command NOT FOUND'
-        Write-Host '    plan:  would run `uv tool install mnemoseed-local`'
+        Write-Host "    plan:  would run ``uv tool install $CliPin``"
     }
     Write-Host '[5] init'
     Write-Host "    plan:  would run ``mnemoseed-local init`` when $ConfigPath does not exist; skipped when present"
@@ -356,13 +360,13 @@ Add-ToProcessPath $UvBinDir
 
 Write-Host '[4/9] mnemoseed-local CLI'
 if (Test-CommandExists 'mnemoseed-local') {
-    Write-Host '      found - upgrading via uv tool...'
-    & uv tool upgrade mnemoseed-local
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool upgrade mnemoseed-local' failed (exit $LASTEXITCODE)" }
+    Write-Host "      found - upgrading via uv tool ($CliPin)..."
+    & uv tool upgrade $CliPin
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool upgrade $CliPin' failed (exit $LASTEXITCODE)" }
 } else {
-    Write-Host '      not found - installing via uv tool...'
-    & uv tool install mnemoseed-local
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool install mnemoseed-local' failed (exit $LASTEXITCODE)" }
+    Write-Host "      not found - installing via uv tool ($CliPin)..."
+    & uv tool install $CliPin
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool install $CliPin' failed (exit $LASTEXITCODE)" }
 }
 if (-not (Test-CommandExists 'mnemoseed-local')) {
     Exit-WithError "mnemoseed-local was installed but is not on PATH; add $UvBinDir to PATH and re-run"
@@ -437,7 +441,7 @@ if ($finalDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`')
 }
 Write-Host ''
-Write-Host 'installation complete.'
+Write-Host "installation complete: $CliPin"
 Write-Host 'next steps:'
 Write-Host '  mnemoseed-local up            # start the daemon'
 Write-Host '  (hook already installed; register MCP gateway in opencode.json if needed)'
