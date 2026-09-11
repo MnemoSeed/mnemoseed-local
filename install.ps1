@@ -80,7 +80,7 @@ $OllamaTrayStartupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Pro
 $DefaultModel = 'qwen3.5:9b'
 # The exact wheel spec: a floating `latest` would silently track main. Keep in
 # lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
-$CliPin = 'mnemoseed-local==0.2.0'
+$CliPin = 'mnemoseed-local==0.0.1'
 
 # --- helpers ---------------------------------------------------------------
 
