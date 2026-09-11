@@ -305,13 +305,39 @@ const DEBUG: boolean = Boolean(process.env.MNEMOSEED_LOCAL_DEBUG)
 const DATA_DIR: string =
   process.env.MNEMOSEED_LOCAL_DATA_DIR || join(homedir(), ".mnemoseed-local")
 const DEBUG_LOG_PATH: string = join(DATA_DIR, "hook-debug.jsonl")
+// The opt-in JSONL sink is otherwise append-forever. Before an
+// append, a sink over the cap rotates once to a single `.1` generation
+// (replacing any existing one), bounding the on-disk total at ~2x the cap.
+// The whole lane stays fail-open: a stat/rename failure resolves quietly and
+// the line is still appended against whatever file is present.
+const _HOOK_DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
+const DEBUG_LOG_ARCHIVE_PATH: string = DEBUG_LOG_PATH + ".1"
+
+async function rotateDebugLogIfOversized(): Promise<void> {
+  try {
+    const info = await stat(DEBUG_LOG_PATH)
+    if (info.size <= _HOOK_DEBUG_LOG_MAX_BYTES) return
+    await rename(DEBUG_LOG_PATH, DEBUG_LOG_ARCHIVE_PATH)
+  } catch {
+    // missing sink or a held handle: nothing to rotate, append proceeds
+  }
+}
+
+// Serialize the sink so two concurrent debug lines cannot both observe the
+// oversized file and double-rotate (the second rename would clobber the
+// archive with the freshly-truncated file). Fail-open by construction: a
+// rejected link is swallowed and the next line retries.
+let debugSinkChain: Promise<void> = Promise.resolve()
 
 function debugLog(tag: string, payload: unknown): void {
   console.debug(`mnemoseed-local: ${tag}:`, payload)
   if (!DEBUG) return
   console.error(`mnemoseed-local: ${tag}:`, payload)
   const line = JSON.stringify({ ts: new Date().toISOString(), tag, payload })
-  void mkdir(dirname(DEBUG_LOG_PATH), { recursive: true })
+  debugSinkChain = debugSinkChain
+    .catch(() => {})
+    .then(() => mkdir(dirname(DEBUG_LOG_PATH), { recursive: true }))
+    .then(() => rotateDebugLogIfOversized())
     .then(() => appendFile(DEBUG_LOG_PATH, line + "\n", "utf8"))
     .catch((error: unknown) => console.debug("mnemoseed-local: debug sink failed:", error))
 }
@@ -980,6 +1006,16 @@ const REPLAY_OVERLAP_MS = 30000
 const WATERMARK_SHARD_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const WATERMARK_SHARD_GC_MAX_DELETE = 20
 const WATERMARK_TMP_GC_MAX_DELETE = 20
+// Age-based sweep for stale watermark artifacts a crashed instance
+// left behind. The legacy `hook-watermarks.json.<Date.now>.tmp` family is not
+// matched by the own-prefix or crash-tmp sweeps above, so it accumulated
+// unbounded. TTL = 7 days: far longer
+// than any in-flight atomic write, so a live persist's tmp is never eligible.
+// Guarded to at most one directory scan per interval; the first persist of a
+// process sweeps immediately (last-sweep clock starts at 0).
+const WATERMARK_STALE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const WATERMARK_STALE_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+const WATERMARK_STALE_SWEEP_MAX_DELETE = 50
 const WATERMARK_PERSIST_RETRY_MAX = 5
 const WATERMARK_PERSIST_RETRY_BASE_MS = 10
 // Bounded follow-up writes when a note lands mid-cycle (IMPORTANT-5): the
@@ -1003,6 +1039,9 @@ let watermarkTmpCounter = 0
 let watermarkRenameFault: "off" | "once" | "always" = "off"
 let watermarkUnlinkFault: "off" | "once" | "always" = "off"
 let watermarkLivenessFault: "off" | "dead" = "off"
+// Last-run clock for the stale-tmp sweep guard (0 => first persist
+// of the process sweeps immediately).
+let watermarkStaleSweepLastAt = 0
 let persistInnerActive = 0
 let persistInnerMaxActive = 0
 // Monotonic edit counter: every accepted watermark advance bumps it, so a
@@ -1112,6 +1151,87 @@ async function sweepOwnedTmps(limit: number): Promise<number> {
     }
   }
   if (removed > 0) debugLog("watermark own tmp sweep", { removed })
+  return removed
+}
+
+function isWatermarkTmpArtifact(name: string): boolean {
+  // Only the watermark family's atomic-write leftovers are eligible: the
+  // legacy `hook-watermarks.json.<Date.now>.tmp`, this process's own tmp
+  // prefix, and the exact crash-tmp format. Unrelated tools' tmps never match.
+  if (name.startsWith(`${WATERMARKS_LEGACY_BASENAME}.`) && name.endsWith(".tmp")) return true
+  if (name.startsWith(watermarkOwnedTmpPrefix())) return true
+  return WATERMARK_CRASH_TMP_RE.test(name)
+}
+
+async function sweepStaleWatermarkArtifacts(force: boolean): Promise<number> {
+  // Age-based cleanup of watermark artifacts a crashed/killed
+  // instance left behind. Unlike collectWatermarkGarbage (dead PID + 24h for
+  // shards and crash-tmps), this catches the legacy `hook-watermarks.json.*.tmp`
+  // family that the own-prefix and crash-tmp sweeps never match, plus a coarse
+  // 7-day backstop for tmp artifacts whose owner PID can no longer be
+  // classified (a live atomic write never spans 7 days). Best-effort and
+  // bounded. The interval guard makes the directory scan at most hourly
+  // (the first persist of a process, last=0, sweeps immediately).
+  const now = Date.now()
+  if (
+    !force &&
+    watermarkStaleSweepLastAt !== 0 &&
+    now - watermarkStaleSweepLastAt < WATERMARK_STALE_SWEEP_INTERVAL_MS
+  ) {
+    return 0
+  }
+  watermarkStaleSweepLastAt = now
+  let entries: string[]
+  try {
+    entries = await readdir(DATA_DIR)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const name of entries) {
+    if (removed >= WATERMARK_STALE_SWEEP_MAX_DELETE) break
+    if (name === WATERMARK_SHARD_BASENAME) continue
+    const isTmp = isWatermarkTmpArtifact(name)
+    if (!isTmp && !isShardBasename(name)) continue
+    const full = join(DATA_DIR, name)
+    let mtimeMs: number
+    try {
+      mtimeMs = (await stat(full)).mtimeMs
+    } catch {
+      continue
+    }
+    if (now - mtimeMs <= WATERMARK_STALE_MAX_AGE_MS) continue
+    if (!isTmp) {
+      // shard: only ever delete a conclusively dead owner's file — never the
+      // 7-day age alone (a paused/long-lived owner may still hold its shard).
+      // Corrupt bytes are preserved, matching collectWatermarkGarbage's
+      // content-validity discipline.
+      const pid = parseShardPid(name)
+      if (pid === null || classifyPid(pid) !== "dead") continue
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(await readFile(full, "utf8"))
+      } catch {
+        continue
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue
+      let hasInvalid = false
+      for (const value of Object.values(parsed as Record<string, unknown>)) {
+        if (!isValidWatermarkValue(value)) {
+          hasInvalid = true
+          break
+        }
+      }
+      if (hasInvalid) continue
+    }
+    try {
+      await watermarkUnlink(full)
+      removed += 1
+    } catch {
+      // best-effort cleanup only
+    }
+  }
+  if (removed > 0) debugLog("watermark stale artifact sweep", { removed })
   return removed
 }
 
@@ -1470,6 +1590,14 @@ async function persistWatermarksBody(): Promise<void> {
     await collectWatermarkGarbage(entries)
   } catch (error) {
     console.debug("mnemoseed-local: watermark GC failed:", error)
+  }
+  // Fold-before-delete holds — every shard's keys were merged into
+  // the own shard above, so an old dead-owner shard is safe to reap. The
+  // legacy `.tmp` family has no keys and is reaped by age alone.
+  try {
+    await sweepStaleWatermarkArtifacts(false)
+  } catch (error) {
+    console.debug("mnemoseed-local: watermark stale sweep failed:", error)
   }
 }
 
@@ -2161,6 +2289,7 @@ export default async function MnemoSeedLocalPlugin(
               watermarkLivenessFault = mode === "dead" ? "dead" : "off"
             },
             runGc: () => collectWatermarkGarbage(),
+            runStaleSweep: (force: boolean) => sweepStaleWatermarkArtifacts(force === true),
             maxConcurrency: () => persistInnerMaxActive,
             armIoBarrier: () => {
               armWatermarkIoBarrier()

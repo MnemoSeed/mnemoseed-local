@@ -459,8 +459,10 @@ class Watchdog:
         """Last words, forensic dump, then force-exit — the production fire path.
 
         The dump is a forensic artifact (F2 根治 D5): every thread's stack
-        lands in ``CONFIG_DIR/daemon.log`` (append, no line cap) so the hung
-        teardown's players are on disk after the process is gone. CONFIG_DIR is
+        lands in ``CONFIG_DIR/daemon.log`` (append; the file is bounded only by
+        the boot-time one-generation rotation in app.py, so a single
+        daemon-lifetime dump is never dropped) so the hung teardown's players
+        are on disk after the process is gone. CONFIG_DIR is
         resolved at call time — a relocated home is honored. The header and
         summary are flushed before the traceback lands, so the on-disk order
         is header-then-stacks. The exit runs in a finally over the whole

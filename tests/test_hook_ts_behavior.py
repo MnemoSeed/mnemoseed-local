@@ -665,3 +665,40 @@ def test_config_hook_is_fail_open_on_frozen_objects(tmp_path: Path) -> None:
     assert transcript["frozenMcpHasMnemoseed"] is None
     expected = {"type": "local", "command": ["mnemoseed-local", "mcp"], "enabled": True}
     assert transcript["afterMnemoseed"] == expected
+
+
+# ---------------------------------------------------------------- debug-log rotation
+
+
+def test_debug_sink_rotates_once_when_oversized_and_keeps_logging(tmp_path: Path) -> None:
+    """The opt-in JSONL debug sink is otherwise append-forever. Before
+    a debug append, an oversized hook-debug.jsonl is rotated once to a single
+    hook-debug.jsonl.1 generation and the triggering line still lands in the
+    fresh file — rotation must never lose the line or block the hook."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "hook-debug-rotate")
+    assert transcript["rotated"] is True, transcript
+    assert transcript["archivedBytes"] > transcript["capBytes"], (
+        "the archived generation must carry the pre-rotation bytes"
+    )
+    assert transcript["freshHasLine"] is True, "the triggering line must land in the fresh sink"
+    assert transcript["freshBytes"] < transcript["capBytes"], "the fresh sink restarts small"
+
+
+def test_debug_sink_does_not_rotate_below_the_cap(tmp_path: Path) -> None:
+    """A below-cap debug sink is appended in place — no .1 generation
+    is invented for a small file."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "hook-debug-no-rotate")
+    assert transcript["rotated"] is False, transcript
+    assert transcript["linePresent"] is True, transcript
+
+
+def test_debug_sink_rotation_replaces_the_existing_generation(tmp_path: Path) -> None:
+    """One generation only — an existing hook-debug.jsonl.1 is
+    replaced by the rotation, never multiplied."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "hook-debug-rotate-replace")
+    assert transcript["replaced"] is True, transcript
+    assert transcript["noSecondGeneration"] is True, transcript
+    assert transcript["freshHasLine"] is True, transcript

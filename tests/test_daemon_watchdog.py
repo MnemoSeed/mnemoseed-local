@@ -755,6 +755,113 @@ def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
     assert "port=7788" in boot_line
 
 
+# ------------------------------------------- daemon.log boot rotation
+
+
+def _attach_for_rotation() -> None:
+    from mnemoseed_local.daemon.app import _attach_daemon_log_handler
+
+    _attach_daemon_log_handler()
+
+
+def test_daemon_log_rotates_once_at_attach_when_oversized(log_home: Path) -> None:
+    """An oversized daemon.log is rotated to a single daemon.log.1
+    generation at handler attach, and the fresh daemon.log starts empty. The
+    bound is therefore ~2x the cap; the fire path's append-by-name keeps
+    working on the fresh file."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES
+
+    log_file = log_home / DAEMON_LOG_NAME
+    oversized = b"x" * (_DAEMON_LOG_MAX_BYTES + 1)
+    log_file.write_bytes(oversized)
+    _attach_for_rotation()
+    try:
+        rotated = log_home / "daemon.log.1"
+        assert rotated.exists(), "an oversized daemon.log must be rotated at attach"
+        assert rotated.read_bytes() == oversized, "the rotated generation must preserve the bytes"
+        assert log_file.exists() and log_file.stat().st_size == 0, (
+            "the fresh daemon.log must start empty after rotation"
+        )
+    finally:
+        _detach_daemon_log_handler()
+
+
+def test_daemon_log_not_rotated_below_the_cap(log_home: Path) -> None:
+    """A daemon.log at or below the cap is left untouched and no .1
+    generation is invented."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES
+
+    log_file = log_home / DAEMON_LOG_NAME
+    content = b"y" * min(1024, _DAEMON_LOG_MAX_BYTES)
+    log_file.write_bytes(content)
+    _attach_for_rotation()
+    try:
+        assert not (log_home / "daemon.log.1").exists(), "no rotation under the cap"
+        assert log_file.read_bytes() == content, "the below-cap bytes must be untouched"
+    finally:
+        _detach_daemon_log_handler()
+
+
+def test_daemon_log_rotation_replaces_the_existing_generation(log_home: Path) -> None:
+    """One generation only — an existing daemon.log.1 is replaced, not
+    appended to and not multiplied into .2."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES
+
+    log_file = log_home / DAEMON_LOG_NAME
+    (log_home / "daemon.log.1").write_bytes(b"old-generation")
+    oversized = b"z" * (_DAEMON_LOG_MAX_BYTES + 1)
+    log_file.write_bytes(oversized)
+    _attach_for_rotation()
+    try:
+        assert (log_home / "daemon.log.1").read_bytes() == oversized, (
+            "the existing .1 generation must be replaced"
+        )
+        assert not (log_home / "daemon.log.2").exists(), "at most one generation is kept"
+    finally:
+        _detach_daemon_log_handler()
+
+
+def test_daemon_log_boot_rotation_still_records_the_boot_line(log_home: Path) -> None:
+    """A real lifespan boot over an oversized daemon.log rotates first
+    and still records the boot line into the fresh file — the durable-log
+    contract survives the rotation."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES
+
+    log_file = log_home / DAEMON_LOG_NAME
+    oversized = b"q" * (_DAEMON_LOG_MAX_BYTES + 1)
+    log_file.write_bytes(oversized)
+    app = create_app()
+    with TestClient(app) as client:
+        assert client.get("/healthz").json()["status"] == "ok"
+        live_text = log_file.read_text(encoding="utf-8")
+        assert "daemon boot:" in live_text, "the boot line must land in the fresh log"
+    assert (log_home / "daemon.log.1").read_bytes() == oversized
+
+
+def test_watchdog_fire_appends_after_a_boot_rotation(log_home: Path) -> None:
+    """The watchdog fire path opens daemon.log by NAME and appends, so
+    it keeps landing in the fresh file after a boot rotation (the rotation must
+    not strand the forensic dump in the archived generation)."""
+    from mnemoseed_local.daemon.app import _DAEMON_LOG_MAX_BYTES
+
+    log_file = log_home / DAEMON_LOG_NAME
+    oversized = b"r" * (_DAEMON_LOG_MAX_BYTES + 1)
+    log_file.write_bytes(oversized)
+    _attach_for_rotation()
+    try:
+        exit_calls: list[int] = []
+        watchdog = Watchdog("127.0.0.1", 7788, exit_func=lambda code: exit_calls.append(code))
+        watchdog._default_fire("boot-grace")
+        assert exit_calls == [1]
+        fresh = log_file.read_text(encoding="utf-8")
+        assert "watchdog fire (boot-grace)" in fresh
+        assert "forensic dump" in fresh, "the fire-path dump must land in the fresh log"
+        archived = (log_home / "daemon.log.1").read_text(encoding="utf-8")
+        assert "forensic dump" not in archived, "the dump must not land in the archived generation"
+    finally:
+        _detach_daemon_log_handler()
+
+
 # ------------------------------------------- QA I-1: no real-home pollution
 
 

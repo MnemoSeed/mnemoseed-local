@@ -215,6 +215,20 @@ def test_owned_tmp_sweep_recovers_failed_cleanup(tmp_path: Path) -> None:
     assert transcript["unrelatedPreserved"] is True, transcript
 
 
+def test_stale_watermark_tmps_are_swept_by_age_once_per_interval(tmp_path: Path) -> None:
+    """Watermark tmp orphans older than the TTL are removed at persist
+    time, young ones and unrelated files survive, and the sweep is guarded to
+    at most once per interval — a newly-dropped old tmp is not swept by the
+    immediate next persist, only by a forced sweep."""
+    bundle = _bundle(tmp_path)
+    transcript = _run_watermark(bundle, "watermark-stale-sweep")
+    assert transcript["oldRemoved"] is True, transcript
+    assert transcript["youngKept"] is True, transcript
+    assert transcript["unrelatedKept"] is True, transcript
+    assert transcript["guardHeld"] is True, transcript
+    assert transcript["forcedRemoved"] is True, transcript
+
+
 def test_early_ack_retained_and_invalid_rejected(tmp_path: Path) -> None:
     """IMPORTANT-4: pre-load ACKs accumulate; NaN/Infinity/negative ignored."""
     bundle = _bundle(tmp_path)
