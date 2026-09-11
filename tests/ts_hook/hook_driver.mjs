@@ -4,7 +4,7 @@
 // to assert on. No daemon, no network, no LLM — everything is canned.
 
 import { pathToFileURL } from "node:url"
-import { mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -1477,6 +1477,131 @@ async function main() {
       break
     }
 
+    case "hook-debug-rotate": {
+      // An oversized opt-in sink rotates once to .1 at append time
+      // and the triggering line still lands in the fresh file.
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const logPath = join(dataDir, "hook-debug.jsonl")
+      const archivePath = join(dataDir, "hook-debug.jsonl.1")
+      await mkdir(dataDir, { recursive: true })
+      const cap = 10 * 1024 * 1024
+      const oversized = "x".repeat(cap + 4096)
+      await writeFile(logPath, oversized, "utf8")
+      await hooks.event({ event: messageUpdatedAssistant("m_rot_1", 1000) })
+      await delay(150)
+      const archived = await readFile(archivePath, "utf8").catch(() => "")
+      const fresh = await readFile(logPath, "utf8").catch(() => "")
+      console.log(
+        JSON.stringify({
+          rotated: archived.length > 0,
+          archivedBytes: archived.length,
+          capBytes: cap,
+          freshHasLine: fresh.includes("assistant completion shape"),
+          freshBytes: fresh.length,
+        }),
+      )
+      break
+    }
+
+    case "hook-debug-no-rotate": {
+      // A below-cap sink is appended in place — no .1 invented.
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const logPath = join(dataDir, "hook-debug.jsonl")
+      const archivePath = join(dataDir, "hook-debug.jsonl.1")
+      await mkdir(dataDir, { recursive: true })
+      await writeFile(logPath, "seed\n", "utf8")
+      await hooks.event({ event: messageUpdatedAssistant("m_norot_1", 1000) })
+      await delay(150)
+      const archiveExists = await stat(archivePath).then(
+        () => true,
+        () => false,
+      )
+      const fresh = await readFile(logPath, "utf8").catch(() => "")
+      console.log(
+        JSON.stringify({
+          rotated: archiveExists,
+          linePresent: fresh.includes("assistant completion shape"),
+        }),
+      )
+      break
+    }
+
+    case "hook-debug-rotate-replace": {
+      // One generation only — a pre-existing .1 is replaced.
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const logPath = join(dataDir, "hook-debug.jsonl")
+      const archivePath = join(dataDir, "hook-debug.jsonl.1")
+      const secondArchive = join(dataDir, "hook-debug.jsonl.2")
+      await mkdir(dataDir, { recursive: true })
+      await writeFile(archivePath, "old-generation", "utf8")
+      const cap = 10 * 1024 * 1024
+      const oversized = "x".repeat(cap + 4096)
+      await writeFile(logPath, oversized, "utf8")
+      await hooks.event({ event: messageUpdatedAssistant("m_rot_rep_1", 1000) })
+      await delay(150)
+      const archiveBytes = await readFile(archivePath, "utf8").catch(() => "")
+      const secondExists = await stat(secondArchive).then(
+        () => true,
+        () => false,
+      )
+      const fresh = await readFile(logPath, "utf8").catch(() => "")
+      console.log(
+        JSON.stringify({
+          replaced: archiveBytes.length > "old-generation".length,
+          noSecondGeneration: !secondExists,
+          freshHasLine: fresh.includes("assistant completion shape"),
+        }),
+      )
+      break
+    }
+
+    case "hook-debug-rotate-concurrent": {
+      // Two debug emissions launched against an oversized sink WITHOUT awaiting
+      // between them must serialize through the sink chain: exactly one rotation, both
+      // lines land in the fresh file, and no .2 generation is invented. A dropped
+      // chain would let both observes see the oversized file and double-rotate — the
+      // second rename clobbers the archive with the freshly-truncated file.
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const logPath = join(dataDir, "hook-debug.jsonl")
+      const archivePath = join(dataDir, "hook-debug.jsonl.1")
+      const secondArchive = join(dataDir, "hook-debug.jsonl.2")
+      await mkdir(dataDir, { recursive: true })
+      const cap = 10 * 1024 * 1024
+      const oversized = "x".repeat(cap + 4096)
+      await writeFile(logPath, oversized, "utf8")
+      const e1 = messageUpdatedAssistant("m_conc_1", 1000)
+      const e2 = messageUpdatedAssistant("m_conc_2", 2000)
+      await Promise.all([
+        hooks.event({ event: e1 }),
+        hooks.event({ event: e2 }),
+      ])
+      await delay(200)
+      const archiveBytes = await readFile(archivePath, "utf8").catch(() => "")
+      const archiveHoldsPreRotation = archiveBytes.length === oversized.length && archiveBytes === oversized
+      const secondExists = await stat(secondArchive).then(
+        () => true,
+        () => false,
+      )
+      const fresh = await readFile(logPath, "utf8").catch(() => "")
+      const shapeLines = fresh
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((l) => l.tag === "assistant completion shape" || (l.payload && l.payload.tag === "assistant completion shape"))
+      const bothLines = shapeLines.length >= 2
+      console.log(
+        JSON.stringify({
+          rotated: archiveHoldsPreRotation,
+          bothLines,
+          noSecondGeneration: !secondExists,
+          freshStillSmall: fresh.length < cap,
+          shapeCount: shapeLines.length,
+        }),
+      )
+      break
+    }
+
     case "config-inject": {
       // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
       // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual
@@ -2536,6 +2661,55 @@ async function main() {
         )
       ).every(Boolean)
       console.log(JSON.stringify({ decoysExcluded, converged, decoysPreserved, shard }))
+      break
+    }
+
+    case "watermark-stale-sweep": {
+      // Age-based sweep of stale watermark tmp artifacts. An old
+      // legacy `.tmp` is reaped; a young tmp and an unrelated tmp survive; the
+      // interval guard suppresses a second sweep until forced.
+      const seam = hooks.__watermarkTest
+      if (!seam) {
+        console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-stale-sweep" }))
+        break
+      }
+      const dataDir = process.env.MNEMOSEED_LOCAL_DATA_DIR
+      const oldDate = new Date(Date.now() - 8 * 24 * 3600 * 1000)
+      const youngDate = new Date(Date.now() - 60 * 1000)
+      const oldTmp = join(dataDir, "hook-watermarks.json.1700000000000.tmp")
+      const youngTmp = join(dataDir, "hook-watermarks.json.1799999999999.tmp")
+      const unrelatedTmp = join(dataDir, "other-tool.tmp")
+      await writeFile(oldTmp, "old-stale", "utf8")
+      await writeFile(youngTmp, "young-live", "utf8")
+      await writeFile(unrelatedTmp, "unrelated", "utf8")
+      await utimes(oldTmp, oldDate, oldDate)
+      await utimes(youngTmp, youngDate, youngDate)
+      await utimes(unrelatedTmp, oldDate, oldDate)
+      const exists = async (p) => {
+        try {
+          await stat(p)
+          return true
+        } catch {
+          return false
+        }
+      }
+      // first persist sweeps immediately (last-sweep clock starts at 0)
+      seam.note("wm-test-stale-a", 100)
+      await seam.persist()
+      const oldRemoved = !(await exists(oldTmp))
+      const youngKept = await exists(youngTmp)
+      const unrelatedKept = await exists(unrelatedTmp)
+      // drop a NEW old tmp, then run a guarded (non-forced) sweep: the guard
+      // must suppress it, leaving the new artifact in place.
+      const guardedTmp = join(dataDir, "hook-watermarks.json.1711111111111.tmp")
+      await writeFile(guardedTmp, "guard-sentinel", "utf8")
+      await utimes(guardedTmp, oldDate, oldDate)
+      await seam.runStaleSweep(false)
+      const guardHeld = await exists(guardedTmp)
+      // forced sweep must reap it
+      await seam.runStaleSweep(true)
+      const forcedRemoved = !(await exists(guardedTmp))
+      console.log(JSON.stringify({ oldRemoved, youngKept, unrelatedKept, guardHeld, forcedRemoved }))
       break
     }
 

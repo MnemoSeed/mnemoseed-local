@@ -94,6 +94,16 @@ from mnemoseed_local.util.daemon_executor import DaemonExecutor
 
 logger = logging.getLogger("mnemoseed_local.daemon")
 
+# The durable daemon.log is append-forever; bound it at boot. Boot-time
+# rotation keeps the hot path untouched — the watchdog fire path opens the file
+# by NAME (append), so it keeps working across a rotation, and the handler needs
+# no mid-run swap (no rename-while-open race). Tradeoff: within one daemon
+# lifetime the live file grows unbounded (the hot path never rotates); the bound
+# is per boot cycle — each boot rotates at most one ~cap-sized generation, so disk
+# usage is bounded at the next boot.
+_DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024
+_DAEMON_LOG_ARCHIVE_NAME = "daemon.log.1"
+
 # The dream role the reflect boundary runs (A2 MVP), and the B1 ensemble
 # verify judging seat (design/01 decision 1): roles stay pipeline-internal
 # params so a future deep/short split can re-open them. The B5 vote seat B's
@@ -883,6 +893,29 @@ def _build_capture(
     )
 
 
+def _rotate_daemon_log_if_oversized() -> None:
+    """One-generation boot-time rotation of an oversized daemon.log.
+
+    Renames daemon.log -> daemon.log.1 (replacing any existing .1) before the
+    durable handler attaches. Each boot cycle rotates at most the previous
+    cycle's file, so within one daemon lifetime the live file can exceed the
+    cap (the hot path never rotates); the total on disk is bounded at the next
+    boot. CONFIG_DIR is resolved at call time so a relocated home is honored.
+    Best-effort: a rotation failure must never block the boot, so the caller's
+    attach still proceeds against whatever file is present."""
+    from mnemoseed_local.config import CONFIG_DIR
+
+    log_path = CONFIG_DIR / "daemon.log"
+    try:
+        if not log_path.exists() or log_path.stat().st_size <= _DAEMON_LOG_MAX_BYTES:
+            return
+        log_path.replace(CONFIG_DIR / _DAEMON_LOG_ARCHIVE_NAME)
+    except OSError as error:
+        # A pre-existing .1 that cannot be replaced, or a held handle, leaves
+        # the oversized log in place; the next boot retries. Never fatal.
+        logger.warning("daemon.log rotation skipped: %s", error)
+
+
 def _attach_daemon_log_handler() -> None:
     """Attach the durable daemon.log FileHandler to the ``mnemoseed_local``
     logger (PRD-B2.3 D4), idempotent across repeated lifespan entries in one
@@ -904,6 +937,9 @@ def _attach_daemon_log_handler() -> None:
     from mnemoseed_local.config import CONFIG_DIR
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Bound the append-forever log before opening it (never rotate a file the
+    # handler already holds open).
+    _rotate_daemon_log_if_oversized()
     handler = logging.FileHandler(CONFIG_DIR / "daemon.log", encoding="utf-8")
     handler.name = "daemon.log"
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))

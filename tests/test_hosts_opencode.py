@@ -640,3 +640,35 @@ def test_plugin_replay_keeps_the_engineering_red_lines() -> None:
     assert source.count("hook-watermarks.json") >= 1 and "journal" not in source.lower(), (
         "single listed artifact; NO WAL/journal machinery (PRD boundary)"
     )
+
+
+# ---------------------------------------------------------------- bounded disk growth
+
+
+def test_plugin_bounds_the_debug_sink_with_a_named_cap_and_rotation() -> None:
+    """The opt-in JSONL sink is otherwise append-forever. Pin the
+    module-level cap constant, the single-generation archive path, and that the
+    rotation runs inside the debug lane's fail-open chain."""
+    source = _plugin_source()
+    assert "const _HOOK_DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024" in source, (
+        "the debug-sink cap must be a named module-level constant"
+    )
+    assert "hook-debug.jsonl.1" in source or "DEBUG_LOG_ARCHIVE_PATH" in source
+    assert "rotateDebugLogIfOversized" in source, "the rotation helper must exist"
+    # the sink chain mkdir -> rotate -> append, so rotation is fail-open
+    assert re.search(
+        r"debugSinkChain[\s\S]*?rotateDebugLogIfOversized\(\)[\s\S]*?appendFile\(DEBUG_LOG_PATH",
+        source,
+    ), "rotation must sit inside the debug lane's serialized fail-open chain"
+
+
+def test_plugin_bounds_stale_watermark_artifacts_by_age_with_a_guard() -> None:
+    """Stale watermark tmp artifacts are swept by age, bounded, with
+    an interval guard so the whole directory is not stat-ed on every write."""
+    source = _plugin_source()
+    assert "const WATERMARK_STALE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000" in source, (
+        "the stale-artifact TTL must be a named module-level constant"
+    )
+    assert "const WATERMARK_STALE_SWEEP_INTERVAL_MS" in source, "the interval guard must be named"
+    assert "sweepStaleWatermarkArtifacts(" in source, "the sweep entry must exist"
+    assert "watermarkStaleSweepLastAt" in source, "the guard clock must exist"
