@@ -3,9 +3,15 @@
 Core loop: capture -> dream (automatic by default, ``--once`` manual
 fallback) -> decay -> retrieve. Dream
 inference runs against a local model (ollama default, openai-compatible
-fallback driver kept). No accounts, no console: profile is hardcoded to
-``default`` at the application boundary.
+fallback driver kept). No accounts: profile is hardcoded to ``default``
+at the application boundary.
 """
+
+
+def __dir__() -> list[str]:
+    """Include attributes resolvable via ``__getattr__`` in directory listings."""
+    names = {k for k in globals().keys() if not k.startswith("_")}
+    return sorted(names | {"__doc__", "__version__"})
 
 
 def __getattr__(name: str) -> str:

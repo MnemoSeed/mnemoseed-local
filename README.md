@@ -112,6 +112,15 @@ Profile namespaces are managed on the running daemon:
 `mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
 deletes data and does not unbind agents).
 
+> **Install availability.** The one-command installer pins `mnemoseed-local`
+> from the default package index, which must first publish the package there.
+> Publishing is planned but not yet done: `mnemoseed-local` is not on PyPI
+> today and origin has no release tag, so the installer fails cleanly at its
+> package-install step until that lands. From a source checkout, install the
+> current work and the CLI without a package index:
+> `uv tool install --force .` (then `mnemoseed-local up`). The one-command
+> installers pick this up automatically once the release is published.
+
 ### Claude Code
 
 `mnemoseed-local hook install claude_code` merges marked MnemoSeed hook entries

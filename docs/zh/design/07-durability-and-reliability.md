@@ -14,11 +14,11 @@
 | 进程吊死 / 监听消失 | 进程内 watchdog 自检测 + 快退 + 法医 dump | B2.3 + F2 根治 |
 | 用户可控启停（on/off） | 哨兵文件持久禁用 + 优雅关停端点 | B2.5 |
 
-三块共享的顶层语义：**"检测 + 快退 + 可复原"，不是"自愈"**。shipped 代码只负责把失效形态转化为干净的退出（exit code 1 + 末语日志 + 法医 dump），退出之后的拉起归用户侧（手点 `up`，或 README 文档化的 AtLogOn + waiting bounded wrapper）。数据丢失包络 = 普通崩溃同款，由 B2.2 的 ack 水位 + 会话级重生回放兜底；源头（宿主会话史）持久，视图即可重建。
+三块共享的顶层语义：**"检测 + 快退 + 可复原"，不是"自愈"**。shipped 代码只负责把失效形态转化为干净的退出（exit code 1 + 末语日志 + 法医 dump），退出之后的拉起归用户侧（手点 `mnemoseed-local up`；无自动重启——系统未部署 supervisor 链）。数据丢失包络 = 普通崩溃同款，由 B2.2 的 ack 水位 + 会话级重生回放兜底；源头（宿主会话史）持久，视图即可重建。
 
 边界（诚实）：
 
-- shipped **不新增 supervisor、不 spawn 子进程**（`test_cli.py:582-601` 的"`up` 绝不 spawn 子进程"钉不被触碰）、不落 pidfile、不做端口预检。
+- shipped **不新增 supervisor、不 spawn 子进程**（`tests/test_cli.py:680-685` 的"`up` 绝不 spawn 子进程"钉不被触碰）、不落 pidfile、不做端口预检。
 - 事件循环饥饿（bound-but-stalled，监听在但请求不答）属 B6 域，本批不治——watchdog 对 connect 成功一律视为存活，只记日志行不退出。
 - 防火墙静默丢弃 loopback SYN（无 RST）的主机上，死监听与 stall 不可区分，watchdog 惰性（不治，记档）。
 - Windows 无 SIGTERM 语义：`os._exit` / 任务管理器结束任务都是硬杀，不触发 lifespan teardown，capture drain 不跑——这正是 B2.2 兜底的存在理由。
@@ -186,7 +186,7 @@ flowchart TD
 - `docs/zh/prd/PRD-B2.3-daemon-reliability.md`（仓库 PRD，B2.3 daemon 可靠性 + F2 根治；同主仓 Rxx 状态：本仓库自己）
 - `docs/zh/prd/PRD-B2.5-daemon-onoff.md`（仓库 PRD，B2.5 on/off；同主仓 Rxx 状态：本仓库自己）
 - `docs/zh/prd/PRD-B2-roadmap.md`（仓库 PRD，Phase B 总路线图与批次记录，含 F2 根治批次；同主仓 Rxx 状态：本仓库自己）
-- `README.md` §Daemon supervision（仓库文档，Task Scheduler AtLogOn + 用户侧 bounded wrapper、ExecutionTimeLimit=0、disabled marker 与最多三次重试语义；工程形态一段，可引用为运维形态）
+- org decision `2026-09-10-supervisor-chain-removal`（组织决策记录：移除 supervisor 链后 shipped 形态不含任何自动重启机制；用户侧拉起仅以 `mnemoseed-local up` 手动运行）
 - 工程性事实（非文献条目，注明）：OpenCode 宿主自身持久化完整会话史（`client.session.messages` 可读回），daemon 捕获为派生视图——源头不丢，视图即可重建。
 
 实现代码取证源（均在仓库 `src/mnemoseed_local/` 与 `hosts/opencode/` 下）：`daemon/watchdog.py`、`daemon/runner.py`、`util/daemon_executor.py`、`mcp_gateway/reliable_client.py`、`daemon_state.py`、`cli.py`、`hosts/opencode/plugin.ts`。

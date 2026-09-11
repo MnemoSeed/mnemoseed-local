@@ -23,6 +23,7 @@ mnemoseed-local = **本地单用户 MVP 守护进程**：
    最小依赖集；uv 管理；`src/mnemoseed_local/__init__.py`
    （`__version__`；2026-08-18 用户拍板：开发期版本线归位 `0.0.1`，原 A1 记录
    `0.1.0` 作废）。
+   > **存档与现状**：开发期版本线现已随 B2.x 推进至 `0.2.0`。
 2. **config**：`config.py` + `configwrite/`（注册表裁剪到 MVP 实际使用：
    storage + dream + decay + llm 路由键；不含 registry/providers）。
    单 profile `default` 硬编码（只参考主仓库 identity 理解签名，不移植账号）。

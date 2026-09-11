@@ -21,7 +21,7 @@ Agent 每次新开会话都会遗忘。Local 版在本机替你保存"值得记�
 
 - **本地优先**：默认零云依赖，dream 走本地模型
 - **无账号**：localhost 即信任边界，默认使用约定的 `default` 命名空间（多 profile 管理面见 design/04 §3.6）
-- **CLI 优先**：capture / retrieve / dream / decay / daemon（自动做梦为默认，`dream once` 为手动兜底）
+- **CLI 优先**：capture / retrieve / dream / decay / daemon（自动做梦为默认，`dream --once` 为手动兜底）
 - **生产血统**：从 mnemoseed 主仓库移植而来，存储层、schema、迁移完全同源
 
 ## 状态
