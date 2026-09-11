@@ -13,15 +13,47 @@ from fastapi.testclient import TestClient
 
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import HostId
+from mnemoseed_local.storage.drivers import (
+    bge_m3_onnx,
+    lancedb_embedded,
+    sqlite_graph,
+    sqlite_meta,
+    synthetic_embedder,
+)
+from mnemoseed_local.storage.registry import (
+    EMBED_DRIVERS,
+    GRAPH_DRIVERS,
+    META_DRIVERS,
+    VECTOR_DRIVERS,
+    register,
+)
 
 PROFILE = "default"
 SESSION = "sess-obs"
 
 SECRET_BODY_TEXT = "机密请求体内容绝不能进日志"
 
+# test_registry.py clears the driver registries wholesale; any daemon-booting
+# module ordered after it must defensively re-register (test_preset_embedded
+# precedent).
+_DRIVERS = (
+    (VECTOR_DRIVERS, lancedb_embedded.LanceDbEmbeddedStore),
+    (GRAPH_DRIVERS, sqlite_graph.SqliteGraphDriver),
+    (META_DRIVERS, sqlite_meta.SqliteMetaDriver),
+    (EMBED_DRIVERS, bge_m3_onnx.BgeM3OnnxEmbedder),
+    (EMBED_DRIVERS, synthetic_embedder.SyntheticEmbedder),
+)
 
-@pytest.fixture
-def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+
+@pytest.fixture(autouse=True)
+def _ensure_registered():
+    for registry, cls in _DRIVERS:
+        if not registry.contains(cls.info.name):
+            register(registry)(cls)
+    yield
+
+
+def _write_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: str) -> Path:
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         'preset = "embedded"\n'
@@ -32,7 +64,7 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
         "[dream.llm.dream]\n"
         'driver = "stub"\n'
-        'model = "stub"\n',
+        'model = "stub"\n' + capture,
         encoding="utf-8",
     )
     monkeypatch.delenv("STORAGE_MODE", raising=False)
@@ -40,6 +72,17 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
     return cfg
+
+
+@pytest.fixture
+def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    return _write_config(tmp_path, monkeypatch, "")
+
+
+@pytest.fixture
+def recall_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Config with capture.auto_recall on (serves are real injections)."""
+    return _write_config(tmp_path, monkeypatch, "[capture]\nauto_recall = true\n")
 
 
 def _boot(config_path: Path) -> TestClient:
@@ -108,6 +151,96 @@ def test_default_profile_never_logs_a_first_sighting(config_path: Path, caplog) 
     with _boot(config_path) as client, caplog.at_level(logging.INFO):
         client.post("/ingest", json=_ingest_body(profile=PROFILE))
     assert not [r for r in caplog.records if "first sighting" in r.getMessage()]
+
+
+# ---------------------------------------------------------------- T2 recall counters
+
+
+def test_recall_counters_default_to_zero(config_path: Path) -> None:
+    """The three T2 counters start at zero on a fresh boot."""
+    with _boot(config_path) as client:
+        obs = client.get("/api/v1/observability").json()
+        assert obs["recall_injection_count"] == 0
+        assert obs["recall_injection_chars_total"] == 0
+        assert obs["recall_pending_served_count"] == 0
+
+
+def _ingest_prompt(client: TestClient, session_id: str, ts: float, text: str) -> None:
+    response = client.post(
+        "/ingest",
+        json={
+            "host": "opencode",
+            "event": "user_prompt",
+            "session_id": session_id,
+            "profile_id": PROFILE,
+            "ts": ts,
+            "content": {"text": text},
+        },
+    )
+    assert response.status_code == 202, response.text
+
+
+def test_recall_injection_counters_increment_on_real_serve(recall_config_path: Path) -> None:
+    """Ingest a session with entities that trigger a focal scan, then pull
+    recall_pending — the observability counters increment by the expected amounts."""
+    with _boot(recall_config_path) as client:
+        # settle an old session that has entity-bearing chunks to serve
+        _ingest_prompt(client, "sess-old", 1.0, "LanceDb 是向量存储层")
+        client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
+        # fresh session prompt triggers focal scan
+        _ingest_prompt(client, "sess-new", 2.0, "LanceDb 现在处于什么阶段")
+        obs_before = client.get("/api/v1/observability").json()
+        assert obs_before["recall_injection_count"] == 0
+        assert obs_before["recall_injection_chars_total"] == 0
+        assert obs_before["recall_pending_served_count"] == 0
+        # pull — this is the injection serve
+        pull = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-new"},
+        )
+        assert pull.status_code == 200, pull.text
+        payload = pull.json()
+        assert payload["enabled"] is True
+        assert len(payload["items"]) > 0, "expected at least one focal item served"
+        served_chars = sum(len(item["text"]) + 1 for item in payload["items"])
+        obs_after = client.get("/api/v1/observability").json()
+        assert obs_after["recall_injection_count"] == 1
+        assert obs_after["recall_injection_chars_total"] == served_chars
+        assert obs_after["recall_pending_served_count"] == 1
+
+
+def test_recall_counters_are_cumulative_across_multiple_serves(recall_config_path: Path) -> None:
+    """Multiple serve events accumulate correctly in both counters."""
+    with _boot(recall_config_path) as client:
+        # set up old sessions for focal serve
+        _ingest_prompt(client, "sess-old", 1.0, "MnemoSeed 的记忆系统使用 LanceDb")
+        client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
+        _ingest_prompt(client, "sess-old2", 1.1, "LanceDb 的向量维度是 64")
+        client.post("/session/end", json={"session_id": "sess-old2", "profile_id": PROFILE})
+
+        # serve 1
+        _ingest_prompt(client, "sess-a", 2.0, "LanceDb 是什么")
+        pull_a = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-a"},
+        )
+        assert pull_a.status_code == 200
+        chars_a = sum(len(item["text"]) + 1 for item in pull_a.json()["items"])
+        client.post("/session/end", json={"session_id": "sess-a", "profile_id": PROFILE})
+
+        # serve 2
+        _ingest_prompt(client, "sess-b", 3.0, "MnemoSeed 使用 LanceDb 吗")
+        pull_b = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-b"},
+        )
+        assert pull_b.status_code == 200
+        chars_b = sum(len(item["text"]) + 1 for item in pull_b.json()["items"])
+
+        obs = client.get("/api/v1/observability").json()
+        assert obs["recall_injection_count"] == 2
+        assert obs["recall_injection_chars_total"] == chars_a + chars_b
+        assert obs["recall_pending_served_count"] == 2
 
 
 # ---------------------------------------------------------------- request logging toggle

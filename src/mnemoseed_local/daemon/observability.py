@@ -29,6 +29,11 @@ class Observability:
         self._mcp_handshake_count = 0
         self._last_mcp_handshake_at: float | None = None
         self._seen_profiles: set[str] = set()
+        # T2 auto-recall: aggregate-only since-boot counters for the mid-session
+        # injection serve (count of serves + cumulative injected chars). Pure
+        # observation numbers — no per-session breakdown, no ids, no text.
+        self._recall_injection_count = 0
+        self._recall_injection_chars_total = 0
 
     def note_capture_ingest(self) -> None:
         with self._lock:
@@ -54,6 +59,12 @@ class Observability:
                 profile_id,
             )
 
+    def note_recall_injection(self, char_count: int) -> None:
+        """Record one T2 auto-recall injection serve (aggregate-only counter)."""
+        with self._lock:
+            self._recall_injection_count += 1
+            self._recall_injection_chars_total += char_count
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -61,4 +72,7 @@ class Observability:
                 "capture_ingest_count": self._capture_ingests,
                 "mcp_handshake_count": self._mcp_handshake_count,
                 "last_mcp_handshake_at": self._last_mcp_handshake_at,
+                "recall_injection_count": self._recall_injection_count,
+                "recall_injection_chars_total": self._recall_injection_chars_total,
+                "recall_pending_served_count": self._recall_injection_count,
             }

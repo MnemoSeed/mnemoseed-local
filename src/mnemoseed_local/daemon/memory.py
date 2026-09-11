@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from mnemoseed_local.capture.stamper import ConsistencyVerdict, NearDuplicateChecker, WriteConfig
 from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
+from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
 
@@ -423,9 +424,10 @@ def _group_session_tails(
 class MemoryService:
     """Daemon-owned memory engine: leverages the retrieval + storage ports."""
 
-    def __init__(self, stores: Stores, config: Config) -> None:
+    def __init__(self, stores: Stores, config: Config, observability: Observability | None = None) -> None:
         self._stores = stores
         self._config = config
+        self._observability = observability
         self._cues = CueExtractor()
         # design/09 §3.5: the rescue band thresholds ride the live config so a
         # calibration update reaches the retriever without code edits.
@@ -1533,9 +1535,12 @@ class MemoryService:
                 non_focal = self._pending_non_focal.pop(actual_key, 0)
                 self._pending_consumed[actual_key] = True  # the serve leaves its tombstone
                 # B2.7: accrue the daemon-side T2 char count (budget_consumed).
-                self._budget_consumed[actual_key] = self._budget_consumed.get(actual_key, 0) + sum(
-                    len(item["text"]) + 1 for item in items
-                )
+                served_chars = sum(len(item["text"]) + 1 for item in items)
+                self._budget_consumed[actual_key] = self._budget_consumed.get(actual_key, 0) + served_chars
+                # T2 observability: aggregate-only since-boot counters (no per-session
+                # breakdown, no text, no ids — observation numbers only).
+                if self._observability is not None:
+                    self._observability.note_recall_injection(served_chars)
                 slot_consumed = True
             elif slot is not None:
                 # D6 empty serve: the slot survives so a fresh pull can still

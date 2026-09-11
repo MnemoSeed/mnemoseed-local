@@ -1014,7 +1014,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.dream_worker.enqueue_resume(resume_pipeline, resume_snapshot)
     # Memory surface (T4): one retrieval engine whose track executor is shut
     # down in teardown, before the stores close.
-    app.state.memory = MemoryService(stores, config)
+    app.state.memory = MemoryService(stores, config, observability=app.state.observability)
     # Retention redesign one-time migration (design/09 §4.1): existing pin
     # chunks recompute their effective weight under the flashbulb λ from their
     # own reinforcement baseline — deterministic, idempotent, marker-gated.
@@ -1203,7 +1203,14 @@ def create_app() -> FastAPI:
         """Since-boot activity counters for the doctor surface (B2.12)."""
         observability: Observability | None = getattr(app.state, "observability", None)
         if observability is None:
-            return {"boot_started_at": 0.0, "capture_ingest_count": 0, "mcp_handshake_count": 0}
+            return {
+                "boot_started_at": 0.0,
+                "capture_ingest_count": 0,
+                "mcp_handshake_count": 0,
+                "recall_injection_count": 0,
+                "recall_injection_chars_total": 0,
+                "recall_pending_served_count": 0,
+            }
         return observability.snapshot()
 
     @app.get("/api/v1/audit")
