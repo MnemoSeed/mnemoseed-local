@@ -47,7 +47,7 @@ UV_BIN_DIR="$HOME/.local/bin"
 DEFAULT_MODEL='qwen3.5:9b'
 # The exact wheel spec: a floating `latest` would silently track main. Keep in
 # lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
-CLI_PIN='mnemoseed-local==0.2.0'
+CLI_PIN='mnemoseed-local==0.0.1'
 OLLAMA_URL='https://ollama.com/install.sh'
 UV_URL='https://astral.sh/uv/install.sh'
 
