@@ -408,6 +408,20 @@ const settledSessions = new Map<string, true>()
 // succeeded with text (pending retry at the next sweep point).
 const pendingAssistant = new Map<string, Set<string>>()
 
+// B2 scoped-resume lineage (issue #187): sessionID -> parentID cache populated
+// from session.created's properties.info.parentID (a subagent/spawned session
+// names its parent; root sessions carry none). Absent = unknown, never a guess.
+const sessionParentIds = new Map<string, string | null>()
+// sessionID -> the FIRST user prompt text of the session: the raw resume_query
+// for scoped-resume anchor matching (a prompt naming a repo/session identifier
+// anchors the session to its true lineage instead of sharing its org CWD).
+const sessionFirstMessages = new Map<string, string>()
+
+function parentIdOfSessionID(cache: Map<string, string | null>, sessionID: string): string | null {
+  return cache.has(sessionID) ? (cache.get(sessionID) ?? null) : null
+}
+
+
 function parkAssistant(sessionID: string, messageID: string): void {
   let set = pendingAssistant.get(sessionID)
   if (set === undefined) {
@@ -784,17 +798,26 @@ function pollCandidates(served: any): number {
 async function fetchSessionTails(sessionID: string): Promise<any> {
   // The ONE awaited network call in the whole hook (invariant): the daemon
   // read that feeds the injection, bounded by AbortSignal and fail-open.
+  const body: JsonRecord = {
+    profile_id: PROFILE_ID,
+    sessions: SESSION_TAIL_SESSIONS,
+    per_session: SESSION_TAIL_PER_SESSION,
+    exclude_session_id: sessionID,
+    self_session_id: sessionID,
+  }
+  // Scoped-resume (issue #187): the session's first user prompt is the raw
+  // resume_query for anchor matching, and the session's own parent id lets the
+  // daemon know whether this caller is a root (no parent) — which hard-filters
+  // child/subagent sessions out of the matched set.
+  const resumeQuery = sessionFirstMessages.get(sessionID)
+  if (resumeQuery) body.resume_query = resumeQuery.slice(0, 500)
+  const spid = parentIdOfSessionID(sessionParentIds, sessionID)
+  if (spid !== null) body.self_parent_id = spid
   try {
     const response = await fetch(BASE_URL + "/session/recent", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        profile_id: PROFILE_ID,
-        sessions: SESSION_TAIL_SESSIONS,
-        per_session: SESSION_TAIL_PER_SESSION,
-        exclude_session_id: sessionID,
-        self_session_id: sessionID,
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
     if (!response.ok) {
@@ -869,7 +892,25 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
     if (!injectedSessions.has(sessionID)) {
       injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
       const data = await fetchSessionTails(sessionID)
-      const built = data !== null ? buildRecallInjection(data.sessions, data.self_window) : null
+      // Scoped-resume (issue #187): T1 injection proceeds only when the
+      // daemon returns selection "matched". Unresolved/unscoped selections
+      // yield no injection. A response without a selection key is an old
+      // daemon: it fails closed when this hook sent resume_query (the
+      // first prompt was captured); without a captured first prompt there
+      // is no intent to scope from and the legacy path applies.
+      const sentQuery = sessionFirstMessages.has(sessionID)
+      const sel = (data as any)?.selection
+      const injectionAllowed =
+        data !== null && (typeof sel !== "string" ? !sentQuery : sel === "matched")
+      let built = null
+      if (injectionAllowed) {
+        built = buildRecallInjection(data.sessions, data.self_window)
+      } else {
+        debugLog("session-start injection skipped (selection=%s)", {
+          sessionID,
+          selection: typeof sel === "string" ? sel : data === null ? "unavailable" : "legacy-daemon",
+        })
+      }
       // B2.12: one observability line per session-start injection attempt.
       if (DEBUG) {
         debugLog("session-start injection", {
@@ -1753,6 +1794,8 @@ function postUserIngest(
     raw,
   }
   if (agent) body.agent = agent
+  const spid = parentIdOfSessionID(sessionParentIds, sessionID)
+  if (spid !== null) body.session_parent_id = spid
   post(
     "/ingest",
     body,
@@ -1776,9 +1819,7 @@ function postAssistantIngest(
   const content: JsonRecord = { text }
   const modelId = modelIdOf(info)
   if (modelId) content.model_id = modelId
-  post(
-    "/ingest",
-    {
+  const astBody: JsonRecord = {
       host: HOST_ID,
       event: "assistant_message",
       session_id: sessionID,
@@ -1786,7 +1827,12 @@ function postAssistantIngest(
       ts: stamp,
       content,
       raw: { messageID },
-    },
+    }
+  const astSpid = parentIdOfSessionID(sessionParentIds, sessionID)
+  if (astSpid !== null) astBody.session_parent_id = astSpid
+  post(
+    "/ingest",
+    astBody,
     () => {
       noteWatermark(sessionID, stamp)
       if (messageID) unparkAssistant(sessionID, messageID)
@@ -1814,9 +1860,7 @@ function postToolIngest(
   ts: number,
   raw: JsonRecord,
 ): void {
-  post(
-    "/ingest",
-    {
+  const toolBody: JsonRecord = {
       host: HOST_ID,
       event: "tool_use",
       session_id: sessionID,
@@ -1824,7 +1868,12 @@ function postToolIngest(
       ts,
       content: { tool_name: toolName, input: args, output },
       raw,
-    },
+    }
+  const toolSpid = parentIdOfSessionID(sessionParentIds, sessionID)
+  if (toolSpid !== null) toolBody.session_parent_id = toolSpid
+  post(
+    "/ingest",
+    toolBody,
     () => noteWatermark(sessionID, ts),
     scheduleRecovery(sessionID),
   )
@@ -2035,6 +2084,10 @@ export default async function MnemoSeedLocalPlugin(
       if (!text) return
       const sessionID = String(hookInput?.sessionID ?? "")
       if (!sessionID) return
+      // Cache the first user prompt text as the session's resume_query
+      if (!sessionFirstMessages.has(sessionID)) {
+        sessionFirstMessages.set(sessionID, text)
+      }
       const raw: JsonRecord = {}
       const messageID = hookInput?.messageID ?? hookOutput?.message?.id
       if (typeof messageID === "string" && messageID) raw.messageID = messageID
@@ -2123,6 +2176,16 @@ export default async function MnemoSeedLocalPlugin(
       const triggerSession = sessionIdOfEvent(event)
       if (triggerSession) enqueueForSession(triggerSession, () => reconcileSession(client, triggerSession))
       switch (event?.type) {
+        case "session.created":
+        case "session.updated": {
+          const sessionID = sessionIdOfEvent(event)
+          const parentID = (event as any)?.properties?.info?.parentID
+          if (sessionID) {
+            if (typeof parentID === "string" && parentID) sessionParentIds.set(sessionID, parentID)
+            else if (!sessionParentIds.has(sessionID)) sessionParentIds.set(sessionID, null)
+          }
+          break
+        }
         case "message.updated": {
           const sessionID = sessionIdOfEvent(event)
           if (sessionID) {
@@ -2176,6 +2239,8 @@ export default async function MnemoSeedLocalPlugin(
           citedChunks.delete(sessionID)
           pendingPull.delete(sessionID)
           t1InjectedChunkIds.delete(sessionID)
+          sessionParentIds.delete(sessionID)
+          sessionFirstMessages.delete(sessionID)
           enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
           await persistWatermarks()
           enqueueForSession(sessionID, () => settle(sessionID))

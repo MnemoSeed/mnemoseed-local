@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -221,13 +222,23 @@ class ErrorEventsRequest(BaseModel):
 
 
 class SessionRecentRequest(BaseModel):
-    """Request body for POST /session/recent (B2 time-ordered resume)."""
+    """Request body for POST /session/recent (B2 time-ordered resume).
+
+    resume_query: raw current user prompt for scoped-resume anchor matching
+        (max 500 chars); None means the original profile-global recency behavior.
+    self_parent_id: the calling session's own parent id (None=root caller,
+        string=child caller). Filters matched candidates to root sessions when
+        the caller is a root (self_parent_id is None) so child/subagent sessions
+        stay invisible to their orchestrator.
+    """
 
     profile_id: ProfileRef
     sessions: int = Field(default=2, ge=1, le=5)
     per_session: int = Field(default=20, ge=1, le=100)
     exclude_session_id: str | None = None
     self_session_id: str | None = None
+    resume_query: str | None = Field(default=None, max_length=500)
+    self_parent_id: str | None = None
 
 
 class SessionWindowsRequest(BaseModel):
@@ -268,6 +279,56 @@ class ReinforceRequest(BaseModel):
         if not self.chunk_ids and not self.node_ids:
             raise ValueError("reinforce requires at least one chunk_id or node_id target")
         return self
+
+
+# Scoped-resume anchor extraction (issue #187): bare kebab identifiers (at
+# least 8 chars, OR 2+ hyphens, OR a digit), bare snake_case, backticked
+# tokens, dotted paths, and path basenames — the stable identifiers a resuming
+# session names in its first prompt. Pure and model-free: casefold-deduped,
+# capped at RESUME_ANCHOR_CAP entries, never a model call.
+_KEBAB_RE = re.compile(r"(?<![A-Za-z0-9-])([a-z][a-z0-9]*(?:-[a-z0-9]+)+)(?![A-Za-z0-9-])")
+_SNAKE_RE = re.compile(r"(?<![A-Za-z0-9_])([a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?![A-Za-z0-9_])")
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_DOTTED_RE = re.compile(r"(?<![A-Za-z0-9.])([A-Za-z_][A-Za-z0-9_.]*)\.[A-Za-z0-9_]+(?![A-Za-z0-9.])")
+_RESUME_ANCHOR_CAP = 8
+
+
+def _kebab_anchor_qualifies(token: str) -> bool:
+    if len(token) >= 8:
+        return True
+    if token.count("-") >= 2:
+        return True
+    return any(ch.isdigit() for ch in token)
+
+
+def _extract_resume_anchors(text: str | None) -> list[str]:
+    """Model-free anchor identifiers from a raw current user prompt.
+
+    Repository/session identifiers are the stable cross-process handle a resume query
+    names (a sibling repo or a child/subagent session share the same org CWD but
+    never the same bare identifier). Returns casefold-deduped anchors, capped at
+    ``_RESUME_ANCHOR_CAP``; a text with no recognizable identifier yields [].
+    """
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for token in _KEBAB_RE.findall(text):
+        if _kebab_anchor_qualifies(token):
+            seen[token.casefold()] = None
+    for token in _SNAKE_RE.findall(text):
+        seen[token.casefold()] = None
+    for token in _BACKTICK_RE.findall(text):
+        seen[token.strip("`").casefold()] = None
+    for match in _DOTTED_RE.finditer(text):
+        # Full dotted token (e.g. "main.py", not bare "main"): the bare
+        # stem is too generic and substring-matches unrelated prose.
+        seen[match.group(0).casefold()] = None
+    for token in _BACKTICK_RE.findall(text):
+        # path basenames of backticked paths, e.g. `fix/187-session-resume`
+        base = token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if base and base != token:
+            seen[base.casefold()] = None
+    return list(seen)[:_RESUME_ANCHOR_CAP]
 
 
 def _discover_session_ids(
@@ -901,6 +962,8 @@ class MemoryService:
         exclude_session_id: str | None = None,
         self_session_id: str | None = None,
         active_sessions: frozenset[str] = frozenset(),
+        resume_query: str | None = None,
+        self_parent_id: str | None = None,
     ) -> dict[str, Any]:
         """B2 time-ordered resume: the newest sessions' verbatim chunk tails.
 
@@ -910,7 +973,25 @@ class MemoryService:
         widens the page by one session's worth of chunks so the caller's own
         session can be filtered out without starving the survivor groups.
         Every group carries its exact per-session window; ``self_window`` is
-        the caller-named session's window when it has chunks, else null."""
+        the caller-named session's window when it has chunks, else null.
+
+        When ``resume_query`` is set, the endpoint performs scoped-resume
+        matching (issue #187): anchors extracted from the query are matched
+        against USER segments of profile chunks, and sessions are filtered
+        to root sessions only (``session_parent_id IS NULL``). Unmatched
+        queries return empty sessions. Without ``resume_query`` the original
+        profile-global recency behavior applies."""
+        if resume_query is not None:
+            return self._session_recent_scoped(
+                profile_id=profile_id,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+                resume_query=resume_query,
+                self_parent_id=self_parent_id,
+            )
         limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
@@ -953,6 +1034,8 @@ class MemoryService:
             "sessions": groups,
             "self_window": self_window,
             "guidance": _RECENT_SESSIONS_GUIDANCE,
+            "selection": "unscoped",
+            "selection_reason": "no resume_query",
         }
         rules_budget = self._build_rules_budget(
             profile_id=profile_id, session_id=self_session_id, per_session=per_session
@@ -960,6 +1043,128 @@ class MemoryService:
         if rules_budget is not None:
             result["rules_budget"] = rules_budget.model_dump()
         return result
+
+    def _session_recent_scoped(
+        self,
+        *,
+        profile_id: str,
+        per_session: int = 20,
+        sessions: int = 2,
+        exclude_session_id: str | None = None,
+        self_session_id: str | None = None,
+        active_sessions: frozenset[str] = frozenset(),
+        resume_query: str,
+        self_parent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Scoped-resume matching (issue #187): extract anchors, scan USER
+        segments, filter to root sessions, return matched tails."""
+        anchors = _extract_resume_anchors(resume_query)
+        if not anchors:
+            return {
+                "profile_id": profile_id,
+                "sessions": [],
+                "self_window": None,
+                "guidance": _RECENT_SESSIONS_GUIDANCE,
+                "selection": "unresolved",
+                "selection_reason": "no anchors",
+            }
+        # Scan a bounded page for anchor hits in USER segments only
+        limit = 2000
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
+        )
+        matched_ids: set[str] = set()
+        is_root: dict[str, bool | None] = {}  # True=root, False=child, None=legacy unknown
+        for chunk in page.items:
+            sid = chunk.provenance.session_id
+            if not sid:
+                continue
+            if exclude_session_id is not None and sid == exclude_session_id:
+                continue
+            if self_session_id is not None and sid == self_session_id:
+                continue
+            # Match USER segments only: the verbatim channel stores one
+            # labelled line per present role, so only the user line may
+            # anchor a resume (an assistant-side incidental mention must
+            # never select its session).
+            text = chunk.text
+            user_lines = [
+                line[len("user:") :].strip() for line in text.splitlines() if line.startswith("user:")
+            ]
+            if not user_lines:
+                continue
+            content_lower = "\n".join(user_lines).casefold()
+            hit = any(anchor in content_lower for anchor in anchors)
+            if hit:
+                matched_ids.add(sid)
+            # Track root status from session_parent_id
+            spid = getattr(chunk, "session_parent_id", None)
+            if sid not in is_root:
+                is_root[sid] = True if spid is None else (False if spid else None)
+            elif spid is not None and is_root[sid] is not False:
+                # If any chunk says parent, the session is a child
+                is_root[sid] = False
+        # Filter to root sessions only (True), excluding legacy unknown (None)
+        caller_is_root = self_parent_id is None
+        filtered: set[str] = set()
+        if caller_is_root:
+            for sid in matched_ids:
+                status = is_root.get(sid)
+                if status is True:  # only confirmed root sessions
+                    filtered.add(sid)
+                # legacy unknown (None) excluded: no lineage data, cannot assert
+                # the session is a root — the honest exclusion.
+        else:
+            # A child caller sees all matched sessions (no over-filtering)
+            filtered = matched_ids
+        if not filtered:
+            return {
+                "profile_id": profile_id,
+                "sessions": [],
+                "self_window": None,
+                "guidance": _RECENT_SESSIONS_GUIDANCE,
+                "selection": "unresolved",
+                "selection_reason": "no session matched",
+            }
+        # Fetch tails for matched IDs; the grouping walk keeps recency
+        # order and applies the session cap to survivors.
+        match_chunks = [c for c in page.items if c.provenance.session_id in filtered]
+        groups = _group_session_tails(
+            match_chunks,
+            per_session=per_session,
+            sessions=sessions,
+        )
+        for group in groups:
+            window = _scan_session_window(
+                self._stores.vector, profile_id=profile_id, session_id=group["session_id"]
+            )
+            group["window"] = _window_iso(window)
+            group["window_truncated"] = window.window_truncated
+            group["active"] = group["session_id"] in active_sessions
+            latest = window.latest
+            group["seconds_since_last_activity"] = (
+                max(0.0, time.time() - latest) if latest is not None and latest > 0 else None
+            )
+        self_window: dict[str, Any] | None = None
+        if self_session_id:
+            window = _scan_session_window(
+                self._stores.vector, profile_id=profile_id, session_id=self_session_id
+            )
+            if window.first is not None:
+                self_window = {
+                    "session_id": self_session_id,
+                    "window": _window_iso(window),
+                    "chunk_count": window.chunk_count,
+                    "active": self_session_id in active_sessions,
+                }
+        return {
+            "profile_id": profile_id,
+            "sessions": groups,
+            "self_window": self_window,
+            "guidance": _RECENT_SESSIONS_GUIDANCE,
+            "selection": "matched",
+            "anchors": anchors,
+        }
 
     def _build_rules_budget(
         self,
@@ -2154,7 +2359,12 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
     """B2 (PRD-B2): time-ordered session tails for the resume seam — the
     "continue where the last conversation ended" surface, verbatim chunks,
     newest session group first, tails ascending. ``exclude_session_id`` lets
-    the session-start injection read skip the caller's own session."""
+    the session-start injection read skip the caller's own session.
+
+    When ``resume_query`` is set, scoped-resume matching (issue #187) replaces
+    the profile-global recency — only sessions whose USER segments contain
+    extracted anchor identifiers are returned, filtered to root sessions when
+    ``self_parent_id`` is None."""
     service: MemoryService = request.app.state.memory
     sessions = getattr(getattr(request.app.state, "capture", None), "sessions", None)
     active = frozenset(sessions()) if sessions is not None else frozenset()
@@ -2165,6 +2375,8 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
         exclude_session_id=req.exclude_session_id,
         self_session_id=req.self_session_id,
         active_sessions=active,
+        resume_query=req.resume_query,
+        self_parent_id=req.self_parent_id,
     )
 
 

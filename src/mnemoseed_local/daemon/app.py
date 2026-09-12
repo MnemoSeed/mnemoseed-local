@@ -320,6 +320,7 @@ def _daemon_write_context(turn: Turn, config: Config) -> WriteContext:
         agent_label=config.profiles.persona_for(turn.origin_agent),
         cognitive_tier=CognitiveTier.TIER_1,
         origin_agent=turn.origin_agent,
+        session_parent_id=turn.session_parent_id,
         host=turn.host.value,
         entities=entities,
         tools_used=_turn_tool_names(turn),

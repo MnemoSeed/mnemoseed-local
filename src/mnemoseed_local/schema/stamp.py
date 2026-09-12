@@ -95,6 +95,10 @@ class ChunkStamp(BaseModel):
     # legacy rows and any capture without a host-reported agent. Never read by
     # scoring/decay/retrieval ranking.
     origin_agent: str | None = None
+    # Session lineage: the parent session id that spawned this one (subagent/
+    # orchestrator nesting). NULL for root sessions and legacy rows. Never read
+    # by scoring/decay/retrieval ranking.
+    session_parent_id: str | None = None
     cues: Cues = Field(default_factory=Cues)
     provenance: Provenance
     decay_weight: float = Field(default=1.0, ge=0.0, le=1.0)

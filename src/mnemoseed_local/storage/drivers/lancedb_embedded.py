@@ -562,6 +562,8 @@ class LanceDbEmbeddedStore:
                 pa.field("explicit_pin", pa.bool_()),
                 # inert origin-agent attribution label (write-time provenance)
                 pa.field("origin_agent", pa.string()),
+                # session lineage: parent session id (subagent/orchestrator nesting)
+                pa.field("session_parent_id", pa.string()),
             ]
         )
 
@@ -584,11 +586,13 @@ class LanceDbEmbeddedStore:
             # rules_json: B2.7 standing constraints; explicit_pin: design/09
             # §3.5 pin-class flag (legacy rows keep NULL until their next
             # rewrite and the filter clause falls back to the authoritative
-            # provenance source); origin_agent: write-time attribution label.
+            # provenance source); origin_agent: write-time attribution label;
+            # session_parent_id: session-lineage carrier.
             for name, column_type in (
                 ("rules_json", pa.string()),
                 ("explicit_pin", pa.bool_()),
                 ("origin_agent", pa.string()),
+                ("session_parent_id", pa.string()),
             ):
                 if name not in self._table.schema.names:
                     self._add_nullable_column(name, column_type)
@@ -675,6 +679,7 @@ class LanceDbEmbeddedStore:
             ),
             "explicit_pin": is_explicit_pin(provenance.source),
             "origin_agent": chunk.origin_agent,
+            "session_parent_id": chunk.session_parent_id,
         }
 
     def _to_stamp(self, row: dict[str, Any]) -> ChunkStamp:
@@ -693,6 +698,7 @@ class LanceDbEmbeddedStore:
             model_id=str(row["model_id"]),
             persona_id=row.get("persona_id"),
             origin_agent=row.get("origin_agent"),
+            session_parent_id=row.get("session_parent_id"),
             cues=Cues(
                 project=cues_row.get("project"),
                 host=cues_row.get("host"),

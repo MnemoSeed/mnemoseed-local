@@ -136,11 +136,12 @@ def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     assert remember["inputSchema"]["required"] == ["text"]
     supersede = next(tool for tool in tools if tool["name"] == "supersede")
     assert supersede["inputSchema"]["required"] == ["superseded_node_id", "successor_node_id"]
-    # B2: the time-ordered resume surface takes no required arguments
+    # #187: scoped resume requires the raw current prompt for anchor matching
     recent = next(tool for tool in tools if tool["name"] == "recent_sessions")
-    assert "required" not in recent["inputSchema"]
+    assert recent["inputSchema"]["required"] == ["resume_query"]
     assert recent["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
     assert recent["inputSchema"]["properties"]["n_per_session"]["type"] == "integer"
+    assert recent["inputSchema"]["properties"]["resume_query"]["type"] == "string"
     # the session time-window surface takes no required arguments
     windows = next(tool for tool in tools if tool["name"] == "session_windows")
     assert "required" not in windows["inputSchema"]
