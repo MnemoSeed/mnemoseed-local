@@ -425,4 +425,13 @@ senior-qa-reviewer：`1386 passed / 3 skipped` 门绿；ruff/format/mypy（90 fi
 
 如实边界：`floor_sweep_report` 不触 live 测，不重烧 GPU，仅重放报告内载荷；`canary_count` 仅影响材料批大小，不改动档位/预算/seed 语义。
 
+## 批次增量 B5-vote 评测口径（#193）
+
+> 理论锚：**不适用（not borrowed）**——本批是评测臂对已落地 vote 机制的诚实度量口径，不新增生产机制、不借神经/心理规律；数值 bar 不在本批立项（无数据前不设数）。
+
+1. **vote cell 形态**：`EvalCell.vote_b` 为独立的 B 座路由（`dream_vote`，永不复用 verifier）；rig 向 `ReflectOrchestrator` 传 `vote_llm`、向 `DreamPipeline` 传 `mode=lambda: cell.ensemble`；探活覆盖全部三路由；`ensemble=vote` 无 `vote_b` 即 `vote_b_missing:` 大声 skip/fail。默认展开仍为 `off,verify`（`matrix --ensemble` 可显式加 `vote`，B 座由 `--vote-b` 显式给出，无默认 vote 激活）。
+2. **报告 v1.2**：`ReportedTriple` 增 `model_id`（可选）与 `vote_disagreement`（默认 False），旧 v1/v1.1 照常加载取默认；`CellReport.vote` 仅成功 vote 有值（`VoteMetrics`），off/verify 与失败 vote 均为 None、不编造。
+3. **B5 校准口径（只计数、不设 bar）**：`VoteMetrics{model_a, model_b, agreement_triples, disagreement_parties, disagreement_groups, single_side_triples, dropped_polarity_conflicts}`，全部由合并前权威 `ReflectionResult` 导出（agreement=存活 CORE/ISOLATED 且双座 token 精确相等；disagreement=存活 `vote_disagreement` 方，groups 按 casefold (subject,predicate) 去重；single-side=余下存活方；conflicts=`len(result.conflicts)`）；seat 比对精确相等不用子串，含 `|` 的座型号直接拒绝。
+4. **诚实无 bar 政策**：本批只立仪器不批数值；N>=3 pilot 跑在已装本地模型上后只记录数字、不追认 bar，#123 开工前置条件另议。
+
 

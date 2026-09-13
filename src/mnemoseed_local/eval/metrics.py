@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from mnemoseed_local.dream.reflect import ReflectionResult, Route
 from mnemoseed_local.eval.canary import CanarySession, matches_fact
 from mnemoseed_local.eval.harness import CellRun
 
@@ -68,6 +69,67 @@ class CostMetrics:
     reflect_prompt_tokens: int | None
     reflect_completion_tokens: int | None
     verify_tokens: int | None
+
+
+@dataclass(frozen=True)
+class VoteMetrics:
+    """Vote calibration counts for one successful vote run, derived before
+    graph routing from the authoritative combined ReflectionResult.
+
+    Units are triple counts, never rates or bars: agreement triples surviving
+    CORE/ISOLATED with exact both-seat token equality; disagreement parties
+    surviving vote_disagreement; disagreement groups as unique casefolded
+    (subject, predicate) among the parties; single-side survivors that are
+    neither; dropped polarity conflicts as len(result.conflicts)."""
+
+    model_a: str
+    model_b: str
+    agreement_triples: int
+    disagreement_parties: int
+    disagreement_groups: int
+    single_side_triples: int
+    dropped_polarity_conflicts: int
+
+
+def _is_agreement(model_id: str | None, model_a: str, model_b: str) -> bool:
+    """Exact both-seat token equality: the combiner joins seats with "|", so
+    an agreement triple carries exactly the two seat ids, in either order."""
+    if model_id is None:
+        return False
+    parts = model_id.split("|")
+    return len(parts) == 2 and sorted(parts) == sorted([model_a, model_b])
+
+
+def vote_metrics(result: ReflectionResult, *, model_a: str, model_b: str) -> VoteMetrics:
+    """Derive vote counts from the combined result (pre-routing evidence)."""
+    if not model_a or not model_b:
+        raise ValueError("vote metrics require both seat model ids")
+    if "|" in model_a or "|" in model_b:
+        raise ValueError("vote model ids must not contain the pipe delimiter '|'")
+    agreement = 0
+    parties = 0
+    groups: set[tuple[str, str]] = set()
+    single_side = 0
+    for triple in result.triples:
+        if triple.vote_disagreement:
+            parties += 1
+            groups.add((triple.subject.casefold().strip(), triple.predicate.casefold().strip()))
+        elif _is_agreement(triple.model_id, model_a, model_b) and triple.route in (
+            Route.CORE,
+            Route.ISOLATED,
+        ):
+            agreement += 1
+        else:
+            single_side += 1
+    return VoteMetrics(
+        model_a=model_a,
+        model_b=model_b,
+        agreement_triples=agreement,
+        disagreement_parties=parties,
+        disagreement_groups=len(groups),
+        single_side_triples=single_side,
+        dropped_polarity_conflicts=len(result.conflicts),
+    )
 
 
 def _node_props(node: Any) -> dict[str, Any]:

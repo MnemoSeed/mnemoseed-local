@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from mnemoseed_local.config import CONFIG_DIR
-from mnemoseed_local.eval.metrics import CanaryMetrics, CostMetrics, VerifyMetrics
+from mnemoseed_local.eval.metrics import CanaryMetrics, CostMetrics, VerifyMetrics, VoteMetrics
 
-REPORT_SCHEMA_VERSION = "v1.1"
+REPORT_SCHEMA_VERSION = "v1.2"
 
 #: Seed-policy values (B4a): "per-seat-fixed" marks runs whose ollama seats
 #: carry the pinned sampling seed; "none" marks ``--no-seat-seed`` runs.
@@ -42,7 +42,9 @@ class SkippedCell:
 @dataclass(frozen=True)
 class ReportedTriple:
     """One merged node's eval surface (v1.1 payload — full triple dump so a
-    later RULER revision can re-judge recall offline, no GPU rerun)."""
+    later RULER revision can re-judge recall offline, no GPU rerun; v1.2
+    preserves the combined triple model_id and vote_disagreement so offline
+    review can reconstruct cross-seat agreement)."""
 
     graph: str  # "main" | "isolated"
     node_id: str
@@ -51,6 +53,8 @@ class ReportedTriple:
     object: str
     polarity: str
     confidence: float
+    model_id: str | None = None
+    vote_disagreement: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,7 @@ class CellReport:
     reflect_collapse_attempts: int = 0
     reflect_recovered: bool = False
     seat_seed: int | None = None
+    vote: VoteMetrics | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +169,30 @@ def _cost_from_dict(data: dict[str, Any]) -> CostMetrics:
     )
 
 
+def _vote_to_dict(m: VoteMetrics) -> dict[str, Any]:
+    return {
+        "model_a": m.model_a,
+        "model_b": m.model_b,
+        "agreement_triples": m.agreement_triples,
+        "disagreement_parties": m.disagreement_parties,
+        "disagreement_groups": m.disagreement_groups,
+        "single_side_triples": m.single_side_triples,
+        "dropped_polarity_conflicts": m.dropped_polarity_conflicts,
+    }
+
+
+def _vote_from_dict(data: dict[str, Any]) -> VoteMetrics:
+    return VoteMetrics(
+        model_a=str(data["model_a"]),
+        model_b=str(data["model_b"]),
+        agreement_triples=int(data["agreement_triples"]),
+        disagreement_parties=int(data["disagreement_parties"]),
+        disagreement_groups=int(data["disagreement_groups"]),
+        single_side_triples=int(data["single_side_triples"]),
+        dropped_polarity_conflicts=int(data["dropped_polarity_conflicts"]),
+    )
+
+
 def report_to_dict(report: EvalReport) -> dict[str, Any]:
     return {
         "eval_version": report.eval_version,
@@ -184,12 +213,15 @@ def report_to_dict(report: EvalReport) -> dict[str, Any]:
                         "object": t.object,
                         "polarity": t.polarity,
                         "confidence": t.confidence,
+                        "model_id": t.model_id,
+                        "vote_disagreement": t.vote_disagreement,
                     }
                     for t in cell.triples
                 ],
                 "reflect_collapse_attempts": cell.reflect_collapse_attempts,
                 "reflect_recovered": cell.reflect_recovered,
                 "seat_seed": cell.seat_seed,
+                "vote": _vote_to_dict(cell.vote) if cell.vote is not None else None,
             }
             for cell in report.cells
         ],
@@ -210,6 +242,7 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
                 verify=_verify_from_dict(cell["verify"]),
                 cost=_cost_from_dict(cell["cost"]),
                 # v1 reports carry no payload field: tolerate (empty triples).
+                # v1.0/v1.1 triples carry no model_id/vote_disagreement: default.
                 triples=tuple(
                     ReportedTriple(
                         graph=str(t["graph"]),
@@ -219,6 +252,8 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
                         object=str(t["object"]),
                         polarity=str(t["polarity"]),
                         confidence=float(t["confidence"]),
+                        model_id=None if t.get("model_id") is None else str(t["model_id"]),
+                        vote_disagreement=bool(t.get("vote_disagreement", False)),
                     )
                     for t in cell.get("triples", [])
                 ),
@@ -226,6 +261,8 @@ def report_from_dict(data: dict[str, Any]) -> EvalReport:
                 reflect_collapse_attempts=int(cell.get("reflect_collapse_attempts", 0)),
                 reflect_recovered=bool(cell.get("reflect_recovered", False)),
                 seat_seed=None if cell.get("seat_seed") is None else int(cell["seat_seed"]),
+                # v1.2 vote surface: pre-v1.2 reports carry none — default None.
+                vote=None if cell.get("vote") is None else _vote_from_dict(cell["vote"]),
             )
             for cell in data["cells"]
         ),

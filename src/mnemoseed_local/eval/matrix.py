@@ -31,7 +31,7 @@ import httpx
 from mnemoseed_local.dream.snapshot import Snapshot
 from mnemoseed_local.eval.harness import CellRun, EvalCell, EvalRig, EvalRoute, RigPaths
 from mnemoseed_local.eval.materials import Material, MaterialError, fresh_replay, load_replay
-from mnemoseed_local.eval.metrics import cost_metrics, score_canary, verify_metrics
+from mnemoseed_local.eval.metrics import cost_metrics, score_canary, verify_metrics, vote_metrics
 from mnemoseed_local.eval.report import (
     REPORT_SCHEMA_VERSION,
     SEAT_SEED_POLICY_FIXED,
@@ -89,6 +89,7 @@ def default_matrix(
     roster: Sequence[str] = ROSTER_DEFAULT,
     ensembles: Sequence[str] = ("off", "verify"),
     verifier_model: str = "gemma4:e4b",
+    vote_b_model: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     num_ctx: int = DEFAULT_NUM_CTX,
     delta_budget_tokens: int = 32000,
@@ -96,7 +97,10 @@ def default_matrix(
     seat_seed: int | None = SEAT_SEED_DEFAULT,
 ) -> list[EvalCell]:
     """Roster × ensembles expansion (deterministic, per-model pairing).
-    ``extra_routes`` (cloud anchors) join the same off/verify pairing."""
+    ``extra_routes`` (cloud anchors) join the same off/verify pairing. Vote
+    cells carry an explicit vote-B route (``vote_b_model``); no default vote
+    activation exists — ensemble vote without ``vote_b_model`` builds a cell
+    with no B seat that fails loudly at probe/rig time."""
     cells: list[EvalCell] = []
     seats = [ollama_route(model, base_url=base_url, num_ctx=num_ctx, seat_seed=seat_seed) for model in roster]
     seats.extend(extra_routes)
@@ -104,7 +108,12 @@ def default_matrix(
         for ensemble in ensembles:
             verifier = (
                 ollama_route(verifier_model, base_url=base_url, num_ctx=num_ctx, seat_seed=seat_seed)
-                if ensemble != "off"
+                if ensemble == "verify"
+                else None
+            )
+            vote_b = (
+                ollama_route(vote_b_model, base_url=base_url, num_ctx=num_ctx, seat_seed=seat_seed)
+                if ensemble == "vote" and vote_b_model is not None
                 else None
             )
             cells.append(
@@ -112,6 +121,7 @@ def default_matrix(
                     reflect=reflect,
                     ensemble=ensemble,
                     verifier=verifier,
+                    vote_b=vote_b,
                     delta_budget_tokens=delta_budget_tokens,
                 )
             )
@@ -197,7 +207,9 @@ def probe_ollama_models(
 
 
 def _cell_missing_reason(cell: EvalCell, probe: dict[str, str | None]) -> str | None:
-    for route in (cell.reflect, cell.verifier):
+    if cell.ensemble == "vote" and cell.vote_b is None:
+        return "vote_b_missing: ensemble vote requires an explicit vote_b route (never the verifier)"
+    for route in (cell.reflect, cell.verifier, cell.vote_b):
         if route is None:
             continue
         reason = probe.get(route.model)
@@ -320,22 +332,24 @@ def run_matrix(
     env: Callable[[str], str | None] | None = None,
     base_url: str = DEFAULT_BASE_URL,
 ) -> EvalReport:
-    """Run every available cell over every material; collect a v1.1 report.
+    """Run every available cell over every material; collect a v1.2 report.
 
-    Skip semantics: every seat route (both roles) is probed once up front; a
-    cell with any unusable route is a skipped row — ``missing_model:`` for an
-    absent ollama tag (exit-neutral), ``route_unavailable:`` for a dead
-    server/cloud anchor or an unset key env (a loud failure row). Material
-    load failures (``material_error:``) and run failures (``run_error:``) are
-    failure rows. A replay whose ``snapshot.profile_id`` was already claimed by
-    an earlier material in this rig is a ``profile_collision:`` failure row
-    (profile identity is provenance evidence, never renamed). Skipped cells
-    never build a rig.
+    Skip semantics: every seat route (all roles, including vote-B) is probed
+    once up front; a cell with any unusable route is a skipped row —
+    ``missing_model:`` for an absent ollama tag (exit-neutral),
+    ``route_unavailable:`` for a dead server/cloud anchor or an unset key env
+    (a loud failure row), ``vote_b_missing:`` for a vote cell with no explicit
+    B seat (a loud failure row, never silent). Material load failures
+    (``material_error:``) and run failures (``run_error:``) are failure rows.
+    A replay whose ``snapshot.profile_id`` was already claimed by an earlier
+    material in this rig is a ``profile_collision:`` failure row (profile
+    identity is provenance evidence, never renamed). Skipped cells never
+    build a rig.
     """
     unique_routes = {
         (route.driver, route.model): route
         for cell in cells
-        for route in (cell.reflect, cell.verifier)
+        for route in (cell.reflect, cell.verifier, cell.vote_b)
         if route is not None
     }
     probe = (
@@ -401,6 +415,20 @@ def run_matrix(
                 except Exception as exc:  # noqa: BLE001 - typed report row, never a traceback out
                     skipped.append(SkippedCell(cell_id=cell.cell_id, reason=f"run_error: {exc}"))
                     continue
+                overlay: dict[tuple[str, str, str, str], tuple[str | None, bool]] = {}
+                if run.reflect_result is not None:
+                    for triple in run.reflect_result.triples:
+                        overlay[(triple.subject, triple.predicate, triple.object, triple.polarity)] = (
+                            triple.model_id,
+                            triple.vote_disagreement,
+                        )
+                vote = None
+                if cell.ensemble == "vote" and cell.vote_b is not None and run.reflect_result is not None:
+                    vote = vote_metrics(
+                        run.reflect_result,
+                        model_a=cell.reflect.model,
+                        model_b=cell.vote_b.model,
+                    )
                 cell_reports.append(
                     CellReport(
                         cell_id=cell.cell_id,
@@ -408,7 +436,9 @@ def run_matrix(
                         canary=score_canary(material.session, run) if material.session is not None else None,
                         verify=verify_metrics(run),
                         cost=cost_metrics(run),
-                        # v1.1: full merged payload for GPU-free rescoring later
+                        # v1.1: full merged payload for GPU-free rescoring later;
+                        # v1.2 overlays the combined model_id/vote_disagreement
+                        # by canonical exact key, never from needs_reconcile.
                         triples=tuple(
                             ReportedTriple(
                                 graph=node.graph,
@@ -418,12 +448,21 @@ def run_matrix(
                                 object=node.object,
                                 polarity=node.polarity,
                                 confidence=node.confidence,
+                                model_id=overlay.get(
+                                    (node.subject, node.predicate, node.object, node.polarity),
+                                    (None, False),
+                                )[0],
+                                vote_disagreement=overlay.get(
+                                    (node.subject, node.predicate, node.object, node.polarity),
+                                    (None, False),
+                                )[1],
                             )
                             for node in (*run.core_nodes, *run.isolated_nodes)
                         ),
                         reflect_collapse_attempts=run.reflect_collapse_attempts,
                         reflect_recovered=run.reflect_recovered,
                         seat_seed=run.seat_seed,
+                        vote=vote,
                     )
                 )
         finally:
