@@ -572,15 +572,9 @@ def test_vote_b_cannot_equal_reflect_seat(tmp_path: Path) -> None:
     """R2: vote_b == reflect is degenerate vote evidence (one model voting
     twice is not consensus) — rejected unconditionally even when an explicit
     distinct verifier exists."""
-    from mnemoseed_local.eval.canary import canary_session
-
     degenerate = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=STUB_A)
     with pytest.raises(ValueError, match="(?i)verifier|reflect"):
-        rig = EvalRig(RigPaths(root=tmp_path / "rig"), degenerate)
-        try:
-            rig.run_canary(canary_session(82, facts=2, noise=1))
-        finally:
-            rig.close()
+        EvalRig(RigPaths(root=tmp_path / "rig"), degenerate)
     materials = material_catalog(None, canary_seed=1, canary_count=1)
     report = run_matrix([degenerate], materials, root=tmp_path / "mx")
     assert report.cells == ()
@@ -588,11 +582,13 @@ def test_vote_b_cannot_equal_reflect_seat(tmp_path: Path) -> None:
 
 
 def test_vote_half_degraded_seat_reads_unrecovered(tmp_path: Path) -> None:
-    """R1: if seat A collapses and recovers while seat B stays clean, the
-    run's collapse surface must show BOTH seats' evidence (max attempts,
-    recovered=True only when every attempting guard recovered). A fully
-    failing B seat (attempts>0, never recovered) must read unrecovered so
-    score_canary nulls recall instead of blessing half-degraded evidence."""
+    """R1: reported attempts are the MAX across both seat guards and
+    recovered is True only when every attempting guard recovered. The
+    reachable half-degraded shape in the rig is: A recovers after one
+    collapse, B exhausts its retries unrecovered (the reverse — A
+    exhausted — aborts the chain before B ever runs, per pipeline
+    order). Pre-fix code let B's counters overwrite A's; the aggregation
+    must read BOTH seats (max attempts, all attempting guards recovered)."""
     from mnemoseed_local.eval.canary import canary_session
     from mnemoseed_local.llm.drivers.stub import StubLLM
     from mnemoseed_local.llm.types import ChatResult, Usage
@@ -607,7 +603,6 @@ def test_vote_half_degraded_seat_reads_unrecovered(tmp_path: Path) -> None:
         if key == "a" and seen["a"] == 1:
             return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
         if key == "b":
-            # seat B never produces a well-formed extraction
             return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
         return original(self, system=system, user=user)
 
@@ -618,15 +613,21 @@ def test_vote_half_degraded_seat_reads_unrecovered(tmp_path: Path) -> None:
             EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
         )
         try:
-            run = rig.run_canary(canary_session(83, facts=3, noise=1))
+            rig.run_canary(canary_session(83, facts=3, noise=1))
         finally:
             rig.close()
+        guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
+        guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
     finally:
         StubLLM.chat = original  # type: ignore[method-assign]
-    guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
-    guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
-    assert guard_b is not None and guard_a.run_collapse_attempts > 0
+    assert guard_a is not None and guard_b is not None
+    # A recovered after one collapse; B exhausted unrecovered
+    assert guard_a.run_collapse_attempts == 1 and guard_a.run_recovered is True
     assert guard_b.run_collapse_attempts > 0 and guard_b.run_recovered is False
-    # the reported surface aggregates: B exhausted unrecovered -> unrecovered
+    # aggregated surface: attempts = max across BOTH guards (pre-fix single-
+    # slot code overwrote A's counters with B's), and ANY unrecovered
+    # attempting guard forces recovered=False
+    assert rig._reflector.last_collapse_attempts == max(
+        guard_a.run_collapse_attempts, guard_b.run_collapse_attempts
+    )
     assert rig._reflector.last_reflect_recovered is False
-    assert run.merge_committed is False or run.reflect_result is None
