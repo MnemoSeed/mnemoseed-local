@@ -176,13 +176,24 @@ def probe_ollama_models(
     timeout: float = 2.0,
 ) -> dict[str, str | None]:
     """model -> None (pulled) | skip reason. A probe failure marks EVERY model
-    honestly (one unreachable server fails the whole ollama set at once)."""
+    honestly (one unreachable server fails the whole ollama set at once).
+
+    Ollama resolves an untagged model reference to ``:latest``. Explicit tags
+    remain exact so a requested non-latest tag cannot silently change models.
+    """
     fetch = fetch_tags or _fetch_ollama_tags
     try:
         tags = set(fetch(base_url, timeout))
     except Exception as exc:  # noqa: BLE001 - probe degradation is typed, never a crash
         return {model: f"ollama unreachable: {exc}" for model in models}
-    return {model: (None if model in tags else f"model not pulled: {model}") for model in models}
+    return {
+        model: (
+            None
+            if model in tags or (":" not in model and f"{model}:latest" in tags)
+            else f"model not pulled: {model}"
+        )
+        for model in models
+    }
 
 
 def _cell_missing_reason(cell: EvalCell, probe: dict[str, str | None]) -> str | None:

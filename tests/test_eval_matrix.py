@@ -155,6 +155,22 @@ def test_probe_missing_model() -> None:
     assert "qwen3.5:9b" in probe["qwen3.5:9b"]  # type: ignore[operator]
 
 
+def test_probe_accepts_implicit_latest_without_weakening_explicit_tags() -> None:
+    implicit = "mnemoseed-local/qwen3.5-9b-iq3xs"
+    explicit_latest = f"{implicit}:latest"
+    explicit_other = f"{implicit}:other"
+    absent = "missing/model"
+
+    def fake_tags(base_url: str, timeout: float) -> tuple[str, ...]:
+        return (explicit_latest, f"{explicit_other}:latest")
+
+    probe = probe_ollama_models((implicit, explicit_latest, explicit_other, absent), fetch_tags=fake_tags)
+    assert probe[implicit] is None
+    assert probe[explicit_latest] is None
+    assert probe[explicit_other] == f"model not pulled: {explicit_other}"
+    assert probe[absent] == f"model not pulled: {absent}"
+
+
 def test_probe_network_failure_marks_everything() -> None:
     def dead_tags(base_url: str, timeout: float) -> tuple[str, ...]:
         raise OSError("connection refused")
