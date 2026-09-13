@@ -1,0 +1,633 @@
+"""Issue #193 hostile tests: vote truthfulness + report v1.2 (RED first)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from mnemoseed_local.dream.reflect import ReflectedTriple, ReflectionResult, Route
+from mnemoseed_local.eval.harness import EvalCell, EvalRig, EvalRoute, RigPaths
+from mnemoseed_local.eval.materials import material_catalog
+from mnemoseed_local.eval.matrix import run_matrix
+from mnemoseed_local.schema.stamp import CognitiveTier
+from mnemoseed_local.storage.ports import TurnRange
+
+STUB_A = EvalRoute(driver="stub", model="stub-a")
+STUB_B_GEN = EvalRoute(driver="stub", model="stub-b")
+STUB_V = EvalRoute(driver="stub_verifier", model="stub-v")
+
+_RANGE = TurnRange(0, 4)
+
+
+def _triple(
+    subject: str,
+    predicate: str,
+    obj: str,
+    *,
+    model_id: str | None,
+    route: Route = Route.CORE,
+    disagreement: bool = False,
+    polarity: str = "positive",
+) -> ReflectedTriple:
+    return ReflectedTriple(
+        subject=subject,
+        predicate=predicate,
+        object=obj,
+        tiers=(CognitiveTier.TIER_1,),
+        chunk_ids=("c1",),
+        turn_range=_RANGE,
+        confidence=0.7,
+        route=route,
+        polarity=polarity,
+        model_id=model_id,
+        vote_disagreement=disagreement,
+    )
+
+
+def _result(triples: tuple[ReflectedTriple, ...]) -> ReflectionResult:
+    return ReflectionResult(
+        snapshot_id="s",
+        profile_id="canary",
+        turn_range=_RANGE,
+        prompt_version="v1",
+        triples=triples,
+    )
+
+
+def test_vote_cell_has_distinct_vote_b_route() -> None:
+    cell = EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN)
+    assert cell.vote_b is not None
+    assert cell.vote_b.model == "stub-b"
+    assert cell.cell_id != EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_V).cell_id
+
+
+def test_vote_rig_runs_both_seats_and_reports() -> None:
+    """Truthfulness oracle: a vote dream must journal BOTH per-seat results,
+    the combine marker, and a combined model_id carrying both seat ids. A
+    mutant that drops the mode/vote_llm wiring degrades to the single-seat
+    off path (no REFLECT_A_DONE/REFLECT_B_DONE, model_id never both seats),
+    which this test must catch."""
+    import json
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as tmp:
+        rig = EvalRig(
+            RigPaths(root=Path(tmp) / "rig"),
+            EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
+        )
+        try:
+            from mnemoseed_local.eval.canary import canary_session
+
+            run = rig.run_canary(canary_session(71, facts=4, noise=2))
+            journals = sorted((Path(tmp) / "rig" / "dreams").glob("*.json"))
+            # read BEFORE close(): rig teardown purges the journal dir
+            payloads = [json.loads(j.read_text(encoding="utf-8")) for j in journals]
+        finally:
+            rig.close()
+    assert run.merge_committed
+    assert run.reflect_result is not None
+    assert run.reflect_outcome is not None
+    assert run.reflect_outcome.result is not None
+    assert run.core_nodes, "vote dream wrote no core nodes"
+    # dual-seat evidence: the journal carries both seat payloads, the vote
+    # phases, and the combined result attributes BOTH seat ids.
+    assert payloads, "no dream journal written"
+    snap = payloads[-1]
+    phases = set(snap.get("phases", []))
+    assert {"reflect_a_done", "reflect_b_done", "combine_done", "merge_done"} <= phases
+    votes = snap.get("vote_results") or {}
+    assert "a" in votes and "b" in votes, "both seat results must be journaled"
+    combined = snap["reflect_result"]["triples"]
+    assert combined, "combined result carries no triples"
+    assert all(t.get("model_id") == "stub-a|stub-b" for t in combined), (
+        "combined triples must attribute to both seats"
+    )
+
+
+def test_vote_never_reuses_verifier_as_b(tmp_path: Path) -> None:
+    from mnemoseed_local.eval.canary import canary_session
+
+    verifier_only = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=None)
+    with pytest.raises(Exception, match="(?i)vote_b|vote.*B|missing"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), verifier_only)
+        try:
+            rig.run_canary(canary_session(72, facts=2, noise=1))
+        finally:
+            rig.close()
+
+
+def test_missing_b_cannot_succeed(tmp_path: Path) -> None:
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=None)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    assert report.cells == ()
+    assert len(report.skipped) == 1
+    assert "vote" in report.skipped[0].reason.lower() or "missing" in report.skipped[0].reason.lower()
+
+
+def test_off_verify_reports_have_no_vote(tmp_path: Path) -> None:
+    cells = [
+        EvalCell(reflect=STUB_A, ensemble="off", verifier=STUB_V),
+        EvalCell(reflect=STUB_A, ensemble="verify", verifier=STUB_V),
+    ]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    assert len(report.cells) == 2
+    for cell in report.cells:
+        assert cell.vote is None
+
+
+def test_vote_metrics_counts() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result(
+        (
+            _triple("user", "prefers", "dark mode", model_id="stub-a|stub-b", route=Route.CORE),
+            _triple("user", "prefers", "light mode", model_id="stub-a", disagreement=True),
+            _triple("user", "prefers", "sepia mode", model_id="stub-b", disagreement=True),
+            _triple("user", "decided", "ship it", model_id="stub-a"),
+        )
+    )
+    metrics = vote_metrics(result, model_a="stub-a", model_b="stub-b")
+    assert metrics.model_a == "stub-a"
+    assert metrics.model_b == "stub-b"
+    assert metrics.agreement_triples == 1
+    assert metrics.disagreement_parties == 2
+    assert metrics.disagreement_groups == 1
+    assert metrics.single_side_triples == 1
+    assert metrics.dropped_polarity_conflicts == 0
+
+
+def test_vote_parties_vs_groups() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result(
+        (
+            _triple("user", "prefers", "a1", model_id="stub-a", disagreement=True),
+            _triple("user", "prefers", "a2", model_id="stub-b", disagreement=True),
+            _triple("user", "decided", "b1", model_id="stub-a", disagreement=True),
+        )
+    )
+    metrics = vote_metrics(result, model_a="stub-a", model_b="stub-b")
+    assert metrics.disagreement_parties == 3
+    assert metrics.disagreement_groups == 2
+
+
+def test_vote_dropped_conflict_absent_graph() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    base = _result(())
+    result = type(base)(
+        snapshot_id=base.snapshot_id,
+        profile_id=base.profile_id,
+        turn_range=base.turn_range,
+        prompt_version=base.prompt_version,
+        triples=(),
+        conflicts=(("user", "prefers", "dark mode"),),
+    )
+    metrics = vote_metrics(result, model_a="stub-a", model_b="stub-b")
+    assert metrics.dropped_polarity_conflicts == 1
+    assert metrics.agreement_triples == 0
+    assert metrics.single_side_triples == 0
+
+
+def test_vote_single_side_neither() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result((_triple("user", "prefers", "solo", model_id="stub-a"),))
+    metrics = vote_metrics(result, model_a="stub-a", model_b="stub-b")
+    assert metrics.single_side_triples == 1
+    assert metrics.agreement_triples == 0
+    assert metrics.disagreement_parties == 0
+
+
+def test_vote_same_model_case() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result(
+        (
+            _triple("user", "prefers", "both", model_id="stub-a|stub-a", route=Route.CORE),
+            _triple("user", "prefers", "one", model_id="stub-a"),
+        )
+    )
+    metrics = vote_metrics(result, model_a="stub-a", model_b="stub-a")
+    assert metrics.agreement_triples == 1
+    assert metrics.single_side_triples == 1
+
+
+def test_vote_delimiter_guard() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result((_triple("user", "prefers", "x", model_id="a|b"),))
+    with pytest.raises(ValueError, match="(?i)pipe|delimiter|\\|"):
+        vote_metrics(result, model_a="a|b", model_b="stub-b")
+
+
+def test_report_v12_roundtrip_preserves_vote(tmp_path: Path) -> None:
+    from mnemoseed_local.eval.metrics import CostMetrics, VerifyMetrics
+    from mnemoseed_local.eval.report import CellReport, EvalReport, ReportedTriple, load_report, write_report
+
+    triple = ReportedTriple(
+        graph="main",
+        node_id="n1",
+        subject="user",
+        predicate="prefers",
+        object="dark mode",
+        polarity="positive",
+        confidence=0.8,
+        model_id="stub-a|stub-b",
+        vote_disagreement=False,
+    )
+    report = EvalReport(
+        eval_version="v1.2",
+        started_at="2026-08-22T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id="c",
+                material="canary-00",
+                canary=None,
+                verify=VerifyMetrics(
+                    verifier_model=None,
+                    judged=0,
+                    accepted=0,
+                    rejected=0,
+                    rejected_keys=(),
+                    fallbacks={},
+                ),
+                cost=CostMetrics(
+                    duration_s=1.0,
+                    token_usage=10,
+                    reflect_prompt_tokens=None,
+                    reflect_completion_tokens=None,
+                    verify_tokens=None,
+                ),
+                triples=(triple,),
+            ),
+        ),
+    )
+    path = write_report(report, tmp_path, matrix_slug="v12")
+    loaded = load_report(path)
+    assert loaded == report
+    assert loaded.cells[0].triples[0].model_id == "stub-a|stub-b"
+    assert loaded.cells[0].triples[0].vote_disagreement is False
+
+
+def test_old_schema_loads_with_defaults(tmp_path: Path) -> None:
+    from mnemoseed_local.eval.report import load_report
+
+    old = {
+        "eval_version": "v1.1",
+        "started_at": "2026-08-18T00:00:00Z",
+        "cells": [
+            {
+                "cell_id": "c",
+                "material": "canary-00",
+                "canary": None,
+                "verify": {
+                    "verifier_model": None,
+                    "judged": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "rejected_keys": [],
+                    "fallbacks": {},
+                },
+                "cost": {
+                    "duration_s": 1.0,
+                    "token_usage": 5,
+                    "reflect_prompt_tokens": None,
+                    "reflect_completion_tokens": None,
+                    "verify_tokens": None,
+                },
+                "triples": [
+                    {
+                        "graph": "main",
+                        "node_id": "n1",
+                        "subject": "user",
+                        "predicate": "prefers",
+                        "object": "dark mode",
+                        "polarity": "positive",
+                        "confidence": 0.7,
+                    }
+                ],
+            }
+        ],
+        "skipped": [],
+    }
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = load_report(path)
+    triple = loaded.cells[0].triples[0]
+    assert triple.model_id is None
+    assert triple.vote_disagreement is False
+    assert loaded.cells[0].vote is None
+
+
+def test_vote_report_carries_combined_evidence(tmp_path: Path) -> None:
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    assert report.eval_version == "v1.2"
+    assert len(report.cells) == 1
+    cell = report.cells[0]
+    assert cell.vote is not None
+    assert cell.vote.model_a == "stub-a"
+    assert cell.vote.model_b == "stub-b"
+    assert cell.vote.agreement_triples > 0
+    assert cell.vote.dropped_polarity_conflicts == 0
+    assert cell.triples, "vote report must embed triples"
+    assert any(t.model_id == "stub-a|stub-b" for t in cell.triples)
+    assert all(t.model_id is not None for t in cell.triples)
+
+
+def test_vote_rescore_preserves_vote(tmp_path: Path) -> None:
+    from mnemoseed_local.eval.report import load_report, write_report
+    from mnemoseed_local.eval.rescore import rescore_report
+
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN)]
+    materials = material_catalog(None, canary_seed=7, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path / "root")
+    path = write_report(report, tmp_path / "reports", matrix_slug="vote")
+    rescored = load_report(rescore_report(path, canary_seed=7))
+    assert rescored.cells[0].vote == report.cells[0].vote
+    assert rescored.cells[0].triples == report.cells[0].triples
+
+
+def test_vote_b_route_probed(tmp_path: Path) -> None:
+    missing_b = EvalRoute(driver="ollama", model="absent-model:9b")
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=missing_b)]
+
+    def fake_tags(base_url: str, timeout: float) -> tuple[str, ...]:
+        return ()
+
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path, fetch_tags=fake_tags)
+    assert report.cells == ()
+    assert len(report.skipped) == 1
+    assert "absent-model:9b" in report.skipped[0].reason
+
+
+def test_vote_exact_seat_ids_no_substring() -> None:
+    from mnemoseed_local.eval.metrics import vote_metrics
+
+    result = _result((_triple("user", "prefers", "x", model_id="stub-a|stub-b", route=Route.CORE),))
+    metrics = vote_metrics(result, model_a="stub", model_b="stub-b")
+    assert metrics.agreement_triples == 0
+    assert metrics.single_side_triples == 1
+
+
+def test_vote_triple_overlay_uses_canonical_exact_key(tmp_path: Path) -> None:
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    cell = report.cells[0]
+    for triple in cell.triples:
+        assert triple.subject and triple.predicate and triple.object and triple.polarity
+        assert triple.model_id is not None
+        assert triple.vote_disagreement is False
+
+
+def test_vote_failure_has_no_fabricated_metrics(tmp_path: Path) -> None:
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+
+    original = StubLLM.chat
+
+    def always_fail(self, *, system: str, user: str):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    StubLLM.chat = always_fail  # type: ignore[method-assign]
+    try:
+        cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN)]
+        materials = material_catalog(None, canary_seed=1, canary_count=1)
+        report = run_matrix(cells, materials, root=tmp_path)
+    finally:
+        StubLLM.chat = original  # type: ignore[method-assign]
+    # a fully-failing seat never yields a vote-metrics row: either the row
+    # is skipped entirely or its vote stays None (M1: no degraded blessing)
+    assert all(c.vote is None for c in report.cells)
+    if not report.cells:
+        assert report.skipped, "a failed vote cell must surface as a skipped row"
+
+
+def test_vote_b_verifier_collision_rejected(tmp_path: Path) -> None:
+    """I1: vote_b identical to the verifier route is rejected loudly at both
+    the rig and the matrix layer — the judging seat must never silently run
+    as vote-B generator."""
+    from mnemoseed_local.eval.canary import canary_session
+
+    collision = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=STUB_V)
+    with pytest.raises(ValueError, match="(?i)verifier"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), collision)
+        try:
+            rig.run_canary(canary_session(73, facts=2, noise=1))
+        finally:
+            rig.close()
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([collision], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_overlay_duplicate_keys_kept_deterministic() -> None:
+    """I4: drives the REAL overlay seam (_vote_overlay) with two triples
+    sharing one canonical SPOP key but different model_id/vote flags — the
+    combiner guarantees upstream uniqueness, but IF a combiner change ever
+    introduces duplicate keys, the overlay must resolve deterministically
+    (last wins) instead of crashing or misattributing arbitrarily. This
+    test pins that collision behavior where a regression will surface."""
+    from mnemoseed_local.eval.matrix import _vote_overlay
+
+    first = _triple("user", "prefers", "dark mode", model_id="stub-a", disagreement=False)
+    second = _triple("user", "prefers", "dark mode", model_id="stub-b", disagreement=True)
+    result = _result((first, second))
+    overlay = _vote_overlay(result)
+    assert len(overlay) == 1
+    key = ("user", "prefers", "dark mode", "positive")
+    # deterministic resolution: the LAST entry for a duplicate key wins
+    assert overlay[key] == ("stub-b", True)
+    # a distinct SPOP key never collides
+    third = _triple("user", "prefers", "light mode", model_id="stub-a")
+    overlay = _vote_overlay(_result((first, third)))
+    assert len(overlay) == 2
+    assert overlay[("user", "prefers", "light mode", "positive")] == ("stub-a", False)
+
+
+def test_old_v10_report_without_triples_loads(tmp_path: Path) -> None:
+    """M4: v1.0 reports carry no triples key at all — must load with empty
+    payload and vote None, never crash."""
+    from mnemoseed_local.eval.report import load_report
+
+    old = {
+        "eval_version": "v1.0",
+        "started_at": "2026-08-01T00:00:00Z",
+        "cells": [
+            {
+                "cell_id": "c",
+                "material": "canary-00",
+                "canary": None,
+                "verify": {
+                    "verifier_model": None,
+                    "judged": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "rejected_keys": [],
+                    "fallbacks": {},
+                },
+                "cost": {
+                    "duration_s": 1.0,
+                    "token_usage": 5,
+                    "reflect_prompt_tokens": None,
+                    "reflect_completion_tokens": None,
+                    "verify_tokens": None,
+                },
+            }
+        ],
+        "skipped": [],
+    }
+    path = tmp_path / "old-v10.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = load_report(path)
+    assert loaded.cells[0].triples == ()
+    assert loaded.cells[0].vote is None
+
+
+def test_vote_b_cannot_equal_effective_verifier_reflect_fallback(tmp_path: Path) -> None:
+    """I1 residual: with verifier=None the effective verifier falls back to
+    the reflect seat — vote_b equal to REFLECT must be rejected too, not
+    just an explicit verifier collision."""
+    from mnemoseed_local.eval.canary import canary_session
+
+    collision = EvalCell(reflect=STUB_A, ensemble="vote", verifier=None, vote_b=STUB_A)
+    with pytest.raises(ValueError, match="(?i)verifier"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), collision)
+        try:
+            rig.run_canary(canary_session(74, facts=2, noise=1))
+        finally:
+            rig.close()
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([collision], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_vote_b_guard_records_b_seat_collapses(tmp_path: Path) -> None:
+    """I3: seat B rides its own collapse guard (a single shared instance,
+    not a per-run resolver that would hide its counters). A B-side verbatim
+    [] with tiny provider completion (the collapse fingerprint) must engage
+    the retry ring and be COUNTED — not flow into combine as an ok-empty
+    seat. A-side collapse stays counted by its own guard, symmetric."""
+    from mnemoseed_local.eval.canary import canary_session
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+    from mnemoseed_local.llm.types import ChatResult, Usage
+
+    seen = {"a": 0, "b": 0}
+    original = StubLLM.chat
+
+    def collapsing(self, *, system: str, user: str):  # type: ignore[no-untyped-def]
+        model = str(getattr(self, "model", "") or "")
+        key = "a" if model == "stub-a" else "b"
+        seen[key] += 1
+        if key == "a" and seen["a"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        if key == "b" and seen["b"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        return original(self, system=system, user=user)
+
+    StubLLM.chat = collapsing  # type: ignore[method-assign]
+    try:
+        rig = EvalRig(
+            RigPaths(root=tmp_path / "rig"),
+            EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
+        )
+        try:
+            run = rig.run_canary(canary_session(75, facts=3, noise=1))
+            guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
+            guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
+        finally:
+            rig.close()
+    finally:
+        StubLLM.chat = original  # type: ignore[method-assign]
+    assert guard_b is not None, "vote seat B must carry its own collapse guard"
+    assert guard_b.run_collapse_attempts == 1, "B-side [] collapse must be counted by the B guard"
+    assert guard_b.run_recovered is True, "B-side retry recovery must be recorded"
+    assert guard_a.run_collapse_attempts == 1, "A-side collapse stays counted by its own guard"
+    assert run.reflect_result is not None
+    assert run.reflect_result.triples, "recovered B seat still contributes combined evidence"
+
+
+def test_vote_metrics_error_yields_typed_skip_row(tmp_path: Path) -> None:
+    """M2: a hostile seat id (pipe-delimited model name reaching the matrix
+    past probing) must surface as a vote_metrics_error skipped row, never
+    as a traceback out of run_matrix."""
+    hostile = EvalRoute(driver="stub", model="bad|pipe")
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=hostile)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    assert report.cells == ()
+    assert any("vote_metrics_error" in s.reason for s in report.skipped)
+
+
+def test_vote_b_cannot_equal_reflect_seat(tmp_path: Path) -> None:
+    """R2: vote_b == reflect is degenerate vote evidence (one model voting
+    twice is not consensus) — rejected unconditionally even when an explicit
+    distinct verifier exists."""
+    degenerate = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=STUB_A)
+    with pytest.raises(ValueError, match="(?i)verifier|reflect"):
+        EvalRig(RigPaths(root=tmp_path / "rig"), degenerate)
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([degenerate], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_vote_half_degraded_seat_reads_unrecovered(tmp_path: Path) -> None:
+    """R1: reported attempts are the MAX across both seat guards and
+    recovered is True only when every attempting guard recovered. The
+    reachable half-degraded shape in the rig is: A recovers after one
+    collapse, B exhausts its retries unrecovered (the reverse — A
+    exhausted — aborts the chain before B ever runs, per pipeline
+    order). Pre-fix code let B's counters overwrite A's; the aggregation
+    must read BOTH seats (max attempts, all attempting guards recovered)."""
+    from mnemoseed_local.eval.canary import canary_session
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+    from mnemoseed_local.llm.types import ChatResult, Usage
+
+    seen = {"a": 0, "b": 0}
+    original = StubLLM.chat
+
+    def collapsing(self, *, system: str, user: str):  # type: ignore[no-untyped-def]
+        model = str(getattr(self, "model", "") or "")
+        key = "a" if model == "stub-a" else "b"
+        seen[key] += 1
+        if key == "a" and seen["a"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        if key == "b":
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        return original(self, system=system, user=user)
+
+    StubLLM.chat = collapsing  # type: ignore[method-assign]
+    try:
+        rig = EvalRig(
+            RigPaths(root=tmp_path / "rig"),
+            EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
+        )
+        try:
+            rig.run_canary(canary_session(83, facts=3, noise=1))
+        finally:
+            rig.close()
+        guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
+        guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
+    finally:
+        StubLLM.chat = original  # type: ignore[method-assign]
+    assert guard_a is not None and guard_b is not None
+    # A recovered after one collapse; B exhausted unrecovered
+    assert guard_a.run_collapse_attempts == 1 and guard_a.run_recovered is True
+    assert guard_b.run_collapse_attempts > 0 and guard_b.run_recovered is False
+    # aggregated surface: attempts = max across BOTH guards (pre-fix single-
+    # slot code overwrote A's counters with B's), and ANY unrecovered
+    # attempting guard forces recovered=False
+    assert rig._reflector.last_collapse_attempts == max(
+        guard_a.run_collapse_attempts, guard_b.run_collapse_attempts
+    )
+    assert rig._reflector.last_reflect_recovered is False

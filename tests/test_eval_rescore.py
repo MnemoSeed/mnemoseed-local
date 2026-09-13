@@ -47,7 +47,7 @@ def stub_report(tmp_path: Path) -> tuple[EvalReport, Path]:
 
 def test_matrix_embeds_full_triple_payload(stub_report) -> None:
     report, _ = stub_report
-    assert report.eval_version == "v1.1"
+    assert report.eval_version == "v1.2"
     triples = report.cells[0].triples
     assert triples, "cells must embed their full triple payload"
     assert all(isinstance(t, ReportedTriple) for t in triples)
@@ -361,7 +361,7 @@ def test_floor_sweep_writes_suffixed_json(stub_report) -> None:
     sweep_path = floor_sweep_report(path, canary_seed=7)
     assert sweep_path.name.endswith(f"{path.stem}-floor-sweep.json")
     data = json.loads(sweep_path.read_text(encoding="utf-8"))
-    assert data["eval_version"] == "v1.1"
+    assert data["eval_version"] == "v1.2"
     assert data["source"] == path.name
     assert data["canary_seed"] == 7
     assert data["cells"], "canary cells must produce sweep rows"

@@ -84,6 +84,7 @@ def _matrix_command(args: argparse.Namespace) -> int:
         roster=models,
         ensembles=ensembles,
         verifier_model=args.verifier,
+        vote_b_model=args.vote_b,
         base_url=args.base_url,
         num_ctx=args.num_ctx,
         delta_budget_tokens=args.delta_budget,
@@ -387,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
     matrix.add_argument("--models", default=",".join(ROSTER_DEFAULT), help="comma-separated ollama tags")
     matrix.add_argument("--ensemble", default="off,verify", help="comma-separated ensemble modes")
     matrix.add_argument("--verifier", default="gemma4:e4b", help="uniform verifier seat model")
+    matrix.add_argument(
+        "--vote-b",
+        default=None,
+        help="explicit vote-B seat model (used only when --ensemble includes vote)",
+    )
     matrix.add_argument(
         "--extra-route",
         action="append",
