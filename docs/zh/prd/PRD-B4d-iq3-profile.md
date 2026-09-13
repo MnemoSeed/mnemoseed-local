@@ -299,8 +299,14 @@ base_url = "http://127.0.0.1:8080/v1"
 - 门禁：`pwsh -File scripts/gate.ps1`（pytest/ruff/format/mypy）在 worktree 保持绿（docs-only，无 src 改动）。
 
 - **2026-08-30 进阶：Phase 0 供应链落地 + Phase 1 首跑（本机 dev 机）**：模型源选定并落定——`bartowski/Qwen_Qwen3.5-9B-GGUF`（base `Qwen/Qwen3.5-9B`，量化自观 Apache-2.0）；文件 `Qwen_Qwen3.5-9B-IQ3_XS.gguf`，repo HEAD commit pin `182be2fd6c7bc44887d88a91cb03ff009cc9f549`，**sha256 下载核对一致**（`120ef957b56c90668993d4ea2220ca8608a4b0e48874f3e509ee0c912a330eb9`，实测体积 4.82GB / 4.49 GiB）。Modelfile 镜像 `qwen3.5:9b` library 模板（TEMPLATE/RENDERER/PARSER/params 同基线，只换 FROM），`ollama create mnemoseed-local/qwen3.5-9b-iq3xs` 成功，`ollama list` 得见 tag `e77652dc20f7`（4.8GB）。
-  - **矩阵名注意**：`mnemoseed-local/...` 为带命名空间 tag，行列 id 需 `:latest` 后缀（matrix.py:185 精确匹配，缺即 `missing_model` skip）。
+  - **矩阵名修正（2026-09-13，#191）**：Ollama 将无显式 tag 的模型引用解释为 `:latest`；旧 eval probe 却对 `/api/tags` 做精确字符串匹配，导致本 PRD §8.2 的无 tag 标准命令把已安装的 IQ3 模型静默记为 `missing_model`（exit 0）。#191 令探活与 Ollama 对齐：无 tag 引用可匹配同名 `:latest`，显式 tag 仍严格匹配；标准命令无需追加后缀。
   - **Phase 1 首跑（GPU，canary-00，seed=42）**——off：recall **0.38** / pollution **3** / core 8 / tokens 1692，无坍缩；verify：recall **0.00** / pollution 0 / judged 8 但被全 reject。Q4 基线同跑：off recall 0.38 / pollution 2 / tokens 1361；verify recall 0.25 / pollution 1。单跑单材料，**不构成 bar**——作为方向性信号：IQ3 在 off 席不劣于基线、且 IQ3 verify 席崩溃（exactly §1-1 预期：量化加剧形状不稳，flag 后复跑才定）。
   - **CPU 速度参考**（见硬件门 §8）——dev 机 3800X 强制 `num_gpu=0` 测得 9B Q4 ≈3.5 tok/s、IQ3_XS 推算 ~4–5 tok/s，**低于 ≥15 bar**；这证实 dev 机非 16GB 目标画像的真门槛是带宽，最终判读仍待办公机纯 CPU（DDR5 ultrabook 可能反超 ~10-13 tok/s，见 3800X vs LPDDR5x 对照）。
   - 体系链路全绿：main 门禁 `pwsh -File scripts/gate.ps1` 不变（docs-only 无 src 改动）。
   - **待办**：≥3 跑取共识（§2 任务 4 纪律，当前仅 1 跑）；纯 CPU 跑（`OLLAMA_NUM_GPU=0` 重启 ollama 或 llama.cpp `--no-gpu` 通道）再读 KV/峰值内存；还原 Q4 verify 还原度影响（IQ3 verify 塌是否复现/波及基线）。
+
+- **2026-09-13 dev-GPU 三跑共识（#191，4 cells × 3 runs，12/12 完成）**：采用 §8.2 双模型 × off/verify，`seat_seed_policy=per-seat-fixed`；报告为 `2026-09-13T13-38-35Z-4cells-1materials.json`、`13-43-08Z`、`13-46-49Z`。首次无 tag 试跑 `13-32-51Z` 因上述 probe 缺陷只跑 Q4、IQ3 两格 `missing_model`，不计入三跑共识。
+  - Q4 off recall `[0.50, 0.75, 0.25]`（mean `0.500`），pollution `[0, 0, 0]`；collapse recovery 触发 2/3，均 `recovered=True`。Q4 verify recall `[0.75, 0.50, 0.375]`（mean `0.542`），pollution `[0, 1, 0]`；recovery 触发 1/3 并成功。
+  - IQ3 off recall `[0.00, 0.625, 0.00]`（mean `0.208`），pollution `[0, 1, 1]`；IQ3 verify recall `[0.375, 0.25, 0.25]`（mean `0.292`），pollution `[0, 0, 0]`；两臂均无 collapse attempt，故不存在 recovery 成败判定。
+  - **诚实 verdict**：IQ3 三跑共识未达到 §8.3 `canary_recall >= 0.6` 质量 bar，且 off 臂 2/3 为零 recall；不因单次 `0.625` 越线而晋级。Q4 同样高方差，数据仅为 dev 机 GPU 信息面，**不替代**目标办公机纯 CPU / 16GB / KV@16k 硬件门，该门继续 `pending`。
+  - 辅助资源点仅作形状记录：IQ3 冷载后 `ollama ps` 见 `4.4GB / 100% GPU / context 4096`，非 16k、非纯 CPU、非峰值采样，明确不作为 §8.3 bar #5/#6 证据。
