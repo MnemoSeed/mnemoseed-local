@@ -222,14 +222,16 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
         elif name == "dream_once":
             payload = client.post("/memory/dream_once", {"profile_id": client.profile_id})
         elif name == "recent_sessions":
+            resume_query = arguments.get("resume_query")
+            if not isinstance(resume_query, str) or not resume_query.strip():
+                return _error_result("recent_sessions requires a non-empty resume_query")
             recent_body: dict[str, Any] = {"profile_id": client.profile_id}
             if arguments.get("n_sessions") is not None:
                 recent_body["sessions"] = arguments["n_sessions"]
             if arguments.get("n_per_session") is not None:
                 recent_body["per_session"] = arguments["n_per_session"]
-            if arguments.get("resume_query") is not None:
-                recent_body["resume_query"] = arguments["resume_query"]
-            if arguments.get("self_parent_id") is not None:
+            recent_body["resume_query"] = resume_query
+            if "self_parent_id" in arguments:
                 recent_body["self_parent_id"] = arguments["self_parent_id"]
             payload = client.post("/session/recent", recent_body)
         elif name == "session_windows":

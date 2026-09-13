@@ -992,6 +992,21 @@ class MemoryService:
                 resume_query=resume_query,
                 self_parent_id=self_parent_id,
             )
+        # #187 mixed-version compat: a pre-#187 hook sends BOTH automatic-path
+        # identity fields (self_session_id == exclude_session_id == current session)
+        # with no resume_query. That is an automatic path — never silently fall back
+        # to profile-global replay. Fail closed with explicit unresolved metadata;
+        # direct diagnostics that carry at most one identity field keep the legacy
+        # unscoped behavior below.
+        if exclude_session_id is not None and self_session_id is not None:
+            return {
+                "profile_id": profile_id,
+                "sessions": [],
+                "self_window": None,
+                "guidance": _RECENT_SESSIONS_GUIDANCE,
+                "selection": "unresolved",
+                "selection_reason": "automatic-path identity fields without resume_query",
+            }
         limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)

@@ -206,6 +206,52 @@ def test_legacy_path_reports_unscoped_selection(config_path: Path) -> None:
         assert payload["selection"] == "unscoped"
 
 
+def test_single_identity_field_without_query_stays_unscoped(config_path: Path) -> None:
+    """#187: the compatibility discriminator requires BOTH automatic-path identity
+    fields. Existing direct diagnostics send only ONE (either exclude_session_id or
+    self_session_id); a bare single field must keep the legacy unscoped diagnostic
+    behavior."""
+    with TestClient(create_app()) as client:
+        _ingest(client, "root-x", 1.0, "diagnostic tail")
+        _end(client, "root-x")
+
+        for body in [
+            {"profile_id": PROFILE, "exclude_session_id": "sess-cur"},
+            {"profile_id": PROFILE, "self_session_id": "sess-cur"},
+        ]:
+            response = client.post("/session/recent", json=body)
+            assert response.status_code == 200, response.text
+            assert response.json()["selection"] == "unscoped"
+
+
+def test_dual_identity_fields_without_query_fails_closed(config_path: Path) -> None:
+    """#187 mixed-version compat: a pre-#187 OpenCode hook POSTs
+    /session/recent with BOTH automatic-path identity fields
+    (self_session_id == exclude_session_id == current session) and no resume_query,
+    then ignores the selection field and injects returned sessions. That is an
+    automatic path — it must NEVER silently fall back to profile-global replay.
+    Fail closed: explicit unresolved metadata, zero sessions, no cross-project
+    verbatim."""
+    with TestClient(create_app()) as client:
+        _ingest(client, "root-other", 1.0, "other project tail that must NOT replay")
+        _end(client, "root-other")
+
+        body = client.post(
+            "/session/recent",
+            json={
+                "profile_id": PROFILE,
+                "exclude_session_id": "sess-current",
+                "self_session_id": "sess-current",
+            },
+        )
+        assert body.status_code == 200, body.text
+        payload = body.json()
+        assert payload["selection"] == "unresolved"
+        assert payload["sessions"] == []
+        blob = "\n".join(c["text"] for s in payload["sessions"] for c in s["chunks"])
+        assert "must NOT replay" not in blob
+
+
 def test_session_parent_id_column_migrates_and_legacy_rows_stay_null(tmp_path: Path) -> None:
     """Pre-lineage tables gain session_parent_id; legacy rows stay NULL."""
     import sys

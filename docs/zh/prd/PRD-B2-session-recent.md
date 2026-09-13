@@ -43,5 +43,6 @@
 
 - `POST /session/recent` 新增可选 `resume_query`（原始当前用户 prompt，≤500）与 `self_parent_id`（调用方父会话，无即根调用）。
 - 有 `resume_query` 时只返回用户段命中锚点的根会话尾部，附 `selection: matched`；无锚点或无命中时返回 `selection: unresolved` 且零会话；无 `resume_query` 时保留全局回放并附 `selection: unscoped`。
+- **混合版本自动路径例外（2026-09-13，issue #187 兼容修正）：** 无 `resume_query` 但**同时**携带两个自动路径身份字段（`self_session_id` 与 `exclude_session_id`，均为旧版 hook 的当前会话）时，判定为自动路径而非直接诊断——**绝不静默回退全局回放**，返回 `selection: unresolved` 且零会话（fail-closed）。只携带至多一个身份字段仍保留 `unscoped` 诊断行为（既有直接诊断用例）。
 - MCP `recent_sessions` 要求 `resume_query`；T1 仅在 `selection == matched` 时注入，否则跳过。
 - 通用 `recall` 仍跨项目；`session_windows` 不在本片内。
