@@ -429,56 +429,28 @@ def test_vote_b_verifier_collision_rejected(tmp_path: Path) -> None:
     assert any("verifier" in s.reason for s in report.skipped)
 
 
-def test_overlay_duplicate_keys_kept_deterministic(tmp_path: Path) -> None:
-    """I4: the reflect-result overlay keys on the canonical SPOP tuple.
-    Combiner folding guarantees uniqueness upstream, but IF a duplicate key
-    ever appears the overlay must not crash or misattribute silently for the
-    common case — and this test pins the collision behavior explicitly so a
-    combiner change that introduces duplicates surfaces here, not in prod."""
-    from mnemoseed_local.eval.metrics import CostMetrics, VerifyMetrics
-    from mnemoseed_local.eval.report import CellReport, EvalReport, ReportedTriple, load_report, write_report
+def test_overlay_duplicate_keys_kept_deterministic() -> None:
+    """I4: drives the REAL overlay seam (_vote_overlay) with two triples
+    sharing one canonical SPOP key but different model_id/vote flags — the
+    combiner guarantees upstream uniqueness, but IF a combiner change ever
+    introduces duplicate keys, the overlay must resolve deterministically
+    (last wins) instead of crashing or misattributing arbitrarily. This
+    test pins that collision behavior where a regression will surface."""
+    from mnemoseed_local.eval.matrix import _vote_overlay
 
-    # construct a raw report whose read-back overlay would collide: same
-    # SPOP from two seats with different model_id — verify the REPORT layer
-    # (round-trip) keeps whatever the overlay chose, deterministically.
-    def build(model_id: str) -> ReportedTriple:
-        return ReportedTriple(
-            graph="main",
-            node_id="n1",
-            subject="user",
-            predicate="prefers",
-            object="dark mode",
-            polarity="positive",
-            confidence=0.8,
-            model_id=model_id,
-            vote_disagreement=False,
-        )
-
-    report = EvalReport(
-        eval_version="v1.2",
-        started_at="2026-09-13T00:00:00Z",
-        cells=(
-            CellReport(
-                cell_id="c",
-                material="canary-00",
-                canary=None,
-                verify=VerifyMetrics(
-                    verifier_model=None, judged=0, accepted=0, rejected=0, rejected_keys=(), fallbacks={}
-                ),
-                cost=CostMetrics(
-                    duration_s=1.0,
-                    token_usage=10,
-                    reflect_prompt_tokens=None,
-                    reflect_completion_tokens=None,
-                    verify_tokens=None,
-                ),
-                triples=(build("stub-a"),),
-            ),
-        ),
-    )
-    path = write_report(report, tmp_path, matrix_slug="dup")
-    loaded = load_report(path)
-    assert loaded == report
+    first = _triple("user", "prefers", "dark mode", model_id="stub-a", disagreement=False)
+    second = _triple("user", "prefers", "dark mode", model_id="stub-b", disagreement=True)
+    result = _result((first, second))
+    overlay = _vote_overlay(result)
+    assert len(overlay) == 1
+    key = ("user", "prefers", "dark mode", "positive")
+    # deterministic resolution: the LAST entry for a duplicate key wins
+    assert overlay[key] == ("stub-b", True)
+    # a distinct SPOP key never collides
+    third = _triple("user", "prefers", "light mode", model_id="stub-a")
+    overlay = _vote_overlay(_result((first, third)))
+    assert len(overlay) == 2
+    assert overlay[("user", "prefers", "light mode", "positive")] == ("stub-a", False)
 
 
 def test_old_v10_report_without_triples_loads(tmp_path: Path) -> None:
@@ -518,3 +490,79 @@ def test_old_v10_report_without_triples_loads(tmp_path: Path) -> None:
     loaded = load_report(path)
     assert loaded.cells[0].triples == ()
     assert loaded.cells[0].vote is None
+
+
+def test_vote_b_cannot_equal_effective_verifier_reflect_fallback(tmp_path: Path) -> None:
+    """I1 residual: with verifier=None the effective verifier falls back to
+    the reflect seat — vote_b equal to REFLECT must be rejected too, not
+    just an explicit verifier collision."""
+    from mnemoseed_local.eval.canary import canary_session
+
+    collision = EvalCell(reflect=STUB_A, ensemble="vote", verifier=None, vote_b=STUB_A)
+    with pytest.raises(ValueError, match="(?i)verifier"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), collision)
+        try:
+            rig.run_canary(canary_session(74, facts=2, noise=1))
+        finally:
+            rig.close()
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([collision], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_vote_b_guard_records_b_seat_collapses(tmp_path: Path) -> None:
+    """I3: seat B rides its own collapse guard (a single shared instance,
+    not a per-run resolver that would hide its counters). A B-side verbatim
+    [] with tiny provider completion (the collapse fingerprint) must engage
+    the retry ring and be COUNTED — not flow into combine as an ok-empty
+    seat. A-side collapse stays counted by its own guard, symmetric."""
+    from mnemoseed_local.eval.canary import canary_session
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+    from mnemoseed_local.llm.types import ChatResult, Usage
+
+    seen = {"a": 0, "b": 0}
+    original = StubLLM.chat
+
+    def collapsing(self, *, system: str, user: str):  # type: ignore[no-untyped-def]
+        model = str(getattr(self, "model", "") or "")
+        key = "a" if model == "stub-a" else "b"
+        seen[key] += 1
+        if key == "a" and seen["a"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        if key == "b" and seen["b"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        return original(self, system=system, user=user)
+
+    StubLLM.chat = collapsing  # type: ignore[method-assign]
+    try:
+        rig = EvalRig(
+            RigPaths(root=tmp_path / "rig"),
+            EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
+        )
+        try:
+            run = rig.run_canary(canary_session(75, facts=3, noise=1))
+            guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
+            guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
+        finally:
+            rig.close()
+    finally:
+        StubLLM.chat = original  # type: ignore[method-assign]
+    assert guard_b is not None, "vote seat B must carry its own collapse guard"
+    assert guard_b.run_collapse_attempts == 1, "B-side [] collapse must be counted by the B guard"
+    assert guard_b.run_recovered is True, "B-side retry recovery must be recorded"
+    assert guard_a.run_collapse_attempts == 1, "A-side collapse stays counted by its own guard"
+    assert run.reflect_result is not None
+    assert run.reflect_result.triples, "recovered B seat still contributes combined evidence"
+
+
+def test_vote_metrics_error_yields_typed_skip_row(tmp_path: Path) -> None:
+    """M2: a hostile seat id (pipe-delimited model name reaching the matrix
+    past probing) must surface as a vote_metrics_error skipped row, never
+    as a traceback out of run_matrix."""
+    hostile = EvalRoute(driver="stub", model="bad|pipe")
+    cells = [EvalCell(reflect=STUB_A, ensemble="vote", vote_b=hostile)]
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix(cells, materials, root=tmp_path)
+    assert report.cells == ()
+    assert any("vote_metrics_error" in s.reason for s in report.skipped)

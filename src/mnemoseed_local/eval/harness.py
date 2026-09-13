@@ -354,14 +354,23 @@ class _RecordingMerger(Merger):
 class _RecordingReflector(ReflectOrchestrator):
     """Reflector that keeps its last typed outcome (cost telemetry) plus the
     collapse-guard counters for the current run (B4a report surface). Vote
-    runs retain the final combined outcome so the report reads one truth."""
+    runs retain the final combined outcome so the report reads one truth.
+    In vote mode, seat B has its own independent guard whose counters reset
+    and record per run, symmetric with seat A."""
 
-    def __init__(self, *, collapse_guard: _CollapseGuard | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        collapse_guard: _CollapseGuard | None = None,
+        vote_b_guard: _CollapseGuard | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.last_outcome: ReflectOutcome | None = None
         self.last_collapse_attempts: int = 0
         self.last_reflect_recovered: bool = False
         self._collapse_guard = collapse_guard
+        self._vote_b_guard = vote_b_guard
 
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
         if self._collapse_guard is not None:
@@ -382,7 +391,12 @@ class _RecordingReflector(ReflectOrchestrator):
         return self.last_outcome
 
     def reflect_vote_b(self, snapshot: Snapshot) -> ReflectOutcome:
+        if self._vote_b_guard is not None:
+            self._vote_b_guard.reset_run()
         self.last_outcome = super().reflect_vote_b(snapshot)
+        if self._vote_b_guard is not None:
+            self.last_collapse_attempts = self._vote_b_guard.run_collapse_attempts
+            self.last_reflect_recovered = self._vote_b_guard.run_recovered
         return self.last_outcome
 
     def combine(self, snapshot: Snapshot) -> ReflectOutcome:
@@ -433,17 +447,19 @@ class EvalRig:
         self.profile_id = profile_id
         if cell.ensemble == "vote" and cell.vote_b is None:
             raise ValueError("ensemble 'vote' requires an explicit vote_b route (never the verifier)")
-        if (
-            cell.ensemble == "vote"
-            and cell.verifier is not None
-            and cell.vote_b is not None
-            and cell.vote_b.driver == cell.verifier.driver
-            and cell.vote_b.model == cell.verifier.model
-        ):
-            raise ValueError(
-                "vote_b must be a distinct route from the verifier "
-                "(a judging seat reused as a generator corrupts vote semantics)"
-            )
+        if cell.ensemble == "vote" and cell.vote_b is not None:
+            # compare against the EFFECTIVE verifier route (verifier falls
+            # back to the reflect seat when None): the judging seat must
+            # never silently run as the vote-B generator.
+            effective_verifier = cell.verifier or cell.reflect
+            if (
+                cell.vote_b.driver == effective_verifier.driver
+                and cell.vote_b.model == effective_verifier.model
+            ):
+                raise ValueError(
+                    "vote_b must be a distinct route from the verifier "
+                    "(a judging seat reused as a generator corrupts vote semantics)"
+                )
         # fail-loud freshness (shared contract): prior state under root is
         # contamination evidence, never wiped — matrix scopes each cell's rig
         # under its own per-run directory instead.
@@ -521,13 +537,25 @@ class EvalRig:
             router.resolve("dream"), recovery_factory=_reflect_recovery_factory(cell.reflect)
         )
         reflector_kwargs: dict[str, Any] = {}
+        vote_b_guard: _CollapseGuard | None = None
         if cell.vote_b is not None:
             # Vote seat B is a distinct generator on its own dream_vote route,
-            # never the verifier judging seat reused as a generator.
-            reflector_kwargs["vote_llm"] = router.resolve("dream_vote")
+            # never the verifier judging seat reused as a generator. It carries
+            # its OWN collapse guard (independent retry/recovery, symmetric
+            # with seat A) so a B-side [] collapse retries loudly instead of
+            # silently degrading vote to effective single-seat-A evidence.
+            # The rig's routes are pinned for its lifetime, so the guard is a
+            # single shared instance wired as vote_llm — NOT the daemon's
+            # resolve_vote_llm hot-apply seam (a fresh guard per run would
+            # hide its counters from the report surface).
+            vote_b_guard = _CollapseGuard(
+                router.resolve("dream_vote"), recovery_factory=_reflect_recovery_factory(cell.vote_b)
+            )
+            reflector_kwargs["vote_llm"] = vote_b_guard
         reflector = _RecordingReflector(
             llm=collapse_guard,
             collapse_guard=collapse_guard,
+            vote_b_guard=vote_b_guard,
             # B4a: cap the reflect retry lane at 3 total attempts (default 3
             # retries = 4 attempts is wasteful against a deterministic collapse).
             max_retries=2,

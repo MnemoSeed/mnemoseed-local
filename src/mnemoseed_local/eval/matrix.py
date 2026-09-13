@@ -206,17 +206,31 @@ def probe_ollama_models(
     }
 
 
+def _vote_overlay(
+    reflect_result: object,
+) -> dict[tuple[str, str, str, str], tuple[str | None, bool]]:
+    """Map the combined ReflectionResult's triples onto the canonical exact
+    SPOP key. If a duplicate key ever appears (combiner folding guarantees
+    uniqueness upstream), the LAST entry wins deterministically — pinned by
+    test_overlay_duplicate_keys_kept_deterministic so a combiner change that
+    introduces duplicates surfaces there, not in production reports."""
+    overlay: dict[tuple[str, str, str, str], tuple[str | None, bool]] = {}
+    for triple in getattr(reflect_result, "triples", ()):  # ReflectionResult.triples
+        overlay[(triple.subject, triple.predicate, triple.object, triple.polarity)] = (
+            triple.model_id,
+            triple.vote_disagreement,
+        )
+    return overlay
+
+
 def _cell_missing_reason(cell: EvalCell, probe: dict[str, str | None]) -> str | None:
     if cell.ensemble == "vote" and cell.vote_b is None:
         return "vote_b_missing: ensemble vote requires an explicit vote_b route (never the verifier)"
-    if (
-        cell.ensemble == "vote"
-        and cell.verifier is not None
-        and cell.vote_b is not None
-        and cell.vote_b.driver == cell.verifier.driver
-        and cell.vote_b.model == cell.verifier.model
-    ):
-        return "vote_b_verifier_collision: vote_b must differ from the verifier route"
+    if cell.ensemble == "vote" and cell.vote_b is not None:
+        # the EFFECTIVE verifier falls back to the reflect seat when None
+        effective_verifier = cell.verifier or cell.reflect
+        if cell.vote_b.driver == effective_verifier.driver and cell.vote_b.model == effective_verifier.model:
+            return "vote_b_verifier_collision: vote_b must differ from the verifier route"
     for route in (cell.reflect, cell.verifier, cell.vote_b):
         if route is None:
             continue
@@ -423,20 +437,20 @@ def run_matrix(
                 except Exception as exc:  # noqa: BLE001 - typed report row, never a traceback out
                     skipped.append(SkippedCell(cell_id=cell.cell_id, reason=f"run_error: {exc}"))
                     continue
-                overlay: dict[tuple[str, str, str, str], tuple[str | None, bool]] = {}
-                if run.reflect_result is not None:
-                    for triple in run.reflect_result.triples:
-                        overlay[(triple.subject, triple.predicate, triple.object, triple.polarity)] = (
-                            triple.model_id,
-                            triple.vote_disagreement,
-                        )
+                overlay = _vote_overlay(run.reflect_result) if run.reflect_result is not None else {}
                 vote = None
                 if cell.ensemble == "vote" and cell.vote_b is not None and run.reflect_result is not None:
-                    vote = vote_metrics(
-                        run.reflect_result,
-                        model_a=cell.reflect.model,
-                        model_b=cell.vote_b.model,
-                    )
+                    try:
+                        vote = vote_metrics(
+                            run.reflect_result,
+                            model_a=cell.reflect.model,
+                            model_b=cell.vote_b.model,
+                        )
+                    except ValueError as exc:
+                        # hostile seat ids (empty / pipe-delimited): a typed
+                        # skipped row, never a traceback out of run_matrix
+                        skipped.append(SkippedCell(cell_id=cell.cell_id, reason=f"vote_metrics_error: {exc}"))
+                        continue
                 cell_reports.append(
                     CellReport(
                         cell_id=cell.cell_id,
