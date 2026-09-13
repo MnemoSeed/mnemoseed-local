@@ -80,7 +80,9 @@ class VoteMetrics:
     CORE/ISOLATED with exact both-seat token equality; disagreement parties
     surviving vote_disagreement; disagreement groups as unique casefolded
     (subject, predicate) among the parties; single-side survivors that are
-    neither; dropped polarity conflicts as len(result.conflicts)."""
+    neither (note: SALVAGE-route triples count here too — they survive the
+    combiner but do not reach the report's core/isolated node payload);
+    dropped polarity conflicts as len(result.conflicts)."""
 
     model_a: str
     model_b: str

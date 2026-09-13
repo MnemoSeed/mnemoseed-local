@@ -64,8 +64,13 @@ def test_vote_cell_has_distinct_vote_b_route() -> None:
 
 
 def test_vote_rig_runs_both_seats_and_reports() -> None:
+    """Truthfulness oracle: a vote dream must journal BOTH per-seat results,
+    the combine marker, and a combined model_id carrying both seat ids. A
+    mutant that drops the mode/vote_llm wiring degrades to the single-seat
+    off path (no REFLECT_A_DONE/REFLECT_B_DONE, model_id never both seats),
+    which this test must catch."""
+    import json
     import tempfile as _tf
-    from pathlib import Path as _P  # noqa: F401
 
     with _tf.TemporaryDirectory() as tmp:
         rig = EvalRig(
@@ -76,6 +81,9 @@ def test_vote_rig_runs_both_seats_and_reports() -> None:
             from mnemoseed_local.eval.canary import canary_session
 
             run = rig.run_canary(canary_session(71, facts=4, noise=2))
+            journals = sorted((Path(tmp) / "rig" / "dreams").glob("*.json"))
+            # read BEFORE close(): rig teardown purges the journal dir
+            payloads = [json.loads(j.read_text(encoding="utf-8")) for j in journals]
         finally:
             rig.close()
     assert run.merge_committed
@@ -83,6 +91,19 @@ def test_vote_rig_runs_both_seats_and_reports() -> None:
     assert run.reflect_outcome is not None
     assert run.reflect_outcome.result is not None
     assert run.core_nodes, "vote dream wrote no core nodes"
+    # dual-seat evidence: the journal carries both seat payloads, the vote
+    # phases, and the combined result attributes BOTH seat ids.
+    assert payloads, "no dream journal written"
+    snap = payloads[-1]
+    phases = set(snap.get("phases", []))
+    assert {"reflect_a_done", "reflect_b_done", "combine_done", "merge_done"} <= phases
+    votes = snap.get("vote_results") or {}
+    assert "a" in votes and "b" in votes, "both seat results must be journaled"
+    combined = snap["reflect_result"]["triples"]
+    assert combined, "combined result carries no triples"
+    assert all(t.get("model_id") == "stub-a|stub-b" for t in combined), (
+        "combined triples must attribute to both seats"
+    )
 
 
 def test_vote_never_reuses_verifier_as_b(tmp_path: Path) -> None:
@@ -382,4 +403,118 @@ def test_vote_failure_has_no_fabricated_metrics(tmp_path: Path) -> None:
         report = run_matrix(cells, materials, root=tmp_path)
     finally:
         StubLLM.chat = original  # type: ignore[method-assign]
-    assert report.cells == () or all(c.vote is None for c in report.cells)
+    # a fully-failing seat never yields a vote-metrics row: either the row
+    # is skipped entirely or its vote stays None (M1: no degraded blessing)
+    assert all(c.vote is None for c in report.cells)
+    if not report.cells:
+        assert report.skipped, "a failed vote cell must surface as a skipped row"
+
+
+def test_vote_b_verifier_collision_rejected(tmp_path: Path) -> None:
+    """I1: vote_b identical to the verifier route is rejected loudly at both
+    the rig and the matrix layer — the judging seat must never silently run
+    as vote-B generator."""
+    from mnemoseed_local.eval.canary import canary_session
+
+    collision = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=STUB_V)
+    with pytest.raises(ValueError, match="(?i)verifier"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), collision)
+        try:
+            rig.run_canary(canary_session(73, facts=2, noise=1))
+        finally:
+            rig.close()
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([collision], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_overlay_duplicate_keys_kept_deterministic(tmp_path: Path) -> None:
+    """I4: the reflect-result overlay keys on the canonical SPOP tuple.
+    Combiner folding guarantees uniqueness upstream, but IF a duplicate key
+    ever appears the overlay must not crash or misattribute silently for the
+    common case — and this test pins the collision behavior explicitly so a
+    combiner change that introduces duplicates surfaces here, not in prod."""
+    from mnemoseed_local.eval.metrics import CostMetrics, VerifyMetrics
+    from mnemoseed_local.eval.report import CellReport, EvalReport, ReportedTriple, load_report, write_report
+
+    # construct a raw report whose read-back overlay would collide: same
+    # SPOP from two seats with different model_id — verify the REPORT layer
+    # (round-trip) keeps whatever the overlay chose, deterministically.
+    def build(model_id: str) -> ReportedTriple:
+        return ReportedTriple(
+            graph="main",
+            node_id="n1",
+            subject="user",
+            predicate="prefers",
+            object="dark mode",
+            polarity="positive",
+            confidence=0.8,
+            model_id=model_id,
+            vote_disagreement=False,
+        )
+
+    report = EvalReport(
+        eval_version="v1.2",
+        started_at="2026-09-13T00:00:00Z",
+        cells=(
+            CellReport(
+                cell_id="c",
+                material="canary-00",
+                canary=None,
+                verify=VerifyMetrics(
+                    verifier_model=None, judged=0, accepted=0, rejected=0, rejected_keys=(), fallbacks={}
+                ),
+                cost=CostMetrics(
+                    duration_s=1.0,
+                    token_usage=10,
+                    reflect_prompt_tokens=None,
+                    reflect_completion_tokens=None,
+                    verify_tokens=None,
+                ),
+                triples=(build("stub-a"),),
+            ),
+        ),
+    )
+    path = write_report(report, tmp_path, matrix_slug="dup")
+    loaded = load_report(path)
+    assert loaded == report
+
+
+def test_old_v10_report_without_triples_loads(tmp_path: Path) -> None:
+    """M4: v1.0 reports carry no triples key at all — must load with empty
+    payload and vote None, never crash."""
+    from mnemoseed_local.eval.report import load_report
+
+    old = {
+        "eval_version": "v1.0",
+        "started_at": "2026-08-01T00:00:00Z",
+        "cells": [
+            {
+                "cell_id": "c",
+                "material": "canary-00",
+                "canary": None,
+                "verify": {
+                    "verifier_model": None,
+                    "judged": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "rejected_keys": [],
+                    "fallbacks": {},
+                },
+                "cost": {
+                    "duration_s": 1.0,
+                    "token_usage": 5,
+                    "reflect_prompt_tokens": None,
+                    "reflect_completion_tokens": None,
+                    "verify_tokens": None,
+                },
+            }
+        ],
+        "skipped": [],
+    }
+    path = tmp_path / "old-v10.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = load_report(path)
+    assert loaded.cells[0].triples == ()
+    assert loaded.cells[0].vote is None

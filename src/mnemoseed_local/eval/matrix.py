@@ -209,6 +209,14 @@ def probe_ollama_models(
 def _cell_missing_reason(cell: EvalCell, probe: dict[str, str | None]) -> str | None:
     if cell.ensemble == "vote" and cell.vote_b is None:
         return "vote_b_missing: ensemble vote requires an explicit vote_b route (never the verifier)"
+    if (
+        cell.ensemble == "vote"
+        and cell.verifier is not None
+        and cell.vote_b is not None
+        and cell.vote_b.driver == cell.verifier.driver
+        and cell.vote_b.model == cell.verifier.model
+    ):
+        return "vote_b_verifier_collision: vote_b must differ from the verifier route"
     for route in (cell.reflect, cell.verifier, cell.vote_b):
         if route is None:
             continue

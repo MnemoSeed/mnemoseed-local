@@ -433,6 +433,17 @@ class EvalRig:
         self.profile_id = profile_id
         if cell.ensemble == "vote" and cell.vote_b is None:
             raise ValueError("ensemble 'vote' requires an explicit vote_b route (never the verifier)")
+        if (
+            cell.ensemble == "vote"
+            and cell.verifier is not None
+            and cell.vote_b is not None
+            and cell.vote_b.driver == cell.verifier.driver
+            and cell.vote_b.model == cell.verifier.model
+        ):
+            raise ValueError(
+                "vote_b must be a distinct route from the verifier "
+                "(a judging seat reused as a generator corrupts vote semantics)"
+            )
         # fail-loud freshness (shared contract): prior state under root is
         # contamination evidence, never wiped — matrix scopes each cell's rig
         # under its own per-run directory instead.
