@@ -566,3 +566,67 @@ def test_vote_metrics_error_yields_typed_skip_row(tmp_path: Path) -> None:
     report = run_matrix(cells, materials, root=tmp_path)
     assert report.cells == ()
     assert any("vote_metrics_error" in s.reason for s in report.skipped)
+
+
+def test_vote_b_cannot_equal_reflect_seat(tmp_path: Path) -> None:
+    """R2: vote_b == reflect is degenerate vote evidence (one model voting
+    twice is not consensus) — rejected unconditionally even when an explicit
+    distinct verifier exists."""
+    from mnemoseed_local.eval.canary import canary_session
+
+    degenerate = EvalCell(reflect=STUB_A, ensemble="vote", verifier=STUB_V, vote_b=STUB_A)
+    with pytest.raises(ValueError, match="(?i)verifier|reflect"):
+        rig = EvalRig(RigPaths(root=tmp_path / "rig"), degenerate)
+        try:
+            rig.run_canary(canary_session(82, facts=2, noise=1))
+        finally:
+            rig.close()
+    materials = material_catalog(None, canary_seed=1, canary_count=1)
+    report = run_matrix([degenerate], materials, root=tmp_path / "mx")
+    assert report.cells == ()
+    assert any("verifier" in s.reason for s in report.skipped)
+
+
+def test_vote_half_degraded_seat_reads_unrecovered(tmp_path: Path) -> None:
+    """R1: if seat A collapses and recovers while seat B stays clean, the
+    run's collapse surface must show BOTH seats' evidence (max attempts,
+    recovered=True only when every attempting guard recovered). A fully
+    failing B seat (attempts>0, never recovered) must read unrecovered so
+    score_canary nulls recall instead of blessing half-degraded evidence."""
+    from mnemoseed_local.eval.canary import canary_session
+    from mnemoseed_local.llm.drivers.stub import StubLLM
+    from mnemoseed_local.llm.types import ChatResult, Usage
+
+    seen = {"a": 0, "b": 0}
+    original = StubLLM.chat
+
+    def collapsing(self, *, system: str, user: str):  # type: ignore[no-untyped-def]
+        model = str(getattr(self, "model", "") or "")
+        key = "a" if model == "stub-a" else "b"
+        seen[key] += 1
+        if key == "a" and seen["a"] == 1:
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        if key == "b":
+            # seat B never produces a well-formed extraction
+            return ChatResult(text="[]", usage=Usage(completion_tokens=1), model=model, driver="stub")
+        return original(self, system=system, user=user)
+
+    StubLLM.chat = collapsing  # type: ignore[method-assign]
+    try:
+        rig = EvalRig(
+            RigPaths(root=tmp_path / "rig"),
+            EvalCell(reflect=STUB_A, ensemble="vote", vote_b=STUB_B_GEN),
+        )
+        try:
+            run = rig.run_canary(canary_session(83, facts=3, noise=1))
+        finally:
+            rig.close()
+    finally:
+        StubLLM.chat = original  # type: ignore[method-assign]
+    guard_a = rig._reflector._collapse_guard  # noqa: SLF001 - test seam
+    guard_b = rig._reflector._vote_b_guard  # noqa: SLF001 - test seam
+    assert guard_b is not None and guard_a.run_collapse_attempts > 0
+    assert guard_b.run_collapse_attempts > 0 and guard_b.run_recovered is False
+    # the reported surface aggregates: B exhausted unrecovered -> unrecovered
+    assert rig._reflector.last_reflect_recovered is False
+    assert run.merge_committed is False or run.reflect_result is None

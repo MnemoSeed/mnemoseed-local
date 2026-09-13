@@ -227,10 +227,18 @@ def _cell_missing_reason(cell: EvalCell, probe: dict[str, str | None]) -> str | 
     if cell.ensemble == "vote" and cell.vote_b is None:
         return "vote_b_missing: ensemble vote requires an explicit vote_b route (never the verifier)"
     if cell.ensemble == "vote" and cell.vote_b is not None:
-        # the EFFECTIVE verifier falls back to the reflect seat when None
+        # the EFFECTIVE verifier falls back to the reflect seat when None;
+        # B == A is degenerate vote evidence (one model voting twice is not
+        # consensus) — both rejected unconditionally
         effective_verifier = cell.verifier or cell.reflect
-        if cell.vote_b.driver == effective_verifier.driver and cell.vote_b.model == effective_verifier.model:
-            return "vote_b_verifier_collision: vote_b must differ from the verifier route"
+        same_as_verifier = (
+            cell.vote_b.driver == effective_verifier.driver and cell.vote_b.model == effective_verifier.model
+        )
+        same_as_reflect = (
+            cell.vote_b.driver == cell.reflect.driver and cell.vote_b.model == cell.reflect.model
+        )
+        if same_as_verifier or same_as_reflect:
+            return "vote_b_verifier_collision: vote_b must differ from the verifier and reflect routes"
     for route in (cell.reflect, cell.verifier, cell.vote_b):
         if route is None:
             continue

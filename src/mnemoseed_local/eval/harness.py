@@ -375,6 +375,8 @@ class _RecordingReflector(ReflectOrchestrator):
     def reflect(self, snapshot: Snapshot) -> ReflectOutcome:
         if self._collapse_guard is not None:
             self._collapse_guard.reset_run()
+        if self._vote_b_guard is not None:
+            self._vote_b_guard.reset_run()
         self.last_outcome = super().reflect(snapshot)
         if self._collapse_guard is not None:
             self.last_collapse_attempts = self._collapse_guard.run_collapse_attempts
@@ -385,23 +387,32 @@ class _RecordingReflector(ReflectOrchestrator):
         if self._collapse_guard is not None:
             self._collapse_guard.reset_run()
         self.last_outcome = super().reflect_vote_a(snapshot)
-        if self._collapse_guard is not None:
-            self.last_collapse_attempts = self._collapse_guard.run_collapse_attempts
-            self.last_reflect_recovered = self._collapse_guard.run_recovered
+        self._record_vote_guards()
         return self.last_outcome
 
     def reflect_vote_b(self, snapshot: Snapshot) -> ReflectOutcome:
         if self._vote_b_guard is not None:
             self._vote_b_guard.reset_run()
         self.last_outcome = super().reflect_vote_b(snapshot)
-        if self._vote_b_guard is not None:
-            self.last_collapse_attempts = self._vote_b_guard.run_collapse_attempts
-            self.last_reflect_recovered = self._vote_b_guard.run_recovered
+        self._record_vote_guards()
         return self.last_outcome
 
     def combine(self, snapshot: Snapshot) -> ReflectOutcome:
         self.last_outcome = super().combine(snapshot)
+        self._record_vote_guards()
         return self.last_outcome
+
+    def _record_vote_guards(self) -> None:
+        """Collapse surface for vote runs: BOTH seats contribute — the
+        reported attempts are the max across guards, and recovered is True
+        only when every guard that attempted a collapse recovered (a
+        half-degraded vote run must read as unrecovered, never as clean)."""
+        guards = tuple(g for g in (self._collapse_guard, self._vote_b_guard) if g is not None)
+        if not guards:
+            return
+        self.last_collapse_attempts = max(g.run_collapse_attempts for g in guards)
+        attempted = [g for g in guards if g.run_collapse_attempts > 0]
+        self.last_reflect_recovered = all(g.run_recovered for g in attempted) if attempted else False
 
 
 # ---------------------------------------------------------------- the rig
@@ -450,15 +461,22 @@ class EvalRig:
         if cell.ensemble == "vote" and cell.vote_b is not None:
             # compare against the EFFECTIVE verifier route (verifier falls
             # back to the reflect seat when None): the judging seat must
-            # never silently run as the vote-B generator.
+            # never silently run as the vote-B generator, and B == A is
+            # degenerate vote evidence (one model voting twice is not
+            # consensus) — rejected unconditionally.
             effective_verifier = cell.verifier or cell.reflect
-            if (
+            same_as_verifier = (
                 cell.vote_b.driver == effective_verifier.driver
                 and cell.vote_b.model == effective_verifier.model
-            ):
+            )
+            same_as_reflect = (
+                cell.vote_b.driver == cell.reflect.driver and cell.vote_b.model == cell.reflect.model
+            )
+            if same_as_verifier or same_as_reflect:
                 raise ValueError(
-                    "vote_b must be a distinct route from the verifier "
-                    "(a judging seat reused as a generator corrupts vote semantics)"
+                    "vote_b must be a distinct route from both the verifier and the reflect seat "
+                    "(a judging seat reused as a generator, or one model voting twice, "
+                    "corrupts vote semantics)"
                 )
         # fail-loud freshness (shared contract): prior state under root is
         # contamination evidence, never wiped — matrix scopes each cell's rig
