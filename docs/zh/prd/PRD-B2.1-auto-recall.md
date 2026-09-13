@@ -246,3 +246,7 @@ TDD（先红后绿）→ 对抗 QA 自验 → 全量门禁（`uv run pytest -q` 
 
 **修订（2026-08-23，默认值翻转）**：上文"`capture.auto_recall` 默认 off 不变（翻转仍待 live 遥测）"已被同日决策取代——出厂默认已翻转 **ON**（依据 = 阈值 0.5/2400 全量确认 + 用户拍板核心功能默认开启；本机同日手动启用）；原文保留作历史记录，不删。
 
+### T0 探针收线（2026-09-13，#189）
+
+T0 临时探针（`mnemoseed-probe.ts`，2026-08-19 安装）使命全部完成：注入面定案（T0）与基线修正 ③ 的绑定形取证均已落档，assistant 轮捕获经 QA-1+2 重构后由生产链路 + T2/T3 遥测覆盖。探针按其文件头自声明的"remove after T0"退役：本机 `~/.config/opencode/plugin/mnemoseed-probe.ts` 移除；`probe-t0.jsonl`（154,696 行 / 86MB / 1,072 sessions，其中无上限的 `assistant.completed.probe` 扩线占 74%）一次性行数确认后截断归档，生产代码零改动（写入方是探针插件而非 mnemoseed-local 本体，故不走 PR 管线，本记录即闭档）。观测结论保留在本 PRD，不再需要 live 持续采集。
+
