@@ -136,11 +136,12 @@ def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     assert remember["inputSchema"]["required"] == ["text"]
     supersede = next(tool for tool in tools if tool["name"] == "supersede")
     assert supersede["inputSchema"]["required"] == ["superseded_node_id", "successor_node_id"]
-    # B2: the time-ordered resume surface takes no required arguments
+    # #187: scoped resume requires the raw current prompt for anchor matching
     recent = next(tool for tool in tools if tool["name"] == "recent_sessions")
-    assert "required" not in recent["inputSchema"]
+    assert recent["inputSchema"]["required"] == ["resume_query"]
     assert recent["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
     assert recent["inputSchema"]["properties"]["n_per_session"]["type"] == "integer"
+    assert recent["inputSchema"]["properties"]["resume_query"]["type"] == "string"
     # the session time-window surface takes no required arguments
     windows = next(tool for tool in tools if tool["name"] == "session_windows")
     assert "required" not in windows["inputSchema"]
@@ -240,8 +241,9 @@ def test_call_dream_once_without_arguments_key() -> None:
 
 
 def test_call_recent_sessions_maps_arguments_to_the_daemon_endpoint() -> None:
-    """B2: recent_sessions proxies to POST /session/recent with the wire key
-    names (n_sessions -> sessions, n_per_session -> per_session)."""
+    """B2/#187: recent_sessions proxies to POST /session/recent with the wire key
+    names (n_sessions -> sessions, n_per_session -> per_session) and a valid
+    resume_query, preserving the optional self_parent_id."""
     payload = {"profile_id": "default", "sessions": [{"session_id": "s1", "latest_at": 2.0, "chunks": []}]}
     client = StubClient(payload=payload)
     _, responses = run_gateway(
@@ -249,24 +251,98 @@ def test_call_recent_sessions_maps_arguments_to_the_daemon_endpoint() -> None:
             _request(
                 8,
                 "tools/call",
-                {"name": "recent_sessions", "arguments": {"n_sessions": 3, "n_per_session": 5}},
+                {
+                    "name": "recent_sessions",
+                    "arguments": {
+                        "n_sessions": 3,
+                        "n_per_session": 5,
+                        "resume_query": "continue mnemoseed-local development",
+                        "self_parent_id": None,
+                    },
+                },
             )
         ],
         client,
     )
     assert responses[0]["result"]["isError"] is False
     assert json.loads(responses[0]["result"]["content"][0]["text"]) == payload
-    assert client.calls == [("/session/recent", {"profile_id": "default", "sessions": 3, "per_session": 5})]
+    assert client.calls == [
+        (
+            "/session/recent",
+            {
+                "profile_id": "default",
+                "sessions": 3,
+                "per_session": 5,
+                "resume_query": "continue mnemoseed-local development",
+                "self_parent_id": None,
+            },
+        )
+    ]
 
 
-def test_call_recent_sessions_without_arguments_sends_profile_only() -> None:
+def test_call_recent_sessions_missing_resume_query_is_rejected() -> None:
+    """#187: no runtime unscoped fallback — a recent_sessions call without a
+    resume_query must be rejected rather than POSTing /session/recent."""
     client = StubClient(payload={"profile_id": "default", "sessions": []})
     _, responses = run_gateway(
         [_request(8, "tools/call", {"name": "recent_sessions"})],
         client,
     )
-    assert responses[0]["result"]["isError"] is False
-    assert client.calls == [("/session/recent", {"profile_id": "default"})]
+    assert responses[0]["result"]["isError"] is True
+    assert client.calls == []
+    assert responses[0]["result"]["content"][0]["text"]
+
+
+def test_call_recent_sessions_null_resume_query_is_rejected() -> None:
+    """#187: an explicit null resume_query is still absent and must be rejected."""
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [
+            _request(
+                8,
+                "tools/call",
+                {"name": "recent_sessions", "arguments": {"resume_query": None}},
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is True
+    assert client.calls == []
+
+
+def test_call_recent_sessions_empty_resume_query_is_rejected() -> None:
+    """#187: a blank resume_query cannot anchor a scoped match and must be rejected."""
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [
+            _request(
+                8,
+                "tools/call",
+                {"name": "recent_sessions", "arguments": {"resume_query": "   "}},
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is True
+    assert client.calls == []
+
+
+def test_call_recent_sessions_non_string_resume_query_is_rejected() -> None:
+    """#187: only a genuine non-empty string may be forwarded — a non-string
+    value must be rejected, never coerced to a query."""
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [
+            _request(
+                8,
+                "tools/call",
+                {"name": "recent_sessions", "arguments": {"resume_query": 12345}},
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is True
+    assert client.calls == []
 
 
 def test_call_session_windows_maps_arguments_to_the_daemon_endpoint() -> None:

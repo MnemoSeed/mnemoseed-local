@@ -76,6 +76,9 @@ class WriteContext:
     # Inert origin-agent attribution from the turn's anchoring user prompt;
     # parallel to ``agent_label`` (the soul carrier) and never merged with it.
     origin_agent: str | None = None
+    # Session lineage: the parent session id that spawned this one (subagent/
+    # orchestrator nesting). None=root caller, string=child caller.
+    session_parent_id: str | None = None
     cognitive_tier: CognitiveTier = CognitiveTier.TIER_1
     project: str | None = None
     host: str | None = None
@@ -418,4 +421,5 @@ class StampWriter:
         )
         stamp.persona_id = ctx.agent_label
         stamp.origin_agent = ctx.origin_agent
+        stamp.session_parent_id = ctx.session_parent_id
         return stamp

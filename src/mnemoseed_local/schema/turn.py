@@ -95,6 +95,9 @@ class IngestEvent(BaseModel):
     # Origin-agent attribution reported by the host (additive, wire-compatible
     # both directions); absent means unknown, never a guess.
     agent: str | None = None
+    # Session lineage: the parent session id that spawned this one (subagent/
+    # orchestrator nesting). None=root caller, string=child caller.
+    session_parent_id: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -180,6 +183,9 @@ class Turn(BaseModel):
     # Inert provenance label from the turn's anchoring user_prompt event
     # (source monitoring, write-time attribution); scoring/ranking never read it.
     origin_agent: str | None = None
+    # Session lineage: the parent session id that spawned this one (subagent/
+    # orchestrator nesting). None=root caller, string=child caller.
+    session_parent_id: str | None = None
     started_at: float
     ended_at: float | None = None
     closed: bool = False

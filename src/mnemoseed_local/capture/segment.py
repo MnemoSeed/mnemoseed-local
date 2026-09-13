@@ -74,6 +74,9 @@ class _SessionState:
             # assistant/tool events never override it (mid-session agent
             # switches survive at turn granularity).
             turn.origin_agent = event.agent
+            # Session lineage: parent id on the user prompt event establishes
+            # the session's nesting; assistant/tool events never override it.
+            turn.session_parent_id = event.session_parent_id
             turn.steps.append(TurnStep(role=TurnRole.USER, content=content.text))
         elif event.event is IngestEventType.ASSISTANT_MESSAGE:
             content = event.content

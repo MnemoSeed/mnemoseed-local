@@ -123,11 +123,14 @@ TOOLS: list[dict[str, Any]] = [
         "name": "recent_sessions",
         "description": "Fetch the most recent sessions' verbatim tails from mnemoseed-local — "
         "use it to re-anchor on where the previous conversation ended "
-        "(time-ordered resume, newest session group first). "
+        "(scoped resume, newest session group first). "
         "CAUTION: groups may be OTHER conversations. active=true means that conversation is still "
         "in progress — do not adopt or continue its work here unless the user explicitly asks; "
         "for dormant sessions resume only what the user asks THIS session to continue. "
-        "The response's guidance field restates this.",
+        "The response's guidance field restates this. "
+        "When resume_query is provided, the daemon extracts anchor identifiers from the "
+        "raw user prompt and returns only sessions whose USER content matches; "
+        "use self_parent_id=None for root callers (filters child sessions out).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -139,7 +142,16 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "integer",
                     "description": "verbatim tail size per session, in chunks (default 20, max 100)",
                 },
+                "resume_query": {
+                    "type": "string",
+                    "description": "raw current prompt for scoped-resume matching (max 500 chars)",
+                },
+                "self_parent_id": {
+                    "type": "string",
+                    "description": "the calling session's own parent id (None=root caller, string=child)",
+                },
             },
+            "required": ["resume_query"],
             "additionalProperties": False,
         },
     },
@@ -210,11 +222,17 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
         elif name == "dream_once":
             payload = client.post("/memory/dream_once", {"profile_id": client.profile_id})
         elif name == "recent_sessions":
+            resume_query = arguments.get("resume_query")
+            if not isinstance(resume_query, str) or not resume_query.strip():
+                return _error_result("recent_sessions requires a non-empty resume_query")
             recent_body: dict[str, Any] = {"profile_id": client.profile_id}
             if arguments.get("n_sessions") is not None:
                 recent_body["sessions"] = arguments["n_sessions"]
             if arguments.get("n_per_session") is not None:
                 recent_body["per_session"] = arguments["n_per_session"]
+            recent_body["resume_query"] = resume_query
+            if "self_parent_id" in arguments:
+                recent_body["self_parent_id"] = arguments["self_parent_id"]
             payload = client.post("/session/recent", recent_body)
         elif name == "session_windows":
             windows_body: dict[str, Any] = {"profile_id": client.profile_id}
