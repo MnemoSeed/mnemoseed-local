@@ -99,6 +99,8 @@
 
 - **#123 读路径可逆冲突标记提前启动（2026-08-28 收口，squash `b7e2660`/PR #146，issue #123 的读标记半件、整体保持开放）**：架构师判定 B5 vote 机制代码已齐（combine/pipeline/reflect/snapshot/merge 全通，"vote 无消费方"说法已过期），读路径可逆 flag 立即可建。交付：读路径在两同实体 in-effect 陈述"看似矛盾"时仅提可逆证据指针 `read_conflict_id`（确定性 token-Jaccard + 否定 + agreement-edit 检测器，读路径零模型调用；graph schema v10 可空列 + `clear_read_conflict` 原语）；绝不判定孰对、绝不改写、绝不碰 provenance.confidence/text，under-flag 姿态（近一致 tense/typo/日期勘误 1985/1987 永不打标）。QA 三轮收敛（BLOCKER：实体作主语被 drop 致 1985/2001 漏标 → 修 token 面）→ CLOSABLE（遗留 #147 stopword 同名实体掩蔽，另 B5 校准未到、reconciliation 挂起）。门禁 1855 passed / 5 skipped。
 
+- **#123 dream-side reconciliation 设计先行（2026-09-14，docs-only；issue 仍 OPEN）**：PR #194 已把 B5 vote eval 从静默 off 修为真实双席，并落 report v1.2；首次 N=3 no-bar pilot 证明 instrument 可用但 5/8 行 timeout-degraded，不能据此 ratify 数值。`design/12-reconciliation.md` 冻结单一 shared verify/vote stream、四态 disposition、pair/version exact identity、非互惠/孤儿 reparation、version-chain-only downweight、GraphStore receipt/CAS/outbox 幂等及 #123/#113 E2 边界。**只合设计，不写生产代码、不启动 detector/E2、不改默认、不设 bar**；future S-A..S-E 均需另行授权。
+
 - **#75 观察项扩展（2026-08-28，零代码 comment 形）**：架构师指出原 P0/P1/P2 缺两轴、窗口期将尽会串死下游 gate——追加 P3（会话内重相关失去频次，喂 #122 Gate-1）与 P4（粗误差类频次，喂 #113 检测器选择），同一 issue 评论排查表。
 
 - **#147 读标记 stopword 同名实体掩蔽修复（2026-08-28 收口，squash PR #149 → issue #147）**：QA 在 #123 收口后深挖出同族残留——`_statement_tokens` 收了 entities 参数却忽略了它，真实名与 stopword 相撞（如 "Will"）时主体被 drop，同 frame 分歧（"Will lives in Rome"/"...Paris"）漏标。修法：把主体提及从 drop 集 (STOPWORDS|NEGATION) 中剔除仅保留 subject；补回归钉（stopword 主体分歧打标、near-agreement 不打、complementary 不打），并证非 stopword 主体与 stopword 主体行为完全对齐。QA CLOSABLE（0 BLOCKER，1 NIT）。门禁 1889 passed / 5 skipped。

@@ -71,6 +71,8 @@ Dream LLM 对提名账本行做裁决 → 经既有 verify/vote 质量门 + 预�
 
 **同族机制协调（#123，红线级注记）**：读路径冲突标记 → dream 侧和解（#123）与本管线同族——底层问题同为「结局改变记忆地位」：#123 的读侧可逆 flag 与本管线的 `needs_reconcile` 错误信号最终汇入同一条 dream verify/vote 裁决流。两批必须共享同一裁决与降权机制（corrected-memory downweighting 一律走版本链），**不得各建一套分叉机制**。排期上 #123 依赖 B5 vote 门；后落地一方复用先落地一方的裁决通道，不重复设计。
 
+**#123 设计先行补充（2026-09-14，docs-only）**：共享流的四态 disposition、pair-scoped typed result、非互惠/孤儿处理、version-chain downweight、compare-and-clear、同库 receipt/outbox 幂等与 #123/#113 所有权边界，统一冻结于 `docs/zh/design/12-reconciliation.md`。PR #194 只证明 vote eval instrument 真实；首次 N=3 pilot 多数行 timeout-degraded，未 ratify 任何数值。该设计不启动本 E2 通道、不打开 `experience_channel`、不授权 detector 或生产实现；所有实现切片仍须另行过门。
+
 ### E3 · 投递面
 
 B2.7 式预算内注入块 + 围栏 + 守卫 fail-open 直通；lesson 的 recall 呈现；console 可见性（过滤项 design/07 已有）。**捆绑条件（红线级）**：单项 disable/forget 工具必须与本投递面同一批次交付——控制叙事依赖它成立。
