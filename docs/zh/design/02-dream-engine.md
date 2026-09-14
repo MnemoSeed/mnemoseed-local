@@ -21,7 +21,7 @@
 - **写侧归本篇，读侧归 03**：本篇定义的是"写侧"——merge 标记了什么（graph 节点写入 + 源 chunk 的 `consolidated=true` 标记）与 consolidation watermark 的形状（turn range 存入 MetaStore 的 per-profile `pool_state` 行）。读侧的"3λ 降权探针 / 未合并 chunk 探测"归本仓系列 `design/03-storage-and-retrieval.md`（Freshness Guard 探针以 `watermark.end+1` 起滤、命中候选融合分 ×0.8 降权后重跑选择循环、`consolidated` 的 chunk 按 λ×3 衰减——03 的 §3.5 与 §3.6 定义），本篇只给指针，不展开。
 - **不做遗忘**：遗忘（decay）归 03（decay sweep 由 `DecaySweeper` 执行，consolidated chunk 按 λ×3 衰减——`snapshot.py:157` 明确引用该语义）。本篇只负责标记"已合并"。
 - **不做预算上限**：`dream.token_budget_usd` 已移除（config 载入即 deprecation 报错，`config.py:470`）；TokenLedger 是纯 token 记录（append-only），无封顶、无"超支后 capture-only"、无 USD 估算。
-- **不做 vote**：`dream.ensemble` 枚举仍接受 `vote` 值，但运行期无消费端——`TripleVerifier.verify` 只在 `== "verify"` 时动作，`vote` 按 off 处理（`verify.py:213`；PRD-B1 QA 观察 3 如实记录；vote 的 journal 双相位 + combiner 属 B5 挂起立项）。
+- **vote 已落地、默认仍休眠**：B5 已接通 A/B seat、journal 双相位、deterministic combiner 与 merge；`dream.ensemble` 默认仍为 `off`。PR #194 进一步修复 eval rig 的 mode/vote-B 接线并提供 report v1.2 证据面。尚未落地的是 `read_conflict_id` / `needs_reconcile` 的 dream-side 消费与处置；其 docs-only 安全契约见 `design/12-reconciliation.md`，当前不授权生产实现或默认激活。
 - **不做"做梦解谜"**：引擎提炼的是事实性 triple，不产出洞察、不解析潜意识（理论锚不借清单，见 §2 末）。
 - **不做 LLM 裁判**：无第三个"仲裁"模型；合并逻辑是确定性代码，不是 LLM 投票（mvp-design §4.1 决策 1）。
 
