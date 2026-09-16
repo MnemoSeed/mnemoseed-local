@@ -87,6 +87,10 @@ COVERAGE: dict[str, dict[str, str]] = {
         # error-event ledger (E1 error-experience pipeline, PRD-B2.13)
         "append_error_event": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
         "query_error_events": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
+        # reconcile nomination (S-A: atomic carrier + NODE rows)
+        "append_reconcile_nomination": (
+            "test_contract_meta.py::test_append_reconcile_nomination_atomic_carrier_and_rows"
+        ),
         # identity chain (issue #14): owner account + hashed bearer secrets
         "create_user": "test_contract_meta.py::test_users_crud_and_password_rotation",
         "create_owner": "test_contract_meta.py::test_create_owner_atomic_and_conflict",
@@ -120,10 +124,12 @@ COVERAGE: dict[str, dict[str, str]] = {
 # reversible evidence pointer backing the read-conflict annotation).
 # MetaStore grew to 37 with the E1 error-event ledger surface
 # (append_error_event + query_error_events: the signal-agnostic write seam and
-# profile-scoped paginated read backing PRD-B2.13 E1).
+# profile-scoped paginated read backing PRD-B2.13 E1), and to 38 with
+# append_reconcile_nomination (S-A: the atomic nomination carrier
+# write — one transaction, carrier + two NODE ledger rows, typed dedup).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
     "GraphStore": 23,
-    "MetaStore": 37,
+    "MetaStore": 38,
     "Embedder": 3,
 }

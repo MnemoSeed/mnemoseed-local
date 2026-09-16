@@ -39,6 +39,14 @@ from mnemoseed_local.dream.merge import (
     Merger,
     MergeSummary,
 )
+from mnemoseed_local.dream.nominate import (  # noqa: I001 - module surface
+    READ_CONFLICT_KIND,
+    MaterializeReport,
+    after_commit,
+    materialize_nominations,
+    mint_generation,
+    run_committed_nominations,
+)
 from mnemoseed_local.dream.pipeline import DreamPipeline
 from mnemoseed_local.dream.prompts import (
     PROMPT_VERSION,
@@ -120,6 +128,12 @@ __all__ = [
     "Merger",
     "NullGraphDigest",
     "NullSnapshotter",
+    "MaterializeReport",
+    "READ_CONFLICT_KIND",
+    "after_commit",
+    "materialize_nominations",
+    "mint_generation",
+    "run_committed_nominations",
     "ReflectLLM",
     "ReflectOrchestrator",
     "ReflectOutcome",

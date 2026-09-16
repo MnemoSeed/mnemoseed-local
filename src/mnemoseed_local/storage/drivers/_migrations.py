@@ -49,6 +49,9 @@ class CreateTable:
     # table-level unique constraints, e.g. (("node_id", "version"),); rendered as
     # UNIQUE (node_id, version) so INSERT OR REPLACE keeps its replace semantics.
     unique: tuple[tuple[str, ...], ...] = ()
+    # table-level CHECK expressions, e.g. ("kind IN ('a', 'b')",); rendered as
+    # CHECK (...) so the closed vocabulary holds even for direct SQL writes.
+    checks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,7 @@ def render_sqlite(op: DDLOp) -> str:
     if isinstance(op, CreateTable):
         parts = [_sqlite_column_sql(c) for c in op.columns]
         parts.extend(f"UNIQUE ({', '.join(cols)})" for cols in op.unique)
+        parts.extend(f"CHECK ({expr})" for expr in op.checks)
         body = ", ".join(parts)
         return f"CREATE TABLE IF NOT EXISTS {op.name} ({body})"
     if isinstance(op, CreateIndex):
@@ -564,6 +568,75 @@ _V12_ADD_STATUS = AddColumn(store="meta", table="error_events", column=Column("s
 _V12_ADD_REASON = AddColumn(store="meta", table="error_events", column=Column("reason", "TEXT"))
 _V12_ADD_RETRYABLE = AddColumn(store="meta", table="error_events", column=Column("retryable", "INTEGER"))
 
+# v14: the reconcile nomination carrier — one immutable row
+# per durable, exactly-once read-conflict nomination (nomination_id UNIQUE,
+# canonical_kind closed by schema CHECK plus port validation, generation
+# minted at scan).
+# The atomic port writes the carrier plus the two NODE ledger rows in ONE
+# BEGIN IMMEDIATE txn; only a carrier UNIQUE violation rolls back to typed
+# dedup (never a half-group) — other integrity faults re-raise. Append-only
+# via BEFORE UPDATE/DELETE triggers, same discipline as error_events/audit_log.
+# error_events gains a nullable nomination_id linkage column (explicit linkage
+# only; NULL stays unattributed; ALTER TABLE ADD COLUMN preserves the existing
+# triggers).
+_RECONCILE_NOMINATIONS_TABLE = CreateTable(
+    store="meta",
+    name="reconcile_nominations",
+    columns=(
+        Column("nomination_id", "TEXT", primary_key=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("canonical_kind", "TEXT", not_null=True),
+        Column("composite_group_id", "TEXT", not_null=True),
+        Column("source_generation", "INTEGER", not_null=True),
+        Column("lo_node_id", "TEXT", not_null=True),
+        Column("hi_node_id", "TEXT", not_null=True),
+        Column("lo_version", "INTEGER", not_null=True),
+        Column("hi_version", "INTEGER", not_null=True),
+        Column("lo_expected_peer", "TEXT", not_null=True),
+        Column("hi_expected_peer", "TEXT", not_null=True),
+        Column("evidence_event_ids", "TEXT", not_null=True),
+        Column("source_channels", "TEXT", not_null=True),
+        Column("created_at", "TEXT", not_null=True),
+    ),
+    checks=("canonical_kind IN ('read_conflict', 'vote_disagreement')",),
+)
+
+_RECONCILE_NOMINATIONS_GROUP_INDEX = CreateIndex(
+    store="meta",
+    name="idx_reconcile_nominations_profile_group",
+    table="reconcile_nominations",
+    columns=("profile_id", "composite_group_id"),
+)
+
+_RECONCILE_NOMINATIONS_UPDATE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_reconcile_nominations_no_update",
+    timing="BEFORE",
+    event="UPDATE",
+    table="reconcile_nominations",
+    action="BEGIN SELECT RAISE(ABORT, 'reconcile_nominations is append-only'); END",
+    pg_action="RAISE EXCEPTION 'reconcile_nominations is append-only'",
+)
+
+_RECONCILE_NOMINATIONS_DELETE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_reconcile_nominations_no_delete",
+    timing="BEFORE",
+    event="DELETE",
+    table="reconcile_nominations",
+    action="BEGIN SELECT RAISE(ABORT, 'reconcile_nominations is append-only'); END",
+    pg_action="RAISE EXCEPTION 'reconcile_nominations is append-only'",
+)
+
+_V14_ADD_NOMINATION_ID = AddColumn(store="meta", table="error_events", column=Column("nomination_id", "TEXT"))
+
+_ERROR_EVENTS_NOMINATION_INDEX = CreateIndex(
+    store="meta",
+    name="idx_error_events_nomination",
+    table="error_events",
+    columns=("nomination_id",),
+)
+
 # v13 (PRD-B2.13 composite representation): a composite signal is one
 # ledger ROW PER SOURCE; the rows of one signal share a deterministic
 # composite_group_id (sha256 of profile|session|turn window|detected-at) so
@@ -709,6 +782,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             "NULL — single-source and legacy rows stay NULL)"
         ),
         ops=(_V13_ADD_COMPOSITE_GROUP,),
+    ),
+    Migration(
+        version=14,
+        description=(
+            "reconcile nomination carrier: immutable "
+            "reconcile_nominations table (nomination_id UNIQUE, closed "
+            "canonical kind, minted generation) + append-only triggers + "
+            "profile/group index; nullable nomination_id linkage column on "
+            "error_events + its index (ALTER TABLE ADD COLUMN keeps the "
+            "existing triggers); the atomic port writes the carrier plus the "
+            "two NODE ledger rows in one transaction"
+        ),
+        ops=(
+            _RECONCILE_NOMINATIONS_TABLE,
+            _RECONCILE_NOMINATIONS_GROUP_INDEX,
+            _RECONCILE_NOMINATIONS_UPDATE_TRIGGER,
+            _RECONCILE_NOMINATIONS_DELETE_TRIGGER,
+            _V14_ADD_NOMINATION_ID,
+            _ERROR_EVENTS_NOMINATION_INDEX,
+        ),
     ),
 )
 

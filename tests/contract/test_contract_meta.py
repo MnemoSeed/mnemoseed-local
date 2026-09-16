@@ -7,6 +7,7 @@ the database level, and the same atomic pool semantics.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -373,15 +374,16 @@ def test_dream_run_finish_completes_the_row(stack) -> None:
 
 
 def test_schema_version_and_migrate_forward_only(stack) -> None:
-    """meta's head is v13 (frozen v1 schema + v3 profile_score_pool + v4
+    """meta's head is v14 (frozen v1 schema + v3 profile_score_pool + v4
     dream_token_ledger + v6 identity users/token_hash + v7 profile archive
     flag + v8 reserved config.scope + v9 pool filed_points_total ledger +
     v11 error-event ledger + v12 provider fingerprint + v13 composite group
-    carrier); migrate is idempotent and forward-only."""
-    assert stack.meta.schema_version() == 13
-    assert stack.meta.migrate() == 13
-    assert stack.meta.migrate(target=1) == 13  # back-targeting is a no-op at head
-    assert stack.meta.schema_version() == 13
+    carrier + v14 reconcile nomination carrier); migrate is idempotent and
+    forward-only."""
+    assert stack.meta.schema_version() == 14
+    assert stack.meta.migrate() == 14
+    assert stack.meta.migrate(target=1) == 14  # back-targeting is a no-op at head
+    assert stack.meta.schema_version() == 14
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:
@@ -452,6 +454,57 @@ def test_error_event_append_and_query_profile_scoped(stack) -> None:
     other = stack.meta.query_error_events(ErrorEventFilter(profile_id="u2"), Page(0, 50))
     assert other.total == 1
     assert other.items[0].evidence_ptr.kind is EvidenceKind.SESSION
+
+
+def test_append_reconcile_nomination_atomic_carrier_and_rows(stack) -> None:
+    """S-A: the atomic nomination write is one transaction (carrier +
+    two NODE ledger rows); a duplicate id rolls back to typed dedup, never a
+    half-group."""
+    from mnemoseed_local.storage.ports import (
+        NominationOutcome,
+        NominationRequest,
+        derive_nomination_id,
+    )
+
+    request = NominationRequest(
+        profile_id="u1",
+        canonical_kind="read_conflict",
+        node_a="na",
+        version_a=1,
+        expected_peer_a="nb",
+        node_b="nb",
+        version_b=1,
+        expected_peer_b="na",
+        source_generation=1,
+        observed_at=100.0,
+        evidence=(
+            EvidencePointer(kind=EvidenceKind.NODE, id="na"),
+            EvidencePointer(kind=EvidenceKind.NODE, id="nb"),
+        ),
+        source_channels=("read_conflict_flag",),
+    )
+    result = stack.meta.append_reconcile_nomination(request)
+    assert result.outcome is NominationOutcome.APPENDED
+    expected = derive_nomination_id("read_conflict", "u1", "na", 1, "nb", 1, 1)
+    assert result.nomination_id == expected
+
+    dup = stack.meta.append_reconcile_nomination(request)
+    assert dup.outcome is NominationOutcome.DUPLICATED
+    assert dup.nomination_id == expected
+    carrier = stack.meta._conn.execute("SELECT * FROM reconcile_nominations").fetchall()
+    assert len(carrier) == 1
+    group = "nom-" + expected[:16]
+    events = stack.meta._conn.execute(
+        "SELECT * FROM error_events WHERE composite_group_id = ?", (group,)
+    ).fetchall()
+    assert len(events) == 2
+    assert {int(e["id"]) for e in events} == set(json.loads(dict(carrier[0])["evidence_event_ids"]))
+    # append-only triggers remain active on the carrier
+    with pytest.raises(sqlite3.IntegrityError):
+        stack.meta._conn.execute(
+            "UPDATE reconcile_nominations SET source_generation = 99 WHERE nomination_id = ?",
+            (expected,),
+        )
 
 
 def test_error_event_signal_type_filter_and_isolation(stack) -> None:

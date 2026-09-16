@@ -12,6 +12,8 @@ set, and missing capabilities produce explicit degradations or a refused startup
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -153,6 +155,7 @@ class NodeFilter:
     node_type: NodeType | None = None
     entities: tuple[str, ...] = ()
     min_decay: float = 0.0
+    has_read_conflict: bool = False  # S-A scanner page: current nodes with a live pointer
 
 
 class EdgeKind(StrEnum):
@@ -297,6 +300,39 @@ class AuditFilter:
     until: float | None = None
 
 
+@dataclass(frozen=True)
+class NominationRequest:
+    """One atomic nomination request (S-A; read-conflict producer).
+
+    Carries the pair as scanned (``node_a`` flagged ``node_b``); identity is
+    canonicalized by ``derive_nomination_id``. ``source_generation`` and
+    ``observed_at`` come from the scanner; wire identity never carries either
+    as a threshold (design/12 §3.2).
+    """
+
+    profile_id: str
+    canonical_kind: str
+    node_a: str
+    version_a: int
+    expected_peer_a: str
+    node_b: str
+    version_b: int
+    expected_peer_b: str
+    source_generation: int
+    observed_at: float
+    evidence: tuple[EvidencePointer, ...] = ()
+    source_channels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NominationResult:
+    """The typed append outcome (freeze F8)."""
+
+    outcome: NominationOutcome
+    nomination_id: str
+    composite_group_id: str
+
+
 class ErrorSignalType(StrEnum):
     """Error-signal family namespace (PRD-B2.13 E1, reserved and extensible).
 
@@ -377,6 +413,7 @@ class ErrorEvent:
     reason: str | None = None
     retryable: int | None = None
     composite_group_id: str | None = None
+    nomination_id: str | None = None  # explicit S-A linkage; NULL = unattributed
 
 
 @dataclass(frozen=True)
@@ -609,6 +646,101 @@ class OwnerConflictError(StorageError):
     transaction finds an owner already committed, or when a write constraint
     (users.username UNIQUE) rejects the insert -- never a bare IntegrityError.
     """
+
+
+# ------------------------------------------------------- reconciliation nomination (S-A)
+
+#: The closed canonical-kind vocabulary for footprinted reconciliation
+#: nominations (freeze F1). ``PUBLISHED`` ledger rows are carriers, never
+#: kinds; future kinds need an append-only contract review, never reuse.
+CANONICAL_NOMINATION_KINDS: frozenset[str] = frozenset({"read_conflict", "vote_disagreement"})
+
+
+class NominationOutcome(StrEnum):
+    """Result of one atomic nomination append."""
+
+    APPENDED = "appended"
+    DUPLICATED = "duplicated"
+
+
+class NominationRejectedError(ValueError):
+    """A nomination request failed contract validation (never retried as-is)."""
+
+
+def derive_nomination_id(
+    canonical_kind: str,
+    profile_id: str,
+    node_a: str,
+    version_a: int,
+    node_b: str,
+    version_b: int,
+    source_generation: int,
+) -> str:
+    """Stable nominated identity (freeze F2): sha256 over the closed parts.
+
+    The parts travel as one JSON array, never delimiter-joined, so values
+    containing separator characters cannot collide across field boundaries.
+    Order-canonicalized: ``(a, va, b, vb)`` and ``(b, vb, a, va)`` hash to the
+    same id, so the reversed pair can never mint a second nomination (the
+    double-downweight guard). Kind/profile/generation are identity members;
+    wall clock never enters.
+    """
+    lo, hi = sorted([(node_a, int(version_a)), (node_b, int(version_b))])
+    parts = [
+        canonical_kind,
+        profile_id,
+        lo[0],
+        str(lo[1]),
+        hi[0],
+        str(hi[1]),
+        str(int(source_generation)),
+    ]
+    return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def derive_composite_group_id(nomination_id: str) -> str:
+    """Group id for the two ledger rows of one nomination (freeze F3)."""
+    return "nom-" + nomination_id[:16]
+
+
+#: Exact provenance a read-conflict nomination must carry (freeze F9).
+READ_CONFLICT_CHANNELS: tuple[str, ...] = ("read_conflict_flag",)
+
+
+def check_nomination_endpoints(request: NominationRequest) -> None:
+    """Endpoint ids are always explicit, never blank or missing."""
+    for label, value in (
+        ("node_a", request.node_a),
+        ("node_b", request.node_b),
+        ("expected_peer_a", request.expected_peer_a),
+        ("expected_peer_b", request.expected_peer_b),
+    ):
+        if not (value or "").strip():
+            raise NominationRejectedError(f"nomination {label} is required and never guessed")
+
+
+def check_nomination_provenance(request: NominationRequest) -> None:
+    """Freeze F9 provenance for producer-backed kinds (S-A: read_conflict only).
+
+    A read-conflict request must carry exactly the scanner channel and exactly
+    the two NODE pointers of its pair; anything else raises before any write.
+    Reserved kinds without a producer gain their rule with their producer.
+    """
+    if request.canonical_kind != "read_conflict":
+        return
+    if tuple(request.source_channels) != READ_CONFLICT_CHANNELS:
+        raise NominationRejectedError(
+            f"read_conflict nominations carry exactly {list(READ_CONFLICT_CHANNELS)} as source_channels"
+        )
+    want = sorted(
+        [
+            (EvidenceKind.NODE.value, request.node_a),
+            (EvidenceKind.NODE.value, request.node_b),
+        ]
+    )
+    got = sorted([(pointer.kind.value, pointer.id) for pointer in request.evidence])
+    if got != want:
+        raise NominationRejectedError("read_conflict evidence must be exactly the pair NODE pointers")
 
 
 class UnknownDriverError(StorageError):
@@ -1031,6 +1163,23 @@ class MetaStore(Protocol):
         ``profile_id`` is always explicit (D5 isolation). Rows return in stable
         append order (id asc), ready for E2 dream adjudication and the issue
         #123 reconciliation channel to consume as evidence pointers.
+        """
+        raise NotImplementedError
+
+    def append_reconcile_nomination(self, request: NominationRequest) -> NominationResult:
+        """Atomically materialize one named nomination (S-A).
+
+        One BEGIN IMMEDIATE transaction writes the immutable carrier row plus
+        the two NODE ledger rows that share its composite group. Dedup is
+        decided by the carrier INSERT itself (conflict on ``nomination_id``
+        inserts nothing and reports DUPLICATED); every other integrity fault
+        re-raises, never a half-group and never a silent dedup. The accepted
+        ``canonical_kind`` vocabulary is the closed set
+        ``CANONICAL_NOMINATION_KINDS``; ``vote_disagreement`` is
+        schema-reserved with no producer in this slice. Endpoint ids are
+        validated non-blank and producer-backed kinds additionally pass
+        ``check_nomination_provenance`` (freeze F9). Never
+        a model call; runs on the dream worker only.
         """
         raise NotImplementedError
 

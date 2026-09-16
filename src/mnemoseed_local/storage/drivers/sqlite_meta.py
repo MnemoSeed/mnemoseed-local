@@ -26,6 +26,7 @@ from mnemoseed_local.storage.drivers._migrations import apply_migrations
 from mnemoseed_local.storage.drivers._threadlocal import ThreadLocalConnections
 from mnemoseed_local.storage.drivers._time import epoch_from_iso, iso8601_utc
 from mnemoseed_local.storage.ports import (
+    CANONICAL_NOMINATION_KINDS,
     AuditEntry,
     AuditFilter,
     Capability,
@@ -38,6 +39,10 @@ from mnemoseed_local.storage.ports import (
     ErrorSignalType,
     EvidenceKind,
     EvidencePointer,
+    NominationOutcome,
+    NominationRejectedError,
+    NominationRequest,
+    NominationResult,
     OwnerConflictError,
     Page,
     PageResult,
@@ -47,10 +52,23 @@ from mnemoseed_local.storage.ports import (
     StoredUser,
     Token,
     TurnRange,
+    check_nomination_endpoints,
+    check_nomination_provenance,
+    derive_composite_group_id,
+    derive_nomination_id,
 )
 from mnemoseed_local.storage.registry import META_DRIVERS, register
 
 _CAPABILITIES = frozenset({Capability.META_TRANSACTION, Capability.META_CONCURRENT_READERS})
+
+
+class _CarrierDuplicate(Exception):
+    """Internal: the carrier INSERT inserted no row (a genuine re-nomination)."""
+
+    def __init__(self, nomination_id: str, composite_group_id: str) -> None:
+        super().__init__(nomination_id)
+        self.nomination_id = nomination_id
+        self.composite_group_id = composite_group_id
 
 
 @register(META_DRIVERS)
@@ -561,8 +579,8 @@ class SqliteMetaDriver:
             "INSERT INTO error_events (profile_id, signal_type, observed_at, "
             "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
             "detector_id, eligibility_tag, provider, model, status, reason, "
-            "retryable, composite_group_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "retryable, composite_group_id, nomination_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.profile_id,
                 event.signal_type.value,
@@ -580,6 +598,7 @@ class SqliteMetaDriver:
                 event.reason,
                 event.retryable,
                 composite_group,
+                event.nomination_id,
             ),
         )
 
@@ -614,6 +633,133 @@ class SqliteMetaDriver:
         ).fetchall()
         items = [_decode_error_event(r) for r in rows]
         return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
+
+    # ------------------------------- reconcile nomination
+
+    def append_reconcile_nomination(self, request: NominationRequest) -> NominationResult:
+        """Atomically materialize one named nomination (S-A/F8).
+
+        One BEGIN IMMEDIATE transaction inserts the immutable carrier row and
+        the two NODE ledger rows sharing its composite group. Dedup is
+        decided by the carrier INSERT itself — ``ON CONFLICT(nomination_id)
+        DO NOTHING`` plus the affected rowcount — but a zero rowcount maps
+        to typed ``DUPLICATED`` only when the carrier row already existed
+        before this call's first write; otherwise a loud ``IntegrityError``
+        reports the suppressed insert. Every other integrity fault (ledger
+        rows, CHECK, NOT NULL, triggers) raises unwrapped, never a half-group
+        and never a silent dedup. Endpoint ids
+        are validated non-blank and producer-backed kinds additionally pass
+        ``check_nomination_provenance`` (freeze F9) before any write; the
+        accepted ``canonical_kind`` vocabulary is the closed set
+        ``CANONICAL_NOMINATION_KINDS``. Retry replays N times → one carrier.
+        """
+        if not (request.profile_id or "").strip():
+            raise NominationRejectedError("nomination profile_id is required and never guessed")
+        if request.canonical_kind not in CANONICAL_NOMINATION_KINDS:
+            raise NominationRejectedError(
+                f"nomination canonical_kind {request.canonical_kind!r} is outside the "
+                f"closed set {sorted(CANONICAL_NOMINATION_KINDS)}"
+            )
+        if request.node_a == request.node_b:
+            raise NominationRejectedError("nomination endpoints must differ (self pair is not a conflict)")
+        check_nomination_endpoints(request)
+        check_nomination_provenance(request)
+        nomination_id = derive_nomination_id(
+            request.canonical_kind,
+            request.profile_id,
+            request.node_a,
+            request.version_a,
+            request.node_b,
+            request.version_b,
+            request.source_generation,
+        )
+        composite_group = derive_composite_group_id(nomination_id)
+        lo, hi = sorted(
+            [
+                (request.node_a, int(request.version_a), request.expected_peer_a),
+                (request.node_b, int(request.version_b), request.expected_peer_b),
+            ]
+        )
+        channels_json = json.dumps(list(request.source_channels))
+        observed = iso8601_utc(request.observed_at)
+        try:
+            with _transaction(self._conn):
+                # DUPLICATED means the carrier was already materialized before
+                # this call began. The check runs before every write so a
+                # trigger synthesizing rows mid-transaction can never fake it.
+                preexists = self._conn.execute(
+                    "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
+                    (nomination_id,),
+                ).fetchone()
+                event_ids: list[int] = []
+                for node_id, _peer_id in ((lo[0], lo[2]), (hi[0], hi[2])):
+                    cursor = self._conn.execute(
+                        "INSERT INTO error_events (profile_id, signal_type, observed_at, "
+                        "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
+                        "detector_id, eligibility_tag, provider, model, status, reason, "
+                        "retryable, composite_group_id, nomination_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            request.profile_id,
+                            ErrorSignalType.PUBLISHED.value,
+                            observed,
+                            EvidenceKind.NODE.value,
+                            node_id,
+                            None,
+                            None,
+                            None,
+                            "read_conflict_scanner",
+                            "mark-as-is",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            composite_group,
+                            nomination_id,
+                        ),
+                    )
+                    event_ids.append(int(cursor.lastrowid or 0))
+                carrier_cursor = self._conn.execute(
+                    "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
+                    "canonical_kind, composite_group_id, source_generation, "
+                    "lo_node_id, hi_node_id, lo_version, hi_version, "
+                    "lo_expected_peer, hi_expected_peer, evidence_event_ids, "
+                    "source_channels, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(nomination_id) DO NOTHING",
+                    (
+                        nomination_id,
+                        request.profile_id,
+                        request.canonical_kind,
+                        composite_group,
+                        int(request.source_generation),
+                        lo[0],
+                        hi[0],
+                        lo[1],
+                        hi[1],
+                        lo[2],
+                        hi[2],
+                        json.dumps(event_ids),
+                        channels_json,
+                        iso8601_utc(time.time()),
+                    ),
+                )
+                if carrier_cursor.rowcount == 0:
+                    if preexists is None:
+                        raise sqlite3.IntegrityError(f"carrier insert for {nomination_id} stored no row")
+                    raise _CarrierDuplicate(nomination_id, composite_group)
+        except _CarrierDuplicate as duplicate:
+            return NominationResult(
+                outcome=NominationOutcome.DUPLICATED,
+                nomination_id=duplicate.nomination_id,
+                composite_group_id=duplicate.composite_group_id,
+            )
+        return NominationResult(
+            outcome=NominationOutcome.APPENDED,
+            nomination_id=nomination_id,
+            composite_group_id=composite_group,
+        )
 
     # ------------------------------------------------------------ dream runs
 
@@ -782,6 +928,10 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         composite_group = row["composite_group_id"]  # type: ignore[index]
     except (KeyError, IndexError, ValueError):
         composite_group = None
+    try:
+        nomination_id = row["nomination_id"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        nomination_id = None
     return ErrorEvent(
         profile_id=str(row["profile_id"]),
         signal_type=ErrorSignalType(str(row["signal_type"])),
@@ -801,6 +951,7 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         reason=str(reason) if reason is not None else None,
         retryable=int(retryable) if retryable is not None else None,
         composite_group_id=str(composite_group) if composite_group is not None else None,
+        nomination_id=str(nomination_id) if nomination_id is not None else None,
     )
 
 

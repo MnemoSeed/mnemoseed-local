@@ -284,6 +284,8 @@ class SqliteGraphDriver:
         if filter.min_decay > 0.0:
             clauses.append("decay_weight >= ?")
             params.append(filter.min_decay)
+        if filter.has_read_conflict:
+            clauses.append("read_conflict_id IS NOT NULL")
         if filter.entities:
             placeholders = ", ".join(["?"] * len(filter.entities))
             clauses.append(f"EXISTS (SELECT 1 FROM json_each(entities) e WHERE e.value IN ({placeholders}))")
