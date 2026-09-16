@@ -240,6 +240,17 @@ def test_append_nomination_carrier_trigger_fault_raises(meta: SqliteMetaDriver) 
     assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
 
 
+def test_append_nomination_carrier_ignore_reports_fault(meta: SqliteMetaDriver) -> None:
+    meta._conn.execute(
+        "CREATE TRIGGER suppress_carrier BEFORE INSERT ON reconcile_nominations "
+        "BEGIN SELECT RAISE(IGNORE); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
 def test_append_nomination_rejects_blank_endpoint_ids(meta: SqliteMetaDriver) -> None:
     with pytest.raises(ValueError):
         meta.append_reconcile_nomination(_request(expected_peer_a=None))
@@ -459,3 +470,16 @@ def test_scanner_pages_past_a_full_first_page() -> None:
     found = nominate._scannable_nodes(_PagedGraph(), PROFILE)
     assert seen_offsets == [0, 1000]
     assert len(found) == 1001
+
+
+def test_scanner_skips_malformed_pair_and_continues(graph: SqliteGraphDriver, meta: SqliteMetaDriver) -> None:
+    graph.upsert_node(_node("   "))
+    graph.upsert_node(_node("peer"))
+    _flag(graph, "   ", "peer")
+    graph.upsert_node(_node("va"))
+    graph.upsert_node(_node("vb"))
+    _flag(graph, "va", "vb")
+    report = nominate.materialize_nominations(graph, meta, PROFILE, clock=lambda: 1700000000.0)
+    assert len(report.appended) == 1
+    assert report.skipped == 1
+    assert len(_carrier_rows(meta)) == 1

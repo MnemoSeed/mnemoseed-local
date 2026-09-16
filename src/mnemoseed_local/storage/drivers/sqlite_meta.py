@@ -736,6 +736,12 @@ class SqliteMetaDriver:
                     ),
                 )
                 if carrier_cursor.rowcount == 0:
+                    landed = self._conn.execute(
+                        "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
+                        (nomination_id,),
+                    ).fetchone()
+                    if landed is None:
+                        raise sqlite3.IntegrityError(f"carrier insert for {nomination_id} stored no row")
                     raise _CarrierDuplicate(nomination_id, composite_group)
         except _CarrierDuplicate as duplicate:
             return NominationResult(

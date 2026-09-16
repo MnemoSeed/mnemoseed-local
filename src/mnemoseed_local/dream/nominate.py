@@ -100,8 +100,10 @@ def materialize_nominations(
 
     Emits IFF the pair is reciprocal, same-profile and both endpoints are
     current; versions are captured as expected. Every other shape is skipped
-    with zero writes. Idempotent: a second scan re-derives the same
-    generation and hits the carrier's UNIQUE constraint (typed dedup).
+    with zero writes. A malformed pair (port validation) is skipped with a
+    warning so one bad pair can never starve later valid pairs; infra faults
+    still abort the pass loudly. Idempotent: a second scan re-derives the
+    same generation and hits the carrier's UNIQUE constraint (typed dedup).
     """
     now = (clock or time.time)()
     read_terminal = terminal_reader or (lambda _profile, _lo, _hi: 0)
@@ -159,7 +161,12 @@ def materialize_nominations(
             request.version_b,
             request.source_generation,
         )
-        result = meta.append_reconcile_nomination(request)
+        try:
+            result = meta.append_reconcile_nomination(request)
+        except ValueError as exc:
+            logger.warning("skipping malformed pair %s: %s", pair_key, exc)
+            skipped += 1
+            continue
         if result.outcome is NominationOutcome.APPENDED:
             appended.append(result.nomination_id)
         else:
