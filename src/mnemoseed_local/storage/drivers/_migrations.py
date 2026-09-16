@@ -49,6 +49,9 @@ class CreateTable:
     # table-level unique constraints, e.g. (("node_id", "version"),); rendered as
     # UNIQUE (node_id, version) so INSERT OR REPLACE keeps its replace semantics.
     unique: tuple[tuple[str, ...], ...] = ()
+    # table-level CHECK expressions, e.g. ("kind IN ('a', 'b')",); rendered as
+    # CHECK (...) so the closed vocabulary holds even for direct SQL writes.
+    checks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,7 @@ def render_sqlite(op: DDLOp) -> str:
     if isinstance(op, CreateTable):
         parts = [_sqlite_column_sql(c) for c in op.columns]
         parts.extend(f"UNIQUE ({', '.join(cols)})" for cols in op.unique)
+        parts.extend(f"CHECK ({expr})" for expr in op.checks)
         body = ", ".join(parts)
         return f"CREATE TABLE IF NOT EXISTS {op.name} ({body})"
     if isinstance(op, CreateIndex):
@@ -566,13 +570,15 @@ _V12_ADD_RETRYABLE = AddColumn(store="meta", table="error_events", column=Column
 
 # v14: the reconcile nomination carrier — one immutable row
 # per durable, exactly-once read-conflict nomination (nomination_id UNIQUE,
-# canonical_kind closed at write time by the port, generation minted at scan).
+# canonical_kind closed by schema CHECK plus port validation, generation
+# minted at scan).
 # The atomic port writes the carrier plus the two NODE ledger rows in ONE
-# BEGIN IMMEDIATE txn; a UNIQUE violation rolls the whole txn back (never a
-# half-group) and reports typed dedup. Append-only via BEFORE UPDATE/DELETE
-# triggers, same discipline as error_events/audit_log. error_events gains a
-# nullable nomination_id linkage column (explicit linkage only; NULL stays
-# unattributed; ALTER TABLE ADD COLUMN preserves the existing triggers).
+# BEGIN IMMEDIATE txn; only a carrier UNIQUE violation rolls back to typed
+# dedup (never a half-group) — other integrity faults re-raise. Append-only
+# via BEFORE UPDATE/DELETE triggers, same discipline as error_events/audit_log.
+# error_events gains a nullable nomination_id linkage column (explicit linkage
+# only; NULL stays unattributed; ALTER TABLE ADD COLUMN preserves the existing
+# triggers).
 _RECONCILE_NOMINATIONS_TABLE = CreateTable(
     store="meta",
     name="reconcile_nominations",
@@ -592,6 +598,7 @@ _RECONCILE_NOMINATIONS_TABLE = CreateTable(
         Column("source_channels", "TEXT", not_null=True),
         Column("created_at", "TEXT", not_null=True),
     ),
+    checks=("canonical_kind IN ('read_conflict', 'vote_disagreement')",),
 )
 
 _RECONCILE_NOMINATIONS_GROUP_INDEX = CreateIndex(

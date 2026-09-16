@@ -477,6 +477,11 @@ def test_append_reconcile_nomination_atomic_carrier_and_rows(stack) -> None:
         expected_peer_b="na",
         source_generation=1,
         observed_at=100.0,
+        evidence=(
+            EvidencePointer(kind=EvidenceKind.NODE, id="na"),
+            EvidencePointer(kind=EvidenceKind.NODE, id="nb"),
+        ),
+        source_channels=("read_conflict_flag",),
     )
     result = stack.meta.append_reconcile_nomination(request)
     assert result.outcome is NominationOutcome.APPENDED

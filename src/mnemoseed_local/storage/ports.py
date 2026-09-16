@@ -13,6 +13,7 @@ set, and missing capabilities produce explicit degradations or a refused startup
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -673,13 +674,15 @@ def derive_nomination_id(
 ) -> str:
     """Stable nominated identity (freeze F2): sha256 over the closed parts.
 
+    The parts travel as one JSON array, never delimiter-joined, so values
+    containing separator characters cannot collide across field boundaries.
     Order-canonicalized: ``(a, va, b, vb)`` and ``(b, vb, a, va)`` hash to the
     same id, so the reversed pair can never mint a second nomination (the
     double-downweight guard). Kind/profile/generation are identity members;
     wall clock never enters.
     """
     lo, hi = sorted([(node_a, int(version_a)), (node_b, int(version_b))])
-    parts = (
+    parts = [
         canonical_kind,
         profile_id,
         lo[0],
@@ -687,13 +690,41 @@ def derive_nomination_id(
         hi[0],
         str(hi[1]),
         str(int(source_generation)),
-    )
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    ]
+    return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def derive_composite_group_id(nomination_id: str) -> str:
     """Group id for the two ledger rows of one nomination (freeze F3)."""
     return "nom-" + nomination_id[:16]
+
+
+#: Exact provenance a read-conflict nomination must carry (freeze F9).
+READ_CONFLICT_CHANNELS: tuple[str, ...] = ("read_conflict_flag",)
+
+
+def check_nomination_provenance(request: NominationRequest) -> None:
+    """Freeze F9 provenance for producer-backed kinds (S-A: read_conflict only).
+
+    A read-conflict request must carry exactly the scanner channel and exactly
+    the two NODE pointers of its pair; anything else raises before any write.
+    Reserved kinds without a producer gain their rule with their producer.
+    """
+    if request.canonical_kind != "read_conflict":
+        return
+    if tuple(request.source_channels) != READ_CONFLICT_CHANNELS:
+        raise ValueError(
+            f"read_conflict nominations carry exactly {list(READ_CONFLICT_CHANNELS)} as source_channels"
+        )
+    want = sorted(
+        [
+            (EvidenceKind.NODE.value, request.node_a),
+            (EvidenceKind.NODE.value, request.node_b),
+        ]
+    )
+    got = sorted([(pointer.kind.value, pointer.id) for pointer in request.evidence])
+    if got != want:
+        raise ValueError("read_conflict evidence must be exactly the pair NODE pointers")
 
 
 class UnknownDriverError(StorageError):
@@ -1123,13 +1154,14 @@ class MetaStore(Protocol):
         """Atomically materialize one named nomination (S-A).
 
         One BEGIN IMMEDIATE transaction writes the immutable carrier row plus
-        the two NODE ledger rows that share its composite group; the unique
-        ``nomination_id`` constraint makes a duplicate request roll back the
-        whole txn and report DUPLICATED, never a half-group. The accepted
-        ``canonical_kind`` vocabulary is the closed set
-        ``CANONICAL_NOMINATION_KINDS``; ``vote_disagreement`` is schema-reserved
-        with no producer in this slice. Never a model call; runs on the dream
-        worker only.
+        the two NODE ledger rows that share its composite group; only a
+        ``nomination_id`` UNIQUE violation rolls back to typed DUPLICATED —
+        any other integrity fault re-raises, never a half-group and never a
+        silent dedup. The accepted ``canonical_kind`` vocabulary is the closed
+        set ``CANONICAL_NOMINATION_KINDS``; ``vote_disagreement`` is
+        schema-reserved with no producer in this slice. Producer-backed kinds
+        additionally pass ``check_nomination_provenance`` (freeze F9). Never
+        a model call; runs on the dream worker only.
         """
         raise NotImplementedError
 

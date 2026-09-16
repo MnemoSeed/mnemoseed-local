@@ -8,6 +8,7 @@ Contract freeze F1–F10 lives in design/12; tests pin the freeze, not prose.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -84,8 +85,14 @@ def _request(a: str = "na", b: str = "nb", **over) -> NominationRequest:
         "expected_peer_b": a,
         "source_generation": 1,
         "observed_at": 1700000000.0,
+        "source_channels": ("read_conflict_flag",),
     }
     base.update(over)
+    if "evidence" not in over:
+        base["evidence"] = (
+            EvidencePointer(kind=EvidenceKind.NODE, id=base["node_a"]),
+            EvidencePointer(kind=EvidenceKind.NODE, id=base["node_b"]),
+        )
     return NominationRequest(**base)
 
 
@@ -115,6 +122,12 @@ def test_nomination_id_stable_order_canonical_and_sized() -> None:
 def test_composite_group_id_is_nom_prefixed_slice_of_nomination_id() -> None:
     nid = derive_nomination_id("read_conflict", PROFILE, "na", 2, "nb", 1, 1)
     assert derive_composite_group_id(nid) == "nom-" + nid[:16]
+
+
+def test_nomination_id_rejects_delimiter_ambiguity() -> None:
+    pipe_profile = derive_nomination_id("read_conflict", "p|x", "a", 1, "z", 1, 1)
+    pipe_node = derive_nomination_id("read_conflict", "p", "x|a", 1, "z", 1, 1)
+    assert pipe_profile != pipe_node
 
 
 # ------------------------------------------------------------- F1 / F8 port
@@ -165,6 +178,37 @@ def test_append_nomination_rejects_open_kind_and_blank_profile(
         meta.append_reconcile_nomination(_request(canonical_kind="user_correction"))
     with pytest.raises(ValueError):
         meta.append_reconcile_nomination(_request(profile_id="   "))
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
+def test_append_nomination_rejects_foreign_provenance(meta: SqliteMetaDriver) -> None:
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(_request(source_channels=("other_flag",)))
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(
+            _request(evidence=(EvidencePointer(kind=EvidenceKind.SESSION, id="s1"),))
+        )
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(
+            _request(
+                evidence=(
+                    EvidencePointer(kind=EvidenceKind.NODE, id="na"),
+                    EvidencePointer(kind=EvidenceKind.NODE, id="nx"),
+                )
+            )
+        )
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
+def test_append_nomination_reraises_non_dedup_fault(meta: SqliteMetaDriver) -> None:
+    meta._conn.execute(
+        "CREATE TRIGGER force_integrity BEFORE INSERT ON error_events "
+        "BEGIN SELECT RAISE(ABORT, 'forced non-dedup fault'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
     assert _carrier_rows(meta) == []
     assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
 

@@ -13,6 +13,7 @@ import re
 import sqlite3
 from collections.abc import Sequence
 
+import pytest
 from _support import make_pref
 
 from mnemoseed_local.schema.graph import GraphNode
@@ -89,7 +90,7 @@ def _parse_create_table(sql: str) -> list[tuple[str, str, bool, bool, bool, bool
     columns = (
         _parse_column_clause(cl)
         for cl in _split_top_level(_table_body(sql))
-        if not cl.upper().startswith("UNIQUE")
+        if not cl.upper().startswith("UNIQUE") and not cl.upper().startswith("CHECK")
     )
     return [c for c in columns if c]
 
@@ -148,6 +149,16 @@ def test_create_tables_render_the_shared_op_model() -> None:
                 assert parsed[3] == column.not_null  # not null
                 assert parsed[4] == (column.default is not None)  # default
                 assert parsed[5] == (column.references is not None)  # references
+
+
+def test_create_table_checks_render_as_check() -> None:
+    for migration in MIGRATIONS:
+        for op in migration.ops:
+            if not isinstance(op, CreateTable):
+                continue
+            sql = render_sqlite(op)
+            for expr in op.checks:
+                assert f"CHECK ({expr})" in sql
 
 
 def test_indexes_render_from_shared_ops() -> None:
@@ -517,6 +528,34 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
         "created_at",
     ]
     assert int(meta.execute("SELECT COUNT(*) FROM reconcile_nominations").fetchone()[0]) == 0
+    carrier_sql = meta.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reconcile_nominations'"
+    ).fetchone()[0]
+    assert "CHECK (canonical_kind IN ('read_conflict', 'vote_disagreement'))" in carrier_sql
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.execute(
+            "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
+            "canonical_kind, composite_group_id, source_generation, lo_node_id, "
+            "hi_node_id, lo_version, hi_version, lo_expected_peer, "
+            "hi_expected_peer, evidence_event_ids, source_channels, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "backdoor",
+                "p",
+                "backdoor",
+                "g",
+                1,
+                "a",
+                "b",
+                1,
+                1,
+                "b",
+                "a",
+                "[]",
+                "[]",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
 
 
 def _project_without_deltas(rows: list[dict[str, object]]) -> list[dict[str, object]]:

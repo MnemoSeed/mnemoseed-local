@@ -51,6 +51,7 @@ from mnemoseed_local.storage.ports import (
     StoredUser,
     Token,
     TurnRange,
+    check_nomination_provenance,
     derive_composite_group_id,
     derive_nomination_id,
 )
@@ -628,11 +629,13 @@ class SqliteMetaDriver:
         """Atomically materialize one named nomination (S-A/F8).
 
         One BEGIN IMMEDIATE transaction inserts the immutable carrier row and
-        the two NODE ledger rows sharing its composite group; a UNIQUE
-        violation on ``nomination_id`` rolls the whole txn back (zero
-        half-groups) and reports ``DUPLICATED``. The accepted canonical-kind
-        vocabulary is the closed set ``CANONICAL_NOMINATION_KINDS`` — an open
-        kind raises before any write. Retry replays N times → one carrier.
+        the two NODE ledger rows sharing its composite group; only a UNIQUE
+        violation on the carrier ``nomination_id`` rolls back to typed
+        ``DUPLICATED`` (zero half-groups) — any other integrity fault
+        re-raises. The accepted canonical-kind vocabulary is the closed set
+        ``CANONICAL_NOMINATION_KINDS`` — an open kind raises before any write.
+        Producer-backed kinds additionally pass ``check_nomination_provenance``
+        (freeze F9). Retry replays N times → one carrier.
         """
         if not (request.profile_id or "").strip():
             raise ValueError("nomination profile_id is required and never guessed")
@@ -643,6 +646,7 @@ class SqliteMetaDriver:
             )
         if request.node_a == request.node_b:
             raise ValueError("nomination endpoints must differ (self pair is not a conflict)")
+        check_nomination_provenance(request)
         nomination_id = derive_nomination_id(
             request.canonical_kind,
             request.profile_id,
@@ -717,6 +721,12 @@ class SqliteMetaDriver:
                     ),
                 )
         except sqlite3.IntegrityError:
+            landed = self._conn.execute(
+                "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
+                (nomination_id,),
+            ).fetchone()
+            if landed is None:
+                raise
             return NominationResult(
                 outcome=NominationOutcome.DUPLICATED,
                 nomination_id=nomination_id,
