@@ -229,6 +229,28 @@ def test_append_nomination_reraises_fault_despite_existing_carrier(
     assert len(_group_events(meta, group)) == 2
 
 
+def test_append_nomination_carrier_trigger_fault_raises(meta: SqliteMetaDriver) -> None:
+    meta._conn.execute(
+        "CREATE TRIGGER force_carrier BEFORE INSERT ON reconcile_nominations "
+        "BEGIN SELECT RAISE(ABORT, 'forced carrier fault'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
+def test_append_nomination_rejects_blank_endpoint_ids(meta: SqliteMetaDriver) -> None:
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(_request(expected_peer_a=None))
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(_request(node_a="   "))
+    with pytest.raises(ValueError):
+        meta.append_reconcile_nomination(_request(expected_peer_b=""))
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
 def test_legacy_event_rows_decode_unattributed(meta: SqliteMetaDriver) -> None:
     meta.append_error_event(
         ErrorEvent(

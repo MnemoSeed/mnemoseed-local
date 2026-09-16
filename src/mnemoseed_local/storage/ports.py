@@ -703,6 +703,18 @@ def derive_composite_group_id(nomination_id: str) -> str:
 READ_CONFLICT_CHANNELS: tuple[str, ...] = ("read_conflict_flag",)
 
 
+def check_nomination_endpoints(request: NominationRequest) -> None:
+    """Endpoint ids are always explicit, never blank or missing."""
+    for label, value in (
+        ("node_a", request.node_a),
+        ("node_b", request.node_b),
+        ("expected_peer_a", request.expected_peer_a),
+        ("expected_peer_b", request.expected_peer_b),
+    ):
+        if not (value or "").strip():
+            raise ValueError(f"nomination {label} is required and never guessed")
+
+
 def check_nomination_provenance(request: NominationRequest) -> None:
     """Freeze F9 provenance for producer-backed kinds (S-A: read_conflict only).
 
@@ -1154,13 +1166,15 @@ class MetaStore(Protocol):
         """Atomically materialize one named nomination (S-A).
 
         One BEGIN IMMEDIATE transaction writes the immutable carrier row plus
-        the two NODE ledger rows that share its composite group; only a
-        ``nomination_id`` UNIQUE violation rolls back to typed DUPLICATED —
-        any other integrity fault re-raises, never a half-group and never a
-        silent dedup. The accepted ``canonical_kind`` vocabulary is the closed
-        set ``CANONICAL_NOMINATION_KINDS``; ``vote_disagreement`` is
-        schema-reserved with no producer in this slice. Producer-backed kinds
-        additionally pass ``check_nomination_provenance`` (freeze F9). Never
+        the two NODE ledger rows that share its composite group. Dedup is
+        decided by the carrier INSERT itself (conflict on ``nomination_id``
+        inserts nothing and reports DUPLICATED); every other integrity fault
+        re-raises, never a half-group and never a silent dedup. The accepted
+        ``canonical_kind`` vocabulary is the closed set
+        ``CANONICAL_NOMINATION_KINDS``; ``vote_disagreement`` is
+        schema-reserved with no producer in this slice. Endpoint ids are
+        validated non-blank and producer-backed kinds additionally pass
+        ``check_nomination_provenance`` (freeze F9). Never
         a model call; runs on the dream worker only.
         """
         raise NotImplementedError
