@@ -60,6 +60,15 @@ from mnemoseed_local.storage.registry import META_DRIVERS, register
 _CAPABILITIES = frozenset({Capability.META_TRANSACTION, Capability.META_CONCURRENT_READERS})
 
 
+class _CarrierDuplicate(Exception):
+    """Internal: the carrier INSERT hit its PRIMARY KEY (a genuine re-nomination)."""
+
+    def __init__(self, nomination_id: str, composite_group_id: str) -> None:
+        super().__init__(nomination_id)
+        self.nomination_id = nomination_id
+        self.composite_group_id = composite_group_id
+
+
 @register(META_DRIVERS)
 class SqliteMetaDriver:
     """MetaStore over a single SQLite file."""
@@ -629,13 +638,16 @@ class SqliteMetaDriver:
         """Atomically materialize one named nomination (S-A/F8).
 
         One BEGIN IMMEDIATE transaction inserts the immutable carrier row and
-        the two NODE ledger rows sharing its composite group; only a UNIQUE
-        violation on the carrier ``nomination_id`` rolls back to typed
-        ``DUPLICATED`` (zero half-groups) — any other integrity fault
-        re-raises. The accepted canonical-kind vocabulary is the closed set
-        ``CANONICAL_NOMINATION_KINDS`` — an open kind raises before any write.
-        Producer-backed kinds additionally pass ``check_nomination_provenance``
-        (freeze F9). Retry replays N times → one carrier.
+        the two NODE ledger rows sharing its composite group. Only the
+        carrier INSERT maps an integrity failure to typed ``DUPLICATED``:
+        kind/columns are pre-validated and the carrier has no INSERT
+        triggers, so its sole failure mode is the PRIMARY KEY (a genuine
+        duplicate) — ledger-row faults always propagate, never a half-group
+        and never a silent dedup. The accepted canonical-kind vocabulary is
+        the closed set ``CANONICAL_NOMINATION_KINDS`` — an open kind raises
+        before any write. Producer-backed kinds additionally pass
+        ``check_nomination_provenance`` (freeze F9). Retry replays N times →
+        one carrier.
         """
         if not (request.profile_id or "").strip():
             raise ValueError("nomination profile_id is required and never guessed")
@@ -696,41 +708,38 @@ class SqliteMetaDriver:
                         ),
                     )
                     event_ids.append(int(cursor.lastrowid or 0))
-                self._conn.execute(
-                    "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
-                    "canonical_kind, composite_group_id, source_generation, "
-                    "lo_node_id, hi_node_id, lo_version, hi_version, "
-                    "lo_expected_peer, hi_expected_peer, evidence_event_ids, "
-                    "source_channels, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        nomination_id,
-                        request.profile_id,
-                        request.canonical_kind,
-                        composite_group,
-                        int(request.source_generation),
-                        lo[0],
-                        hi[0],
-                        lo[1],
-                        hi[1],
-                        lo[2],
-                        hi[2],
-                        json.dumps(event_ids),
-                        channels_json,
-                        iso8601_utc(time.time()),
-                    ),
-                )
-        except sqlite3.IntegrityError:
-            landed = self._conn.execute(
-                "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
-                (nomination_id,),
-            ).fetchone()
-            if landed is None:
-                raise
+                try:
+                    self._conn.execute(
+                        "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
+                        "canonical_kind, composite_group_id, source_generation, "
+                        "lo_node_id, hi_node_id, lo_version, hi_version, "
+                        "lo_expected_peer, hi_expected_peer, evidence_event_ids, "
+                        "source_channels, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            nomination_id,
+                            request.profile_id,
+                            request.canonical_kind,
+                            composite_group,
+                            int(request.source_generation),
+                            lo[0],
+                            hi[0],
+                            lo[1],
+                            hi[1],
+                            lo[2],
+                            hi[2],
+                            json.dumps(event_ids),
+                            channels_json,
+                            iso8601_utc(time.time()),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise _CarrierDuplicate(nomination_id, composite_group) from None
+        except _CarrierDuplicate as duplicate:
             return NominationResult(
                 outcome=NominationOutcome.DUPLICATED,
-                nomination_id=nomination_id,
-                composite_group_id=composite_group,
+                nomination_id=duplicate.nomination_id,
+                composite_group_id=duplicate.composite_group_id,
             )
         return NominationResult(
             outcome=NominationOutcome.APPENDED,

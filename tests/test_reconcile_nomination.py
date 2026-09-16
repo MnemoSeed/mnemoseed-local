@@ -213,6 +213,22 @@ def test_append_nomination_reraises_non_dedup_fault(meta: SqliteMetaDriver) -> N
     assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
 
 
+def test_append_nomination_reraises_fault_despite_existing_carrier(
+    meta: SqliteMetaDriver,
+) -> None:
+    first = meta.append_reconcile_nomination(_request())
+    assert first.outcome is NominationOutcome.APPENDED
+    meta._conn.execute(
+        "CREATE TRIGGER force_integrity BEFORE INSERT ON error_events "
+        "BEGIN SELECT RAISE(ABORT, 'forced unrelated fault'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
+    assert len(_carrier_rows(meta)) == 1
+    group = "nom-" + first.nomination_id[:16]
+    assert len(_group_events(meta, group)) == 2
+
+
 def test_legacy_event_rows_decode_unattributed(meta: SqliteMetaDriver) -> None:
     meta.append_error_event(
         ErrorEvent(
