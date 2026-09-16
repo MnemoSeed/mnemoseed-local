@@ -642,10 +642,12 @@ class SqliteMetaDriver:
         One BEGIN IMMEDIATE transaction inserts the immutable carrier row and
         the two NODE ledger rows sharing its composite group. Dedup is
         decided by the carrier INSERT itself — ``ON CONFLICT(nomination_id)
-        DO NOTHING`` plus the affected rowcount: 0 means a genuine duplicate
-        (rolls back to typed ``DUPLICATED``), 1 means appended. Every other
-        integrity fault (ledger rows, CHECK, NOT NULL, triggers) raises
-        unwrapped, never a half-group and never a silent dedup. Endpoint ids
+        DO NOTHING`` plus the affected rowcount — but a zero rowcount maps
+        to typed ``DUPLICATED`` only when the carrier row already existed
+        before this call's first write; otherwise a loud ``IntegrityError``
+        reports the suppressed insert. Every other integrity fault (ledger
+        rows, CHECK, NOT NULL, triggers) raises unwrapped, never a half-group
+        and never a silent dedup. Endpoint ids
         are validated non-blank and producer-backed kinds additionally pass
         ``check_nomination_provenance`` (freeze F9) before any write; the
         accepted ``canonical_kind`` vocabulary is the closed set
@@ -682,6 +684,13 @@ class SqliteMetaDriver:
         observed = iso8601_utc(request.observed_at)
         try:
             with _transaction(self._conn):
+                # DUPLICATED means the carrier was already materialized before
+                # this call began. The check runs before every write so a
+                # trigger synthesizing rows mid-transaction can never fake it.
+                preexists = self._conn.execute(
+                    "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
+                    (nomination_id,),
+                ).fetchone()
                 event_ids: list[int] = []
                 for node_id, _peer_id in ((lo[0], lo[2]), (hi[0], hi[2])):
                     cursor = self._conn.execute(
@@ -711,10 +720,6 @@ class SqliteMetaDriver:
                         ),
                     )
                     event_ids.append(int(cursor.lastrowid or 0))
-                preexists = self._conn.execute(
-                    "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
-                    (nomination_id,),
-                ).fetchone()
                 carrier_cursor = self._conn.execute(
                     "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
                     "canonical_kind, composite_group_id, source_generation, "

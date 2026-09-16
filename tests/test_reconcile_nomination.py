@@ -522,3 +522,23 @@ def test_scanner_reraises_unexpected_port_failure() -> None:
 
     with pytest.raises(ValueError, match="simulated infra failure"):
         nominate.materialize_nominations(_Graph(), _BadMeta(), PROFILE)
+
+
+def test_append_nomination_event_trigger_synthesized_carrier_raises(
+    meta: SqliteMetaDriver,
+) -> None:
+    meta._conn.execute(
+        "CREATE TRIGGER synth_from_event BEFORE INSERT ON error_events "
+        "WHEN NEW.nomination_id IS NOT NULL "
+        "BEGIN INSERT OR IGNORE INTO reconcile_nominations (nomination_id, "
+        "profile_id, canonical_kind, composite_group_id, source_generation, "
+        "lo_node_id, hi_node_id, lo_version, hi_version, lo_expected_peer, "
+        "hi_expected_peer, evidence_event_ids, source_channels, created_at) "
+        "VALUES (NEW.nomination_id, NEW.profile_id, 'read_conflict', "
+        "NEW.composite_group_id, 1, 'na', 'nb', 1, 1, 'nb', 'na', '[]', "
+        "'[\"read_conflict_flag\"]', NEW.observed_at); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
