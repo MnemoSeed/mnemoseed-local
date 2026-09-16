@@ -57,13 +57,14 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (37 methods)
+## MetaStore (38 methods)
 
 | Method | Contract test |
 |---|---|
 | add_token_usage | `test_contract_meta.py::test_dream_token_ledger_atomic_increment` |
 | advance_watermark | `test_contract_meta.py::test_pool_watermark_gap_raises` |
 | append_error_event | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
+| append_reconcile_nomination | `test_contract_meta.py::test_append_reconcile_nomination_atomic_carrier_and_rows` |
 | archive_profile | `test_contract_meta.py::test_profile_archive_flag` |
 | audit_append | `test_contract_meta.py::test_audit_append_and_query` |
 | audit_query | `test_contract_meta.py::test_audit_append_and_query` |

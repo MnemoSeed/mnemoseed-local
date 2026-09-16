@@ -65,6 +65,7 @@ from mnemoseed_local.dream import (
     Snapshot,
     TokenLedger,
     TripleVerifier,
+    nominate,
     resume_boundary,
 )
 from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
@@ -821,12 +822,23 @@ def _build_capture(
         except Exception as exc:  # noqa: BLE001
             logger.warning("run-completion journal failed for %s: %s", completion.run_id, exc)
 
+    def _on_run_committed_with_nominations(completion: RunCompletion) -> None:
+        """F4: record the run, then materialize nominations
+        best-effort. Ordering is frozen (record → scan), both on the dream
+        worker thread; the scan swallows every failure so a nomination
+        problem can never disturb a committed merge or block ingest."""
+        nominate.after_commit(
+            _record_run_completion,
+            lambda: nominate.run_committed_nominations(stores.graph, stores.meta, completion.profile_id),
+            completion,
+        )
+
     pipeline = DreamPipeline(
         trigger=trigger,
         snapshotter=snapshotter,
         reflector=reflector,
         merger=merger,
-        on_run_committed=_record_run_completion,
+        on_run_committed=_on_run_committed_with_nominations,
         on_extract_failed=lambda failure: _audit_extract_failure(stores.meta, failure),
         # B5 vote: the live ensemble mode ("off" | "verify" | "vote") read off
         # the config each run, so the pipeline dispatches the vote dual-seat

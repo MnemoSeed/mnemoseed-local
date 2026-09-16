@@ -146,11 +146,11 @@ def test_error_event_has_v12_fields() -> None:
 # ----  migration -----------------------------------------------------------
 
 
-def test_migration_head_is_version_13() -> None:
-    """v12 pinned the head at 12; v13 (composite group carrier) advances it."""
-    assert latest_version() == 13
+def test_migration_head_is_version_14() -> None:
+    """v13 pinned the head at 13; v14 (reconcile nomination carrier) advances it."""
+    assert latest_version() == 14
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14]
 
 
 def test_error_events_has_v12_columns(b1_config: Path) -> None:

@@ -26,6 +26,7 @@ from mnemoseed_local.storage.drivers._migrations import apply_migrations
 from mnemoseed_local.storage.drivers._threadlocal import ThreadLocalConnections
 from mnemoseed_local.storage.drivers._time import epoch_from_iso, iso8601_utc
 from mnemoseed_local.storage.ports import (
+    CANONICAL_NOMINATION_KINDS,
     AuditEntry,
     AuditFilter,
     Capability,
@@ -38,6 +39,9 @@ from mnemoseed_local.storage.ports import (
     ErrorSignalType,
     EvidenceKind,
     EvidencePointer,
+    NominationOutcome,
+    NominationRequest,
+    NominationResult,
     OwnerConflictError,
     Page,
     PageResult,
@@ -47,6 +51,8 @@ from mnemoseed_local.storage.ports import (
     StoredUser,
     Token,
     TurnRange,
+    derive_composite_group_id,
+    derive_nomination_id,
 )
 from mnemoseed_local.storage.registry import META_DRIVERS, register
 
@@ -561,8 +567,8 @@ class SqliteMetaDriver:
             "INSERT INTO error_events (profile_id, signal_type, observed_at, "
             "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
             "detector_id, eligibility_tag, provider, model, status, reason, "
-            "retryable, composite_group_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "retryable, composite_group_id, nomination_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.profile_id,
                 event.signal_type.value,
@@ -580,6 +586,7 @@ class SqliteMetaDriver:
                 event.reason,
                 event.retryable,
                 composite_group,
+                event.nomination_id,
             ),
         )
 
@@ -614,6 +621,112 @@ class SqliteMetaDriver:
         ).fetchall()
         items = [_decode_error_event(r) for r in rows]
         return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
+
+    # ------------------------------- reconcile nomination
+
+    def append_reconcile_nomination(self, request: NominationRequest) -> NominationResult:
+        """Atomically materialize one named nomination (S-A/F8).
+
+        One BEGIN IMMEDIATE transaction inserts the immutable carrier row and
+        the two NODE ledger rows sharing its composite group; a UNIQUE
+        violation on ``nomination_id`` rolls the whole txn back (zero
+        half-groups) and reports ``DUPLICATED``. The accepted canonical-kind
+        vocabulary is the closed set ``CANONICAL_NOMINATION_KINDS`` — an open
+        kind raises before any write. Retry replays N times → one carrier.
+        """
+        if not (request.profile_id or "").strip():
+            raise ValueError("nomination profile_id is required and never guessed")
+        if request.canonical_kind not in CANONICAL_NOMINATION_KINDS:
+            raise ValueError(
+                f"nomination canonical_kind {request.canonical_kind!r} is outside the "
+                f"closed set {sorted(CANONICAL_NOMINATION_KINDS)}"
+            )
+        if request.node_a == request.node_b:
+            raise ValueError("nomination endpoints must differ (self pair is not a conflict)")
+        nomination_id = derive_nomination_id(
+            request.canonical_kind,
+            request.profile_id,
+            request.node_a,
+            request.version_a,
+            request.node_b,
+            request.version_b,
+            request.source_generation,
+        )
+        composite_group = derive_composite_group_id(nomination_id)
+        lo, hi = sorted(
+            [
+                (request.node_a, int(request.version_a), request.expected_peer_a),
+                (request.node_b, int(request.version_b), request.expected_peer_b),
+            ]
+        )
+        channels_json = json.dumps(list(request.source_channels))
+        observed = iso8601_utc(request.observed_at)
+        try:
+            with _transaction(self._conn):
+                event_ids: list[int] = []
+                for node_id, _peer_id in ((lo[0], lo[2]), (hi[0], hi[2])):
+                    cursor = self._conn.execute(
+                        "INSERT INTO error_events (profile_id, signal_type, observed_at, "
+                        "evidence_kind, evidence_id, session_id, turn_start, turn_end, "
+                        "detector_id, eligibility_tag, provider, model, status, reason, "
+                        "retryable, composite_group_id, nomination_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            request.profile_id,
+                            ErrorSignalType.PUBLISHED.value,
+                            observed,
+                            EvidenceKind.NODE.value,
+                            node_id,
+                            None,
+                            None,
+                            None,
+                            "read_conflict_scanner",
+                            "mark-as-is",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            composite_group,
+                            nomination_id,
+                        ),
+                    )
+                    event_ids.append(int(cursor.lastrowid or 0))
+                self._conn.execute(
+                    "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
+                    "canonical_kind, composite_group_id, source_generation, "
+                    "lo_node_id, hi_node_id, lo_version, hi_version, "
+                    "lo_expected_peer, hi_expected_peer, evidence_event_ids, "
+                    "source_channels, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        nomination_id,
+                        request.profile_id,
+                        request.canonical_kind,
+                        composite_group,
+                        int(request.source_generation),
+                        lo[0],
+                        hi[0],
+                        lo[1],
+                        hi[1],
+                        lo[2],
+                        hi[2],
+                        json.dumps(event_ids),
+                        channels_json,
+                        iso8601_utc(time.time()),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return NominationResult(
+                outcome=NominationOutcome.DUPLICATED,
+                nomination_id=nomination_id,
+                composite_group_id=composite_group,
+            )
+        return NominationResult(
+            outcome=NominationOutcome.APPENDED,
+            nomination_id=nomination_id,
+            composite_group_id=composite_group,
+        )
 
     # ------------------------------------------------------------ dream runs
 
@@ -782,6 +895,10 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         composite_group = row["composite_group_id"]  # type: ignore[index]
     except (KeyError, IndexError, ValueError):
         composite_group = None
+    try:
+        nomination_id = row["nomination_id"]  # type: ignore[index]
+    except (KeyError, IndexError, ValueError):
+        nomination_id = None
     return ErrorEvent(
         profile_id=str(row["profile_id"]),
         signal_type=ErrorSignalType(str(row["signal_type"])),
@@ -801,6 +918,7 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         reason=str(reason) if reason is not None else None,
         retryable=int(retryable) if retryable is not None else None,
         composite_group_id=str(composite_group) if composite_group is not None else None,
+        nomination_id=str(nomination_id) if nomination_id is not None else None,
     )
 
 
