@@ -663,6 +663,10 @@ class NominationOutcome(StrEnum):
     DUPLICATED = "duplicated"
 
 
+class NominationRejectedError(ValueError):
+    """A nomination request failed contract validation (never retried as-is)."""
+
+
 def derive_nomination_id(
     canonical_kind: str,
     profile_id: str,
@@ -712,7 +716,7 @@ def check_nomination_endpoints(request: NominationRequest) -> None:
         ("expected_peer_b", request.expected_peer_b),
     ):
         if not (value or "").strip():
-            raise ValueError(f"nomination {label} is required and never guessed")
+            raise NominationRejectedError(f"nomination {label} is required and never guessed")
 
 
 def check_nomination_provenance(request: NominationRequest) -> None:
@@ -725,7 +729,7 @@ def check_nomination_provenance(request: NominationRequest) -> None:
     if request.canonical_kind != "read_conflict":
         return
     if tuple(request.source_channels) != READ_CONFLICT_CHANNELS:
-        raise ValueError(
+        raise NominationRejectedError(
             f"read_conflict nominations carry exactly {list(READ_CONFLICT_CHANNELS)} as source_channels"
         )
     want = sorted(
@@ -736,7 +740,7 @@ def check_nomination_provenance(request: NominationRequest) -> None:
     )
     got = sorted([(pointer.kind.value, pointer.id) for pointer in request.evidence])
     if got != want:
-        raise ValueError("read_conflict evidence must be exactly the pair NODE pointers")
+        raise NominationRejectedError("read_conflict evidence must be exactly the pair NODE pointers")
 
 
 class UnknownDriverError(StorageError):

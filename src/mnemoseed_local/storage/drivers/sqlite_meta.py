@@ -40,6 +40,7 @@ from mnemoseed_local.storage.ports import (
     EvidenceKind,
     EvidencePointer,
     NominationOutcome,
+    NominationRejectedError,
     NominationRequest,
     NominationResult,
     OwnerConflictError,
@@ -651,14 +652,14 @@ class SqliteMetaDriver:
         ``CANONICAL_NOMINATION_KINDS``. Retry replays N times → one carrier.
         """
         if not (request.profile_id or "").strip():
-            raise ValueError("nomination profile_id is required and never guessed")
+            raise NominationRejectedError("nomination profile_id is required and never guessed")
         if request.canonical_kind not in CANONICAL_NOMINATION_KINDS:
-            raise ValueError(
+            raise NominationRejectedError(
                 f"nomination canonical_kind {request.canonical_kind!r} is outside the "
                 f"closed set {sorted(CANONICAL_NOMINATION_KINDS)}"
             )
         if request.node_a == request.node_b:
-            raise ValueError("nomination endpoints must differ (self pair is not a conflict)")
+            raise NominationRejectedError("nomination endpoints must differ (self pair is not a conflict)")
         check_nomination_endpoints(request)
         check_nomination_provenance(request)
         nomination_id = derive_nomination_id(
@@ -710,6 +711,10 @@ class SqliteMetaDriver:
                         ),
                     )
                     event_ids.append(int(cursor.lastrowid or 0))
+                preexists = self._conn.execute(
+                    "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
+                    (nomination_id,),
+                ).fetchone()
                 carrier_cursor = self._conn.execute(
                     "INSERT INTO reconcile_nominations (nomination_id, profile_id, "
                     "canonical_kind, composite_group_id, source_generation, "
@@ -736,11 +741,7 @@ class SqliteMetaDriver:
                     ),
                 )
                 if carrier_cursor.rowcount == 0:
-                    landed = self._conn.execute(
-                        "SELECT 1 FROM reconcile_nominations WHERE nomination_id = ?",
-                        (nomination_id,),
-                    ).fetchone()
-                    if landed is None:
+                    if preexists is None:
                         raise sqlite3.IntegrityError(f"carrier insert for {nomination_id} stored no row")
                     raise _CarrierDuplicate(nomination_id, composite_group)
         except _CarrierDuplicate as duplicate:

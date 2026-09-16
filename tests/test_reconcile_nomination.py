@@ -483,3 +483,42 @@ def test_scanner_skips_malformed_pair_and_continues(graph: SqliteGraphDriver, me
     assert len(report.appended) == 1
     assert report.skipped == 1
     assert len(_carrier_rows(meta)) == 1
+
+
+def test_append_nomination_synth_duplicate_trigger_raises(meta: SqliteMetaDriver) -> None:
+    meta._conn.execute(
+        "CREATE TRIGGER synth_duplicate BEFORE INSERT ON reconcile_nominations "
+        "BEGIN INSERT INTO reconcile_nominations (nomination_id, profile_id, "
+        "canonical_kind, composite_group_id, source_generation, lo_node_id, "
+        "hi_node_id, lo_version, hi_version, lo_expected_peer, "
+        "hi_expected_peer, evidence_event_ids, source_channels, created_at) "
+        "VALUES (NEW.nomination_id, NEW.profile_id, NEW.canonical_kind, "
+        "NEW.composite_group_id, NEW.source_generation, NEW.lo_node_id, "
+        "NEW.hi_node_id, NEW.lo_version, NEW.hi_version, NEW.lo_expected_peer, "
+        "NEW.hi_expected_peer, NEW.evidence_event_ids, NEW.source_channels, "
+        "NEW.created_at); SELECT RAISE(IGNORE); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        meta.append_reconcile_nomination(_request())
+    assert _carrier_rows(meta) == []
+    assert meta._conn.execute("SELECT COUNT(*) FROM error_events").fetchone()[0] == 0
+
+
+def test_scanner_reraises_unexpected_port_failure() -> None:
+    def _flagged(node_id: str, peer: str) -> GraphNode:
+        return _node(node_id).model_copy(update={"read_conflict_id": peer})
+
+    class _Graph:
+        def list_nodes(self, _flt, page):
+            items = [_flagged("na", "nb"), _flagged("nb", "na")] if page.offset == 0 else []
+            return PageResult(items=items, total=2, offset=page.offset, limit=1000)
+
+        def get_node(self, node_id: str):
+            return _flagged(node_id, "nb" if node_id == "na" else "na")
+
+    class _BadMeta:
+        def append_reconcile_nomination(self, request):
+            raise ValueError("simulated infra failure")
+
+    with pytest.raises(ValueError, match="simulated infra failure"):
+        nominate.materialize_nominations(_Graph(), _BadMeta(), PROFILE)

@@ -25,6 +25,7 @@ from mnemoseed_local.storage.ports import (
     MetaStore,
     NodeFilter,
     NominationOutcome,
+    NominationRejectedError,
     NominationRequest,
     Page,
     derive_nomination_id,
@@ -163,7 +164,7 @@ def materialize_nominations(
         )
         try:
             result = meta.append_reconcile_nomination(request)
-        except ValueError as exc:
+        except NominationRejectedError as exc:
             logger.warning("skipping malformed pair %s: %s", pair_key, exc)
             skipped += 1
             continue
