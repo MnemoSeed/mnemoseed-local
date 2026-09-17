@@ -293,7 +293,12 @@ class AuditEntry:
 
 @dataclass(frozen=True)
 class ReconciliationApplication:
-    """Immutable terminal pair application input."""
+    """Immutable terminal pair application input.
+
+    ``loser_prior_version``/``loser_new_version`` are caller-captured
+    conflict identity: they enter the replay input hash but never address
+    the mutation — the receipt cites live-computed values instead.
+    """
 
     nomination_id: str
     profile_id: str

@@ -722,3 +722,60 @@ def test_outbox_composite_key_keeps_table_open_for_future_actions(tmp_path: Path
         "SELECT action FROM reconciliation_audit_outbox WHERE nomination_id = 'nom-1' ORDER BY id"
     ).fetchall()
     assert [row[0] for row in rows] == ["reconcile_accepted", "future_action"]
+
+
+def test_repointed_side_keeps_its_pointer(tmp_path: Path) -> None:
+    graph, _ = _stores(tmp_path)
+    _seed_pair(graph)
+    graph.upsert_node(_node("c"))
+    graph.set_read_conflict("a", "c")
+    receipt = graph.apply_reconciliation(_application(), downweight_factor=TEST_ONLY_DOWNWEIGHT_FACTOR)
+    assert receipt.disposition is Disposition.UNRESOLVED
+    assert receipt.reason_code is ReasonCode.STALE_REVISION
+    assert graph.get_node("a").read_conflict_id == "c"
+    assert graph.get_node("b").read_conflict_id is None
+    assert graph.get_node("c").read_conflict_id == "a"
+    assert len(graph.versions("a")) == 1
+    assert len(graph.versions("b")) == 1
+
+
+def test_repair_audit_failure_leaves_pending_and_raises(tmp_path: Path) -> None:
+    graph, meta = _stores(tmp_path)
+    _seed_pair(graph)
+    graph.apply_reconciliation(_application(), downweight_factor=TEST_ONLY_DOWNWEIGHT_FACTOR)
+    assert len(graph.pending_reconciliation_audits(10)) == 1
+
+    def _boom(entry: AuditEntry) -> None:
+        raise OSError("meta-down")
+
+    boom = SimpleNamespace(audit_append=_boom)
+    with pytest.raises(OSError, match="meta-down"):
+        repair_reconciliation_audit(graph, boom, limit=10)
+    assert len(graph.pending_reconciliation_audits(10)) == 1
+    assert repair_reconciliation_audit(graph, meta, limit=10) == 1
+    assert len(graph.pending_reconciliation_audits(10)) == 0
+
+
+def test_cas_clear_requires_exact_peer_predicate(tmp_path: Path) -> None:
+    graph, _ = _stores(tmp_path)
+    _seed_pair(graph)
+    assert (
+        graph._cas_clear_side(
+            node_id="a",
+            profile_id="p1",
+            version=1,
+            expected_peer_id="WRONG",
+        )
+        == 0
+    )
+    assert graph.get_node("a").read_conflict_id == "b"
+    assert (
+        graph._cas_clear_side(
+            node_id="a",
+            profile_id="p1",
+            version=1,
+            expected_peer_id="b",
+        )
+        == 1
+    )
+    assert graph.get_node("a").read_conflict_id is None
