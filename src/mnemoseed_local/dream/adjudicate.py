@@ -199,6 +199,7 @@ class PairAdjudicationInput:
 @dataclass(frozen=True)
 class AdjudicationResult:
     nomination_id: str
+    profile_id: str
     left_node_id: str
     left_version: int
     right_node_id: str
@@ -334,6 +335,8 @@ def render_pair_adjudication_prompt(input: PairAdjudicationInput) -> str:
 
 def parse_pair_seat_output(text: str) -> SeatOutcome:
     """Strictly parse one exact typed pair decision, returning typed degradation."""
+    if not isinstance(text, str):
+        return SeatOutcome(status=SeatStatus.INVALID_OUTPUT)
     if not text.strip():
         return SeatOutcome(status=SeatStatus.EMPTY_RESPONSE)
     try:
@@ -529,6 +532,8 @@ def _validate_input_structure(input: PairAdjudicationInput) -> None:
     _validate_structure(input.nomination)
     _validate_observation(input.left)
     _validate_observation(input.right)
+    if input.left.node_id == input.right.node_id:
+        raise MalformedAdjudicationInputError("endpoint observations must name distinct nodes")
 
 
 def _has_protected_endpoint(
@@ -694,6 +699,7 @@ def _result(
 ) -> AdjudicationResult:
     return AdjudicationResult(
         nomination_id=nomination.nomination_id,
+        profile_id=nomination.profile_id,
         left_node_id=nomination.left_node_id,
         left_version=nomination.left_version,
         right_node_id=nomination.right_node_id,

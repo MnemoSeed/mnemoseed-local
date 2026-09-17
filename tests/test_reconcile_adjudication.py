@@ -481,3 +481,57 @@ def test_ensemble_off_has_no_active_pair_seat() -> None:
             )
     assert DEFAULT_DREAM_ENSEMBLE == "off"
     assert DEFAULT_EXPERIENCE_CHANNEL_ENABLED is False
+
+
+def test_result_carries_profile_id() -> None:
+    decision = _decision(Verdict.CONFLICT, winner="right", loser="left")
+    outcome = SeatOutcome(status=SeatStatus.COMPLETE, decisions=(decision,))
+    result = adjudicate(_input(outcome))
+    assert result.disposition is Disposition.ACCEPTED
+    assert result.profile_id == "profile-1"
+
+
+def test_parse_rejects_non_string_output() -> None:
+    assert parse_pair_seat_output(None).status is SeatStatus.INVALID_OUTPUT  # type: ignore[arg-type]
+    assert parse_pair_seat_output(12345).status is SeatStatus.INVALID_OUTPUT  # type: ignore[arg-type]
+
+
+def test_duplicate_observation_node_ids_raise_typed_error() -> None:
+    left, right = _observations()
+    duplicate = replace(right, node_id="left")
+    with pytest.raises(MalformedAdjudicationInputError):
+        adjudicate(
+            PairAdjudicationInput(
+                nomination=_nomination(),
+                left=left,
+                right=duplicate,
+                ensemble_mode="verify",
+                seat_outcomes=(),
+            )
+        )
+
+
+def test_swapped_unbound_versions_are_deferred() -> None:
+    swapped = replace(_decision(Verdict.NOT_CONFLICT), left_version=7, right_version=3)
+    outcome = SeatOutcome(status=SeatStatus.COMPLETE, decisions=(swapped,))
+    _assert_deferred(adjudicate(_input(outcome)), ReasonCode.IDENTITY_MISMATCH)
+
+
+def test_evidence_subset_and_superset_are_deferred() -> None:
+    for events in ((11,), (11, 12, 13)):
+        mismatched = replace(_decision(Verdict.NOT_CONFLICT), evidence_event_ids=events)
+        outcome = SeatOutcome(status=SeatStatus.COMPLETE, decisions=(mismatched,))
+        _assert_deferred(adjudicate(_input(outcome)), ReasonCode.IDENTITY_MISMATCH)
+
+
+def test_outsider_and_duplicate_direction_are_deferred() -> None:
+    outsider = _decision(Verdict.CONFLICT, winner="stranger", loser="left")
+    _assert_deferred(
+        adjudicate(_input(SeatOutcome(status=SeatStatus.COMPLETE, decisions=(outsider,)))),
+        ReasonCode.CONFLICT_WITHOUT_DIRECTION,
+    )
+    duplicate = _decision(Verdict.CONFLICT, winner="left", loser="left")
+    _assert_deferred(
+        adjudicate(_input(SeatOutcome(status=SeatStatus.COMPLETE, decisions=(duplicate,)))),
+        ReasonCode.CONFLICT_WITHOUT_DIRECTION,
+    )
