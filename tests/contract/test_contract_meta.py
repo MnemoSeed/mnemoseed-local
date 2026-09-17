@@ -374,16 +374,11 @@ def test_dream_run_finish_completes_the_row(stack) -> None:
 
 
 def test_schema_version_and_migrate_forward_only(stack) -> None:
-    """meta's head is v15 (frozen v1 schema + v3 profile_score_pool + v4
-    dream_token_ledger + v6 identity users/token_hash + v7 profile archive
-    flag + v8 reserved config.scope + v9 pool filed_points_total ledger +
-    v11 error-event ledger + v12 provider fingerprint + v13 composite group
-    carrier + v14 reconcile nomination carrier + v15 audit dedup); migrate is idempotent and
-    forward-only."""
-    assert stack.meta.schema_version() == 15
-    assert stack.meta.migrate() == 15
-    assert stack.meta.migrate(target=1) == 15  # back-targeting is a no-op at head
-    assert stack.meta.schema_version() == 15
+    """Meta migrations are idempotent and forward-only at the independent head."""
+    assert stack.meta.schema_version() == 16
+    assert stack.meta.migrate() == 16
+    assert stack.meta.migrate(target=1) == 16
+    assert stack.meta.schema_version() == 16
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:

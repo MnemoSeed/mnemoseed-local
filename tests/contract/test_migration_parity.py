@@ -108,11 +108,11 @@ def _parse_index(sql: str) -> tuple[bool, str, str, tuple[str, ...]]:
 def test_version_sequences_are_shared_and_forward_only() -> None:
     """The dialect-agnostic sequence IS the parity baseline
     (graph 1,2,5,10,15; meta 1,3,4,6,7,8,9,11,12,13,14,15)."""
-    assert latest_version() == 15
+    assert latest_version() == 16
     graph_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("graph"))
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
     assert graph_versions == [1, 2, 5, 10, 15]
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16]
     assert len(MIGRATIONS) == latest_version()
 
 
@@ -399,9 +399,9 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     # composite_group_id carrier; v14 adds the reconcile nomination carrier +
     # the nullable nomination_id linkage column on error_events)
     assert apply_migrations(graph, "graph") == 15
-    assert apply_migrations(meta, "meta") == 15
+    assert apply_migrations(meta, "meta") == 16
     assert current_schema_version(graph, "graph") == 15
-    assert current_schema_version(meta, "meta") == 15
+    assert current_schema_version(meta, "meta") == 16
 
     assert "pinned" in _column_names(graph, "nodes")
     assert "promotion_status" in _column_names(graph, "nodes")
@@ -485,7 +485,7 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     graph_versions = [int(r[0]) for r in graph.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
     meta_versions = [int(r[0]) for r in meta.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
     assert sorted(graph_versions) == [1, 2, 5, 10, 15]
-    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15]
+    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16]
 
     # v11: the append-only error-event ledger is a dedicated meta table (born
     # empty, no backfill) — the E1 signal-agnostic nomination ledger.

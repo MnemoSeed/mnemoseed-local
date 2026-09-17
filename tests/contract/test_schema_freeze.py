@@ -188,6 +188,7 @@ _FROZEN_META_TABLES = (
     "dream_token_ledger",
     "error_events",
     "reconcile_nominations",
+    "reconciliation_attempts",
 )
 _FROZEN_META_INDEXES = (
     "idx_tokens_profile",
@@ -198,6 +199,8 @@ _FROZEN_META_INDEXES = (
     "idx_reconcile_nominations_profile_group",
     "idx_error_events_nomination",
     "idx_audit_log_dedup_key",
+    "idx_reconciliation_attempts_profile_nomination",
+    "idx_reconcile_nominations_profile_nomination",
 )
 _FROZEN_TRIGGERS = (
     ("trg_audit_no_update", "UPDATE"),
@@ -206,6 +209,8 @@ _FROZEN_TRIGGERS = (
     ("trg_error_events_no_delete", "DELETE"),
     ("trg_reconcile_nominations_no_update", "UPDATE"),
     ("trg_reconcile_nominations_no_delete", "DELETE"),
+    ("trg_reconciliation_attempts_no_update", "UPDATE"),
+    ("trg_reconciliation_attempts_no_delete", "DELETE"),
 )
 
 

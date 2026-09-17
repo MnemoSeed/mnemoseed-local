@@ -747,6 +747,22 @@ _V15_AUDIT_DEDUP_INDEX = CreateIndex(
     store="meta", name="idx_audit_log_dedup_key", table="audit_log", columns=("dedup_key",), unique=True
 )
 
+_RECONCILIATION_ATTEMPTS_TABLE = CreateTable(
+    store="meta",
+    name="reconciliation_attempts",
+    columns=(
+        Column("profile_id", "TEXT", not_null=True),
+        Column("nomination_id", "TEXT", not_null=True),
+        Column("dream_run_id", "TEXT", not_null=True),
+        Column("attempt_ordinal", "INTEGER", not_null=True),
+        Column("reserved_at", "REAL", not_null=True),
+        Column("next_eligible_at", "REAL", not_null=True),
+    ),
+    unique=(("nomination_id", "dream_run_id"), ("nomination_id", "attempt_ordinal")),
+    checks=("typeof(attempt_ordinal) = 'integer' AND attempt_ordinal > 0",),
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -917,6 +933,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             _OUTBOX_DELIVERED_ONLY_TRIGGER,
             _V15_ADD_AUDIT_DEDUP_KEY,
             _V15_AUDIT_DEDUP_INDEX,
+        ),
+    ),
+    Migration(
+        version=16,
+        description="immutable reconciliation attempt reservations and profile nomination scan index",
+        ops=(
+            _RECONCILIATION_ATTEMPTS_TABLE,
+            *_immutable_trigger("meta", "reconciliation_attempts"),
+            CreateIndex(
+                store="meta",
+                name="idx_reconciliation_attempts_profile_nomination",
+                table="reconciliation_attempts",
+                columns=("profile_id", "nomination_id", "attempt_ordinal"),
+            ),
+            CreateIndex(
+                store="meta",
+                name="idx_reconcile_nominations_profile_nomination",
+                table="reconcile_nominations",
+                columns=("profile_id", "nomination_id"),
+            ),
         ),
     ),
 )

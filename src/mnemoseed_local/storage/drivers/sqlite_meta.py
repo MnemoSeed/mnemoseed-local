@@ -8,8 +8,11 @@ triggers, not just by driver convention.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -27,6 +30,9 @@ from mnemoseed_local.storage.drivers._threadlocal import ThreadLocalConnections
 from mnemoseed_local.storage.drivers._time import epoch_from_iso, iso8601_utc
 from mnemoseed_local.storage.ports import (
     CANONICAL_NOMINATION_KINDS,
+    AttemptReservation,
+    AttemptReservationOutcome,
+    AttemptReservationResult,
     AuditEntry,
     AuditFilter,
     Capability,
@@ -47,6 +53,8 @@ from mnemoseed_local.storage.ports import (
     Page,
     PageResult,
     PoolState,
+    ReconciliationNominationCarrier,
+    ReconciliationNominationPage,
     StorageError,
     StoredProfile,
     StoredUser,
@@ -763,6 +771,112 @@ class SqliteMetaDriver:
             composite_group_id=composite_group,
         )
 
+    def query_reconciliation_nominations(
+        self, *, profile_id: str, limit: int, cursor: str | None = None
+    ) -> ReconciliationNominationPage:
+        _require_positive_int(limit, "limit")
+        if cursor is None:
+            boundary = int(self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM error_events").fetchone()[0])
+            last_key = ""
+        else:
+            boundary, last_key = _decode_nomination_cursor(cursor, profile_id)
+        rows = self._conn.execute(
+            "SELECT * FROM reconcile_nominations WHERE profile_id = ? AND nomination_id > ? "
+            "AND json_extract(evidence_event_ids, '$[0]') <= ? ORDER BY nomination_id LIMIT ?",
+            (profile_id, last_key, boundary, limit + 1),
+        ).fetchall()
+        items = tuple(_decode_nomination(row) for row in rows[:limit])
+        next_cursor = None
+        if len(rows) > limit:
+            payload = json.dumps([1, profile_id, boundary, items[-1].nomination_id], separators=(",", ":"))
+            next_cursor = base64.urlsafe_b64encode(payload.encode()).decode("ascii")
+        return ReconciliationNominationPage(items, next_cursor)
+
+    def read_reconciliation_evidence(
+        self, *, profile_id: str, nomination_id: str
+    ) -> tuple[ErrorEvent, ...] | None:
+        row = self._conn.execute(
+            "SELECT * FROM reconcile_nominations WHERE profile_id = ? AND nomination_id = ?",
+            (profile_id, nomination_id),
+        ).fetchone()
+        if row is None:
+            return None
+        carrier = _decode_nomination(row)
+        ids = carrier.evidence_event_ids
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM error_events WHERE id IN ({placeholders}) ORDER BY id", ids
+        ).fetchall()
+        if len(rows) != len(ids) or any(
+            event["profile_id"] != profile_id
+            or event["nomination_id"] != nomination_id
+            or event["composite_group_id"] != carrier.composite_group_id
+            for event in rows
+        ):
+            raise StorageError("corrupt reconciliation evidence membership")
+        return tuple(_decode_error_event(event) for event in rows)
+
+    def reserve_attempt(
+        self,
+        *,
+        profile_id: str,
+        nomination_id: str,
+        dream_run_id: str,
+        attempt_limit: int,
+        reserved_at: float,
+        next_eligible_at: float,
+    ) -> AttemptReservationResult:
+        _require_positive_int(attempt_limit, "attempt_limit")
+        for value in (reserved_at, next_eligible_at):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("attempt times must be finite numbers")
+        if next_eligible_at <= reserved_at:
+            raise ValueError("next_eligible_at must be after reserved_at")
+        with _transaction(self._conn):
+            nomination = self._conn.execute(
+                "SELECT 1 FROM reconcile_nominations WHERE profile_id = ? AND nomination_id = ?",
+                (profile_id, nomination_id),
+            ).fetchone()
+            if nomination is None:
+                raise StorageError("nomination does not belong to profile")
+            existing = self._conn.execute(
+                "SELECT * FROM reconciliation_attempts WHERE nomination_id = ? AND dream_run_id = ?",
+                (nomination_id, dream_run_id),
+            ).fetchone()
+            if existing is not None:
+                return AttemptReservationResult(
+                    AttemptReservationOutcome.RESERVED, _decode_attempt(existing), False
+                )
+            count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM reconciliation_attempts WHERE nomination_id = ?", (nomination_id,)
+                ).fetchone()[0]
+            )
+            if count >= attempt_limit:
+                return AttemptReservationResult(AttemptReservationOutcome.BUDGET_EXHAUSTED, None, False)
+            reservation = AttemptReservation(
+                profile_id, nomination_id, dream_run_id, count + 1, reserved_at, next_eligible_at
+            )
+            inserted = self._conn.execute(
+                "INSERT INTO reconciliation_attempts "
+                "(profile_id, nomination_id, dream_run_id, attempt_ordinal, reserved_at, next_eligible_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (profile_id, nomination_id, dream_run_id, count + 1, reserved_at, next_eligible_at),
+            )
+            if inserted.rowcount != 1:
+                raise StorageError("attempt reservation insert stored no row")
+            return AttemptReservationResult(AttemptReservationOutcome.RESERVED, reservation, True)
+
+    def list_reconciliation_attempts(
+        self, *, profile_id: str, nomination_id: str
+    ) -> tuple[AttemptReservation, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM reconciliation_attempts WHERE profile_id = ? AND nomination_id = ? "
+            "ORDER BY attempt_ordinal",
+            (profile_id, nomination_id),
+        ).fetchall()
+        return tuple(_decode_attempt(row) for row in rows)
+
     # ------------------------------------------------------------ dream runs
 
     def record_dream_run(self, run: DreamRun) -> str:
@@ -892,6 +1006,77 @@ def _merge_watermark(current: tuple[int, int], incoming: tuple[int, int]) -> tup
             f"(current end {cur_end}, incoming start {new_start})"
         )
     return min(cur_start, new_start), max(cur_end, new_end)
+
+
+def _require_positive_int(value: int, name: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _decode_nomination_cursor(cursor: str, profile_id: str) -> tuple[int, str]:
+    try:
+        if not isinstance(cursor, str):
+            raise ValueError("cursor must be a string")
+        parts = json.loads(base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True))
+        if (
+            not isinstance(parts, list)
+            or len(parts) != 4
+            or type(parts[0]) is not int
+            or parts[0] != 1
+            or parts[1] != profile_id
+            or type(parts[2]) is not int
+            or parts[2] < 0
+            or not isinstance(parts[3], str)
+            or not parts[3]
+        ):
+            raise ValueError("invalid cursor fields")
+        return parts[2], parts[3]
+    except (ValueError, TypeError, UnicodeError, binascii.Error) as exc:
+        raise ValueError("invalid reconciliation nomination cursor") from exc
+
+
+def _decode_nomination(row: sqlite3.Row) -> ReconciliationNominationCarrier:
+    try:
+        ids = json.loads(row["evidence_event_ids"])
+        channels = json.loads(row["source_channels"])
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(type(value) is not int or value <= 0 for value in ids)
+            or len(set(ids)) != len(ids)
+            or not isinstance(channels, list)
+            or any(not isinstance(value, str) for value in channels)
+        ):
+            raise ValueError("invalid frozen membership")
+        return ReconciliationNominationCarrier(
+            nomination_id=str(row["nomination_id"]),
+            profile_id=str(row["profile_id"]),
+            canonical_kind=str(row["canonical_kind"]),
+            composite_group_id=str(row["composite_group_id"]),
+            source_generation=int(row["source_generation"]),
+            lo_node_id=str(row["lo_node_id"]),
+            hi_node_id=str(row["hi_node_id"]),
+            lo_version=int(row["lo_version"]),
+            hi_version=int(row["hi_version"]),
+            lo_expected_peer=str(row["lo_expected_peer"]),
+            hi_expected_peer=str(row["hi_expected_peer"]),
+            evidence_event_ids=tuple(ids),
+            source_channels=tuple(channels),
+            created_at=str(row["created_at"]),
+        )
+    except (ValueError, TypeError) as exc:
+        raise StorageError("corrupt reconciliation nomination carrier") from exc
+
+
+def _decode_attempt(row: sqlite3.Row) -> AttemptReservation:
+    return AttemptReservation(
+        profile_id=str(row["profile_id"]),
+        nomination_id=str(row["nomination_id"]),
+        dream_run_id=str(row["dream_run_id"]),
+        attempt_ordinal=int(row["attempt_ordinal"]),
+        reserved_at=float(row["reserved_at"]),
+        next_eligible_at=float(row["next_eligible_at"]),
+    )
 
 
 def _decode_audit(row: sqlite3.Row) -> AuditEntry:

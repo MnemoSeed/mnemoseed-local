@@ -47,6 +47,9 @@ COVERAGE: dict[str, dict[str, str]] = {
             "test_reconcile_application.py::"
             + "test_same_nomination_sequential_replay_n_times_is_exactly_once"
         ),
+        "get_reconciliation_receipt": (
+            "test_contract_reconciliation.py::test_receipt_read_is_profile_scoped_and_read_only"
+        ),
         "pending_reconciliation_audits": (
             "test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once"
         ),
@@ -98,6 +101,16 @@ COVERAGE: dict[str, dict[str, str]] = {
         "append_error_event": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
         "query_error_events": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
         # reconcile nomination (S-A: atomic carrier + NODE rows)
+        "query_reconciliation_nominations": (
+            "test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence"
+        ),
+        "read_reconciliation_evidence": (
+            "test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence"
+        ),
+        "reserve_attempt": "test_contract_reconciliation.py::test_reservation_replay_restart_and_budget",
+        "list_reconciliation_attempts": (
+            "test_contract_reconciliation.py::test_reservation_replay_restart_and_budget"
+        ),
         "append_reconcile_nomination": (
             "test_contract_meta.py::test_append_reconcile_nomination_atomic_carrier_and_rows"
         ),
@@ -140,7 +153,7 @@ COVERAGE: dict[str, dict[str, str]] = {
 # write — one transaction, carrier + two NODE ledger rows, typed dedup).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
-    "GraphStore": 26,
-    "MetaStore": 38,
+    "GraphStore": 27,
+    "MetaStore": 42,
     "Embedder": 3,
 }
