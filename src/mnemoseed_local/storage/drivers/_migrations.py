@@ -647,6 +647,106 @@ _V13_ADD_COMPOSITE_GROUP = AddColumn(
     store="meta", table="error_events", column=Column("composite_group_id", "TEXT")
 )
 
+# v15: graph-side application authority and repairable cross-store audit delivery.
+_RECONCILIATION_RECEIPTS_TABLE = CreateTable(
+    store="graph",
+    name="reconciliation_receipts",
+    columns=(
+        Column("nomination_id", "TEXT", primary_key=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("disposition", "TEXT", not_null=True),
+        Column("reason_code", "TEXT", not_null=True),
+        Column("left_node_id", "TEXT", not_null=True),
+        Column("left_version", "INTEGER", not_null=True),
+        Column("left_expected_peer_id", "TEXT", not_null=True),
+        Column("right_node_id", "TEXT", not_null=True),
+        Column("right_version", "INTEGER", not_null=True),
+        Column("right_expected_peer_id", "TEXT", not_null=True),
+        Column("winner_node_id", "TEXT"),
+        Column("loser_node_id", "TEXT"),
+        Column("downweight_factor", "REAL"),
+        Column("applied_at", "TEXT", not_null=True),
+        Column("input_hash", "TEXT", not_null=True),
+        Column("canonical_kind", "TEXT", not_null=True),
+        Column("composite_group_id", "TEXT", not_null=True),
+        Column("evidence_event_ids", "JSON", not_null=True),
+        Column("verdict", "TEXT", not_null=True),
+        Column("quality", "TEXT", not_null=True),
+        Column("loser_prior_version", "INTEGER"),
+        Column("loser_new_version", "INTEGER"),
+    ),
+)
+
+_RECONCILIATION_AUDIT_OUTBOX_TABLE = CreateTable(
+    store="graph",
+    name="reconciliation_audit_outbox",
+    columns=(
+        Column("id", "INTEGER", primary_key=True),
+        Column("nomination_id", "TEXT", not_null=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("action", "TEXT", not_null=True),
+        Column("detail", "JSON", not_null=True),
+        Column("created_at", "TEXT", not_null=True),
+        Column("delivered_at", "TEXT"),
+    ),
+    unique=(("nomination_id", "action"),),
+)
+
+
+def _immutable_trigger(store: StoreTag, table: str) -> tuple[AddTrigger, AddTrigger]:
+    return (
+        AddTrigger(
+            store=store,
+            name=f"trg_{table}_no_update",
+            timing="BEFORE",
+            event="UPDATE",
+            table=table,
+            action=f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END",
+            pg_action=f"RAISE EXCEPTION '{table} is append-only'",
+        ),
+        AddTrigger(
+            store=store,
+            name=f"trg_{table}_no_delete",
+            timing="BEFORE",
+            event="DELETE",
+            table=table,
+            action=f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END",
+            pg_action=f"RAISE EXCEPTION '{table} is append-only'",
+        ),
+    )
+
+
+_RECEIPT_TRIGGERS = _immutable_trigger("graph", "reconciliation_receipts")
+_OUTBOX_DELETE_TRIGGER = AddTrigger(
+    store="graph",
+    name="trg_reconciliation_audit_outbox_no_delete",
+    timing="BEFORE",
+    event="DELETE",
+    table="reconciliation_audit_outbox",
+    action="BEGIN SELECT RAISE(ABORT, 'reconciliation_audit_outbox is append-only'); END",
+    pg_action="RAISE EXCEPTION 'reconciliation_audit_outbox is append-only'",
+)
+_OUTBOX_DELIVERED_ONLY_TRIGGER = AddTrigger(
+    store="graph",
+    name="trg_reconciliation_audit_outbox_delivered_only",
+    timing="BEFORE",
+    event="UPDATE",
+    table="reconciliation_audit_outbox",
+    action=(
+        "BEGIN SELECT CASE WHEN NOT (OLD.id = NEW.id "
+        "AND OLD.nomination_id = NEW.nomination_id "
+        "AND OLD.profile_id = NEW.profile_id AND OLD.action = NEW.action "
+        "AND OLD.detail = NEW.detail AND OLD.created_at = NEW.created_at "
+        "AND OLD.delivered_at IS NULL AND NEW.delivered_at IS NOT NULL) "
+        "THEN RAISE(ABORT, 'reconciliation_audit_outbox permits delivered-only transition') END; END"
+    ),
+    pg_action="RAISE EXCEPTION 'reconciliation_audit_outbox permits delivered-only transition'",
+)
+_V15_ADD_AUDIT_DEDUP_KEY = AddColumn(store="meta", table="audit_log", column=Column("dedup_key", "TEXT"))
+_V15_AUDIT_DEDUP_INDEX = CreateIndex(
+    store="meta", name="idx_audit_log_dedup_key", table="audit_log", columns=("dedup_key",), unique=True
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -801,6 +901,22 @@ MIGRATIONS: tuple[Migration, ...] = (
             _RECONCILE_NOMINATIONS_DELETE_TRIGGER,
             _V14_ADD_NOMINATION_ID,
             _ERROR_EVENTS_NOMINATION_INDEX,
+        ),
+    ),
+    Migration(
+        version=15,
+        description=(
+            "reconciliation application authority: immutable graph receipts, durable delivered-only "
+            "audit outbox, and nullable unique meta audit dedup key"
+        ),
+        ops=(
+            _RECONCILIATION_RECEIPTS_TABLE,
+            _RECONCILIATION_AUDIT_OUTBOX_TABLE,
+            *_RECEIPT_TRIGGERS,
+            _OUTBOX_DELETE_TRIGGER,
+            _OUTBOX_DELIVERED_ONLY_TRIGGER,
+            _V15_ADD_AUDIT_DEDUP_KEY,
+            _V15_AUDIT_DEDUP_INDEX,
         ),
     ),
 )

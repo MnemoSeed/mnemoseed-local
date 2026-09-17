@@ -107,12 +107,12 @@ def _parse_index(sql: str) -> tuple[bool, str, str, tuple[str, ...]]:
 
 def test_version_sequences_are_shared_and_forward_only() -> None:
     """The dialect-agnostic sequence IS the parity baseline
-    (graph 1,2,5,10; meta 1,3,4,6,7,8,9,11,12,13,14)."""
-    assert latest_version() == 14
+    (graph 1,2,5,10,15; meta 1,3,4,6,7,8,9,11,12,13,14,15)."""
+    assert latest_version() == 15
     graph_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("graph"))
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
-    assert graph_versions == [1, 2, 5, 10]
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14]
+    assert graph_versions == [1, 2, 5, 10, 15]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15]
     assert len(MIGRATIONS) == latest_version()
 
 
@@ -390,7 +390,7 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     assert current_schema_version(graph, "graph") == 1
     assert current_schema_version(meta, "meta") == 1
 
-    # forward migration: graph advances to 10, meta to 14 (v2/v5/v10 are
+    # forward migration: both stores advance to v15 (v2/v5/v10 are
     # graph-only; v6 is meta-only: identity users table + hashed token column;
     # v7 is the profile archive flag; v8 is the reserved nullable
     # config.scope column; v9 is the lifetime filed-points ledger column on
@@ -398,10 +398,10 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     # provider/model/status/reason/retryable; v13 adds the nullable shared
     # composite_group_id carrier; v14 adds the reconcile nomination carrier +
     # the nullable nomination_id linkage column on error_events)
-    assert apply_migrations(graph, "graph") == 10
-    assert apply_migrations(meta, "meta") == 14
-    assert current_schema_version(graph, "graph") == 10
-    assert current_schema_version(meta, "meta") == 14
+    assert apply_migrations(graph, "graph") == 15
+    assert apply_migrations(meta, "meta") == 15
+    assert current_schema_version(graph, "graph") == 15
+    assert current_schema_version(meta, "meta") == 15
 
     assert "pinned" in _column_names(graph, "nodes")
     assert "promotion_status" in _column_names(graph, "nodes")
@@ -431,6 +431,8 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
             rows = [{k: v for k, v in r.items() if k != "archived"} for r in rows]
         if table == "config":
             rows = [{k: v for k, v in r.items() if k != "scope"} for r in rows]
+        if table == "audit_log":
+            rows = [{k: v for k, v in r.items() if k != "dedup_key"} for r in rows]
         if table == "error_events":
             rows = [
                 {
@@ -479,11 +481,11 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
     user_row = dict(meta.execute("SELECT token_hash FROM tokens WHERE token_id = 'tok-1'").fetchone())
     assert user_row["token_hash"] is None  # pre-v6 tokens hold no hash (blessed empty)
 
-    # tracker advanced one step per graph/meta delta (v2/v5/v10 graph, v4/v6/v7/v8/v9/v11/v12/v13/v14 meta)
+    # tracker advanced one step per graph/meta delta, including v15 on both stores.
     graph_versions = [int(r[0]) for r in graph.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
     meta_versions = [int(r[0]) for r in meta.execute(f"SELECT version FROM {SCHEMA_VERSION_TABLE}")]
-    assert sorted(graph_versions) == [1, 2, 5, 10]
-    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14]
+    assert sorted(graph_versions) == [1, 2, 5, 10, 15]
+    assert sorted(meta_versions) == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15]
 
     # v11: the append-only error-event ledger is a dedicated meta table (born
     # empty, no backfill) — the E1 signal-agnostic nomination ledger.
@@ -556,6 +558,45 @@ def test_sqlite_v1_to_head_forward_migration_preserves_data() -> None:
                 "2026-01-01T00:00:00Z",
             ),
         )
+
+    assert _column_names(graph, "reconciliation_receipts") == [
+        "nomination_id",
+        "profile_id",
+        "disposition",
+        "reason_code",
+        "left_node_id",
+        "left_version",
+        "left_expected_peer_id",
+        "right_node_id",
+        "right_version",
+        "right_expected_peer_id",
+        "winner_node_id",
+        "loser_node_id",
+        "downweight_factor",
+        "applied_at",
+        "input_hash",
+        "canonical_kind",
+        "composite_group_id",
+        "evidence_event_ids",
+        "verdict",
+        "quality",
+        "loser_prior_version",
+        "loser_new_version",
+    ]
+    assert _column_names(graph, "reconciliation_audit_outbox") == [
+        "id",
+        "nomination_id",
+        "profile_id",
+        "action",
+        "detail",
+        "created_at",
+        "delivered_at",
+    ]
+    outbox_sql = graph.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reconciliation_audit_outbox'"
+    ).fetchone()[0]
+    assert "UNIQUE (nomination_id, action)" in outbox_sql
+    assert "dedup_key" in _column_names(meta, "audit_log")
 
 
 def _project_without_deltas(rows: list[dict[str, object]]) -> list[dict[str, object]]:

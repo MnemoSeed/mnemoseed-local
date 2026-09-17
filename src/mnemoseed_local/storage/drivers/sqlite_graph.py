@@ -9,7 +9,9 @@ reconsolidation never leaves the graph half-written.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -17,6 +19,7 @@ import uuid
 from collections.abc import Iterator
 from collections.abc import Sequence as CSeq
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +30,13 @@ from mnemoseed_local.schema.graph import (
     RelType,
     validate_node_payload,
 )
+from mnemoseed_local.schema.stamp import ProvenanceEvent
 from mnemoseed_local.storage.drivers._migrations import apply_migrations
 from mnemoseed_local.storage.drivers._threadlocal import ThreadLocalConnections
 from mnemoseed_local.storage.drivers._time import epoch_from_iso, iso8601_utc
 from mnemoseed_local.storage.ports import (
     Capability,
+    Disposition,
     DriverInfo,
     EdgeEntry,
     EdgeFilter,
@@ -42,6 +47,11 @@ from mnemoseed_local.storage.ports import (
     NodeFilter,
     Page,
     PageResult,
+    ReasonCode,
+    ReceiptConflictError,
+    ReconciliationApplication,
+    ReconciliationAuditOutboxEntry,
+    ReconciliationReceipt,
     StorageError,
     TimelineEvent,
 )
@@ -55,6 +65,139 @@ _CAPABILITIES = frozenset(
         Capability.GRAPH_EDGE_LIST,
     }
 )
+
+
+class _SemanticFailure(Exception):
+    """A terminal fallback: the mutation rolls back and an unresolved receipt
+    lands instead. ``clear_allowed`` selects whether the fallback still clears
+    the sides that were envelope-exact at load."""
+
+    def __init__(self, reason_code: str, *, clear_allowed: bool = True) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.clear_allowed = clear_allowed
+
+
+def _is_direction_partition(application: ReconciliationApplication) -> bool:
+    """An accepted application names an explicit direction over the pair."""
+    winner_node_id = application.winner_node_id
+    loser_node_id = application.loser_node_id
+    if winner_node_id is None or loser_node_id is None or winner_node_id == loser_node_id:
+        return False
+    return {winner_node_id, loser_node_id} == {
+        application.left_node_id,
+        application.right_node_id,
+    }
+
+
+def _validate_downweight_factor(
+    application: ReconciliationApplication, downweight_factor: float | None
+) -> None:
+    """downweight_factor is supplied by the caller only for accepted
+    applications, has no default, and must be finite and strictly between
+    zero and one. It is an uncalibrated mechanism input, not a product
+    threshold or activation value.
+    """
+    accepted = str(application.disposition) == "accepted"
+    if not accepted:
+        if downweight_factor is not None:
+            raise ValueError("downweight_factor is supplied only for accepted applications")
+        return
+    if (
+        downweight_factor is None
+        or not isinstance(downweight_factor, (int, float))
+        or isinstance(downweight_factor, bool)
+        or not math.isfinite(downweight_factor)
+        or not 0.0 < downweight_factor < 1.0
+    ):
+        raise ValueError("downweight_factor must be finite and strictly between zero and one")
+
+
+def _validate_reconciliation_disposition(application: ReconciliationApplication) -> str:
+    """Only terminal dispositions reach the store; anything else is rejected
+    before any read or write, never as a storage integrity fault."""
+    disposition = str(application.disposition)
+    if disposition not in ("accepted", "rejected", "unresolved"):
+        raise ValueError(
+            "apply_reconciliation disposition must be accepted, rejected, or unresolved; "
+            f"got {disposition!r} (deferred applications never reach the store)"
+        )
+    return disposition
+
+
+def _application_hash(application: ReconciliationApplication, downweight_factor: float | None) -> str:
+    payload = {
+        "nomination_id": application.nomination_id,
+        "profile_id": application.profile_id,
+        "disposition": str(application.disposition),
+        "reason_code": str(application.reason_code),
+        "canonical_kind": str(application.canonical_kind),
+        "composite_group_id": str(application.composite_group_id),
+        "evidence_event_ids": list(application.evidence_event_ids),
+        "verdict": str(application.verdict),
+        "quality": str(application.quality),
+        "left_node_id": application.left_node_id,
+        "left_version": application.left_version,
+        "left_expected_peer_id": application.left_expected_peer_id,
+        "right_node_id": application.right_node_id,
+        "right_version": application.right_version,
+        "right_expected_peer_id": application.right_expected_peer_id,
+        "winner_node_id": application.winner_node_id,
+        "loser_node_id": application.loser_node_id,
+        "loser_prior_version": application.loser_prior_version,
+        "loser_new_version": application.loser_new_version,
+        "applied_at": application.applied_at,
+        "downweight_factor": downweight_factor,
+    }
+    encoded = json.dumps(payload, allow_nan=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _disposition(value: str) -> Disposition:
+    return Disposition(value)
+
+
+def _reason_code(value: str) -> ReasonCode:
+    return ReasonCode(value)
+
+
+def _decode_receipt(row: sqlite3.Row) -> ReconciliationReceipt:
+    return ReconciliationReceipt(
+        nomination_id=str(row["nomination_id"]),
+        profile_id=str(row["profile_id"]),
+        disposition=_disposition(str(row["disposition"])),
+        reason_code=_reason_code(str(row["reason_code"])),
+        canonical_kind=str(row["canonical_kind"]),
+        composite_group_id=str(row["composite_group_id"]),
+        evidence_event_ids=tuple(int(item) for item in json.loads(str(row["evidence_event_ids"]))),
+        verdict=str(row["verdict"]),
+        quality=str(row["quality"]),
+        left_node_id=str(row["left_node_id"]),
+        left_version=int(row["left_version"]),
+        left_expected_peer_id=str(row["left_expected_peer_id"]),
+        right_node_id=str(row["right_node_id"]),
+        right_version=int(row["right_version"]),
+        right_expected_peer_id=str(row["right_expected_peer_id"]),
+        winner_node_id=row["winner_node_id"],
+        loser_node_id=row["loser_node_id"],
+        loser_prior_version=(
+            int(row["loser_prior_version"]) if row["loser_prior_version"] is not None else None
+        ),
+        loser_new_version=(int(row["loser_new_version"]) if row["loser_new_version"] is not None else None),
+        downweight_factor=(float(row["downweight_factor"]) if row["downweight_factor"] is not None else None),
+        applied_at=epoch_from_iso(str(row["applied_at"])),
+    )
+
+
+@dataclass(frozen=True)
+class _ApplicationSide:
+    """One application endpoint loaded independently under the lock."""
+
+    node_id: str
+    expected_version: int
+    expected_peer_id: str
+    live: GraphNode | None
+    exact: bool
 
 
 @register(GRAPH_DRIVERS)
@@ -214,7 +357,11 @@ class SqliteGraphDriver:
             current_version = self._get_current_version(node.node_id)
             if current_version is not None:
                 if invalidate_at is not None:
-                    self._invalidate_locked(node.node_id, invalidate_at)
+                    if node.version != current_version + 1:
+                        raise StorageError(
+                            f"append version {node.version} does not follow current version {current_version}"
+                        )
+                    self._close_for_append_locked(node.node_id, current_version, invalidate_at)
                     self._conn.execute(
                         "UPDATE node_versions SET superseded_by = ? WHERE node_id = ? AND version = ?",
                         (node.version, node.node_id, current_version),
@@ -247,13 +394,10 @@ class SqliteGraphDriver:
         ).fetchone()
         if row is None:
             return
-        payload = json.loads(str(row["payload"]))
-        if row["valid_to"] is None and payload.get("valid_to") is None:
-            payload["valid_to"] = took_over_at
+        if row["valid_to"] is None:
             self._conn.execute(
-                "UPDATE node_versions SET payload = ?, valid_to = ? WHERE node_id = ? AND version = ?",
+                "UPDATE node_versions SET valid_to = ? WHERE node_id = ? AND version = ?",
                 (
-                    json.dumps(payload),
                     iso8601_utc(took_over_at),
                     node_id,
                     old_version,
@@ -262,6 +406,16 @@ class SqliteGraphDriver:
         self._conn.execute(
             "UPDATE node_versions SET superseded_by = ? WHERE node_id = ? AND version = ?",
             (new_version, node_id, old_version),
+        )
+
+    def _close_for_append_locked(self, node_id: str, version: int, valid_to: float) -> None:
+        self._conn.execute(
+            "UPDATE node_versions SET valid_to = ? WHERE node_id = ? AND version = ?",
+            (iso8601_utc(valid_to), node_id, version),
+        )
+        self._conn.execute(
+            "UPDATE nodes SET valid_to = ?, updated_at = ? WHERE node_id = ? AND valid_to IS NULL",
+            (iso8601_utc(valid_to), iso8601_utc(time.time()), node_id),
         )
 
     # ------------------------------------------------------------ node CRUD
@@ -546,6 +700,380 @@ class SqliteGraphDriver:
                 "UPDATE nodes SET read_conflict_id = NULL WHERE node_id = ? AND valid_to IS NULL",
                 (node_id,),
             )
+
+    _RECEIPT_COLUMNS: tuple[str, ...] = (
+        "nomination_id",
+        "profile_id",
+        "disposition",
+        "reason_code",
+        "left_node_id",
+        "left_version",
+        "left_expected_peer_id",
+        "right_node_id",
+        "right_version",
+        "right_expected_peer_id",
+        "winner_node_id",
+        "loser_node_id",
+        "downweight_factor",
+        "applied_at",
+        "input_hash",
+        "canonical_kind",
+        "composite_group_id",
+        "evidence_event_ids",
+        "verdict",
+        "quality",
+        "loser_prior_version",
+        "loser_new_version",
+    )
+
+    def apply_reconciliation(
+        self,
+        application: ReconciliationApplication,
+        *,
+        downweight_factor: float | None,
+    ) -> ReconciliationReceipt:
+        """Receipt identity is checked before mutable graph state. An
+        identical receipt is authoritative and returned without graph
+        mutation. A receipt with the same nomination ID but different
+        immutable input raises ReceiptConflictError. Semantic endpoint
+        failures become terminal unresolved receipts; infrastructure
+        failures roll back and propagate.
+        """
+        disposition_in = _validate_reconciliation_disposition(application)
+        input_hash = _application_hash(application, downweight_factor)
+        with _transaction(self._conn):
+            existing = self._conn.execute(
+                "SELECT * FROM reconciliation_receipts WHERE nomination_id = ?",
+                (application.nomination_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["input_hash"]) != input_hash:
+                    raise ReceiptConflictError(
+                        f"nomination {application.nomination_id!r} conflicts with its immutable receipt"
+                    )
+                return _decode_receipt(existing)
+
+            _validate_downweight_factor(application, downweight_factor)
+            disposition = disposition_in
+            reason_code = str(application.reason_code)
+            sides: tuple[_ApplicationSide, _ApplicationSide] = (
+                _ApplicationSide(
+                    node_id=application.left_node_id,
+                    expected_version=application.left_version,
+                    expected_peer_id=application.left_expected_peer_id,
+                    live=None,
+                    exact=False,
+                ),
+                _ApplicationSide(
+                    node_id=application.right_node_id,
+                    expected_version=application.right_version,
+                    expected_peer_id=application.right_expected_peer_id,
+                    live=None,
+                    exact=False,
+                ),
+            )
+            loser_prior_version: int | None = None
+            loser_new_version: int | None = None
+            self._conn.execute("SAVEPOINT reconciliation_mutation")
+            try:
+                sides = (
+                    self._load_application_side(
+                        application,
+                        node_id=application.left_node_id,
+                        version=application.left_version,
+                        expected_peer_id=application.left_expected_peer_id,
+                    ),
+                    self._load_application_side(
+                        application,
+                        node_id=application.right_node_id,
+                        version=application.right_version,
+                        expected_peer_id=application.right_expected_peer_id,
+                    ),
+                )
+                if any(
+                    side.live is not None
+                    and side.live.profile_id == application.profile_id
+                    and side.live.never_decay
+                    for side in sides
+                ):
+                    raise _SemanticFailure("protected_endpoint", clear_allowed=False)
+                loser_prior_version = self._loser_prior_version(application, sides)
+                if disposition == "accepted":
+                    if not all(side.exact for side in sides) or not _is_direction_partition(application):
+                        raise _SemanticFailure("stale_revision", clear_allowed=True)
+                    loser = next(side.live for side in sides if side.node_id == application.loser_node_id)
+                    assert loser is not None
+                    if loser.decay_weight <= 0.0:
+                        raise _SemanticFailure("decay_weight_not_lowerable", clear_allowed=False)
+                    assert downweight_factor is not None
+                    winner_node_id = (
+                        application.left_node_id
+                        if application.loser_node_id == application.right_node_id
+                        else application.right_node_id
+                    )
+                    self._append_reconciliation_version(
+                        loser,
+                        winner_node_id,
+                        application.nomination_id,
+                        downweight_factor,
+                        application.applied_at,
+                    )
+                    loser_new_version = loser_prior_version + 1 if loser_prior_version is not None else None
+                for side in sides:
+                    if not side.exact:
+                        continue
+                    version = side.expected_version
+                    if disposition == "accepted" and side.node_id == application.loser_node_id:
+                        version += 1
+                    if (
+                        self._cas_clear_side(
+                            node_id=side.node_id,
+                            profile_id=application.profile_id,
+                            version=version,
+                            expected_peer_id=side.expected_peer_id,
+                        )
+                        != 1
+                    ):
+                        raise _SemanticFailure("stale_revision", clear_allowed=False)
+                self._conn.execute("RELEASE SAVEPOINT reconciliation_mutation")
+            except _SemanticFailure as exc:
+                self._conn.execute("ROLLBACK TO SAVEPOINT reconciliation_mutation")
+                self._conn.execute("RELEASE SAVEPOINT reconciliation_mutation")
+                disposition = "unresolved"
+                reason_code = exc.reason_code
+                loser_new_version = None
+                if exc.clear_allowed:
+                    for side in sides:
+                        if side.exact:
+                            self._cas_clear_side(
+                                node_id=side.node_id,
+                                profile_id=application.profile_id,
+                                version=side.expected_version,
+                                expected_peer_id=side.expected_peer_id,
+                            )
+
+            receipt = ReconciliationReceipt(
+                nomination_id=application.nomination_id,
+                profile_id=application.profile_id,
+                disposition=_disposition(disposition),
+                reason_code=_reason_code(reason_code),
+                canonical_kind=str(application.canonical_kind),
+                composite_group_id=str(application.composite_group_id),
+                evidence_event_ids=tuple(application.evidence_event_ids),
+                verdict=str(application.verdict),
+                quality=str(application.quality),
+                left_node_id=application.left_node_id,
+                left_version=application.left_version,
+                left_expected_peer_id=application.left_expected_peer_id,
+                right_node_id=application.right_node_id,
+                right_version=application.right_version,
+                right_expected_peer_id=application.right_expected_peer_id,
+                winner_node_id=application.winner_node_id,
+                loser_node_id=application.loser_node_id,
+                loser_prior_version=loser_prior_version,
+                loser_new_version=loser_new_version,
+                downweight_factor=downweight_factor,
+                applied_at=application.applied_at,
+            )
+            self._insert_receipt(receipt, input_hash)
+            self._insert_reconciliation_outbox(receipt)
+            return receipt
+
+    def _load_application_side(
+        self,
+        application: ReconciliationApplication,
+        *,
+        node_id: str,
+        version: int,
+        expected_peer_id: str,
+    ) -> _ApplicationSide:
+        """Load one endpoint independently; a side is exact only while its
+        live envelope still matches id, profile, version, and expected peer."""
+        node = self.get_node(node_id)
+        exact = (
+            node is not None
+            and node.profile_id == application.profile_id
+            and node.version == version
+            and node.read_conflict_id == expected_peer_id
+        )
+        return _ApplicationSide(
+            node_id=node_id,
+            expected_version=version,
+            expected_peer_id=expected_peer_id,
+            live=node,
+            exact=exact,
+        )
+
+    def _loser_prior_version(
+        self,
+        application: ReconciliationApplication,
+        sides: tuple[_ApplicationSide, _ApplicationSide],
+    ) -> int | None:
+        """The loser version the receipt cites: its live revision, if any."""
+        loser_node_id = application.loser_node_id
+        if loser_node_id is None:
+            return None
+        for side in sides:
+            if side.node_id == loser_node_id:
+                live = side.live
+                if live is not None and live.profile_id == application.profile_id:
+                    return live.version
+                return None
+        return None
+
+    def _cas_clear_side(
+        self,
+        *,
+        node_id: str,
+        profile_id: str,
+        version: int,
+        expected_peer_id: str,
+    ) -> int:
+        """Clear one envelope-exact side only; the predicates never repoint."""
+        cursor = self._conn.execute(
+            "UPDATE nodes SET read_conflict_id = NULL WHERE node_id = ? AND profile_id = ? "
+            "AND version = ? AND valid_to IS NULL AND read_conflict_id = ?",
+            (node_id, profile_id, version, expected_peer_id),
+        )
+        return cursor.rowcount
+
+    def _append_reconciliation_version(
+        self,
+        loser: GraphNode,
+        winner_node_id: str,
+        nomination_id: str,
+        factor: float,
+        applied_at: float,
+    ) -> None:
+        event = ProvenanceEvent(
+            at=applied_at,
+            action="reconciled",
+            actor="dream-engine",
+            detail={
+                "nomination_id": nomination_id,
+                "winner_node_id": winner_node_id,
+                "prior_version": loser.version,
+                "disposition": "accepted",
+            },
+        )
+        provenance = loser.provenance.model_copy(update={"history": [*loser.provenance.history, event]})
+        revision = loser.model_copy(
+            update={
+                "version": loser.version + 1,
+                "prev_version_id": f"{loser.node_id}:{loser.version}",
+                "decay_weight": loser.decay_weight * factor,
+                "provenance": provenance,
+                "valid_from": applied_at,
+                "valid_to": None,
+                "updated_at": applied_at,
+            }
+        )
+        validate_node_payload(revision.node_type, revision.props)
+        self._supersede_snapshot(loser.node_id, loser.version, revision.version, applied_at)
+        columns = ", ".join(self._NODE_COLUMNS)
+        placeholders = ", ".join(["?"] * len(self._NODE_COLUMNS))
+        self._conn.execute(
+            f"INSERT OR REPLACE INTO nodes ({columns}) VALUES ({placeholders})", self._node_row(revision)
+        )
+        self._conn.execute(
+            "INSERT INTO node_versions "
+            "(node_id, version, profile_id, valid_from, valid_to, superseded_by, changed_at, payload) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)",
+            (
+                revision.node_id,
+                revision.version,
+                revision.profile_id,
+                iso8601_utc(revision.valid_from),
+                iso8601_utc(revision.updated_at),
+                revision.model_dump_json(),
+            ),
+        )
+
+    def _insert_receipt(self, receipt: ReconciliationReceipt, input_hash: str) -> None:
+        columns = ", ".join(self._RECEIPT_COLUMNS)
+        placeholders = ", ".join(["?"] * len(self._RECEIPT_COLUMNS))
+        self._conn.execute(
+            f"INSERT INTO reconciliation_receipts ({columns}) VALUES ({placeholders})",
+            (
+                receipt.nomination_id,
+                receipt.profile_id,
+                str(receipt.disposition),
+                str(receipt.reason_code),
+                receipt.left_node_id,
+                receipt.left_version,
+                receipt.left_expected_peer_id,
+                receipt.right_node_id,
+                receipt.right_version,
+                receipt.right_expected_peer_id,
+                receipt.winner_node_id,
+                receipt.loser_node_id,
+                receipt.downweight_factor,
+                iso8601_utc(receipt.applied_at),
+                input_hash,
+                str(receipt.canonical_kind),
+                str(receipt.composite_group_id),
+                json.dumps(list(receipt.evidence_event_ids), separators=(",", ":")),
+                str(receipt.verdict),
+                str(receipt.quality),
+                receipt.loser_prior_version,
+                receipt.loser_new_version,
+            ),
+        )
+
+    def _insert_reconciliation_outbox(self, receipt: ReconciliationReceipt) -> None:
+        detail = {
+            "nomination_id": receipt.nomination_id,
+            "profile_id": receipt.profile_id,
+            "reason_code": str(receipt.reason_code),
+            "disposition": str(receipt.disposition),
+            "left_node_id": receipt.left_node_id,
+            "left_version": receipt.left_version,
+            "right_node_id": receipt.right_node_id,
+            "right_version": receipt.right_version,
+            "winner_node_id": receipt.winner_node_id,
+            "loser_node_id": receipt.loser_node_id,
+        }
+        self._conn.execute(
+            "INSERT INTO reconciliation_audit_outbox "
+            "(nomination_id, profile_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                receipt.nomination_id,
+                receipt.profile_id,
+                f"reconcile_{receipt.disposition}",
+                json.dumps(detail, separators=(",", ":"), sort_keys=True),
+                iso8601_utc(receipt.applied_at),
+            ),
+        )
+
+    def pending_reconciliation_audits(self, limit: int) -> list[ReconciliationAuditOutboxEntry]:
+        if limit < 0:
+            raise ValueError("audit repair limit must be non-negative")
+        rows = self._conn.execute(
+            "SELECT id, nomination_id, profile_id, action, detail, created_at "
+            "FROM reconciliation_audit_outbox WHERE delivered_at IS NULL "
+            "ORDER BY created_at, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            ReconciliationAuditOutboxEntry(
+                outbox_id=int(row["id"]),
+                nomination_id=str(row["nomination_id"]),
+                profile_id=str(row["profile_id"]),
+                action=str(row["action"]),
+                detail=json.loads(str(row["detail"])),
+                created_at=epoch_from_iso(str(row["created_at"])),
+            )
+            for row in rows
+        ]
+
+    def mark_reconciliation_audit_delivered(self, outbox_id: int, delivered_at: float) -> bool:
+        with _transaction(self._conn):
+            cursor = self._conn.execute(
+                "UPDATE reconciliation_audit_outbox SET delivered_at = ? "
+                "WHERE id = ? AND delivered_at IS NULL",
+                (iso8601_utc(delivered_at), outbox_id),
+            )
+            return cursor.rowcount == 1
 
     # ------------------------------------------------------------ version chain
 

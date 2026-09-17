@@ -288,6 +288,77 @@ class AuditEntry:
     detail: dict[str, Any] = field(default_factory=dict)
     at: float = 0.0
     id: int | None = None
+    dedup_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ReconciliationApplication:
+    """Immutable terminal pair application input."""
+
+    nomination_id: str
+    profile_id: str
+    disposition: str
+    reason_code: str
+    canonical_kind: str
+    composite_group_id: str
+    evidence_event_ids: tuple[int, ...]
+    verdict: str
+    quality: str
+    left_node_id: str
+    left_version: int
+    left_expected_peer_id: str
+    right_node_id: str
+    right_version: int
+    right_expected_peer_id: str
+    winner_node_id: str | None
+    loser_node_id: str | None
+    loser_prior_version: int | None
+    loser_new_version: int | None
+    applied_at: float
+
+
+@dataclass(frozen=True)
+class ReconciliationReceipt:
+    """Immutable authority for one terminal graph application."""
+
+    nomination_id: str
+    profile_id: str
+    disposition: str
+    reason_code: str
+    canonical_kind: str
+    composite_group_id: str
+    evidence_event_ids: tuple[int, ...]
+    verdict: str
+    quality: str
+    left_node_id: str
+    left_version: int
+    left_expected_peer_id: str
+    right_node_id: str
+    right_version: int
+    right_expected_peer_id: str
+    winner_node_id: str | None
+    loser_node_id: str | None
+    loser_prior_version: int | None
+    loser_new_version: int | None
+    downweight_factor: float | None
+    applied_at: float
+
+
+@dataclass(frozen=True)
+class ReconciliationAuditOutboxEntry:
+    """One redacted terminal audit waiting for MetaStore delivery."""
+
+    outbox_id: int
+    nomination_id: str
+    profile_id: str
+    action: str
+    detail: dict[str, Any]
+    created_at: float
+
+
+def reconciliation_audit_dedup_key(nomination_id: str, action: str) -> str:
+    """Canonical dedup key for one repaired reconciliation audit."""
+    return json.dumps([nomination_id, action], separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -664,7 +735,58 @@ class NominationOutcome(StrEnum):
 
 
 class NominationRejectedError(ValueError):
-    """A nomination request failed contract validation (never retried as-is)."""
+    """A nomination request failed contract validation (never retried
+    as-is)."""
+
+
+class Disposition(StrEnum):
+    """Terminal reconciliation outcome vocabulary (storage-owned).
+
+    dream.adjudicate re-exports this type so pair decisions and stored
+    receipts share one source of truth; the dependency runs dream to
+    storage, never the reverse.
+    """
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DEFERRED = "deferred"
+    UNRESOLVED = "unresolved"
+
+
+class ReasonCode(StrEnum):
+    """Closed reconciliation reason vocabulary (storage-owned, see Disposition)."""
+
+    CONFLICT_CONFIRMED = "conflict_confirmed"
+    NOT_CONFLICT_CONFIRMED = "not_conflict_confirmed"
+    INSUFFICIENT = "insufficient"
+    ENSEMBLE_OFF = "ensemble_off"
+    UNEXPECTED_ENSEMBLE_MODE = "unexpected_ensemble_mode"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    STALE_REVISION = "stale_revision"
+    PROTECTED_ENDPOINT = "protected_endpoint"
+    DECAY_WEIGHT_NOT_LOWERABLE = "decay_weight_not_lowerable"
+    MISSING_ENDPOINT = "missing_endpoint"
+    CLOSED_ENDPOINT = "closed_endpoint"
+    TOMBSTONED_ENDPOINT = "tombstoned_endpoint"
+    ABSENT_RESULT = "absent_result"
+    SEAT_TIMEOUT = "seat_timeout"
+    SEAT_UNAVAILABLE = "seat_unavailable"
+    INVALID_TYPED_OUTPUT = "invalid_typed_output"
+    COLLAPSE_UNRECOVERED = "collapse_unrecovered"
+    SINGLE_SIDE = "single_side"
+    SALVAGE = "salvage"
+    POLARITY_DROP = "polarity_drop"
+    CONFLICT_WITHOUT_DIRECTION = "conflict_without_direction"
+    SEAT_DISAGREEMENT = "seat_disagreement"
+    EMPTY_RESPONSE = "empty_response"
+    DUPLICATE_RESPONSE = "duplicate_response"
+    EXTRA_RESPONSE = "extra_response"
+    BOTH_SUPPORTED_WITHOUT_VERDICT = "both_supported_without_explicit_not_conflict"
+    LEGACY_DIAGNOSTIC_ONLY = "legacy_diagnostic_only"
+
+
+class ReceiptConflictError(StorageError):
+    """A nomination ID was replayed with different immutable application input."""
 
 
 def derive_nomination_id(
@@ -946,6 +1068,29 @@ class GraphStore(Protocol):
         (``read_conflict_id`` = NULL). Addresses one side only; any peer's
         one-sided pointer to ``node_id`` is left for the tracked reparation.
         """
+        raise NotImplementedError
+
+    def apply_reconciliation(
+        self,
+        application: ReconciliationApplication,
+        *,
+        downweight_factor: float | None,
+    ) -> ReconciliationReceipt:
+        """Receipt identity is checked before mutable graph state. An
+        identical receipt is authoritative and returned without graph
+        mutation. A receipt with the same nomination ID but different
+        immutable input raises ReceiptConflictError. Semantic endpoint
+        failures become terminal unresolved receipts; infrastructure
+        failures roll back and propagate.
+        """
+        raise NotImplementedError
+
+    def pending_reconciliation_audits(self, limit: int) -> list[ReconciliationAuditOutboxEntry]:
+        """Return at most ``limit`` undelivered redacted audits in stable order."""
+        raise NotImplementedError
+
+    def mark_reconciliation_audit_delivered(self, outbox_id: int, delivered_at: float) -> bool:
+        """Transition one outbox row from pending to delivered only."""
         raise NotImplementedError
 
     def invalidate(self, node_id: str, valid_to: float) -> None:

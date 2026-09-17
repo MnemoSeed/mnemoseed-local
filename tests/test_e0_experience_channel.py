@@ -166,10 +166,10 @@ def test_blank_composite_group_normalizes_to_null(tmp_path) -> None:
 # ---------------------------------------------------------------- (A) migration v13/v14
 
 
-def test_migration_v14_is_the_head() -> None:
-    assert latest_version() == 14
+def test_migration_v15_is_the_head() -> None:
+    assert latest_version() == 15
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15]
 
 
 def test_v12_install_upgrades_to_head_with_null_group(tmp_path) -> None:
@@ -187,7 +187,7 @@ def test_v12_install_upgrades_to_head_with_null_group(tmp_path) -> None:
 
     driver = SqliteMetaDriver(path=path)
     try:
-        assert driver.schema_version() == 14
+        assert driver.schema_version() == 15
         cols = [row[1] for row in driver._conn.execute("PRAGMA table_info(error_events)")]
         assert "composite_group_id" in cols
         page = driver.query_error_events(ErrorEventFilter(profile_id="u1"), Page(0, 50))
@@ -198,10 +198,10 @@ def test_v12_install_upgrades_to_head_with_null_group(tmp_path) -> None:
         asyncio.run(driver.close())
 
 
-def test_fresh_install_lands_at_v14(tmp_path) -> None:
+def test_fresh_install_lands_at_v15(tmp_path) -> None:
     driver = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
-        assert driver.schema_version() == 14
+        assert driver.schema_version() == 15
     finally:
         asyncio.run(driver.close())
 

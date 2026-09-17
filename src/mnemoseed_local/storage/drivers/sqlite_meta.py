@@ -500,12 +500,14 @@ class SqliteMetaDriver:
 
     def audit_append(self, entry: AuditEntry) -> None:
         self._conn.execute(
-            "INSERT INTO audit_log (actor, action, detail, at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO audit_log (actor, action, detail, at, dedup_key) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(dedup_key) DO NOTHING",
             (
                 entry.actor,
                 entry.action,
                 json.dumps(entry.detail),
                 iso8601_utc(entry.at if entry.at else time.time()),
+                entry.dedup_key,
             ),
         )
 
