@@ -29,12 +29,13 @@ Driver family covered by the `stack` fixture:
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 | upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
-## GraphStore (23 methods)
+## GraphStore (26 methods)
 
 | Method | Contract test |
 |---|---|
 | add_edge | `test_contract_graph.py::test_add_edge_weight_overwrite` |
 | append_version | `test_contract_graph.py::test_append_version_supersedes_previous` |
+| apply_reconciliation | `test_reconcile_application.py::test_same_nomination_sequential_replay_n_times_is_exactly_once` |
 | as_of | `test_contract_graph.py::test_as_of_bi_temporal_replay` |
 | batch_update_weights | `test_contract_graph.py::test_batch_update_weights` |
 | bump_cooccurrence | `test_contract_graph.py::test_bump_cooccurrence_symmetric_and_increments` |
@@ -47,6 +48,8 @@ Driver family covered by the `stack` fixture:
 | invalidate | `test_contract_graph.py::test_invalidate_closes_current_revision` |
 | list_edges | `test_contract_graph.py::test_list_edges_kinds_filters_and_stable_pagination` |
 | list_nodes | `test_contract_graph.py::test_list_nodes_filter_pagination` |
+| mark_reconciliation_audit_delivered | `test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once` |
+| pending_reconciliation_audits | `test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once` |
 | query_intentions | `test_contract_graph.py::test_query_intentions_status_and_due` |
 | set_flags | `test_contract_graph.py::test_set_and_clear_flags` |
 | set_read_conflict | `test_contract_graph.py::test_read_conflict_sets_reciprocal_pointers` |

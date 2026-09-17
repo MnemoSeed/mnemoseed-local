@@ -92,6 +92,7 @@ from mnemoseed_local.dream.reflect import (
     StubReflectLLM,
     result_from_payload,
 )
+from mnemoseed_local.dream.repair import repair_reconciliation_audit
 from mnemoseed_local.dream.snapshot import (
     FileSnapshotter,
     Snapshot,
@@ -207,6 +208,7 @@ __all__ = [
     "render_chunk_block",
     "render_chunk_blocks",
     "render_pair_adjudication_prompt",
+    "repair_reconciliation_audit",
     "resolve_delta_budget",
     "resume_boundary",
     "result_from_payload",

@@ -37,7 +37,11 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from mnemoseed_local.dream.reflect import ReflectionResult, Route
-from mnemoseed_local.storage.ports import CANONICAL_NOMINATION_KINDS
+from mnemoseed_local.storage.ports import (
+    CANONICAL_NOMINATION_KINDS,
+    Disposition,
+    ReasonCode,
+)
 
 PAIR_ADJUDICATION_PROMPT_VERSION: Final = "v1"
 
@@ -69,42 +73,6 @@ class Quality(StrEnum):
     VERIFIED = "verified"
     VOTED = "voted"
     DEGRADED = "degraded"
-
-
-class Disposition(StrEnum):
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    DEFERRED = "deferred"
-    UNRESOLVED = "unresolved"
-
-
-class ReasonCode(StrEnum):
-    CONFLICT_CONFIRMED = "conflict_confirmed"
-    NOT_CONFLICT_CONFIRMED = "not_conflict_confirmed"
-    INSUFFICIENT = "insufficient"
-    ENSEMBLE_OFF = "ensemble_off"
-    UNEXPECTED_ENSEMBLE_MODE = "unexpected_ensemble_mode"
-    IDENTITY_MISMATCH = "identity_mismatch"
-    STALE_REVISION = "stale_revision"
-    PROTECTED_ENDPOINT = "protected_endpoint"
-    MISSING_ENDPOINT = "missing_endpoint"
-    CLOSED_ENDPOINT = "closed_endpoint"
-    TOMBSTONED_ENDPOINT = "tombstoned_endpoint"
-    ABSENT_RESULT = "absent_result"
-    SEAT_TIMEOUT = "seat_timeout"
-    SEAT_UNAVAILABLE = "seat_unavailable"
-    INVALID_TYPED_OUTPUT = "invalid_typed_output"
-    COLLAPSE_UNRECOVERED = "collapse_unrecovered"
-    SINGLE_SIDE = "single_side"
-    SALVAGE = "salvage"
-    POLARITY_DROP = "polarity_drop"
-    CONFLICT_WITHOUT_DIRECTION = "conflict_without_direction"
-    SEAT_DISAGREEMENT = "seat_disagreement"
-    EMPTY_RESPONSE = "empty_response"
-    DUPLICATE_RESPONSE = "duplicate_response"
-    EXTRA_RESPONSE = "extra_response"
-    BOTH_SUPPORTED_WITHOUT_VERDICT = "both_supported_without_explicit_not_conflict"
-    LEGACY_DIAGNOSTIC_ONLY = "legacy_diagnostic_only"
 
 
 class SeatStatus(StrEnum):

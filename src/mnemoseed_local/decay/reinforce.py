@@ -35,7 +35,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from mnemoseed_local.schema.graph import GraphNode
-from mnemoseed_local.schema.stamp import ChunkStamp
+from mnemoseed_local.schema.stamp import ChunkStamp, ProvenanceEvent
 from mnemoseed_local.storage.factory import Stores
 from mnemoseed_local.storage.ports import WeightUpdate
 
@@ -146,8 +146,41 @@ class Reinforcer:
 
         ``GraphWeightUpdate`` cannot carry ``last_reinforced``, so the graph
         side of the event goes through the existing full-node write port.
+        A revision created by reconciliation is immutable: rebounding it
+        appends the next version instead of overwriting it. Ordinary
+        revisions keep the historical in-place write.
         """
         rebound = min(1.0, node.decay_weight + self._config.bonus)
+        history = node.provenance.history
+        if history and history[-1].action == "reconciled":
+            reinforced = node.model_copy(
+                update={
+                    "version": node.version + 1,
+                    "prev_version_id": f"{node.node_id}:{node.version}",
+                    "decay_weight": rebound,
+                    "last_reinforced": now,
+                    "hit_count": node.hit_count + 1,
+                    "last_hit_at": now,
+                    "valid_from": now,
+                    "valid_to": None,
+                    "updated_at": now,
+                    "provenance": node.provenance.model_copy(
+                        update={
+                            "history": [
+                                *history,
+                                ProvenanceEvent(
+                                    at=now,
+                                    action="reinforced",
+                                    actor="retrieval",
+                                    detail={"prior_version": node.version},
+                                ),
+                            ]
+                        }
+                    ),
+                }
+            )
+            self._stores.graph.append_version(reinforced, invalidate_at=now)
+            return
         reinforced = node.model_copy(
             update={
                 "decay_weight": rebound,

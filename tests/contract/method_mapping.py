@@ -43,6 +43,16 @@ COVERAGE: dict[str, dict[str, str]] = {
         "clear_flags": "test_contract_graph.py::test_set_and_clear_flags",
         "set_read_conflict": "test_contract_graph.py::test_read_conflict_sets_reciprocal_pointers",
         "clear_read_conflict": "test_contract_graph.py::test_clear_read_conflict_clears_single_side",
+        "apply_reconciliation": (
+            "test_reconcile_application.py::"
+            + "test_same_nomination_sequential_replay_n_times_is_exactly_once"
+        ),
+        "pending_reconciliation_audits": (
+            "test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once"
+        ),
+        "mark_reconciliation_audit_delivered": (
+            "test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once"
+        ),
         "invalidate": "test_contract_graph.py::test_invalidate_closes_current_revision",
         "supersede_link": "test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction",
         "append_version": "test_contract_graph.py::test_append_version_supersedes_previous",
@@ -121,7 +131,8 @@ COVERAGE: dict[str, dict[str, str]] = {
 # namespace enumeration behind the doctor's unknown-profile check) and to 16
 # with get_dense (Atlas CHUNKS-ONLY PCA dense projection).
 # GraphStore grew to 23 with set_read_conflict + clear_read_conflict (read-side
-# reversible evidence pointer backing the read-conflict annotation).
+# reversible evidence pointer backing the read-conflict annotation), and to 26
+# with atomic reconciliation apply plus pending/mark audit-outbox repair.
 # MetaStore grew to 37 with the E1 error-event ledger surface
 # (append_error_event + query_error_events: the signal-agnostic write seam and
 # profile-scoped paginated read backing PRD-B2.13 E1), and to 38 with
@@ -129,7 +140,7 @@ COVERAGE: dict[str, dict[str, str]] = {
 # write — one transaction, carrier + two NODE ledger rows, typed dedup).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
-    "GraphStore": 23,
+    "GraphStore": 26,
     "MetaStore": 38,
     "Embedder": 3,
 }

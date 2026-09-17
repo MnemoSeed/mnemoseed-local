@@ -717,12 +717,12 @@ def test_meta_migration_preserves_data_and_is_forward_only(tmp_path):
         # v13 the composite group carrier + v14 the reconcile nomination
         # carrier, so meta lands at 14
         # (the legacy singleton score_pool is neither dropped nor migrated).
-        assert driver.schema_version() == 14
+        assert driver.schema_version() == 15
         got = driver.get_profile("u1")
         assert got is not None
         assert got.display_name == "survivor"
         driver.migrate()  # idempotent re-run
-        assert driver.schema_version() == 14
+        assert driver.schema_version() == 15
     finally:
         asyncio.run(driver.close())
 
@@ -731,7 +731,7 @@ def test_schema_version_equals_latest_new_install(tmp_path):
     db = SqliteMetaDriver(path=tmp_path / "fresh.db")
     try:
         assert db.schema_version() == db.migrate()
-        assert db.schema_version() == 14
+        assert db.schema_version() == 15
         # a profile row written after init survives a migrate() no-op
         db.upsert_profile(StoredProfile(profile_id="u1", display_name="Uma"))
         db.migrate()
@@ -754,7 +754,7 @@ def test_v9_backfills_filed_points_born_empty(tmp_path):
 
     driver = SqliteMetaDriver(path=path)
     try:
-        assert driver.schema_version() == 14
+        assert driver.schema_version() == 15
         state = driver.pool_state("u1")
         assert state.balance == 2.5
         assert state.filed_points_total == 0.0

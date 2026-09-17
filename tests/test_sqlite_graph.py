@@ -527,7 +527,7 @@ def test_migration_1_to_head_data_preserved(tmp_path):
     # a driver opening the v1 file auto-migrates it to head and preserves rows
     driver = SqliteGraphDriver(path=path)
     try:
-        assert current_schema_version(driver._conn, "graph") == 10
+        assert current_schema_version(driver._conn, "graph") == 15
         assert "pinned" in _column_names(driver._conn, "nodes")
         assert "promotion_status" in _column_names(driver._conn, "nodes")
         assert "read_conflict_id" in _column_names(driver._conn, "nodes")
@@ -605,8 +605,15 @@ def test_graph_file_contains_only_graph_tables(tmp_path):
     try:
         apply_migrations(conn, "graph")
         tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert tables == {"schema_version", "nodes", "node_versions", "edges"}
-        assert current_schema_version(conn, "graph") == 10  # v2/v5/v10 are graph-tagged
+        assert tables == {
+            "schema_version",
+            "nodes",
+            "node_versions",
+            "edges",
+            "reconciliation_receipts",
+            "reconciliation_audit_outbox",
+        }
+        assert current_schema_version(conn, "graph") == 15  # v15 adds graph receipts and outbox
     finally:
         conn.close()
 
@@ -635,7 +642,7 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
         # config.scope in v8, the pool filed-points ledger in v9, the append-only
         # error-event ledger in v11, the provider fingerprint in v12, the
         # composite group carrier in v13, the reconcile nomination carrier in v14)
-        assert current_schema_version(conn, "meta") == 14
+        assert current_schema_version(conn, "meta") == 15
     finally:
         conn.close()
 
@@ -643,7 +650,7 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
 def test_migration_sequence_is_shared_and_forward_only():
     versions = [m.version for m in MIGRATIONS]
     assert versions == sorted(versions)
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     stores = {op.store for m in MIGRATIONS for op in m.ops}
     assert stores == {"graph", "meta"}
     # every store-region can reach the tail of the shared sequence independently

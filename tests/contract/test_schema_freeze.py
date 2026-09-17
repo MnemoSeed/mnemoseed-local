@@ -86,7 +86,13 @@ def _field_type(schema: pa.Schema, name: str, kind: type) -> pa.StructType:
 # ---------------------------------------------------------------- A.2 graph
 
 
-_FROZEN_GRAPH_TABLES = ("nodes", "node_versions", "edges")
+_FROZEN_GRAPH_TABLES = (
+    "nodes",
+    "node_versions",
+    "edges",
+    "reconciliation_receipts",
+    "reconciliation_audit_outbox",
+)
 _FROZEN_GRAPH_INDEXES = (
     "idx_nodes_profile_type",
     "idx_nodes_valid",
@@ -94,6 +100,12 @@ _FROZEN_GRAPH_INDEXES = (
     "idx_edges_src",
     "idx_edges_dst",
     "idx_edges_profile",
+)
+_FROZEN_GRAPH_TRIGGERS = (
+    ("trg_reconciliation_receipts_no_update", "UPDATE"),
+    ("trg_reconciliation_receipts_no_delete", "DELETE"),
+    ("trg_reconciliation_audit_outbox_no_delete", "DELETE"),
+    ("trg_reconciliation_audit_outbox_delivered_only", "UPDATE"),
 )
 _FROZEN_NODE_TYPES = frozenset(
     {
@@ -130,6 +142,7 @@ def test_node_type_enum_is_frozen() -> None:
 def test_graph_schema_freeze_walk() -> None:
     tables: dict[str, CreateTable] = {}
     indexes: set[str] = set()
+    triggers: set[tuple[str, str]] = set()
     added_columns: set[str] = set()
     for migration in MIGRATIONS:
         for op in migration.ops:
@@ -139,8 +152,11 @@ def test_graph_schema_freeze_walk() -> None:
                 indexes.add(op.name)
             elif isinstance(op, AddColumn) and op.store == "graph":
                 added_columns.add(op.column.name)
+            elif isinstance(op, AddTrigger) and op.store == "graph":
+                triggers.add((op.name, op.event))
     assert set(tables) == set(_FROZEN_GRAPH_TABLES)
     assert set(_FROZEN_GRAPH_INDEXES) == indexes
+    assert set(_FROZEN_GRAPH_TRIGGERS) == triggers
 
     names = {column.name for column in tables["nodes"].columns}
     assert "node_id" in names and "payload" in names and "entities" in names
@@ -181,6 +197,7 @@ _FROZEN_META_INDEXES = (
     "idx_error_events_profile_time",
     "idx_reconcile_nominations_profile_group",
     "idx_error_events_nomination",
+    "idx_audit_log_dedup_key",
 )
 _FROZEN_TRIGGERS = (
     ("trg_audit_no_update", "UPDATE"),
@@ -225,6 +242,8 @@ def test_meta_schema_freeze_walk() -> None:
     # never a v1 base column — the D1 "settings DB primary" reservation.
     assert "scope" in added_meta_columns
     assert "scope" not in {column.name for column in tables["config"].columns}
+    assert "dedup_key" in added_meta_columns
+    assert "dedup_key" not in {column.name for column in tables["audit_log"].columns}
 
 
 # ------------------------------------------------------- D6 named graph instances
@@ -235,7 +254,7 @@ def test_named_graph_instances_build(tmp_path) -> None:
     main = SqliteGraphDriver(path=tmp_path / "graph-main.db")
     isolated = SqliteGraphDriver(path=tmp_path / "graph-isolated.db")
     assert main.info.name == isolated.info.name == "sqlite_graph"
-    assert current_schema_version(main._conn, "graph") == 10
-    assert current_schema_version(isolated._conn, "graph") == 10
+    assert current_schema_version(main._conn, "graph") == 15
+    assert current_schema_version(isolated._conn, "graph") == 15
     asyncio.run(main.close())
     asyncio.run(isolated.close())
