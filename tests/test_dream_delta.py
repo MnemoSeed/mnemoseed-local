@@ -582,7 +582,6 @@ def _chain(
         graph_main=store,
         graph_isolated=None,
         meta=meta,
-        on_committed=trigger.on_merge_committed,
     )
     pipeline = DreamPipeline(trigger=trigger, snapshotter=fs, reflector=reflector, merger=merger)
     fs.on_ready = pipeline.on_snapshot_ready
@@ -662,7 +661,6 @@ def test_d1_verifier_repro_over_budget_chunk_survives_then_later_dream_completes
             graph_main=store,
             graph_isolated=None,
             meta=_MetaFake(),
-            on_committed=trigger.on_merge_committed,
         ),
     )
     pipeline2.run(snapshot)
@@ -728,10 +726,11 @@ def test_d1_merge_boundary_recovery_respects_persisted_overflow(tmp_path: Path) 
         graph_main=store,
         graph_isolated=None,
         meta=_MetaFake(),
-        on_committed=lambda p: fs2.purge_snapshot(p, _RANGE),
     )
+    trigger = DreamTrigger(snapshotter=NullSnapshotter(), purger=fs2.purge_snapshot)
+    trigger.resume_merge("alice", pending[0].turn_range)
     pipeline = DreamPipeline(
-        trigger=DreamTrigger(snapshotter=NullSnapshotter(), purger=fs2.purge_snapshot),
+        trigger=trigger,
         snapshotter=fs2,
         reflector=reflector,  # type: ignore[arg-type]
         merger=merger,
@@ -862,10 +861,11 @@ def test_d1_recovery_partial_overflow_with_triples_marks_only_consumed(tmp_path:
         graph_main=store,
         graph_isolated=None,
         meta=_MetaFake(),
-        on_committed=lambda p: fs2.purge_snapshot(p, pending[0].turn_range),
     )
+    trigger = DreamTrigger(snapshotter=NullSnapshotter(), purger=fs2.purge_snapshot)
+    trigger.resume_merge("alice", pending[0].turn_range)
     pipeline = DreamPipeline(
-        trigger=DreamTrigger(snapshotter=NullSnapshotter(), purger=fs2.purge_snapshot),
+        trigger=trigger,
         snapshotter=fs2,
         reflector=reflector,  # type: ignore[arg-type]
         merger=merger,

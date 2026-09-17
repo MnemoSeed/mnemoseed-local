@@ -845,6 +845,7 @@ class ReasonCode(StrEnum):
     EXTRA_RESPONSE = "extra_response"
     BOTH_SUPPORTED_WITHOUT_VERDICT = "both_supported_without_explicit_not_conflict"
     LEGACY_DIAGNOSTIC_ONLY = "legacy_diagnostic_only"
+    RETRY_EXHAUSTED = "retry_exhausted"
 
 
 class ReceiptConflictError(StorageError):

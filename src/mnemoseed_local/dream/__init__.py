@@ -44,6 +44,11 @@ from mnemoseed_local.dream.combine import (
     SINGLE_SIDE_SALVAGE_FLOOR,
     combine_results,
 )
+from mnemoseed_local.dream.consumer import (  # noqa: I001 - module surface
+    ConsumerPolicy,
+    ReconciliationConsumer,
+    consumer_enabled,
+)
 from mnemoseed_local.dream.delta import (
     DEFAULT_DELTA_BUDGET_TOKENS,
     DELTA_BUDGET_CEILING_TOKENS,
@@ -139,6 +144,7 @@ __all__ = [
     "PROMPT_VERSION",
     "SINGLE_SIDE_SALVAGE_FLOOR",
     "ChunkBlock",
+    "ConsumerPolicy",
     "AdjudicationResult",
     "Disposition",
     "DeltaPacker",
@@ -176,6 +182,7 @@ __all__ = [
     "ReflectPrompt",
     "ReflectedTriple",
     "ReflectionResult",
+    "ReconciliationConsumer",
     "ReasonCode",
     "Route",
     "SCHEDULER_INTERVAL_S",
@@ -200,6 +207,7 @@ __all__ = [
     "build_cache_prefix",
     "build_reflect_prompt",
     "combine_results",
+    "consumer_enabled",
     "estimate_tokens",
     "load_snapshot_file",
     "ordered_chunks",

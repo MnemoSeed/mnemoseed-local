@@ -790,7 +790,6 @@ def _build_capture(
         graph_main=stores.graph,
         graph_isolated=graph_isolated,
         meta=stores.meta,
-        on_committed=trigger.on_merge_committed,
         config=config,
     )
 

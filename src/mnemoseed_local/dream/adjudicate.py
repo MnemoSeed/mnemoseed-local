@@ -535,8 +535,12 @@ def _validate_observation(endpoint: EndpointObservation) -> None:
             or endpoint.version < 1
         ):
             raise MalformedAdjudicationInputError("live endpoint version must be positive")
-        if not isinstance(endpoint.expected_peer_id, str) or not endpoint.expected_peer_id.strip():
-            raise MalformedAdjudicationInputError("live endpoint expected peer must be a non-empty string")
+        if endpoint.expected_peer_id is not None and (
+            not isinstance(endpoint.expected_peer_id, str) or not endpoint.expected_peer_id.strip()
+        ):
+            raise MalformedAdjudicationInputError(
+                "live endpoint expected peer must be a non-empty string or None"
+            )
 
 
 def _endpoint_fate_reason(left: EndpointObservation, right: EndpointObservation) -> ReasonCode | None:

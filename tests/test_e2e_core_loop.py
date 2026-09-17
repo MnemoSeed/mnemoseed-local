@@ -111,7 +111,6 @@ def test_full_core_loop(stores: tuple[Stores, Config]) -> None:
         graph_main=built.graph,
         graph_isolated=None,
         meta=meta,
-        on_committed=trigger.on_merge_committed,
     )
     pipeline = DreamPipeline(trigger=trigger, snapshotter=snapshotter, reflector=reflector, merger=merger)
     snapshotter.on_ready = pipeline.on_snapshot_ready

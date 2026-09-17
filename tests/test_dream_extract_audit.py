@@ -206,7 +206,9 @@ def test_successful_cycle_writes_no_failure_record(tmp_path: Path) -> None:
 
     class _OkMerger:
         def merge(self, snapshot: Snapshot, result: ReflectionResult) -> Any:
-            return type("_MO", (), {"ok": True, "committed": True, "error": None})()
+            from mnemoseed_local.dream.merge import MergeOutcome
+
+            return MergeOutcome(ok=True, committed=True)
 
     trigger_calls: list[tuple[str, bool]] = []
     trigger = type(

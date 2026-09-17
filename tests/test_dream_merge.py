@@ -174,15 +174,52 @@ def _merger(
     *,
     on_committed: _Recorder | None = None,
     config: Config | None = None,
-) -> Merger:
-    return Merger(
+):
+    merger = Merger(
         graph_main=main,  # type: ignore[arg-type]
         graph_isolated=isolated,  # type: ignore[arg-type]
         meta=meta,
-        on_committed=on_committed,
         clock=lambda: 2000.0,
         config=config,
     )
+    return _PipelineMerge(merger, on_committed)
+
+
+class _PipelineMerge:
+    """Exercise writeback and completion through the pipeline public surface."""
+
+    def __init__(self, merger, completion):
+        self.merger = merger
+        self.completion = completion
+
+    def merge(self, snapshot, result):
+        from types import SimpleNamespace
+
+        from mnemoseed_local.dream.pipeline import DreamPipeline
+        from mnemoseed_local.dream.reflect import ReflectOutcome
+
+        outcomes = []
+
+        def writeback(snapshot, result):
+            outcome = self.merger.merge(snapshot, result)
+            outcomes.append(outcome)
+            return outcome
+
+        pipeline = DreamPipeline(
+            trigger=SimpleNamespace(
+                on_merge_committed=self.completion or (lambda profile: None),
+                on_dream_failed=lambda profile: None,
+            ),
+            snapshotter=SimpleNamespace(active=lambda profile: snapshot),
+            reflector=SimpleNamespace(reflect=lambda snapshot: ReflectOutcome(ok=True, result=result)),
+            merger=SimpleNamespace(merge=writeback),
+        )
+        if "merge_done" in snapshot.phases:
+            outcome = self.merger.merge(snapshot, result)
+            pipeline.run(snapshot)
+            return outcome
+        pipeline.run(snapshot)
+        return outcomes[0]
 
 
 # ---------------------------------------------------------------- routing
@@ -401,7 +438,7 @@ def test_merge_done_marker_gate_skips(
     # result is constructed directly: the merge gate must skip regardless
     result = _result(_triple())
     done = _Recorder()
-    outcome = _merger(main, isolated, meta, on_committed=done).merge(snap, result)
+    outcome = _merger(main, isolated, meta).merge(snap, result)
     assert outcome.ok
     assert outcome.skipped
     assert not outcome.committed
@@ -421,7 +458,7 @@ def test_partial_failure_return_typed_outcome_no_commit(
     boom = _BoomGraph()
     done = _Recorder()
 
-    outcome = _merger(boom, isolated, meta, on_committed=done).merge(snap, result)
+    outcome = _merger(boom, isolated, meta).merge(snap, result)
     assert not outcome.ok
     assert outcome.error
     assert not outcome.committed
@@ -466,15 +503,12 @@ def _floor_merger(
     isolated: object,
     meta: SqliteMetaDriver,
     config: Config,
-    *,
-    on_committed: _Recorder | None = None,
 ) -> Merger:
     """Merger bound to a live Config (design/01 §4.7 hot-read seam)."""
     return Merger(
         graph_main=main,  # type: ignore[arg-type]
         graph_isolated=isolated,  # type: ignore[arg-type]
         meta=meta,
-        on_committed=on_committed,
         config=config,
         clock=lambda: 2000.0,
     )
@@ -531,7 +565,7 @@ def test_floor_without_isolated_instance_fails_typed_and_writes_nothing(
     low = _result(_triple(route=Route.CORE, confidence=0.5))
     done = _Recorder()
 
-    outcome = _floor_merger(main, None, meta, config, on_committed=done).merge(snap, low)
+    outcome = _floor_merger(main, None, meta, config).merge(snap, low)
     assert not outcome.ok
     assert outcome.error is not None
     assert "isolated" in outcome.error
@@ -563,7 +597,7 @@ def test_floor_mixed_triples_without_isolated_never_writes_anything(
     )
     done = _Recorder()
 
-    outcome = _floor_merger(main, None, meta, config, on_committed=done).merge(snap, mixed)
+    outcome = _floor_merger(main, None, meta, config).merge(snap, mixed)
     assert not outcome.ok
     assert outcome.error is not None
     assert "isolated" in outcome.error
