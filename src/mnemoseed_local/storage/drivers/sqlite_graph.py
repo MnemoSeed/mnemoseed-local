@@ -1045,6 +1045,15 @@ class SqliteGraphDriver:
             ),
         )
 
+    def get_reconciliation_receipt(
+        self, *, profile_id: str, nomination_id: str
+    ) -> ReconciliationReceipt | None:
+        row = self._conn.execute(
+            "SELECT * FROM reconciliation_receipts WHERE profile_id = ? AND nomination_id = ?",
+            (profile_id, nomination_id),
+        ).fetchone()
+        return _decode_receipt(row) if row is not None else None
+
     def pending_reconciliation_audits(self, limit: int) -> list[ReconciliationAuditOutboxEntry]:
         if limit < 0:
             raise ValueError("audit repair limit must be non-negative")

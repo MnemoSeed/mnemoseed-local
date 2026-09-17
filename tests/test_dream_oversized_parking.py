@@ -102,9 +102,9 @@ def _pipeline(
 
     class _Merger:
         def merge(self, snapshot: Snapshot, result: ReflectionResult) -> Any:
-            outcome = type("_MO", (), {"ok": True, "committed": True, "error": None})()
-            trigger.on_merge_committed(snapshot.profile_id)
-            return outcome
+            from mnemoseed_local.dream.merge import MergeOutcome
+
+            return MergeOutcome(ok=True, committed=True)
 
     pipeline = DreamPipeline(
         trigger=trigger,  # type: ignore[arg-type]

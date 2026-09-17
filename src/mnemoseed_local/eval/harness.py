@@ -591,7 +591,6 @@ class EvalRig:
             graph_main=self._stores.graph,
             graph_isolated=cast(GraphStore, isolated),
             meta=self._stores.meta,
-            on_committed=trigger.on_merge_committed,
             config=config,
         )
         pipeline = DreamPipeline(

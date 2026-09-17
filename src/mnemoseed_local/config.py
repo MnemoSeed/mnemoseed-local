@@ -10,6 +10,7 @@ offending config key.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -152,6 +153,41 @@ class ExperienceChannelConfig:
 
 
 @dataclass(frozen=True)
+class ReconciliationConfig:
+    """Unratified configuration shape, independent of production activation."""
+
+    # Reconciliation consumption and audit pumping remain unbound in production.
+    # Supplying limits or changing existing ensemble/experience-channel flags does
+    # not authorize activation. Activation requires a separate retry/burn/retention
+    # ratification, applicable quality/downweight ratification, and verification of
+    # bounded provider execution. Unset limits never mean unlimited execution.
+    enabled: bool = False
+    nomination_limit: int | None = None
+    scan_limit: int | None = None
+    audit_repair_limit: int | None = None
+    attempt_limit: int | None = None
+    retry_backoff_seconds: float | None = None
+    attempt_timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("dream.reconciliation.enabled", "must be a boolean")
+        for name in ("nomination_limit", "scan_limit", "audit_repair_limit", "attempt_limit"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ConfigError(f"dream.reconciliation.{name}", "must be a positive integer")
+        for name in ("retry_backoff_seconds", "attempt_timeout_seconds"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ConfigError(f"dream.reconciliation.{name}", "must be a positive finite duration")
+
+
+@dataclass(frozen=True)
 class DreamConfig:
     """Dream-engine runtime flags (PRD-02 FR-2.8 manual-first discipline).
 
@@ -192,6 +228,7 @@ class DreamConfig:
     reflect_batch_max_tokens: int = DEFAULT_DREAM_REFLECT_BATCH_MAX_TOKENS
     # E0 (PRD-B2.13): default-off experience channel (see ExperienceChannelConfig).
     experience_channel: ExperienceChannelConfig = field(default_factory=ExperienceChannelConfig)
+    reconciliation: ReconciliationConfig = field(default_factory=ReconciliationConfig)
 
 
 #: Decay sweep cadence (NFR-4.1: the batch runs once daily).
@@ -697,6 +734,15 @@ def load_config(path: Path | None = None) -> Config:
             pool_forced_cap=float(forced_raw),
             reflect_batch_max_tokens=int(batch_raw),
             experience_channel=ExperienceChannelConfig(enabled=channel_enabled),
+            reconciliation=ReconciliationConfig(
+                **{
+                    key: value
+                    for key, value in _require_table(
+                        dream_table.get("reconciliation", {}), "dream.reconciliation"
+                    ).items()
+                    if key in ReconciliationConfig.__dataclass_fields__
+                }
+            ),
         )
 
         # T6 (FR-2.14): [dream.llm.<role>] overrides per role. Only structural

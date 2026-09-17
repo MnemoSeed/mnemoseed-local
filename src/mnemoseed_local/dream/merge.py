@@ -29,11 +29,9 @@ isolated requirement is enforced upstream too: config load and configwrite
 reject a config with a non-zero floor and no isolated instance, and the daemon
 refuses to boot.
 
-Completion: after every triple of the pass commits, the Merger fires the
-``on_committed`` seam exactly once (wired to trigger.on_merge_committed, which
-runs the safe-clear purger). Any failure returns a typed MergeOutcome with no
-completion callback; the snapshot stays journaled for resume_merge. The Merger
-never raises into the daemon.
+After every triple writes back, the Merger reports graph success only.
+The pipeline owns completion and safe-clear. A failure returns a typed
+MergeOutcome; the snapshot stays journaled for resume_merge.
 """
 
 from __future__ import annotations
@@ -83,8 +81,7 @@ class MergeSummary:
 
 @dataclass(frozen=True)
 class MergeOutcome:
-    """Typed result of one merge pass. ``ok`` is always set; ``committed`` is
-    True exactly when the completion seam fired (every triple wrote back)."""
+    """Graph writeback result; committed means every triple wrote back."""
 
     ok: bool
     summary: MergeSummary | None = None
@@ -110,14 +107,12 @@ class Merger:
         graph_main: GraphStore,
         graph_isolated: GraphStore | None,
         meta: MetaStore,
-        on_committed: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.time,
         config: Config | None = None,
     ) -> None:
         self._graph_main = graph_main
         self._graph_isolated = graph_isolated
         self._meta = meta
-        self._on_committed = on_committed
         self._clock = clock
         self._config = config
 
@@ -139,8 +134,6 @@ class Merger:
         except Exception as exc:  # noqa: BLE001 - typed outcome, never a daemon raise
             logger.warning("merge failed for %s: %s", snapshot.profile_id, exc)
             return MergeOutcome(ok=False, error=str(exc))
-        if self._on_committed is not None:
-            self._on_committed(snapshot.profile_id)
         return MergeOutcome(ok=True, summary=summary, committed=True)
 
     # ------------------------------------------------------------ routing

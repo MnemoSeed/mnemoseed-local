@@ -59,6 +59,14 @@ def _window_key(snapshot: Snapshot) -> tuple[str, int, int]:
 
 
 @dataclass(frozen=True)
+class CommittedMerge:
+    """Identity of a successful graph writeback, not dream completion."""
+
+    profile_id: str
+    dream_run_id: str
+
+
+@dataclass(frozen=True)
 class RunCompletion:
     """One committed dream's completion record for the dream log surface.
 
@@ -140,6 +148,7 @@ class DreamPipeline:
         merger: Merger,
         on_outcome: Callable[[str, TurnRange, bool, str | None], None] | None = None,
         on_run_committed: Callable[[RunCompletion], None] | None = None,
+        on_graph_committed: Callable[[CommittedMerge], None] | None = None,
         on_extract_failed: Callable[[ExtractFailure], None] | None = None,
         mode: Callable[[], str] | None = None,
     ) -> None:
@@ -148,6 +157,7 @@ class DreamPipeline:
         self._reflector = reflector
         self._merger = merger
         self._on_run_committed = on_run_committed
+        self._on_graph_committed = on_graph_committed
         self.on_extract_failed = on_extract_failed
         # B5 vote: the live ensemble mode ("off" | "verify" | "vote"). When
         # wired, the pipeline dispatches the fresh-snapshot boundary to the
@@ -443,7 +453,15 @@ class DreamPipeline:
             )
             self._fail(snapshot, outcome.error, stage="merge", failure_class="merge_degraded", report=report)
             return
-        if outcome.committed and self._on_run_committed is not None:
+        if outcome.committed and not outcome.skipped:
+            try:
+                if self._on_graph_committed is not None:
+                    self._on_graph_committed(CommittedMerge(snapshot.profile_id, snapshot.snapshot_id))
+            except Exception:
+                logger.exception("post-graph work failed for %s", snapshot.profile_id)
+            finally:
+                self._trigger.on_merge_committed(snapshot.profile_id)
+        if outcome.committed and not outcome.skipped and self._on_run_committed is not None:
             now = time.time()
             completion = RunCompletion(
                 run_id=snapshot.snapshot_id,

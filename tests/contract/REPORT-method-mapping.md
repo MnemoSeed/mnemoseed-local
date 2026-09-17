@@ -29,7 +29,7 @@ Driver family covered by the `stack` fixture:
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 | upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
-## GraphStore (26 methods)
+## GraphStore (27 methods)
 
 | Method | Contract test |
 |---|---|
@@ -45,6 +45,7 @@ Driver family covered by the `stack` fixture:
 | diff | `test_contract_graph.py::test_diff_reports_payload_change` |
 | find_same_predicate | `test_contract_graph.py::test_find_same_predicate` |
 | get_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
+| get_reconciliation_receipt | `test_contract_reconciliation.py::test_receipt_read_is_profile_scoped_and_read_only` |
 | invalidate | `test_contract_graph.py::test_invalidate_closes_current_revision` |
 | list_edges | `test_contract_graph.py::test_list_edges_kinds_filters_and_stable_pagination` |
 | list_nodes | `test_contract_graph.py::test_list_nodes_filter_pagination` |
@@ -60,7 +61,7 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (38 methods)
+## MetaStore (42 methods)
 
 | Method | Contract test |
 |---|---|
@@ -85,6 +86,7 @@ Driver family covered by the `stack` fixture:
 | issue_token | `test_contract_meta.py::test_issue_token_and_revoke` |
 | list_dream_runs | `test_contract_meta.py::test_dream_runs_roundtrip` |
 | list_profiles | `test_contract_meta.py::test_profile_crud_and_token_cascade` |
+| list_reconciliation_attempts | `test_contract_reconciliation.py::test_reservation_replay_restart_and_budget` |
 | list_users | `test_contract_meta.py::test_users_crud_and_password_rotation` |
 | migrate | `test_contract_meta.py::test_schema_version_and_migrate_forward_only` |
 | pool_add | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
@@ -93,7 +95,10 @@ Driver family covered by the `stack` fixture:
 | pool_state | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
 | pool_states | `test_contract_meta.py::test_pool_states_returns_all_rows` |
 | query_error_events | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
+| query_reconciliation_nominations | `test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence` |
+| read_reconciliation_evidence | `test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence` |
 | record_dream_run | `test_contract_meta.py::test_dream_runs_roundtrip` |
+| reserve_attempt | `test_contract_reconciliation.py::test_reservation_replay_restart_and_budget` |
 | revoke_token | `test_contract_meta.py::test_issue_token_and_revoke` |
 | rollback_config | `test_contract_meta.py::test_config_versioned_get_set_rollback` |
 | schema_version | `test_contract_meta.py::test_schema_version_and_migrate_forward_only` |

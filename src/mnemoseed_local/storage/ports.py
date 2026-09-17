@@ -366,6 +366,63 @@ def reconciliation_audit_dedup_key(nomination_id: str, action: str) -> str:
     return json.dumps([nomination_id, action], separators=(",", ":"))
 
 
+class AttemptReservationOutcome(StrEnum):
+    """Whether a durable attempt owns one unit of model budget."""
+
+    RESERVED = "reserved"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+@dataclass(frozen=True)
+class AttemptReservation:
+    """Immutable budget ownership for one nomination and dream run."""
+
+    profile_id: str
+    nomination_id: str
+    dream_run_id: str
+    attempt_ordinal: int
+    reserved_at: float
+    next_eligible_at: float
+
+
+@dataclass(frozen=True)
+class AttemptReservationResult:
+    outcome: AttemptReservationOutcome
+    reservation: AttemptReservation | None
+    newly_reserved: bool
+
+
+@dataclass(frozen=True)
+class ReconciliationNominationCarrier:
+    """Stored nomination identity and its frozen evidence membership."""
+
+    nomination_id: str
+    profile_id: str
+    canonical_kind: str
+    composite_group_id: str
+    source_generation: int
+    lo_node_id: str
+    hi_node_id: str
+    lo_version: int
+    hi_version: int
+    lo_expected_peer: str
+    hi_expected_peer: str
+    evidence_event_ids: tuple[int, ...]
+    source_channels: tuple[str, ...]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ReconciliationNominationPage:
+    items: tuple[ReconciliationNominationCarrier, ...]
+    next_cursor: str | None
+
+
+def reconciliation_deferred_dedup_key(nomination_id: str, dream_run_id: str, action: str) -> str:
+    """Canonical dedup key for one run's deferred audit."""
+    return json.dumps([nomination_id, dream_run_id, action], separators=(",", ":"))
+
+
 @dataclass(frozen=True)
 class AuditFilter:
     """Filter for the counted, paginated audit read."""
@@ -788,6 +845,7 @@ class ReasonCode(StrEnum):
     EXTRA_RESPONSE = "extra_response"
     BOTH_SUPPORTED_WITHOUT_VERDICT = "both_supported_without_explicit_not_conflict"
     LEGACY_DIAGNOSTIC_ONLY = "legacy_diagnostic_only"
+    RETRY_EXHAUSTED = "retry_exhausted"
 
 
 class ReceiptConflictError(StorageError):
@@ -1090,6 +1148,12 @@ class GraphStore(Protocol):
         """
         raise NotImplementedError
 
+    def get_reconciliation_receipt(
+        self, *, profile_id: str, nomination_id: str
+    ) -> ReconciliationReceipt | None:
+        """Read the stored receipt without mutation or audit delivery."""
+        raise NotImplementedError
+
     def pending_reconciliation_audits(self, limit: int) -> list[ReconciliationAuditOutboxEntry]:
         """Return at most ``limit`` undelivered redacted audits in stable order."""
         raise NotImplementedError
@@ -1331,6 +1395,37 @@ class MetaStore(Protocol):
         ``check_nomination_provenance`` (freeze F9). Never
         a model call; runs on the dream worker only.
         """
+        raise NotImplementedError
+
+    def query_reconciliation_nominations(
+        self, *, profile_id: str, limit: int, cursor: str | None = None
+    ) -> ReconciliationNominationPage:
+        """Bounded immutable snapshot scan; cursors are opaque and profile-bound."""
+        raise NotImplementedError
+
+    def read_reconciliation_evidence(
+        self, *, profile_id: str, nomination_id: str
+    ) -> tuple[ErrorEvent, ...] | None:
+        """Read only frozen event IDs; corrupt membership raises StorageError."""
+        raise NotImplementedError
+
+    def reserve_attempt(
+        self,
+        *,
+        profile_id: str,
+        nomination_id: str,
+        dream_run_id: str,
+        attempt_limit: int,
+        reserved_at: float,
+        next_eligible_at: float,
+    ) -> AttemptReservationResult:
+        """Atomically replay or reserve budget; invalid or unset caps never mean unlimited."""
+        raise NotImplementedError
+
+    def list_reconciliation_attempts(
+        self, *, profile_id: str, nomination_id: str
+    ) -> tuple[AttemptReservation, ...]:
+        """Return durable attempts in ordinal order within one profile."""
         raise NotImplementedError
 
     def record_dream_run(self, run: DreamRun) -> str:
