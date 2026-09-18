@@ -544,6 +544,14 @@ class SqliteMetaDriver:
         items = [_decode_audit(r) for r in rows]
         return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
 
+    def count_reconciliation_deferred(self, *, profile_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'reconcile_deferred' AND actor = 'dream-engine' "
+            "AND json_extract(detail, '$.profile_id') = ? AND dedup_key IS NOT NULL",
+            (profile_id,),
+        ).fetchone()
+        return int(row[0])
+
     # ------------------------------------------- error-event ledger (PRD-B2.13 E1)
 
     def append_error_event(self, event: ErrorEvent) -> None:

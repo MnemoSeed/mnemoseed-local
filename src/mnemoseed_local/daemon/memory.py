@@ -2568,6 +2568,15 @@ def _dream_data_status(request: Request, profile_id: str) -> dict[str, Any]:
         if not page.items or runs_offset >= page.total:
             break
 
+    receipt_counts = stores.graph.count_reconciliation_receipts(profile_id=profile_id)
+    deferred_count = stores.meta.count_reconciliation_deferred(profile_id=profile_id)
+    reconcile = {
+        "accepted": receipt_counts.get("accepted", 0),
+        "rejected": receipt_counts.get("rejected", 0),
+        "deferred": deferred_count,
+        "unresolved": receipt_counts.get("unresolved", 0),
+    }
+
     return {
         "pool": {
             "balance": pool_state.balance,
@@ -2581,4 +2590,5 @@ def _dream_data_status(request: Request, profile_id: str) -> dict[str, Any]:
             "last_commit_at": last_commit_at,
             "extract_failures": dict(sorted(failed_counts.items())),
         },
+        "reconcile": reconcile,
     }

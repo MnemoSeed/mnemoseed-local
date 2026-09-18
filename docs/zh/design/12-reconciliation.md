@@ -399,6 +399,8 @@ PR #194 后的本机 no-bar pilot（完整文件位于 org evidence `evidence/20
 | S-D | dream completion seam refactor + bounded serialized consumer | crash/retry design QA；证明 regular merge/safe-clear 不回归；retry/burn/retention ratification 后才可激活 |
 | S-E | existing-surface observability | S-C/S-D landed；零正文 audit test |
 
+S-E 命名评审：保留 `reconcile_accepted/rejected/deferred/unresolved`；error-events 使用 E-0 已复用的 `composite_group_id` 与 evidence-fate，不重命名（现有测试 `test_e0_experience_channel.py:227-358`、`daemon/memory.py:2244-2283` 覆盖）。
+
 稳定性受控 calibration 与 bar proposal 不属于上述实现切片：样本量、硬件、timeout 必须先预注册，再走独立 ratification issue。无该裁决，任何切片都不得偷带数值。
 
 本篇合并后，issue #123 仍保持 OPEN；不得因为 design landed 就关闭或启动 S-A。

@@ -337,6 +337,76 @@ def test_deferred_dedup_key_is_compact_and_collision_safe():
     assert ports.reconciliation_audit_dedup_key("n", "a") == '["n","a"]'
 
 
+def test_reconcile_counts_are_cumulative_and_profile_scoped(tmp_path):
+    graph = SqliteGraphDriver(tmp_path / "graph.db")
+    meta = SqliteMetaDriver(tmp_path / "meta.db")
+    try:
+        assert graph.count_reconciliation_receipts(profile_id="p") == {}
+        assert meta.count_reconciliation_deferred(profile_id="p") == 0
+        for i in range(2):
+            meta.audit_append(
+                ports.AuditEntry(
+                    actor="dream-engine",
+                    action="reconcile_deferred",
+                    detail={"profile_id": "p", "nomination_id": f"n{i}"},
+                    at=10.0 + i,
+                    dedup_key=ports.reconciliation_deferred_dedup_key(f"n{i}", f"r{i}", "reconcile_deferred"),
+                )
+            )
+        meta.audit_append(
+            ports.AuditEntry(
+                actor="dream-engine",
+                action="reconcile_deferred",
+                detail={"profile_id": "other", "nomination_id": "nforeign"},
+                at=12.0,
+                dedup_key=ports.reconciliation_deferred_dedup_key("nforeign", "r", "reconcile_deferred"),
+            )
+        )
+        meta.audit_append(
+            ports.AuditEntry(
+                actor="dream-engine", action="reconcile_deferred", detail={"nomination_id": "nk"}
+            )
+        )
+        meta.audit_append(
+            ports.AuditEntry(
+                actor="console-user",
+                action="reconcile_deferred",
+                detail={"profile_id": "p", "nomination_id": "nactor"},
+            )
+        )
+        application = ports.ReconciliationApplication(
+            nomination_id="nom",
+            profile_id="p",
+            disposition="unresolved",
+            reason_code="missing_endpoint",
+            canonical_kind="read_conflict",
+            composite_group_id="group",
+            evidence_event_ids=(1, 2),
+            verdict="insufficient",
+            quality="degraded",
+            left_node_id="a",
+            left_version=1,
+            left_expected_peer_id="b",
+            right_node_id="b",
+            right_version=2,
+            right_expected_peer_id="a",
+            winner_node_id=None,
+            loser_node_id=None,
+            loser_prior_version=None,
+            loser_new_version=None,
+            applied_at=10.0,
+        )
+        for _ in range(3):
+            assert graph.apply_reconciliation(application, downweight_factor=None).disposition == "unresolved"
+        assert graph.count_reconciliation_receipts(profile_id="p") == {"unresolved": 1}
+        assert graph.count_reconciliation_receipts(profile_id="other") == {}
+        assert meta.count_reconciliation_deferred(profile_id="p") == 2
+        assert meta.count_reconciliation_deferred(profile_id="other") == 1
+    finally:
+        asyncio.run(graph.close())
+        asyncio.run(meta.close())
+
+
 def test_reconciliation_config_defaults_and_loader(tmp_path):
     defaults = config.DreamConfig().reconciliation
     expected = {
