@@ -1054,6 +1054,14 @@ class SqliteGraphDriver:
         ).fetchone()
         return _decode_receipt(row) if row is not None else None
 
+    def count_reconciliation_receipts(self, *, profile_id: str) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT disposition, COUNT(*) AS n FROM reconciliation_receipts "
+            "WHERE profile_id = ? GROUP BY disposition",
+            (profile_id,),
+        ).fetchall()
+        return {str(row["disposition"]): int(row["n"]) for row in rows}
+
     def pending_reconciliation_audits(self, limit: int) -> list[ReconciliationAuditOutboxEntry]:
         if limit < 0:
             raise ValueError("audit repair limit must be non-negative")

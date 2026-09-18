@@ -29,7 +29,7 @@ Driver family covered by the `stack` fixture:
 | upsert_chunk | `test_contract_vector.py::test_upsert_get_roundtrip` |
 | upsert_chunks | `test_contract_vector.py::test_upsert_chunks_bulk` |
 
-## GraphStore (27 methods)
+## GraphStore (28 methods)
 
 | Method | Contract test |
 |---|---|
@@ -42,6 +42,7 @@ Driver family covered by the `stack` fixture:
 | capabilities | `test_contract_graph.py::test_capabilities` |
 | clear_flags | `test_contract_graph.py::test_set_and_clear_flags` |
 | clear_read_conflict | `test_contract_graph.py::test_clear_read_conflict_clears_single_side` |
+| count_reconciliation_receipts | `test_contract_reconciliation.py::test_reconcile_counts_are_cumulative_and_profile_scoped` |
 | diff | `test_contract_graph.py::test_diff_reports_payload_change` |
 | find_same_predicate | `test_contract_graph.py::test_find_same_predicate` |
 | get_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
@@ -61,7 +62,7 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (42 methods)
+## MetaStore (43 methods)
 
 | Method | Contract test |
 |---|---|
@@ -74,6 +75,7 @@ Driver family covered by the `stack` fixture:
 | audit_query | `test_contract_meta.py::test_audit_append_and_query` |
 | authenticate_token | `test_contract_meta.py::test_token_secret_hashed_at_rest_and_authenticates` |
 | capabilities | `test_contract_meta.py::test_capabilities` |
+| count_reconciliation_deferred | `test_contract_reconciliation.py::test_reconcile_counts_are_cumulative_and_profile_scoped` |
 | count_users | `test_contract_meta.py::test_users_crud_and_password_rotation` |
 | create_owner | `test_contract_meta.py::test_create_owner_atomic_and_conflict` |
 | create_profile | `test_contract_meta.py::test_create_profile_is_insert_only` |

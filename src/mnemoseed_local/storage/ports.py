@@ -1162,6 +1162,10 @@ class GraphStore(Protocol):
         """Transition one outbox row from pending to delivered only."""
         raise NotImplementedError
 
+    def count_reconciliation_receipts(self, *, profile_id: str) -> dict[str, int]:
+        """Terminal receipt tallies by disposition, profile-scoped (pure read)."""
+        raise NotImplementedError
+
     def invalidate(self, node_id: str, valid_to: float) -> None:
         raise NotImplementedError
 
@@ -1353,6 +1357,12 @@ class MetaStore(Protocol):
         raise NotImplementedError
 
     def audit_append(self, entry: AuditEntry) -> None:
+        raise NotImplementedError
+
+    def count_reconciliation_deferred(self, *, profile_id: str) -> int:
+        """Cumulative deferral events per (nomination × dream run), not a pending-
+        nomination gauge.
+        """
         raise NotImplementedError
 
     def audit_query(self, filter: AuditFilter, page: Page) -> PageResult[AuditEntry]:

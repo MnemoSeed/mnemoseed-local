@@ -56,6 +56,9 @@ COVERAGE: dict[str, dict[str, str]] = {
         "mark_reconciliation_audit_delivered": (
             "test_reconcile_application.py::test_receipt_commit_before_audit_repairs_once"
         ),
+        "count_reconciliation_receipts": (
+            "test_contract_reconciliation.py::test_reconcile_counts_are_cumulative_and_profile_scoped"
+        ),
         "invalidate": "test_contract_graph.py::test_invalidate_closes_current_revision",
         "supersede_link": "test_contract_graph.py::test_supersede_link_closes_and_links_in_one_transaction",
         "append_version": "test_contract_graph.py::test_append_version_supersedes_previous",
@@ -89,6 +92,9 @@ COVERAGE: dict[str, dict[str, str]] = {
         "rollback_config": "test_contract_meta.py::test_config_versioned_get_set_rollback",
         "audit_append": "test_contract_meta.py::test_audit_append_and_query",
         "audit_query": "test_contract_meta.py::test_audit_append_and_query",
+        "count_reconciliation_deferred": (
+            "test_contract_reconciliation.py::test_reconcile_counts_are_cumulative_and_profile_scoped"
+        ),
         "record_dream_run": "test_contract_meta.py::test_dream_runs_roundtrip",
         "list_dream_runs": "test_contract_meta.py::test_dream_runs_roundtrip",
         "update_dream_run_model": "test_contract_meta.py::test_dream_run_model_update_records_resolved_model",
@@ -153,7 +159,7 @@ COVERAGE: dict[str, dict[str, str]] = {
 # write — one transaction, carrier + two NODE ledger rows, typed dedup).
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
-    "GraphStore": 27,
-    "MetaStore": 42,
+    "GraphStore": 28,
+    "MetaStore": 43,
     "Embedder": 3,
 }
