@@ -46,6 +46,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from mnemoseed_local.config import DEFAULT_RECALL_RESCUE_CUE_MIN, DEFAULT_RECALL_RESCUE_FLOOR
+from mnemoseed_local.retrieve.activation import ActivationSnapshot
 from mnemoseed_local.retrieve.cues import ExtractedCues
 from mnemoseed_local.schema.graph import GraphNode
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, Cues
@@ -113,6 +114,7 @@ class ScoreBreakdown:
     graph_centrality: float
     cooccurrence: float
     total: float
+    short_term_activation: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -184,6 +186,9 @@ class HybridRetriever:
         vector_store: VectorStore,
         graph_store: GraphStore,
         embedder: Embedder,
+        activation_snapshot: ActivationSnapshot | None = None,
+        session_id: str | None = None,
+        now: float | None = None,
     ) -> HybridRecall:
         """Rank the merged vector+graph pool; the two tracks run concurrently."""
         config = self._config
@@ -204,7 +209,14 @@ class HybridRetriever:
             graph_store,
             config,
         )
-        return _merge(vector_future.result(), graph_future.result())
+        return _merge(
+            vector_future.result(),
+            graph_future.result(),
+            activation_snapshot=activation_snapshot,
+            profile_id=profile_id,
+            session_id=session_id,
+            now=now,
+        )
 
     def _recall_sequential(
         self,
@@ -381,14 +393,55 @@ def _sort_key(candidate: Candidate) -> tuple[bool, float, str, str]:
 def _merge(
     vector_candidates: Sequence[Candidate],
     graph_candidates: Sequence[Candidate],
+    *,
+    activation_snapshot: ActivationSnapshot | None = None,
+    profile_id: str | None = None,
+    session_id: str | None = None,
+    now: float | None = None,
 ) -> HybridRecall:
     """Fuse both track pools into one order-insensitive ranked recall."""
-    merged = sorted([*vector_candidates, *graph_candidates], key=_sort_key)
+    merged_candidates = [*vector_candidates, *graph_candidates]
+    if (
+        activation_snapshot is not None
+        and profile_id is not None
+        and session_id is not None
+        and now is not None
+    ):
+        merged_candidates = [
+            _apply_activation(c, activation_snapshot, profile_id, session_id, now) for c in merged_candidates
+        ]
+    merged = sorted(merged_candidates, key=_sort_key)
     return HybridRecall(
         candidates=merged,
         vector_hits=len(vector_candidates),
         graph_hits=len(graph_candidates),
     )
+
+
+def _apply_activation(
+    candidate: Candidate,
+    snapshot: ActivationSnapshot,
+    profile_id: str,
+    session_id: str,
+    now: float,
+) -> Candidate:
+    activation = snapshot.score(
+        candidate.kind + ":" + candidate.id,
+        profile_id=profile_id,
+        session_id=session_id,
+        now=now,
+    )
+    if activation == 0.0:
+        return candidate
+    breakdown = _breakdown(
+        semantic=candidate.breakdown.semantic,
+        cue_overlap=candidate.breakdown.cue_overlap,
+        decay_weight=candidate.breakdown.decay_weight,
+        graph_centrality=candidate.breakdown.graph_centrality,
+        config=HybridConfig(),
+        short_term_activation=activation,
+    )
+    return Candidate(**{**candidate.__dict__, "score": breakdown.total, "breakdown": breakdown})
 
 
 def _breakdown(
@@ -398,12 +451,14 @@ def _breakdown(
     decay_weight: float,
     graph_centrality: float,
     config: HybridConfig,
+    short_term_activation: float = 0.0,
 ) -> ScoreBreakdown:
     total = (
         config.weight_semantic * semantic
         + config.weight_cue_overlap * cue_overlap
         + config.weight_decay * decay_weight
         + config.weight_centrality * graph_centrality
+        + short_term_activation
     )
     return ScoreBreakdown(
         semantic=semantic,
@@ -412,6 +467,7 @@ def _breakdown(
         graph_centrality=graph_centrality,
         cooccurrence=0.0,
         total=total,
+        short_term_activation=short_term_activation,
     )
 
 
