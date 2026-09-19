@@ -1,0 +1,390 @@
+{
+  "requested_pairs": 20,
+  "pairs": [
+    {
+      "pair_id": "share-01",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "5f6375a9a0894ab8858eec7710abbf2b",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-02",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "d689cc83530243f88027250d62eaeb71",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-03",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "c6eae74a566f4870b5fbad292882d594",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-04",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-05",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "12e4e9f05c3c489aa8003c9312527ad6",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-06",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "b3cea0e1079c464f83644dba72355e15",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-07",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "e9074dd785b04f9783ba0c8ed004e04e",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-08",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "d689cc83530243f88027250d62eaeb71",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-09",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "c6eae74a566f4870b5fbad292882d594",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-10",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "disjoint-01",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "source_query_ids": [
+        "project",
+        "bug"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-02",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "source_query_ids": [
+        "project",
+        "bug"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-03",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "82c5f4695c8c4f64b83127400411b90f",
+      "source_query_ids": [
+        "project",
+        "meeting"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-04",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "82c5f4695c8c4f64b83127400411b90f",
+      "source_query_ids": [
+        "project",
+        "meeting"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-05",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "87f4aae6987e42b69d0203915c20b3aa",
+      "source_query_ids": [
+        "project",
+        "design"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-06",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "87f4aae6987e42b69d0203915c20b3aa",
+      "source_query_ids": [
+        "project",
+        "design"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-07",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "19d2aa2c09334e42ad21775edb74e975",
+      "source_query_ids": [
+        "project",
+        "deploy"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-08",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "19d2aa2c09334e42ad21775edb74e975",
+      "source_query_ids": [
+        "project",
+        "deploy"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-09",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "8a93bd6790584a108b84cb758215802c",
+      "source_query_ids": [
+        "project",
+        "test"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-10",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "8a93bd6790584a108b84cb758215802c",
+      "source_query_ids": [
+        "project",
+        "test"
+      ],
+      "category": "disjoint"
+    }
+  ],
+  "sharing_pairs": [
+    {
+      "pair_id": "share-01",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "5f6375a9a0894ab8858eec7710abbf2b",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-02",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "d689cc83530243f88027250d62eaeb71",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-03",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "c6eae74a566f4870b5fbad292882d594",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-04",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-05",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "12e4e9f05c3c489aa8003c9312527ad6",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-06",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "b3cea0e1079c464f83644dba72355e15",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-07",
+      "node_id_a": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "node_id_b": "e9074dd785b04f9783ba0c8ed004e04e",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-08",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "d689cc83530243f88027250d62eaeb71",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-09",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "c6eae74a566f4870b5fbad292882d594",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    },
+    {
+      "pair_id": "share-10",
+      "node_id_a": "5f6375a9a0894ab8858eec7710abbf2b",
+      "node_id_b": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "source_query_ids": [
+        "project"
+      ],
+      "category": "sharing"
+    }
+  ],
+  "disjoint_pairs": [
+    {
+      "pair_id": "disjoint-01",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "source_query_ids": [
+        "project",
+        "bug"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-02",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "source_query_ids": [
+        "project",
+        "bug"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-03",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "82c5f4695c8c4f64b83127400411b90f",
+      "source_query_ids": [
+        "project",
+        "meeting"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-04",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "82c5f4695c8c4f64b83127400411b90f",
+      "source_query_ids": [
+        "project",
+        "meeting"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-05",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "87f4aae6987e42b69d0203915c20b3aa",
+      "source_query_ids": [
+        "project",
+        "design"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-06",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "87f4aae6987e42b69d0203915c20b3aa",
+      "source_query_ids": [
+        "project",
+        "design"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-07",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "19d2aa2c09334e42ad21775edb74e975",
+      "source_query_ids": [
+        "project",
+        "deploy"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-08",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "19d2aa2c09334e42ad21775edb74e975",
+      "source_query_ids": [
+        "project",
+        "deploy"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-09",
+      "node_id_a": "c6eae74a566f4870b5fbad292882d594",
+      "node_id_b": "8a93bd6790584a108b84cb758215802c",
+      "source_query_ids": [
+        "project",
+        "test"
+      ],
+      "category": "disjoint"
+    },
+    {
+      "pair_id": "disjoint-10",
+      "node_id_a": "e9074dd785b04f9783ba0c8ed004e04e",
+      "node_id_b": "8a93bd6790584a108b84cb758215802c",
+      "source_query_ids": [
+        "project",
+        "test"
+      ],
+      "category": "disjoint"
+    }
+  ],
+  "pair_count": 20
+}

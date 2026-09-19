@@ -1,0 +1,52 @@
+{
+  "issue": "206",
+  "source_sha": "b6dd3a5",
+  "sampling_method": "POST /memory/recall on localhost:7788 using fixed broad single-term probes; IDs were deduplicated, then co-retrieved sharing pairs and disjoint-query background pairs were formed; no database access",
+  "probe_queries": [
+    "project",
+    "bug",
+    "meeting",
+    "design",
+    "deploy",
+    "test",
+    "error",
+    "plan",
+    "review",
+    "idea",
+    "config",
+    "deadline"
+  ],
+  "probe_queries_count": 12,
+  "memories_collected": 58,
+  "shortfall": 0,
+  "sample_size": 20,
+  "completed_pairs": 20,
+  "sharing_pairs_requested": 10,
+  "background_pairs_requested": 10,
+  "seat_calls": 40,
+  "clock": "2026-09-20",
+  "duration_seconds": 1195.8881858,
+  "tokens": {
+    "prompt": 9636,
+    "completion": 3597,
+    "total": 13233
+  },
+  "status": "observed",
+  "route": "openai_compatible|gpt-5.6-luna|https://api.experientiallabs.ai/v1|EVAL_LUNA_KEY|120|8192",
+  "probe": {
+    "endpoint": "http://localhost:7788/memory/recall",
+    "method": "POST",
+    "http_status": 200
+  },
+  "luna_models_probe": {
+    "endpoint": "https://api.experientiallabs.ai/v1/models",
+    "http_status": 200
+  },
+  "privacy": "pair/node IDs and aggregate metadata only in evidence; no memory text",
+  "evidence_files": [
+    "ids.json",
+    "pairs.json",
+    "observations.json",
+    "manifest.json"
+  ]
+}
