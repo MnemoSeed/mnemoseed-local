@@ -45,7 +45,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
@@ -61,6 +61,7 @@ from mnemoseed_local.dream import DreamTrigger, TriggerStatus
 
 if TYPE_CHECKING:
     from mnemoseed_local.daemon.app import DreamWorker
+from mnemoseed_local.retrieve.activation import ShortTermActivation
 from mnemoseed_local.retrieve.assemble import (
     AssembledContext,
     AssembledEntry,
@@ -150,6 +151,7 @@ class RecallRequest(BaseModel):
     time_bucket: str | None = None
     top_k: int | None = Field(default=None, ge=1, le=100)
     budget: int | None = Field(default=None, ge=1)
+    session_id: str | None = None
 
 
 class RememberRequest(BaseModel):
@@ -485,10 +487,17 @@ def _group_session_tails(
 class MemoryService:
     """Daemon-owned memory engine: leverages the retrieval + storage ports."""
 
-    def __init__(self, stores: Stores, config: Config, observability: Observability | None = None) -> None:
+    def __init__(
+        self,
+        stores: Stores,
+        config: Config,
+        observability: Observability | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._stores = stores
         self._config = config
         self._observability = observability
+        self._clock = clock
         self._cues = CueExtractor()
         # design/09 §3.5: the rescue band thresholds ride the live config so a
         # calibration update reaches the retriever without code edits.
@@ -499,6 +508,7 @@ class MemoryService:
             )
         )
         self._assembler = Assembler()
+        self._activation = ShortTermActivation.default(clock=clock)
         # FR-4.2 event side: retrieval usage becomes a reinforcement event
         # (baseline refresh + bounded rebound), the counterpart of the sweep.
         self._reinforcer = Reinforcer(stores)
@@ -563,6 +573,7 @@ class MemoryService:
         time_bucket: str | None = None,
         top_k: int | None = None,
         budget: int | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Full recall path: cues -> dual-track pool -> budgeted context."""
         extracted = self._cues.extract(query, host=host, project=project, time_bucket=time_bucket)
@@ -573,6 +584,9 @@ class MemoryService:
             vector_store=self._stores.vector,
             graph_store=self._stores.graph,
             embedder=self._stores.embed,
+            activation_snapshot=(self._activation.snapshot() if session_id is not None else None),
+            session_id=session_id,
+            now=self._clock() if session_id is not None else None,
         )
         assembler = self._assembler
         if top_k is not None or budget is not None:
@@ -592,11 +606,25 @@ class MemoryService:
             graph_store=self._stores.graph,
         )
         self._record_hits(context)
+        if session_id is not None:
+            self._refresh_activation(context, profile_id=profile_id, session_id=session_id)
         payload = self._memory_payload(context)
         # design/09 §3.6: dead-zone pins stay reachable as one-line residues on
         # the MCP explicit recall response (never on the T2 injection surface).
         payload["index_residue"] = self._index_residue(profile_id)
         return {"memory": payload}
+
+    def _refresh_activation(self, context: AssembledContext, *, profile_id: str, session_id: str) -> None:
+        """Refresh only entries that survived final assembly."""
+        try:
+            for entry in context.entries:
+                self._activation.refresh(
+                    f"{entry.kind}:{entry.id}",
+                    profile_id=profile_id,
+                    session_id=session_id,
+                )
+        except Exception:
+            logger.warning("activation refresh failed; recall proceeds", exc_info=True)
 
     def _record_hits(self, context: AssembledContext) -> None:
         """FR-3.7 usage events + FR-4.2 reinforcement: fire-and-forget, never
@@ -2320,6 +2348,7 @@ def memory_recall(req: RecallRequest, request: Request) -> dict[str, Any]:
         time_bucket=req.time_bucket,
         top_k=req.top_k,
         budget=req.budget,
+        session_id=req.session_id,
     )
 
 

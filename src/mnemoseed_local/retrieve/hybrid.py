@@ -130,6 +130,7 @@ class Candidate:
     score: float
     breakdown: ScoreBreakdown
     rescued: bool = False
+    selection_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +217,7 @@ class HybridRetriever:
             profile_id=profile_id,
             session_id=session_id,
             now=now,
+            config=config,
         )
 
     def _recall_sequential(
@@ -237,7 +239,7 @@ class HybridRetriever:
         query = cues.cues
         vector_candidates = self._vector_track(query_text, query, profile_id, vector_store, embedder, config)
         graph_candidates = self._graph_track(query, profile_id, graph_store, config)
-        return _merge(vector_candidates, graph_candidates)
+        return _merge(vector_candidates, graph_candidates, config=config)
 
     # ----------------------------------------------------------- vector track
 
@@ -398,9 +400,11 @@ def _merge(
     profile_id: str | None = None,
     session_id: str | None = None,
     now: float | None = None,
+    config: HybridConfig | None = None,
 ) -> HybridRecall:
     """Fuse both track pools into one order-insensitive ranked recall."""
     merged_candidates = [*vector_candidates, *graph_candidates]
+    active_config = config if config is not None else HybridConfig()
     if (
         activation_snapshot is not None
         and profile_id is not None
@@ -408,7 +412,8 @@ def _merge(
         and now is not None
     ):
         merged_candidates = [
-            _apply_activation(c, activation_snapshot, profile_id, session_id, now) for c in merged_candidates
+            _apply_activation(c, activation_snapshot, profile_id, session_id, now, active_config)
+            for c in merged_candidates
         ]
     merged = sorted(merged_candidates, key=_sort_key)
     return HybridRecall(
@@ -424,24 +429,33 @@ def _apply_activation(
     profile_id: str,
     session_id: str,
     now: float,
+    config: HybridConfig,
 ) -> Candidate:
-    activation = snapshot.score(
+    activation_rate = snapshot.boost(
         candidate.kind + ":" + candidate.id,
         profile_id=profile_id,
         session_id=session_id,
         now=now,
     )
-    if activation == 0.0:
+    if activation_rate == 0.0:
         return candidate
+    activation = candidate.score * activation_rate
     breakdown = _breakdown(
         semantic=candidate.breakdown.semantic,
         cue_overlap=candidate.breakdown.cue_overlap,
         decay_weight=candidate.breakdown.decay_weight,
         graph_centrality=candidate.breakdown.graph_centrality,
-        config=HybridConfig(),
+        config=config,
         short_term_activation=activation,
     )
-    return Candidate(**{**candidate.__dict__, "score": breakdown.total, "breakdown": breakdown})
+    return Candidate(
+        **{
+            **candidate.__dict__,
+            "score": breakdown.total,
+            "breakdown": breakdown,
+            "selection_score": candidate.score,
+        }
+    )
 
 
 def _breakdown(

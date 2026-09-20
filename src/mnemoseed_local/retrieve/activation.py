@@ -10,6 +10,10 @@ from types import MappingProxyType
 
 ActivationKey = tuple[str, str, str]
 ActivationEntry = tuple[float, float]
+# Design/13 table; pre-registered 2026-09-20.
+ACTIVATION_HALF_LIFE_SECONDS = 600.0
+ACTIVATION_MAX_BOOST = 0.15
+ACTIVATION_CAPACITY = 200
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,7 @@ class ActivationSnapshot:
     enabled: bool
     half_life: float
     boost_value: float
+    capacity: int
 
     def boost(self, memory_id: str, *, profile_id: str, session_id: str, now: float) -> float:
         if not self.enabled:
@@ -35,11 +40,19 @@ class ActivationSnapshot:
         except (ArithmeticError, TypeError, ValueError):
             return 0.0
 
-    def score(self, memory_id: str, *, profile_id: str, session_id: str, now: float) -> float:
-        return self.boost(memory_id, profile_id=profile_id, session_id=session_id, now=now)
-
 
 class ShortTermActivation:
+    @classmethod
+    def default(cls, *, clock: Callable[[], float]) -> ShortTermActivation:
+        """Create the pre-registered, fail-safe activation owner."""
+        return cls(
+            enabled=False,
+            half_life=ACTIVATION_HALF_LIFE_SECONDS,
+            boost_value=ACTIVATION_MAX_BOOST,
+            capacity=ACTIVATION_CAPACITY,
+            clock=clock,
+        )
+
     def __init__(
         self,
         *,
@@ -77,11 +90,12 @@ class ShortTermActivation:
             enabled=self._enabled,
             half_life=self._half_life,
             boost_value=self._boost_value,
+            capacity=self._capacity,
         )
 
-    def score(self, memory_id: str, *, profile_id: str, session_id: str, now: float | None = None) -> float:
+    def boost(self, memory_id: str, *, profile_id: str, session_id: str, now: float | None = None) -> float:
         timestamp = self._clock() if now is None else now
-        return self.snapshot().score(memory_id, profile_id=profile_id, session_id=session_id, now=timestamp)
+        return self.snapshot().boost(memory_id, profile_id=profile_id, session_id=session_id, now=timestamp)
 
     @staticmethod
     def _valid_id(memory_id: str) -> bool:

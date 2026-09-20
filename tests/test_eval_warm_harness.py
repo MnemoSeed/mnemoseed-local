@@ -29,6 +29,7 @@ from mnemoseed_local.eval.warm_materials import (
     WINDOW_NEGATIVE_CONTROL,
     warm_materials,
 )
+from mnemoseed_local.retrieve.activation import ACTIVATION_MAX_BOOST
 
 
 @pytest.fixture
@@ -96,3 +97,20 @@ def test_warm_baseline_point_metric_can_move(rig_root: Path) -> None:
     # the ε=0 baseline never injects a boost: the served observation is as-is
     assert result.activation_enabled is False
     assert result.activation_eps == 0.0
+
+
+def test_warm_harness_can_measure_activation_on_without_changing_materials(rig_root: Path) -> None:
+    material = warm_materials()[0]
+    result = run_warm_point(material, root=rig_root, sleep=lambda _: None, activation_enabled=True)
+    off = run_warm_point(material, root=rig_root, sleep=lambda _: None, activation_enabled=False)
+
+    assert result.activation_enabled is True
+    assert result.activation_eps == ACTIVATION_MAX_BOOST
+    assert [metric.re_surfaced for metric in result.probe_metrics] == [True, False, False]
+    assert [metric.re_surfaced for metric in result.probe_metrics] == [
+        metric.re_surfaced for metric in off.probe_metrics
+    ]
+    assert result.probe_metrics[0].re_score is not None
+    assert off.probe_metrics[0].re_score is not None
+    assert result.probe_metrics[0].re_score > off.probe_metrics[0].re_score
+    assert {metric.re_rank for metric in result.probe_metrics} == {1, None}

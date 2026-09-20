@@ -229,7 +229,12 @@ class Assembler:
         pool = recall.candidates
         by_id = {candidate.id: candidate for candidate in pool}
         tokens = {candidate.id: estimate_tokens(self._entry_text(candidate)) for candidate in pool}
-        effective = {candidate.id: candidate.score for candidate in pool}
+        effective = {
+            candidate.id: (
+                candidate.selection_score if candidate.selection_score is not None else candidate.score
+            )
+            for candidate in pool
+        }
 
         state = meta_store.pool_state(profile_id)
         watermark = state.watermark
@@ -288,7 +293,13 @@ class Assembler:
             self._entry(admission, marked, config, read_conflict_ids)
             for admission in sorted(
                 admitted,
-                key=lambda item: (item.order, item.candidate.kind, item.candidate.id),
+                key=lambda item: (
+                    item.candidate.rescued,
+                    -item.candidate.score,
+                    item.candidate.kind,
+                    item.candidate.id,
+                    item.order,
+                ),
             )
         )
         return AssembledContext(
@@ -328,6 +339,12 @@ class Assembler:
         consumed: set[str] = set()
         dropped = 0
         order_seq = 0
+
+        def serving_score(candidate: Candidate) -> float:
+            if candidate.selection_score is not None:
+                return candidate.score
+            return effective[candidate.id]
+
         for candidate in ordered:
             if candidate.id in consumed:
                 continue
@@ -335,7 +352,7 @@ class Assembler:
             if group is None:
                 cost = tokens[candidate.id]
                 if len(kept) < config.top_k and used + cost <= config.budget_tokens:
-                    kept.append(_Admission(candidate, effective[candidate.id], (), None, order_seq))
+                    kept.append(_Admission(candidate, serving_score(candidate), (), None, order_seq))
                     order_seq += 1
                     used += cost
                 else:
@@ -354,7 +371,7 @@ class Assembler:
                     kept.append(
                         _Admission(
                             member,
-                            effective[member.id],
+                            serving_score(member),
                             (EntryFlag.CONFLICT_PAIR,),
                             group,
                             order_seq,
@@ -372,7 +389,7 @@ class Assembler:
                     kept.append(
                         _Admission(
                             top,
-                            effective[top.id],
+                            serving_score(top),
                             (EntryFlag.CONFLICT_OMITTED,),
                             group,
                             order_seq,
