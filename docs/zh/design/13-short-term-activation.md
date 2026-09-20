@@ -4,7 +4,16 @@
 
 ACT-R 的快速层与慢速层在本设计中只作为机制映射：快速层对应会话范围内的易失性激活，慢速层对应既有长期记忆检索与衰减字段。该映射不改变既有长期存储的语义，也不把理论参数当作生产默认值。
 
-所有数值均为 **TBD-pending-owner-preregistration**，须在所有者预注册后才能注入测试或未来配置；本阶段不提供数值默认值。
+以下数值由 owner 于 **2026-09-20** 预注册（source: **pre-registered 2026-09-20**），不是可调参数；本阶段总开关仍关闭。
+
+| 参数 | 数值 | owner | 日期 | validating eval |
+| --- | --- | --- | --- | --- |
+| 半衰期 | 10 分钟 | owner | 2026-09-20 | warm-needle delayed re-query |
+| 单记忆最大加分 | base score 的 +15% | owner | 2026-09-20 | warm-needle re-relevance delta |
+| 会话状态容量 | 200 条 | owner | 2026-09-20 | capacity eviction |
+| partner rule | 只刷新已返回的同组成员，不扩池 | owner | 2026-09-20 | membership-preserving golden |
+| refresh | refresh-not-stack | owner | 2026-09-20 | fixed-clock decay |
+| failure | fail-open，零加分 | owner | 2026-09-20 | corrupt-state/failure isolation |
 
 ## 合同
 
@@ -17,9 +26,9 @@ ACT-R 的快速层与慢速层在本设计中只作为机制映射：快速层�
 
 ## 生命周期与边界
 
-容量、半衰期、激活量和淘汰规则均为 TBD-pending-owner-preregistration。容量达到上限时淘汰最旧条目；重启后激活为空。快照不可变，调用方可安全地把同一快照用于确定性排序。
+容量达到上限时淘汰最旧条目；重启后激活为空。快照不可变，调用方可安全地把同一快照用于确定性排序。
 
-会话标识是激活组件的普通参数；本阶段不改变 recall endpoint schema。生产路径默认关闭，关闭时输出必须与当前基线逐字节相同。
+Recall endpoint schema 允许 additive optional `session_id`（默认 `None` 表示 bypass），向后兼容，不新增 route 或 tool。生产路径默认关闭，关闭时输出必须与当前基线逐字节相同。
 
 ## 验收标准
 

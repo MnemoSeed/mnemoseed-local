@@ -38,6 +38,12 @@ from mnemoseed_local.eval.warm_matrix import (
     WARM_EPSILON_BASELINE,
     WarmProbeMetrics,
 )
+from mnemoseed_local.retrieve.activation import (
+    ACTIVATION_CAPACITY,
+    ACTIVATION_HALF_LIFE_SECONDS,
+    ACTIVATION_MAX_BOOST,
+    ShortTermActivation,
+)
 from mnemoseed_local.schema.stamp import (
     ChunkStamp,
     CognitiveTier,
@@ -70,10 +76,13 @@ def _config_toml(root: Path) -> str:
 class WarmRig:
     """One /memory/recall rig over a disposable daemon app, driven over HTTP."""
 
-    def __init__(self, root: Path, *, profile_id: str = "warm-eval") -> None:
+    def __init__(
+        self, root: Path, *, profile_id: str = "warm-eval", activation_enabled: bool = False
+    ) -> None:
         require_fresh_root(root)
         self.root = root
         self.profile_id = profile_id
+        self.activation_enabled = activation_enabled
         (root / "config.toml").write_text(_config_toml(root), encoding="utf-8")
         self._stack: ExitStack | None = None
         self._client: TestClient | None = None
@@ -94,6 +103,14 @@ class WarmRig:
         try:
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
             self._client = stack.enter_context(TestClient(create_app()))
+            if self.activation_enabled:
+                self._state.memory._activation = ShortTermActivation(
+                    enabled=True,
+                    half_life=ACTIVATION_HALF_LIFE_SECONDS,
+                    boost_value=ACTIVATION_MAX_BOOST,
+                    capacity=ACTIVATION_CAPACITY,
+                    clock=time.time,
+                )
         except BaseException:
             stack.close()
             release_daemon_log_handler(self.root)
@@ -149,17 +166,13 @@ class WarmRig:
     def recall(self, query: str) -> dict[str, Any]:
         """POST /memory/recall for the rig's query.
 
-        Design/10 §3.1 keys the future activation state by
-        ``(profile_id, session_id)``, but this endpoint currently carries no
-        ``session_id`` field. The instrument keeps each point's session identity
-        explicit at the material level (``WarmNeedleMaterial.session_id``); when
-        activation is implemented, /memory/recall will need a session_id seam so
-        the per-session activation map can be keyed — out of scope for this
-        baseline (zero runtime retrieval changes)."""
-        response = self.client.post(
-            "/memory/recall",
-            json={"profile_id": self.profile_id, "query": query},
-        )
+        The optional ``session_id`` field carries the material's within-session
+        activation scope. Activation remains opt-in; omitted session identities
+        preserve the activation-off recall contract."""
+        payload: dict[str, Any] = {"profile_id": self.profile_id, "query": query}
+        if self.activation_enabled:
+            payload["session_id"] = self.profile_id
+        response = self.client.post("/memory/recall", json=payload)
         assert response.status_code == 200, response.text
         return cast(dict[str, Any], response.json())
 
@@ -194,6 +207,7 @@ def run_warm_point(
     *,
     root: Path,
     sleep: Callable[[float], None] = time.sleep,
+    activation_enabled: bool = False,
 ) -> WarmPointResult:
     """One warm-needle point on its own fresh rig, strict serial lifecycle.
 
@@ -202,7 +216,7 @@ def run_warm_point(
     after its declared delay. Success deletes the deterministic root so later
     groups can reuse the name; a failure propagates and KEEPS the root as
     forensics (T4a contract)."""
-    with WarmRig(root) as rig:
+    with WarmRig(root, activation_enabled=activation_enabled) as rig:
         rig.seed_material(material)
         metrics: list[WarmProbeMetrics] = []
         for probe in material.probes:
@@ -228,8 +242,8 @@ def run_warm_point(
             )
     result = WarmPointResult(
         point_id=material.point_id,
-        activation_enabled=False,
-        activation_eps=WARM_EPSILON_BASELINE,
+        activation_enabled=activation_enabled,
+        activation_eps=ACTIVATION_MAX_BOOST if activation_enabled else WARM_EPSILON_BASELINE,
         probe_metrics=tuple(metrics),
     )
     shutil.rmtree(root)
