@@ -308,6 +308,16 @@ def adjudication_input_for_mixed(fixture_id: str) -> PairAdjudicationInput:
     )
 
 
+def adjudication_carrier_for(
+    fixture_id: str,
+) -> tuple[PairNomination, EndpointObservation, EndpointObservation]:
+    """Expose the frozen nomination and endpoint observations without seats."""
+    item = next(item for item in all_fixtures() if item.fixture_id == fixture_id)
+    index = _fixture_index(fixture_id)
+    left, right = _observations_for(item)
+    return (_nomination_for(item, index), left, right)
+
+
 def _hash_fixtures(fixtures: tuple[ConflictFixture, ...]) -> str:
     payload = json.dumps(
         [
