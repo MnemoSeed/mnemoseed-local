@@ -196,12 +196,24 @@ def test_preflight_rejects_outside_root_link_missing_and_decoy(tmp_path, monkeyp
     outside = tmp_path / "evil" / "run"
     assert preflight.validate_run_root(repo, outside, home, 54321, env)
 
-    class FakeStat:
-        st_file_attributes = 0x400
+    real_lstat = os.lstat
 
-    monkeypatch.setattr(os, "lstat", lambda path: FakeStat())
+    class ReparseStat:
+        def __init__(self, original) -> None:
+            self._original = original
+            self.st_file_attributes = getattr(original, "st_file_attributes", 0) | 0x400
+
+        def __getattr__(self, name: str):
+            return getattr(self._original, name)
+
+    def lstat_with_reparse(path):
+        original = real_lstat(path)
+        if Path(path) == run:
+            return ReparseStat(original)
+        return original
+
+    monkeypatch.setattr(os, "lstat", lstat_with_reparse)
     assert any("link" in error for error in preflight.validate_run_root(repo, run, home, 54321, env))
-    monkeypatch.undo()
 
     assert any(
         "missing" in error
