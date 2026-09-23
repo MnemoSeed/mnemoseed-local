@@ -5,7 +5,7 @@
 > 目标：G1（可解释性「为何冒出它 / 为何不是另一些」）+ G5（「哪条是用户钉的 vs 推断的」）。
 > 非目标：**不是 RAG 调试器、不是模型内部、不是检索体检台**——不做 top-k 逻辑哪个候选被切、不做 embedding 相似度、不做 ScoreBreakdown 逐项加权解说（那些是 `docs/zh/design/ux/08` §4 Scores 区段的检索自畸形，不是本面）。
 > 状态基线：设计规格（docs-only）。行号引注钉在基线工作树；实现批开工时按当时基线重钉。
-> 主要依据：`daemon/memory.py`（召回/Atlas wire）、`retrieve/assemble.py`（AssembledEntry/EntryFlag）、`schema/stamp.py`（Provenance/is_explicit_pin/EXPLICIT_PIN_SOURCE）、`hosts/opencode/plugin.ts`（T1/T2/T3 注入）、`console/static/{index,app,style}`、`docs/zh/design/ux/08-memory-atlas-spec.md`。
+> 主要依据：`daemon/memory.py`（召回/Atlas wire）、`retrieve/assemble.py`（AssembledEntry/EntryFlag）、`schema/stamp.py`（Provenance/is_explicit_pin/EXPLICIT_PIN_SOURCE）、`hosts/opencode/plugin.ts`（T1/T2/T3 注入）、`console/static/{index,app,style}`、`docs/zh/design/ux/08-memory-atlas-spec.md`。可执行验证统一使用 `scripts/atlas_verify.py`。
 
 ---
 
@@ -302,7 +302,7 @@ The block below is an automatic memory replay...
 - `buildT1`：组头 `flashbulb`（组内任一钉速）+ 钉行 `⟵ pinned` 后缀；`groupFixed`/`lineCost` 预扣含后缀；承压时按 §4.3 顺序丢（先行 → 组标记 → 项），**verbatim `text` 零改写**。
 - `buildT2`：钉行 `⟵ pinned`（无组头），预扣入 `lineCost`。
 
-验收（QA 可验证，用 temp `MNEMOSEED_HOME` + 空闲端口的独立 daemon，绝不碰 dogfood 7788）：
+验收（以下为 T2 专项清单；`scripts/atlas_verify.py` 只验 Atlas 列表基线，不能代替这些断言；任何运行均须隔离目录与端口）：
 - 制造一条 `memory.remember` 钉速 + 若干抓取，跑一次 T1 session-start：注入块中钉速行带 `⟵ pinned`，组头带 `flashbulb`；抓取行**无**行后缀。
 - 压预算到 `auto_recall_budget_chars` 极小值：先丢 `⟵ pinned`，再丢 `flashbulb`，`text` 逐字不变（字节比对注入前注入后）。
 - `EXPLICIT_PIN_SOURCE` 判定正确（不引第二种判定：单一比较，`stamp.py:66-69`）。
@@ -363,28 +363,12 @@ The block below is an automatic memory replay...
 ### 14.2 Playwright 实页步骤（QA 用，隔离规范同 `08 §21.2`）
 
 ```powershell
-# 1) 临时 MNEMOSEED_HOME + 空闲端口（与 dogfood 7788 隔离）
-$env:MNEMOSEED_HOME = Join-Path $env:TEMP "mnemoseed-trust-verify-$(Get-Random)"
-$env:MNEMOSEED_PORT = "17889"        # 空闲端口，探活后写入
-mnemoseed-local up --port $env:MNEMOSEED_PORT
-
-# 2) 注入数据：一条钉速 + 多条抓取（制造会话）
-mnemoseed-local memory remember --profile default --text "Preference: ship zero-copy data paths over duplication"
-mnemoseed-local --host opencode hook event ...   # 或用测试夹具造 /session/recent 尾巴
-
-# 3) Playwright 打开 http://localhost:17889/#/memory/atlas
-#    - 断言：钉速行带 Pinned 徽标；Drawer Asserted by 非 "—"；Confidence 区无数值
-#    - 断言：needs_reconcile 条目出现 Reconcile 徽标；StatusBar 摘要计数正确
-#    - 断言：工具提示/aria-label 屏读；prefers-reduced-motion 无新动效
-
-# 4) 注入面：temp daemon 下跑一次合成 T1，验证 flashbulb/⟵ pinned 标记与预算丢弃
-
-# 5) 清理
-Remove-Item -Recurse -Force $env:MNEMOSEED_HOME
-mnemoseed-local down
+uv run python scripts/atlas_preflight.py
+uv run python scripts/atlas_verify.py
 ```
 
-- **硬性隔离**：始终 `MNEMOSEED_HOME` 临时目录 + 空闲端口；**绝不触真实 `~/.mnemoseed-local` 与 dogfood 7788**。
+- 本脚本仅证明合成列表 0→1、API/页面一致性与跨 profile 隔离；§14.1 的 T1/T2/T3 仍须单独举证，不能从本脚本 PASS 推断已通过。
+- **硬性隔离**：脚本将 `MNEMOSEED_LOCAL_HOME`、HOME、USERPROFILE、配置路径和空闲端口限制在 `.verification-runs`，只停止自有 daemon，保留证据目录。
 
 ### 14.3 门禁
 

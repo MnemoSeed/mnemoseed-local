@@ -77,6 +77,10 @@ focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23).
 
 Multi-session mutual awareness is in pre-PRD research; it is not a feature yet.
 
+## Feature verification
+
+- [Memory Atlas verification](features/atlas.md) — isolated browser proof and retained evidence.
+
 ## Install
 
 One command, zero dependencies to prepare: the orchestrator detects and

@@ -1,8 +1,9 @@
-# Runs the four mandatory quality gates (pytest, ruff check, ruff format --check, mypy src) from the repo root and stops at the first failure.
+# Runs the mandatory quality gates (changed comments, pytest, ruff check, ruff format --check, mypy src) from the repo root and stops at the first failure.
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $gates = [ordered]@{
+    'changed comments' = @('run', 'python', 'scripts/check_changed_comments.py', '--base', 'origin/main')
     'pytest'      = @('run', 'pytest', '-q')
     'ruff check'  = @('run', 'ruff', 'check')
     'ruff format' = @('run', 'ruff', 'format', '--check')

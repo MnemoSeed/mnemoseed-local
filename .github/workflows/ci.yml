@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
@@ -23,12 +25,35 @@ jobs:
         run: uv sync --frozen
       - name: Lint
         run: uv run ruff check src tests
+      - name: Changed comment policy
+        run: uv run python scripts/check_changed_comments.py --base "${{ github.event.pull_request.base.sha || github.event.before }}"
       - name: Format check
         run: uv run ruff format --check src tests
       - name: Type check
         run: uv run mypy src
       - name: Test
         run: uv run pytest -q
+
+  atlas-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.verification-runs/playwright-browsers
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --frozen
+      - name: Install pinned Chromium
+        run: uv run playwright install --with-deps chromium
+      - name: Isolation preflight
+        run: uv run python scripts/atlas_preflight.py
+      - name: Verify Atlas in isolated daemon
+        run: uv run python scripts/atlas_verify.py
 
   install-script-smoke:
     # Phase A3 (T1+T4): the zero-dependency install orchestrators must stay
