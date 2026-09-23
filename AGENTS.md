@@ -43,6 +43,7 @@ listing captured earlier in the session.
   for conflicts (file-surface overlap, test-oracle collisions, ordering)
   BEFORE execution starts.
 - Public code and comments are English-only; Chinese docs live in `docs/zh`; GitHub issues, PRs, and comments are English-only; conversation with the owner is in Chinese.
+- New or modified source comments may only briefly explain a complex block's function. Do not add narrative workaround, temporary, TODO, HACK, issue, PR, QA, person, people, name, background, rationale, attribution, context, or incident history; mechanical directives are allowed.
 - **Code style (user directive 2026-08-20)**: DRY — extract shared logic,
   never copy-paste. Keep features modular and decoupled so problems are easy
   to isolate and features easy to move later. Comments stay minimal: names
@@ -65,7 +66,7 @@ listing captured earlier in the session.
   config) and must not leak into git.
 - **Test/live isolation (user directive 2026-08-31)**: tests, evals, sweeps,
   debug runs and console/Playwright checks must use a spare port (never 7788)
-  and an isolated data dir (temp `MNEMOSEED_HOME` / profile). The installed
+  and an isolated data dir (temp `MNEMOSEED_LOCAL_HOME` / profile). The installed
   runtime at `~/.mnemoseed-local` is never touched by development or testing.
 
 ## Work queue & capture discipline

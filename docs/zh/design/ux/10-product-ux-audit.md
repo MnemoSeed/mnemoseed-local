@@ -243,7 +243,7 @@ Profiles（`index.html:438-496`）：`Create` 表单、列表「Archive 永不�
 
 ## 9. 验证计划（Playwright 实页 + 门禁）
 
-> 遵循 `08-memory-atlas-spec.md §21.2` 的硬隔离：临时 `MNEMOSEED_HOME` + 空闲端口 daemon（如 `17888`），**绝不触碰 dogfood 7788** 与真实 `~/.mnemoseed-local`。
+> 遵循 `08-memory-atlas-spec.md §21.2` 的硬隔离：使用 `scripts/atlas_preflight.py` 与 `scripts/atlas_verify.py`，将 `MNEMOSEED_LOCAL_HOME`、HOME、USERPROFILE、配置路径和空闲端口限制在 `.verification-runs`，**绝不触碰真实用户目录或 dogfood 7788**。
 
 这批整改的实页断言：
 

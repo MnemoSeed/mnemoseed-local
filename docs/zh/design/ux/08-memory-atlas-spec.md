@@ -623,27 +623,14 @@ flowchart LR
 ### 21.2 Playwright 实页验证（必做，不碰 dogfood daemon）
 
 ```powershell
-# 1) 临时 MNEMOSEED_HOME + 空闲端口启动 daemon（与 dogfood 7788 隔离）
-$env:MNEMOSEED_HOME = Join-Path $env:TEMP "mnemoseed-atlas-verify-$(Get-Random)"
-$env:MNEMOSEED_PORT = "17888"  # 任意空闲端口，探活后写入
-mnemoseed-local up --port $env:MNEMOSEED_PORT  # 探活 /healthz 再继续
-
-# 2) 注入若干记忆（便于 Atlas 有数据）
-mnemoseed-local memory remember --profile default --text "We decided to use LanceDB for vector storage because..."
-mnemoseed-local memory remember --profile default --text "Preference: prefer concise code over verbose comments"
-
-# 3) Playwright 打开 Atlas
-npx playwright test --grep "atlas"  # 或直接访问 http://localhost:17888/#/memory/atlas
-# - 断言：Canvas 可见（或 2.5D fallback Banner）、FilterBar 可见、List 虚拟滚动行高 56
-# - 断言：切换 3D/List 不丢选中（hash 保持）
-# - 断言：Drawer 8 区段标题齐全（Header/Provenance/Decay/Scores/Graph/Timeline/Audit/Actions）
-
-# 4) 失败时保留 trace/screenshot，成功后清理
-Remove-Item -Recurse -Force $env:MNEMOSEED_HOME
-mnemoseed-local down
+# Run the repository-owned Launch/Doctor/Drive/Evidence/Cleanup harness. It chooses
+# a free port, uses MNEMOSEED_LOCAL_HOME below this worktree, and retains evidence.
+uv run python scripts/atlas_verify.py
 ```
 
-- **硬性隔离**：始终走 `MNEMOSEED_HOME` 临时目录 + 空闲端口的 daemon；**绝不**触碰用户真实 `~/.mnemoseed-local` 与 dogfood 7788 端口。
+本脚本仅验证合成记忆的 Atlas 列表、API/页面一致性与 profile 隔离；Canvas、Drawer 和模式切换仍需专项验收，不得以此脚本 PASS 代替。
+
+- **硬性隔离**：始终走 `MNEMOSEED_LOCAL_HOME` under the approved worktree + 空闲端口的 daemon；**绝不**触碰用户真实 `~/.mnemoseed-local` 与 dogfood 7788 端口。
 
 ### 21.3 门禁
 

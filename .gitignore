@@ -176,3 +176,7 @@ pip-wheel-metadata/
 .impeccable/
 .opencode/package.json
 .opencode/package-lock.json
+
+.verification-runs/
+__pycache__/
+*.pyc
