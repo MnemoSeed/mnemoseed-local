@@ -54,6 +54,31 @@ jobs:
         run: uv run python scripts/atlas_preflight.py
       - name: Verify Atlas in isolated daemon
         run: uv run python scripts/atlas_verify.py
+      - name: Sanitize and retain Atlas evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .atlas-proof .verification-runs
+          evidence_count="$(find .verification-runs -name evidence.txt -type f 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "$evidence_count" = "1" ]; then
+            evidence="$(find .verification-runs -name evidence.txt -type f -print -quit)"
+            uv run python scripts/sanitize_atlas_evidence.py "$evidence" "$GITHUB_SHA" > .atlas-proof/evidence.txt
+          else
+            uv run python scripts/sanitize_atlas_evidence.py .verification-runs/missing-evidence.txt "$GITHUB_SHA" > .atlas-proof/evidence.txt
+          fi
+          if ! grep -qx 'status=PASS' .atlas-proof/evidence.txt; then
+            echo 'Atlas proof is not a validated PASS' >&2
+            exit 1
+          fi
+      - name: Upload Atlas evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-evidence
+          path: .atlas-proof/evidence.txt
+          if-no-files-found: error
+          retention-days: 14
 
   install-script-smoke:
     # Phase A3 (T1+T4): the zero-dependency install orchestrators must stay
