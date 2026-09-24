@@ -253,17 +253,17 @@ def main() -> int:
                     )
                 finally:
                     browser.close()
-            evidence.write_text(
+            pending_evidence = (
                 f"PASS\nbase_url={base_url}\nempty_count={empty_count}\n"
                 f"filled_count={filled_count}\n"
-                "profile_isolation=PASS\nremember_to_atlas=PASS\n",
-                encoding="utf-8",
+                "profile_isolation=PASS\nremember_to_atlas=PASS\n"
             )
-            print(f"Atlas verification passed at {base_url}; evidence retained at {evidence}")
-            return 0
         finally:
             if process is not None:
                 stop_owned_daemon(process, base_url)
+        evidence.write_text(pending_evidence, encoding="utf-8")
+        print(f"Atlas verification passed at {base_url}; evidence retained at {evidence}")
+        return 0
     except Exception as exc:
         evidence.write_text(f"FAIL\n{exc}\n", encoding="utf-8")
         raise
