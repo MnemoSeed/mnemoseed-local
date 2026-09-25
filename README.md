@@ -16,18 +16,21 @@ dream consolidation fires on its own under its schedule triggers (`--once`
 is the manual fallback), and the focal recall scan runs on every prompt —
 each rolls back with a single config switch
 (`dream.auto_trigger = false` / `capture.auto_recall = false`).
+Capture scores importance without an LLM call, but the default embedder runs a
+small local ONNX encoder, `bge_m3_onnx`, on each turn.
 
-Everything is local-first: chunks are stored verbatim, history is
-append-only, and memory plaintext never leaves the machine. A correction
-appends a version link (`prev_version_id`) to the entry it replaces instead of
-overwriting it, and capture scores importance with a deterministic scorer, so
-no model runs at ingest.
+Everything is local-first: chunks are stored verbatim and history is
+append-only. Reconciling a conflicting decision appends a new version whose
+`prev_version_id` points back at the revision it replaces, instead of
+overwriting it.
 
-> **Scope.** This repo is the MIT, single-machine MVP that proves the core
-> pipeline. It has **no confidentiality guarantees** (no E2EE, no TEE):
-> plaintext stays on your disk and nowhere else. Multi-device sync, the hosted
-> cloud daemon, and the full product vision live in the main repo,
-> [MnemoSeed/mnemoseed](https://github.com/MnemoSeed/mnemoseed).
+> **Scope.** Stored memory has no confidentiality guarantees here: no E2EE, no
+> TEE, no encryption at rest. API keys are stored in the OS credential store
+> when available, with a restricted local-file fallback.
+> Memory plaintext stays on your disk, except for the dream pass, which by
+> default runs against a local model but can be pointed at a remote endpoint.
+> Multi-device sync, the hosted cloud daemon, and the full product vision live in
+> the main repo, [MnemoSeed/mnemoseed](https://github.com/MnemoSeed/mnemoseed).
 
 ## Status
 

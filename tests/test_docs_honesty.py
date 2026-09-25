@@ -7,6 +7,7 @@ cannot silently return. They assert documented surface, not editorial wording.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,35 @@ def test_readme_documents_manual_restart_recovery() -> None:
 
 def test_readme_does_not_claim_opus_class_local_inference() -> None:
     assert "Opus-class" not in README
+
+
+def test_readme_does_not_claim_no_model_runs_at_ingest() -> None:
+    lowered = README.lower()
+    for gone in (
+        "no model at ingest",
+        "no model runs at ingest",
+        "no model runs on ingest",
+    ):
+        assert gone not in lowered, f"README still claims no model runs at ingest: {gone!r}"
+
+
+def test_readme_does_not_claim_memory_plaintext_never_leaves_local_storage() -> None:
+    lowered = README.lower()
+    for gone in ("never leaves the machine", "never leaves the disk"):
+        assert gone not in lowered, f"README still claims plaintext {gone}: {gone!r}"
+
+
+def test_readme_does_not_attribute_prev_version_id_to_corrections_or_supersedes() -> None:
+    lowered = README.lower()
+    sentences = [
+        sentence
+        for sentence in re.split(r"[.!?]", " ".join(lowered.split()))
+        if "prev_version_id" in sentence
+    ]
+    assert sentences, "README must document prev_version_id for this rule to hold"
+    for sentence in sentences:
+        assert "correction" not in sentence, f"README credits prev_version_id to a correction: {sentence!r}"
+        assert "supersed" not in sentence, f"README credits prev_version_id to a supersede: {sentence!r}"
 
 
 def test_readme_names_the_not_yet_surface() -> None:
