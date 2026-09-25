@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$HelperModule,
     [Parameter(Mandatory = $true)][string]$LogonScript,
     [Parameter(Mandatory = $true)][string]$TaskScript,
+    [Parameter(Mandatory = $true)][string]$User,
     [Parameter(Mandatory = $true)][ValidateSet('remote-success', 'local-siblings', 'module-syntax-failure', 'partial-download')][string]$Scenario,
     [Parameter(Mandatory = $true)][string]$Root
 )
@@ -81,7 +82,7 @@ try {
     }
     $unregister = { param($Definition, [string]$Name) $null = $events.Add("unregister:$Name") }
     Invoke-MnemoSeedTaskInstallation -TaskScript $resolved.TaskRegistration -BootstrapSource $resolved.BootstrapSource `
-        -TaskName 'MnemoSeedLocalDaemon' -User $env:USERNAME -TaskLookup $lookup -TaskUnregister $unregister `
+        -TaskName 'MnemoSeedLocalDaemon' -User $User -TaskLookup $lookup -TaskUnregister $unregister `
         -TaskInvoker $registration
     $success = $true
 } catch {

@@ -48,24 +48,27 @@ $portProbe = {
     }
     return $null
 }
-$expectedExecutable = 'C:\Program Files\MnemoSeed\mnemoseed-local.exe'
+$fixtureRoot = [IO.Path]::GetTempPath()
+$expectedExecutable = [IO.Path]::GetFullPath((Join-Path $fixtureRoot 'MnemoSeed/mnemoseed-local.exe'))
+$foreignExecutable = [IO.Path]::GetFullPath((Join-Path $fixtureRoot 'Other/other.exe'))
+$foreignProductExecutable = [IO.Path]::GetFullPath((Join-Path $fixtureRoot 'Other/mnemoseed-local.exe'))
 $processProbe = {
     param([int]$ProcessId)
     $executable = if ($Scenario -in @('unknown-port')) {
-        'C:\Other\other.exe'
+        $foreignExecutable
     } elseif ($Scenario -eq 'mismatched-executable') {
-        'C:\Other\mnemoseed-local.exe'
+        $foreignProductExecutable
     } elseif ($Scenario -eq 'foreign-label') {
-        'C:\Other\other.exe'
+        $foreignExecutable
     } else {
         $expectedExecutable
     }
     $commandLine = if ($Scenario -eq 'foreign-label') {
-        'C:\Other\other.exe --label mnemoseed-local'
+        '"' + $foreignExecutable + '" --label mnemoseed-local'
     } elseif ($Scenario -eq 'unknown-port') {
-        'C:\Other\other.exe serve'
+        '"' + $foreignExecutable + '" serve'
     } else {
-        '"C:\Program Files\MnemoSeed\mnemoseed-local.exe" up'
+        '"' + $expectedExecutable + '" up'
     }
     return [pscustomobject]@{
         ProcessId = $ProcessId

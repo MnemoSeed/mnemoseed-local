@@ -3,19 +3,21 @@ param(
     [Parameter(Mandatory = $true)][string]$Helpers,
     [Parameter(Mandatory = $true)][string]$TaskScript,
     [Parameter(Mandatory = $true)][string]$Bootstrap,
+    [Parameter(Mandatory = $true)][string]$User,
+    [Parameter(Mandatory = $true)][string]$LocalAppData,
     [Parameter(Mandatory = $true)][ValidateSet('owned', 'missing', 'foreign', 'drifted')][string]$Scenario,
     [Parameter(Mandatory = $true)][string]$Result
 )
 
 $ErrorActionPreference = 'Stop'
 . $Helpers
-$action = [pscustomobject]@{ Execute = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"; Arguments = 'serve' }
+$action = [pscustomobject]@{ Execute = (Join-Path $LocalAppData 'Programs\Ollama\ollama.exe'); Arguments = 'serve' }
 $legacyTask = [pscustomobject]@{
     TaskName = 'OllamaHeadlessServe'
     TaskPath = '\'
     Description = 'Headless ollama API server (mnemoseed-local dream engine): background-only, no desktop app required.'
-    Principal = [pscustomobject]@{ UserId = $env:USERNAME; LogonType = 'Interactive' }
-    Triggers = @([pscustomobject]@{ CimClass = [pscustomobject]@{ CimClassName = 'MSFT_TaskLogonTrigger' }; UserId = $env:USERNAME })
+    Principal = [pscustomobject]@{ UserId = $User; LogonType = 'Interactive' }
+    Triggers = @([pscustomobject]@{ CimClass = [pscustomobject]@{ CimClassName = 'MSFT_TaskLogonTrigger' }; UserId = $User })
     Actions = @($action)
 }
 if ($Scenario -eq 'missing') { $legacyTask = $null }
@@ -42,7 +44,7 @@ $invoke = {
 }
 try {
     Invoke-MnemoSeedTaskInstallation -TaskScript $TaskScript -BootstrapSource $Bootstrap `
-        -TaskName 'MnemoSeedLocalDaemon' -User $env:USERNAME -TaskLookup $lookup `
+        -TaskName 'MnemoSeedLocalDaemon' -User $User -TaskLookup $lookup `
         -TaskUnregister $unregister -TaskInvoker $invoke
 } finally {
     $events | ConvertTo-Json -Compress | Set-Content -LiteralPath $Result

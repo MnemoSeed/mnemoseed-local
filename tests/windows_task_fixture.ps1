@@ -4,6 +4,7 @@ param(
     [string]$TaskScript,
     [Parameter(Mandatory = $true)]
     [string]$Bootstrap,
+    [Parameter(Mandatory = $true)][string]$User,
     [Parameter(Mandatory = $true)]
     [ValidateSet('missing', 'correct', 'drift', 'malformed', 'foreign', 'foreign-payload', 'owned-settings-drift', 'uninstall-owned', 'uninstall-foreign', 'uninstall-ambiguous')]
     [string]$Scenario,
@@ -13,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$user = $env:USERNAME
+$user = $User
 $taskIdentity = 'urn:mnemoseed-local:task:windows-logon-daemon:v1'
 $taskDescription = 'Start one MnemoSeed daemon at user logon; no periodic restart.'
 $bootstrapSource = (Get-Content -LiteralPath $Bootstrap -Raw) -replace "`r`n", "`n" -replace "`r", "`n"

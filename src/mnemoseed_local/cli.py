@@ -905,11 +905,11 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     """Remove the local config home and an owned Windows logon task."""
     import subprocess
 
-    scripts = _task_script_paths()
-    if scripts is None:
-        print("error: MnemoSeed logon task helper is unavailable in this installation", file=sys.stderr)
-        return 1
-    if scripts is not None:
+    if sys.platform == "win32":
+        scripts = _task_script_paths()
+        if scripts is None:
+            print("error: MnemoSeed logon task helper is unavailable in this installation", file=sys.stderr)
+            return 1
         task_script, bootstrap_script = scripts
         try:
             result = subprocess.run(

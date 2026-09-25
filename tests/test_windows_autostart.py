@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,11 +20,58 @@ INSTALL_OPERATION_FIXTURE = ROOT / "tests" / "windows_install_operation_fixture.
 HELPER_RESOLUTION_FIXTURE = ROOT / "tests" / "windows_helper_resolution_fixture.ps1"
 INSTALL_BOOTSTRAP_FIXTURE = ROOT / "tests" / "windows_install_bootstrap_fixture.ps1"
 PWSH = os.environ.get("PWSH", "pwsh")
+TEST_USER = "mnemoseed-test-user"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which(PWSH) is None and not Path(PWSH).exists(),
-    reason="Windows PowerShell tests require pwsh",
-)
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "win32", reason="Windows autostart tests require Windows"),
+    pytest.mark.skipif(
+        shutil.which(PWSH) is None and not Path(PWSH).exists(),
+        reason="Windows PowerShell tests require pwsh",
+    ),
+]
+
+
+def run_fixture(command: list[str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    local_app_data = str(tmp_path / "LocalAppData")
+    return subprocess.run(
+        command,
+        env={
+            **os.environ,
+            "MNEMOSEED_LOCAL_HOME": str(tmp_path / "home"),
+            "USERNAME": TEST_USER,
+            "LOCALAPPDATA": local_app_data,
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+
+def task_fixture_command(
+    tmp_path: Path, scenario: str, *, result: Path | None = None, uninstall: bool = False
+) -> list[str]:
+    command = [
+        PWSH,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        str(TASK_FIXTURE),
+        "-TaskScript",
+        str(TASK_REGISTRAR),
+        "-Bootstrap",
+        str(ROOT / "scripts" / "windows-logon.ps1"),
+        "-User",
+        TEST_USER,
+        "-Scenario",
+        scenario,
+        "-Result",
+        str(result or tmp_path / "task-result.json"),
+    ]
+    if uninstall:
+        command.append("-Uninstall")
+    return command
 
 
 def run_bootstrap(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
@@ -51,31 +99,7 @@ def run_bootstrap(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[
 
 
 def run_task(tmp_path: Path, scenario: str, *, uninstall: bool = False) -> subprocess.CompletedProcess[str]:
-    command = [
-        PWSH,
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-File",
-        str(TASK_FIXTURE),
-        "-TaskScript",
-        str(TASK_REGISTRAR),
-        "-Bootstrap",
-        str(ROOT / "scripts" / "windows-logon.ps1"),
-        "-Scenario",
-        scenario,
-        "-Result",
-        str(tmp_path / "task-result.json"),
-    ]
-    if uninstall:
-        command.append("-Uninstall")
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    return run_fixture(task_fixture_command(tmp_path, scenario, uninstall=uninstall), tmp_path)
 
 
 def result_text(tmp_path: Path) -> str:
@@ -219,28 +243,7 @@ def test_installer_task_registration_repairs_missing_or_owned_drift_task(
     tmp_path: Path, scenario: str
 ) -> None:
     result = tmp_path / "task-result.json"
-    completed = subprocess.run(
-        [
-            PWSH,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(TASK_FIXTURE),
-            "-TaskScript",
-            str(TASK_REGISTRAR),
-            "-Bootstrap",
-            str(ROOT / "scripts" / "windows-logon.ps1"),
-            "-Scenario",
-            scenario,
-            "-Result",
-            str(result),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    completed = run_fixture(task_fixture_command(tmp_path, scenario, result=result), tmp_path)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     registration = result.read_text(encoding="utf-8")
@@ -251,28 +254,7 @@ def test_installer_task_registration_repairs_missing_or_owned_drift_task(
 
 def test_unknown_installer_task_is_refused_without_force(tmp_path: Path) -> None:
     result = tmp_path / "task-result.json"
-    completed = subprocess.run(
-        [
-            PWSH,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(TASK_FIXTURE),
-            "-TaskScript",
-            str(TASK_REGISTRAR),
-            "-Bootstrap",
-            str(ROOT / "scripts" / "windows-logon.ps1"),
-            "-Scenario",
-            "malformed",
-            "-Result",
-            str(result),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    completed = run_fixture(task_fixture_command(tmp_path, "malformed", result=result), tmp_path)
 
     assert completed.returncode == 1
     assert "not provably owned" in completed.stderr
@@ -281,56 +263,14 @@ def test_unknown_installer_task_is_refused_without_force(tmp_path: Path) -> None
 
 def test_foreign_same_principal_task_is_refused_without_force(tmp_path: Path) -> None:
     result = tmp_path / "task-result.json"
-    completed = subprocess.run(
-        [
-            PWSH,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(TASK_FIXTURE),
-            "-TaskScript",
-            str(TASK_REGISTRAR),
-            "-Bootstrap",
-            str(ROOT / "scripts" / "windows-logon.ps1"),
-            "-Scenario",
-            "foreign",
-            "-Result",
-            str(result),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    completed = run_fixture(task_fixture_command(tmp_path, "foreign", result=result), tmp_path)
 
     assert completed.returncode == 1
     assert "not provably owned" in completed.stderr
     assert not result.exists()
 
     result = tmp_path / "task-result.json"
-    completed = subprocess.run(
-        [
-            PWSH,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(TASK_FIXTURE),
-            "-TaskScript",
-            str(TASK_REGISTRAR),
-            "-Bootstrap",
-            str(ROOT / "scripts" / "windows-logon.ps1"),
-            "-Scenario",
-            "correct",
-            "-Result",
-            str(result),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    completed = run_fixture(task_fixture_command(tmp_path, "correct", result=result), tmp_path)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "already registered" in completed.stdout
@@ -394,7 +334,7 @@ def test_installer_does_not_manage_ollama_startup() -> None:
 
 
 def run_legacy_migration(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return run_fixture(
         [
             PWSH,
             "-NoLogo",
@@ -404,20 +344,23 @@ def run_legacy_migration(tmp_path: Path, scenario: str) -> subprocess.CompletedP
             str(ROOT / "tests" / "windows_install_migration_fixture.ps1"),
             "-TaskScript",
             str(TASK_REGISTRAR),
+            "-Bootstrap",
+            str(ROOT / "scripts" / "windows-logon.ps1"),
+            "-User",
+            TEST_USER,
+            "-LocalAppData",
+            str(tmp_path / "LocalAppData"),
             "-Scenario",
             scenario,
             "-Result",
             str(tmp_path / "migration-result.json"),
         ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
+        tmp_path,
     )
 
 
 def run_install_operation(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return run_fixture(
         [
             PWSH,
             "-NoLogo",
@@ -431,15 +374,16 @@ def run_install_operation(tmp_path: Path, scenario: str) -> subprocess.Completed
             str(TASK_REGISTRAR),
             "-Bootstrap",
             str(ROOT / "scripts" / "windows-logon.ps1"),
+            "-User",
+            TEST_USER,
+            "-LocalAppData",
+            str(tmp_path / "LocalAppData"),
             "-Scenario",
             scenario,
             "-Result",
             str(tmp_path / "operation-events.json"),
         ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
+        tmp_path,
     )
 
 
@@ -548,6 +492,8 @@ def test_installer_bootstrap_executes_extracted_functions_with_empty_script_root
             str(ROOT / "scripts" / "windows-logon.ps1"),
             "-TaskScript",
             str(TASK_REGISTRAR),
+            "-User",
+            TEST_USER,
             "-Scenario",
             "remote-success",
             "-Root",
@@ -589,6 +535,8 @@ def test_installer_bootstrap_precedence_and_failure_cleanup(tmp_path: Path, scen
             str(ROOT / "scripts" / "windows-logon.ps1"),
             "-TaskScript",
             str(TASK_REGISTRAR),
+            "-User",
+            TEST_USER,
             "-Scenario",
             scenario,
             "-Root",

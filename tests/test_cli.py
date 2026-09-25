@@ -105,17 +105,55 @@ def test_uninstall_removes_owned_task_even_when_config_is_missing(
         calls.append(command)
         return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
+    monkeypatch.setattr("mnemoseed_local.cli.sys.platform", "win32")
     monkeypatch.setattr("subprocess.run", fake_run)
     assert main(["uninstall"]) == 0
     assert calls and "MnemoSeedLocalDaemon" in calls[0]
     assert "no mnemoseed-local data directory" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("failure", ["missing-helper", "launch-error", "nonzero"])
+def test_windows_uninstall_task_cleanup_fails_closed(
+    cli_home: Path, monkeypatch, capsys, failure: str
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.cli.sys.platform", "win32")
+    scripts = (Path("task.ps1"), Path("boot.ps1"))
+    if failure == "missing-helper":
+        monkeypatch.setattr("mnemoseed_local.cli._task_script_paths", lambda: None)
+    elif failure == "launch-error":
+        monkeypatch.setattr("mnemoseed_local.cli._task_script_paths", lambda: scripts)
+        monkeypatch.setattr(
+            "subprocess.run", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("pwsh failed"))
+        )
+    else:
+        monkeypatch.setattr("mnemoseed_local.cli._task_script_paths", lambda: scripts)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: type(
+                "Result", (), {"returncode": 7, "stdout": "", "stderr": "task cleanup failed"}
+            )(),
+        )
+
+    result = main(["uninstall"])
+    assert result == (7 if failure == "nonzero" else 1)
+    assert capsys.readouterr().err
+
+
 def test_uninstall_purge_deletes_only_the_config_home(cli_home: Path, monkeypatch, capsys) -> None:
     cli_home.mkdir(parents=True, exist_ok=True)
-    (cli_home / "config.toml").write_text('preset = "embedded"\n', encoding="utf-8")
+    config_file = cli_home / "config.toml"
+    config_file.write_text('preset = "embedded"\n', encoding="utf-8")
+
+    def fail_if_task_cleanup_is_touched(*args, **kwargs):
+        raise AssertionError("non-Windows uninstall must not inspect a scheduled task")
+
+    monkeypatch.setattr("mnemoseed_local.cli.sys.platform", "linux")
+    monkeypatch.setattr("mnemoseed_local.cli._task_script_paths", fail_if_task_cleanup_is_touched)
+    monkeypatch.setattr("subprocess.run", fail_if_task_cleanup_is_touched)
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
+
     assert main(["uninstall", "--purge"]) == 0
+    assert not config_file.exists()
     assert not cli_home.exists()
     assert "data dir deleted" in capsys.readouterr().out
 
