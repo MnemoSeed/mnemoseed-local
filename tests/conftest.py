@@ -2,61 +2,66 @@
 
 from __future__ import annotations
 
-import socket
+import json
+import os
 from collections.abc import Iterator
+from pathlib import Path
 
+import port_guard
 import pytest
 
-RESERVED_PORTS = frozenset({7788, 4096})
+GUARD_MODULE = Path(port_guard.__file__).resolve()
+# Installed on the child's first ``import socket`` rather than at startup: an
+# eager install would put ``socket`` in every child's ``sys.modules``, and a
+# child that must stay free of the network modules never imports it at all.
+SITECUSTOMIZE = """\
+import builtins
+
+_GUARD_MODULE = {module}
+_import = builtins.__import__
+_installed = False
 
 
-class ReservedPortError(OSError):
-    """Raised when a test reaches for a port reserved for the installed daemon."""
+def _guarded_import(name, *args, **kwargs):
+    global _installed
+    module = _import(name, *args, **kwargs)
+    if not _installed and name == "socket":
+        import importlib.util
+
+        _installed = True
+        _spec = importlib.util.spec_from_file_location("port_guard", _GUARD_MODULE)
+        _guard = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_guard)
+        _guard.install()
+    return module
 
 
-def _port_of(address: object) -> int | None:
-    if isinstance(address, tuple) and len(address) >= 2 and isinstance(address[1], int):
-        return address[1]
-    return None
-
-
-def _reject_reserved(port: int | None) -> None:
-    if port in RESERVED_PORTS:
-        raise ReservedPortError(f"tests must not use the reserved port {port}")
+builtins.__import__ = _guarded_import
+"""
 
 
 @pytest.fixture(autouse=True, scope="session")
-def reserved_ports_stay_unused() -> Iterator[None]:
-    """Fail any test that binds or dials a port the installed daemon owns."""
-    real_bind = socket.socket.bind
-    real_connect = socket.socket.connect
-    real_connect_ex = socket.socket.connect_ex
-    real_create_connection = socket.create_connection
+def reserved_ports_stay_unused(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Refuse a reserved port here and in every child interpreter.
 
-    def bind(self: socket.socket, address: object) -> None:
-        _reject_reserved(_port_of(address))
-        real_bind(self, address)
-
-    def connect(self: socket.socket, address: object) -> None:
-        _reject_reserved(_port_of(address))
-        real_connect(self, address)
-
-    def connect_ex(self: socket.socket, address: object) -> int:
-        _reject_reserved(_port_of(address))
-        return real_connect_ex(self, address)
-
-    def create_connection(address: object, *args: object, **kwargs: object) -> socket.socket:
-        _reject_reserved(_port_of(address))
-        return real_create_connection(address, *args, **kwargs)  # type: ignore[arg-type]
-
-    socket.socket.bind = bind
-    socket.socket.connect = connect
-    socket.socket.connect_ex = connect_ex
-    socket.create_connection = create_connection
+    A child inherits the refusal through a generated ``sitecustomize`` on an
+    injected ``PYTHONPATH``. A child that drops ``PYTHONPATH`` from the
+    environment it builds, or that runs an interpreter with ``-I``, ``-S`` or
+    ``-E``, sits outside this boundary.
+    """
+    guard_dir = tmp_path_factory.mktemp("reserved-port-guard")
+    (guard_dir / "sitecustomize.py").write_text(
+        SITECUSTOMIZE.format(module=json.dumps(str(GUARD_MODULE))), encoding="utf-8"
+    )
+    inherited = os.environ.get("PYTHONPATH", "")
+    entries = [str(guard_dir), *filter(None, inherited.split(os.pathsep))]
+    os.environ["PYTHONPATH"] = os.pathsep.join(entries)
+    port_guard.install()
     try:
         yield
     finally:
-        socket.socket.bind = real_bind
-        socket.socket.connect = real_connect
-        socket.socket.connect_ex = real_connect_ex
-        socket.create_connection = real_create_connection
+        port_guard.uninstall()
+        if inherited:
+            os.environ["PYTHONPATH"] = inherited
+        else:
+            os.environ.pop("PYTHONPATH", None)
