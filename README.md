@@ -18,7 +18,16 @@ each rolls back with a single config switch
 (`dream.auto_trigger = false` / `capture.auto_recall = false`).
 
 Everything is local-first: chunks are stored verbatim, history is
-append-only, and memory plaintext never leaves the machine.
+append-only, and memory plaintext never leaves the machine. A correction
+appends a version link (`prev_version_id`) to the entry it replaces instead of
+overwriting it, and capture scores importance with a deterministic scorer, so
+no model runs at ingest.
+
+> **Scope.** This repo is the MIT, single-machine MVP that proves the core
+> pipeline. It has **no confidentiality guarantees** (no E2EE, no TEE):
+> plaintext stays on your disk and nowhere else. Multi-device sync, the hosted
+> cloud daemon, and the full product vision live in the main repo,
+> [MnemoSeed/mnemoseed](https://github.com/MnemoSeed/mnemoseed).
 
 ## Status
 
