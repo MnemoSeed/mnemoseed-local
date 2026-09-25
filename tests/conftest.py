@@ -35,7 +35,12 @@ class _GuardedLoader:
         self._loader = loader
 
     def create_module(self, spec):
-        return self._loader.create_module(spec)
+        # PEP 451 leaves create_module optional, so a loader with only
+        # exec_module has to import through this wrapper all the same.
+        create_module = getattr(self._loader, "create_module", None)
+        if create_module is None:
+            return None
+        return create_module(spec)
 
     def exec_module(self, module):
         self._loader.exec_module(module)
