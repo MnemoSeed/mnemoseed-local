@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
 from mnemoseed_local.config import Config
-from mnemoseed_local.daemon.app import DreamWorker, create_app
+from mnemoseed_local.daemon.app import DreamSubmission, DreamWorker, create_app
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
 from mnemoseed_local.schema.graph import GraphNode, NodeType
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
@@ -71,6 +71,33 @@ def test_healthz_after_real_boot(config_path: Path) -> None:
         assert body["gate"]["ok"] is True
         health = client.get("/health").json()
         assert health["drivers"]["embed"] == "synthetic"
+
+
+def test_dream_once_reports_provider_unavailable_without_queueing(config_path: Path) -> None:
+    with _boot(config_path) as client:
+        client.app.state.dream_worker._ready = lambda: False
+        client.app.state.dream_worker._provider_status = lambda: "Ollama API unavailable"
+
+        body = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+
+        assert body["launched"] is False
+        assert body["reason"] == "Ollama API unavailable"
+
+
+def test_dream_once_route_returns_the_request_local_reason(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _boot(config_path) as client:
+        worker = client.app.state.dream_worker
+
+        async def submit(_profile_id: str) -> DreamSubmission:
+            return DreamSubmission(False, "request-local reason")
+
+        monkeypatch.setattr(worker, "submit_dream_once", submit)
+        body = client.post("/memory/dream_once", json={"profile_id": PROFILE}).json()
+
+        assert body["launched"] is False
+        assert body["reason"] == "request-local reason"
 
 
 def test_shutdown_releases_the_global_daemon_log_handler(config_path: Path) -> None:
@@ -1172,9 +1199,9 @@ async def test_worker_stop_resolves_queued_manual_job() -> None:
     await asyncio.sleep(0.05)  # the second job lands in the queue behind the first
     await asyncio.wait_for(worker.stop(), timeout=2.0)
     # the in-flight chain ran to completion during executor shutdown
-    assert await asyncio.wait_for(first, timeout=1.0) is True
+    assert (await asyncio.wait_for(first, timeout=1.0)).launched is True
     # the queued job was never launched: resolved False, not left pending
-    assert await asyncio.wait_for(second, timeout=1.0) is False
+    assert (await asyncio.wait_for(second, timeout=1.0)).launched is False
 
 
 async def test_worker_stop_waits_for_in_flight_manual_job() -> None:
@@ -1192,7 +1219,7 @@ async def test_worker_stop_waits_for_in_flight_manual_job() -> None:
     elapsed = time.monotonic() - started
     # stop() waited for the remaining chain instead of returning immediately
     assert elapsed >= 0.2, f"stop() returned before the chain finished: {elapsed:.3f}s"
-    assert await asyncio.wait_for(job, timeout=1.0) is True
+    assert (await asyncio.wait_for(job, timeout=1.0)).launched is True
 
 
 async def test_worker_stop_returns_in_finite_time_with_pending_jobs() -> None:
@@ -1209,8 +1236,8 @@ async def test_worker_stop_returns_in_finite_time_with_pending_jobs() -> None:
     second = asyncio.create_task(worker.submit_dream_once(PROFILE))
     await asyncio.sleep(0.05)
     await asyncio.wait_for(worker.stop(), timeout=2.0)
-    assert await asyncio.wait_for(first, timeout=1.0) is True
-    assert await asyncio.wait_for(second, timeout=1.0) is False
+    assert (await asyncio.wait_for(first, timeout=1.0)).launched is True
+    assert (await asyncio.wait_for(second, timeout=1.0)).launched is False
 
 
 # ------------------------------------------------ multi-profile runtime (#109)

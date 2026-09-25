@@ -86,6 +86,7 @@ from mnemoseed_local.dream.prompts import (
     render_chunk_block,
     render_chunk_blocks,
 )
+from mnemoseed_local.dream.readiness import DreamRouteReadiness
 from mnemoseed_local.dream.reflect import (
     STRIP_TOKENS,
     ReflectedTriple,
@@ -152,6 +153,7 @@ __all__ = [
     "DeltaRequest",
     "DreamEligibility",
     "DreamPipeline",
+    "DreamRouteReadiness",
     "DreamScheduler",
     "DreamState",
     "DreamTrigger",

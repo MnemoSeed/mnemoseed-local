@@ -12,28 +12,23 @@
   Orchestration order (identical to install.sh):
     1. detect / install ollama   (winget Ollama.Ollama; when winget is absent,
        print a manual-download hint and exit non-zero)
-    2. headless ollama server    (serve the dream route invisibly: register a
-       logon scheduled task `OllamaHeadlessServe` running `ollama serve`,
-       and start a serve now when the API is not yet live. The stock
-       tray-autostart shortcut is only noted in a hint — the installer never
-       relocates another product's autostart; the tray GUI stays a
-       user-owned, optional surface. Best-effort: a scheduling
-       failure only prints a hint — the stock tray still serves the API as
-       before. Linux/macOS already get a background service from ollama's
-       own installers (systemd), so install.sh needs no such step)
+    2. Ollama startup boundary  (Ollama keeps its native startup behavior;
+       MnemoSeed never registers an Ollama task or launches `ollama serve`)
     3. detect / install uv       (official installer; well-known install dir is
        prepended to the current process PATH)
     4. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
        to the exact mnemoseed-local==<version> spec; never a floating latest)
-    5. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
-    6. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
+    5. register MnemoSeed's current-user AtLogOn task (hidden, single instance,
+       no periodic trigger and no restart policy)
+    6. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
+    7. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
        the script never changes config keys itself
-    7. ollama pull <dream model> (the dream route's model from config.toml
+    8. ollama pull <dream model> (the dream route's model from config.toml
        [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
-    8. OpenCode host adapter hook (mnemoseed-local hook install opencode)
-    9. final mnemoseed-local doctor re-check + next steps
+    9. OpenCode host adapter hook (mnemoseed-local hook install opencode)
+   10. final mnemoseed-local doctor re-check + next steps
        (mnemoseed-local up; hook already installed)
 
   Idempotent: every step skips when already satisfied. Every failed external
@@ -75,8 +70,11 @@ if ([string]::IsNullOrEmpty($env:MNEMOSEED_LOCAL_HOME)) {
 $ConfigPath = Join-Path $ConfigHome 'config.toml'
 $UvBinDir = Join-Path $env:USERPROFILE '.local\bin'
 $OllamaBinDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
-$OllamaServeTaskName = 'OllamaHeadlessServe'
-$OllamaTrayStartupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk'
+$MnemoSeedTaskName = 'MnemoSeedLocalDaemon'
+$MnemoSeedBootstrapSource = $null
+$MnemoSeedTaskRegistration = $null
+$MnemoSeedHelperStaging = $null
+$HelperBaseUri = 'https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/scripts/'
 $DefaultModel = 'qwen3.5:9b'
 # The exact wheel spec: a floating `latest` would silently track main. Keep in
 # lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
@@ -91,6 +89,70 @@ function Exit-WithError([string]$Reason) {
 
 function Test-CommandExists([string]$Name) {
     return ($null -ne (Get-Command $Name -ErrorAction SilentlyContinue))
+}
+
+function Assert-PowerShellSyntax([string]$Path) {
+    $tokens = $null
+    $errors = $null
+    [void][Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -gt 0) { throw "invalid PowerShell syntax in downloaded helper $Path ($($errors[0].Message))" }
+}
+
+function Resolve-MnemoSeedHelperModule {
+    param(
+        [string]$ScriptRoot,
+        [string]$BaseUri,
+        [scriptblock]$Downloader,
+        [scriptblock]$SyntaxValidator
+    )
+    $script:MnemoSeedHelperStaging = $null
+    $localRoot = $null
+    if (-not [string]::IsNullOrEmpty($ScriptRoot)) {
+        $candidateRoot = Join-Path $ScriptRoot 'scripts'
+        $candidateModule = Join-Path $candidateRoot 'windows-install-helpers.ps1'
+        $candidateBootstrap = Join-Path $candidateRoot 'windows-logon.ps1'
+        $candidateTask = Join-Path $candidateRoot 'windows-logon-task.ps1'
+        if ((Test-Path -LiteralPath $candidateModule -PathType Leaf) -and
+            (Test-Path -LiteralPath $candidateBootstrap -PathType Leaf) -and
+            (Test-Path -LiteralPath $candidateTask -PathType Leaf)) {
+            $localRoot = $candidateRoot
+            if ($null -eq $SyntaxValidator) { $SyntaxValidator = { param([string]$Path) Assert-PowerShellSyntax $Path } }
+            & $SyntaxValidator $candidateModule
+            return $candidateModule
+        }
+    }
+    if ($null -eq $Downloader) {
+        $Downloader = { param([string]$Uri, [string]$OutFile) Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing }
+    }
+    if ($null -eq $SyntaxValidator) {
+        $SyntaxValidator = { param([string]$Path) Assert-PowerShellSyntax $Path }
+    }
+    $stagingRoot = Join-Path $env:TEMP ("mnemoseed-local-helpers-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N'))
+    $script:MnemoSeedHelperStaging = $stagingRoot
+    [void][IO.Directory]::CreateDirectory($stagingRoot)
+    try {
+        $stagedHelper = Join-Path $stagingRoot 'windows-install-helpers.ps1'
+        & $Downloader ($BaseUri + 'windows-install-helpers.ps1') $stagedHelper
+        & $SyntaxValidator $stagedHelper
+        return $stagedHelper
+    } catch {
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $script:MnemoSeedHelperStaging = $null
+        throw
+    }
+}
+
+function Initialize-MnemoSeedHelperModule {
+    param(
+        [string]$ScriptRoot,
+        [string]$BaseUri,
+        [scriptblock]$Downloader,
+        [scriptblock]$SyntaxValidator
+    )
+    return Resolve-MnemoSeedHelperModule -ScriptRoot $ScriptRoot -BaseUri $BaseUri `
+        -Downloader $Downloader -SyntaxValidator $SyntaxValidator
 }
 
 function Add-ToProcessPath([string]$Dir) {
@@ -177,30 +239,11 @@ if ($DryRun) {
             Write-Host '    plan:  winget NOT FOUND - would print a manual-download hint (https://ollama.com/download) and exit non-zero'
         }
     }
-    Write-Host '[2] headless ollama server (invisible daemon; the desktop app stays optional)'
-    $serveTask = Get-ScheduledTask -TaskName $OllamaServeTaskName -ErrorAction SilentlyContinue
-    if ($null -ne $serveTask) {
-        Write-Host "    probe: scheduled task $OllamaServeTaskName EXISTS"
-        Write-Host '    plan:  skip registration'
-    } else {
-        Write-Host "    probe: scheduled task $OllamaServeTaskName NOT FOUND"
-        Write-Host "    plan:  register logon task running ``ollama serve`` (restart 3x/1min on failure)"
-    }
-    if (Test-Path -LiteralPath $OllamaTrayStartupLnk) {
-        Write-Host "    probe: stock Startup-folder tray shortcut FOUND ($OllamaTrayStartupLnk)"
-        Write-Host '    plan:  print a hint only (mnemoseed never relocates another product''s autostart; the tray stays user-owned)'
-    } else {
-        Write-Host '    probe: no stock Startup-folder tray shortcut'
-        Write-Host '    plan:  nothing to note'
-    }
-    try {
-        $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
-        Write-Host '    probe: ollama API is live (127.0.0.1:11434)'
-        Write-Host '    plan:  skip starting a serve now'
-    } catch {
-        Write-Host '    probe: ollama API is down'
-        Write-Host "    plan:  start ``ollama serve`` now (hidden window) so the dream route works immediately"
-    }
+    Write-Host '[2] Ollama startup boundary and legacy migration (native Ollama startup is preserved)'
+    Write-Host '    plan:  remove only the exact root OllamaHeadlessServe task created by the prior MnemoSeed installer'
+    Write-Host '    plan:  preserve and reject a same-name foreign/drifted task with actionable manual guidance'
+    Write-Host '    plan:  do not register an Ollama scheduled task, repair an Ollama executable, or launch `ollama serve`'
+    Write-Host '    plan:  leave Ollama tray/startup configuration unchanged; the daemon bootstrap only waits for its API'
     Write-Host '[3] uv'
     $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
     if ($null -ne $uvCmd) {
@@ -219,20 +262,22 @@ if ($DryRun) {
         Write-Host '    probe: mnemoseed-local command NOT FOUND'
         Write-Host "    plan:  would run ``uv tool install $CliPin``"
     }
-    Write-Host '[5] init'
+    Write-Host '[5] MnemoSeed logon task'
+    Write-Host "    plan:  register the current-user $MnemoSeedTaskName task after the CLI is installed; never use an unknown same-name task"
+    Write-Host '[6] init'
     Write-Host "    plan:  would run ``mnemoseed-local init`` when $ConfigPath does not exist; skipped when present"
-    Write-Host '[6] doctor (first pass)'
+    Write-Host '[7] doctor (first pass)'
     Write-Host '    plan:  would run `mnemoseed-local doctor` (output shown verbatim), then compare the hardware-tier detail'
     Write-Host '           (`recommended tier "<tier>"` vs `current tier "<tier>"`; a hint is printed when they differ; config is never changed)'
     if ($Tier -ne '') {
         Write-Host "    plan:  -Tier $Tier given - would print the hint-only ``config set dream.hardware_tier $Tier`` instruction"
     }
-    Write-Host '[7] model pull (requires confirmation)'
+    Write-Host '[8] model pull (requires confirmation)'
     Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
     Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
-    Write-Host '[8] OpenCode host adapter hook'
+    Write-Host '[9] OpenCode host adapter hook'
     Write-Host '    plan:  would run `mnemoseed-local hook install opencode`'
-    Write-Host '[9] final doctor + guidance'
+    Write-Host '[10] final doctor + guidance'
     Write-Host '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
     Write-Host '           (`mnemoseed-local up`; hook already installed)'
     Write-Host ''
@@ -242,7 +287,7 @@ if ($DryRun) {
 
 # --- step 1: ollama ---------------------------------------------------------
 
-Write-Host '[1/9] ollama'
+Write-Host '[1/10] ollama'
 if (Test-CommandExists 'ollama') {
     Write-Host '      found - skipping install'
 } else {
@@ -261,69 +306,15 @@ if (Test-CommandExists 'ollama') {
     Write-Host '      installed'
 }
 
-# --- step 2: headless ollama server -------------------------------------------
-#
-# The dream route talks to ollama over plain localhost HTTP; no user ever
-# needs the desktop tray. This step makes the invisible-server default real:
-# a logon scheduled task runs `ollama serve` (best-effort restarts), and a
-# serve is started now when the API is still down. The stock Startup-folder
-# tray shortcut is only reported in a hint — mnemoseed never relocates
-# another product's autostart; the tray GUI stays a user-owned, optional
-# surface (and its child serve is the stock path that also works). Best-
-# effort throughout: any scheduling failure prints one hint line and never
-# fails the install.
+# --- step 2: Ollama startup boundary -----------------------------------------
 
-Write-Host '[2/9] headless ollama server'
-
-function Install-HeadlessOllamaServe {
-    param([string]$TaskName, [string]$TrayLnk)
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($null -ne $task) {
-        Write-Host "      scheduled task $TaskName already registered - skipping"
-    } else {
-        try {
-            $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
-            if (-not (Test-Path -LiteralPath $ollamaExe)) { throw "ollama.exe not found at $ollamaExe" }
-            $action = New-ScheduledTaskAction -Execute $ollamaExe -Argument 'serve'
-            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-            [void](Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-                -Description 'Headless ollama API server (mnemoseed-local dream engine): background-only, no desktop app required.')
-            Write-Host "      registered logon task $TaskName (ollama serve, background-only)"
-        } catch {
-            Write-Host "      note: could not register the headless-serve task ($($_.Exception.Message)); the stock tray still serves the API"
-        }
-    }
-    if (Test-Path -LiteralPath $TrayLnk) {
-        Write-Host "      note: the stock tray GUI is registered for autostart ($TrayLnk); mnemoseed does not need it — delete"
-        Write-Host "      that shortcut yourself if you want no tray UI (mnemoseed never relocates it for you)."
-    }
-    try {
-        $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3
-        Write-Host '      ollama API already live - skipping immediate start'
-    } catch {
-        try {
-            $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
-            Start-Process -FilePath $ollamaExe -ArgumentList 'serve' -WindowStyle Hidden
-            $deadline = (Get-Date).AddSeconds(20)
-            $live = $false
-            while ((Get-Date) -lt $deadline -and -not $live) {
-                Start-Sleep -Seconds 2
-                try { $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 3; $live = $true } catch {}
-            }
-            if ($live) { Write-Host '      ollama serve started (background)' } else { throw 'serve did not answer within 20s' }
-        } catch {
-            Write-Host "      note: ollama serve is not live yet ($($_.Exception.Message)); start it manually anytime with: ollama serve"
-        }
-    }
-}
-
-Install-HeadlessOllamaServe -TaskName $OllamaServeTaskName -TrayLnk $OllamaTrayStartupLnk
+Write-Host '[2/10] Ollama startup boundary'
+Write-Host '      native Ollama startup remains unchanged; migration removes only the exact task created by the prior MnemoSeed installer'
+Write-Host '      a foreign or drifted same-name task is preserved and makes installation fail closed with manual guidance'
 
 # --- step 3: uv -------------------------------------------------------------
 
-Write-Host '[3/9] uv'
+Write-Host '[3/10] uv'
 if (Test-CommandExists 'uv') {
     Write-Host '      found - skipping install'
 } else {
@@ -358,7 +349,7 @@ Add-ToProcessPath $UvBinDir
 
 # --- step 3: the mnemoseed-local CLI ---------------------------------------
 
-Write-Host '[4/9] mnemoseed-local CLI'
+Write-Host '[4/10] mnemoseed-local CLI'
 if (Test-CommandExists 'mnemoseed-local') {
     Write-Host "      found - upgrading via uv tool ($CliPin)..."
     & uv tool upgrade $CliPin
@@ -372,9 +363,34 @@ if (-not (Test-CommandExists 'mnemoseed-local')) {
     Exit-WithError "mnemoseed-local was installed but is not on PATH; add $UvBinDir to PATH and re-run"
 }
 
+Write-Host '[5/10] MnemoSeed logon task'
+try {
+    $script:MnemoSeedHelperStaging = Join-Path $env:TEMP ("mnemoseed-local-helpers-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N'))
+    $helperModulePath = Initialize-MnemoSeedHelperModule -ScriptRoot $PSScriptRoot -BaseUri $HelperBaseUri
+    . $helperModulePath
+    $siblingRoot = Join-Path $PSScriptRoot 'scripts'
+    $taskHelperStaging = if ($null -ne $script:MnemoSeedHelperStaging) {
+        $script:MnemoSeedHelperStaging
+    } else {
+        $siblingRoot
+    }
+    $helpers = Resolve-MnemoSeedTaskHelpers -SiblingRoot $siblingRoot `
+        -StagingRoot $taskHelperStaging -BaseUri $HelperBaseUri
+    $script:MnemoSeedBootstrapSource = $helpers.BootstrapSource
+    $script:MnemoSeedTaskRegistration = $helpers.TaskRegistration
+    Invoke-MnemoSeedTaskInstallation -TaskScript $MnemoSeedTaskRegistration `
+        -BootstrapSource $MnemoSeedBootstrapSource -TaskName $MnemoSeedTaskName -User $env:USERNAME
+} catch {
+    Exit-WithError "Windows autostart migration/registration failed closed: $($_.Exception.Message)"
+} finally {
+    if ($null -ne $script:MnemoSeedHelperStaging) {
+        Remove-Item -LiteralPath $script:MnemoSeedHelperStaging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # --- step 4: init ------------------------------------------------------------
 
-Write-Host '[5/9] init'
+Write-Host '[6/10] init'
 if (Test-Path -LiteralPath $ConfigPath) {
     Write-Host "      $ConfigPath already exists - skipping"
 } else {
@@ -384,7 +400,7 @@ if (Test-Path -LiteralPath $ConfigPath) {
 
 # --- step 5: doctor (first pass) + hardware-tier hint ------------------------
 
-Write-Host '[6/9] doctor (first pass)'
+Write-Host '[7/10] doctor (first pass)'
 $firstDoctor = Invoke-Doctor
 if ($firstDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor reported failures (expected before the model pull) - continuing')
@@ -393,7 +409,7 @@ Show-TierHints $firstDoctor.Text
 
 # --- step 6: confirmation-gated model pull -----------------------------------
 
-Write-Host '[7/9] dream model pull'
+Write-Host '[8/10] dream model pull'
 $model = Get-DreamModel $ConfigPath
 if ($model -eq $DefaultModel) {
     Write-Host "      model to pull: $model (built-in default - the dream route's check target)"
@@ -425,7 +441,7 @@ if (-not $confirmed) {
 
 # --- step 7: hook install ------------------------------------------------------
 
-Write-Host '[8/9] OpenCode host adapter hook'
+Write-Host '[9/10] OpenCode host adapter hook'
 & mnemoseed-local hook install opencode
 if ($LASTEXITCODE -ne 0) {
     [Console]::Error.WriteLine("install.ps1: note: 'mnemoseed-local hook install opencode' failed (exit $LASTEXITCODE); you can run it manually later")
@@ -435,7 +451,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # --- step 8: final doctor + guidance -----------------------------------------
 
-Write-Host '[9/9] doctor (final re-check)'
+Write-Host '[10/10] doctor (final re-check)'
 $finalDoctor = Invoke-Doctor
 if ($finalDoctor.Code -ne 0) {
     [Console]::Error.WriteLine('install.ps1: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`')

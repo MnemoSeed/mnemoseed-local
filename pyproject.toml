@@ -46,6 +46,10 @@ mnemoseed-local = "mnemoseed_local.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnemoseed_local"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/windows-logon-task.ps1" = "mnemoseed_local/windows/windows-logon-task.ps1"
+"scripts/windows-logon.ps1" = "mnemoseed_local/windows/windows-logon.ps1"
+
 [tool.ruff]
 line-length = 110
 target-version = "py312"

@@ -553,7 +553,7 @@ async def test_worker_stop_bounded_abandons_wedged_inflight_job() -> None:
     await asyncio.wait_for(worker.stop(), timeout=3.0)
     elapsed = time.monotonic() - started
     assert elapsed < 1.0, f"stop() was not bounded: {elapsed:.3f}s"
-    assert await asyncio.wait_for(job, timeout=1.0) is False
+    assert (await asyncio.wait_for(job, timeout=1.0)).launched is False
     worker_thread = next(
         (t for t in threading.enumerate() if t.name.startswith("mnemoseed-dream-")),
         None,
@@ -583,7 +583,7 @@ async def test_daemon_worker_threads_are_daemon_and_unregistered() -> None:
     worker = DreamWorker(trigger)
     worker.start()
     job = asyncio.create_task(worker.submit_dream_once(PROFILE))
-    assert await asyncio.wait_for(job, timeout=2.0) is True
+    assert (await asyncio.wait_for(job, timeout=2.0)).launched is True
     try:
         dream_threads = [t for t in threading.enumerate() if t.name.startswith("mnemoseed-dream-")]
         assert dream_threads, "no dream worker thread"

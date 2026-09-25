@@ -71,7 +71,7 @@ focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23).
   and none of it is on by default.
 - **Hosts are OpenCode and Claude Code only.** Those are the two integrations
   that ship.
-- **No auto-restart.** Nothing relaunches the daemon for you; see below.
+- **Windows starts at user logon, without crash supervision.** The installer registers one current-user Task Scheduler entry. It does not restart the daemon after a later crash.
 - **Platform coverage is uneven.** Windows is the primary tested platform,
   Linux runs in CI, and macOS requires manual ollama setup.
 
@@ -84,15 +84,11 @@ Multi-session mutual awareness is in pre-PRD research; it is not a feature yet.
 ## Install
 
 One command, zero dependencies to prepare: the orchestrator detects and
-installs ollama + uv when missing, registers ollama as a headless background
-server (on Windows a logon scheduled task runs `ollama serve`; Linux gets the
-systemd service from ollama's own installer; the stock tray GUI stays a
-user-owned, optional surface — the installer only hints at it, never
-relocates another product's autostart), installs the `mnemoseed-local` CLI
-via `uv tool`, runs `init` + `doctor`, and — only after your confirmation —
-pulls the dream model. Idempotent; pass `--dry-run` / `-DryRun` to preview
-the plan with no side effects, and `--yes` / `-Yes` to skip the model-pull
-prompt.
+installs ollama + uv when missing, leaves Ollama's native startup/tray
+configuration unchanged, installs the `mnemoseed-local` CLI via `uv tool`,
+runs `init` + `doctor`, and — only after your confirmation — pulls the dream
+model. Idempotent; pass `--dry-run` / `-DryRun` to preview the plan with no
+side effects, and `--yes` / `-Yes` to skip the model-pull prompt.
 
 Windows (PowerShell 5.1+):
 
@@ -106,11 +102,38 @@ Linux/macOS (POSIX sh):
 curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
 ```
 
-Afterwards: `mnemoseed-local up` starts the daemon. The installer's final setup
-step is `mnemoseed-local hook install opencode`, so the OpenCode hook is installed
-automatically (restart OpenCode to load it). `mnemoseed-local off` stops the
-daemon and disables the memory service persistently; `mnemoseed-local on`
-re-enables it and starts the daemon again. Hook lifecycle:
+When the Windows one-liner is piped to `iex`, the installer first resolves its
+self-contained helper module and the two Windows logon helper scripts from the
+same `main` raw source used by `install.ps1`; the module is downloaded and
+parsed before it is dot-sourced at script scope. Remote files are staged in a
+unique per-process temporary directory (`%TEMP%\\mnemoseed-local-helpers-<pid>-<id>`),
+then that directory is removed after migration and daemon registration, including
+all failure exits. Any download or parse failure aborts setup; a local checkout
+continues to use its sibling scripts directly when all three expected siblings
+are present. During upgrade it removes only the exact
+`\OllamaHeadlessServe` task created by the earlier MnemoSeed installer (exact
+current-user AtLogOn shape, `ollama.exe serve` action, and original description).
+A same-name foreign or drifted task is never removed and instead fails setup
+with manual guidance. It never stops Ollama or changes its native tray/startup
+configuration.
+
+On Windows, the installer also registers the current-user `MnemoSeedLocalDaemon`
+AtLogOn task. At the next user login it waits boundedly for Ollama's API, then
+starts the MnemoSeed daemon even if Ollama is unavailable. Ollama remains
+independently managed by its native tray/startup behavior. The task has no
+periodic trigger or restart policy; it does not recover the daemon after a later
+crash or logoff. OpenCode/MCP only connects to the daemon and does not own its
+startup. `mnemoseed-local off` stops the daemon and persistently gates only the
+MnemoSeed task; it never stops Ollama. While the configured local Ollama model
+is unavailable, automatic dream work remains pending and resumes on a later
+scheduler cycle without a daemon restart; capture, recall, and other memory APIs
+remain available. Manual `dream once` reports `launched: false` with a reason
+while the route is unavailable. Use `mnemoseed-local on` to re-enable and start
+MnemoSeed immediately.
+
+The installer's final setup step is `mnemoseed-local hook install opencode`, so
+the OpenCode hook is installed automatically (restart OpenCode to load it).
+Hook lifecycle:
 `mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
 Profile namespaces are managed on the running daemon:
 `mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
@@ -203,9 +226,10 @@ MIT.
 
 ## Daemon lifecycle
 
-The daemon does not auto-restart. There is no supervisor process, scheduled
-task, or restart chain — MnemoSeed Local intentionally ships none. If the
-daemon dies, start it again yourself:
+On Windows, the daemon starts once at user logon through the
+`MnemoSeedLocalDaemon` current-user task. It does not auto-restart after a later
+crash, and no persistent supervisor or periodic polling task is installed. If
+the daemon dies, start it again yourself:
 
 ```sh
 mnemoseed-local up
@@ -213,7 +237,11 @@ mnemoseed-local up
 
 `up` respects the `daemon.off` marker, so it will not revive a service you
 deliberately disabled with `mnemoseed-local off`; use `mnemoseed-local on` to
-re-enable the service and start the daemon.
+re-enable the service and start the daemon. `off` writes the marker before its
+short cross-process coordination window; if the listener is still possibly
+alive at timeout, it returns non-zero and leaves the marker in place rather than
+claiming the daemon stopped. Uninstall removes the MnemoSeed-owned login task
+by default, but refuses an unknown or foreign same-name task.
 
 Health is observable rather than silently "handled":
 
@@ -227,6 +255,6 @@ Health is observable rather than silently "handled":
   exiting. That leaves evidence for diagnosis — it does not bring the daemon
   back.
 
-Because nothing restarts the daemon, do not build a restart wrapper around it.
-An unattended restart loop masks crashes and can fight the `daemon.off` marker;
-run `up` explicitly after checking `status` / `doctor`.
+Because nothing restarts the daemon after logon startup, do not build a restart
+wrapper around it. An unattended restart loop masks crashes and can fight the
+`daemon.off` marker; run `up` explicitly after checking `status` / `doctor`.
