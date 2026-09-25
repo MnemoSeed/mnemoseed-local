@@ -85,12 +85,30 @@ def test_config_get_requires_loopback(capsys) -> None:
     assert "loopback-only" in capsys.readouterr().err
 
 
-def test_uninstall_without_purge_keeps_data(cli_home: Path, capsys) -> None:
-    cli_home.mkdir(parents=True, exist_ok=True)
-    (cli_home / "config.toml").write_text('preset = "embedded"\n', encoding="utf-8")
+def test_windows_task_scripts_are_included_in_the_wheel() -> None:
+    import tomllib
+
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    includes = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+    assert includes["scripts/windows-logon-task.ps1"] == "mnemoseed_local/windows/windows-logon-task.ps1"
+    assert includes["scripts/windows-logon.ps1"] == "mnemoseed_local/windows/windows-logon.ps1"
+
+
+def test_uninstall_removes_owned_task_even_when_config_is_missing(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
     assert main(["uninstall"]) == 0
-    assert cli_home.exists()
-    assert "purge" in capsys.readouterr().out
+    assert calls and "MnemoSeedLocalDaemon" in calls[0]
+    assert "no mnemoseed-local data directory" in capsys.readouterr().out
 
 
 def test_uninstall_purge_deletes_only_the_config_home(cli_home: Path, monkeypatch, capsys) -> None:
@@ -676,58 +694,31 @@ def _fake_up_runtime(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return calls
 
 
-def test_up_refuses_to_boot_when_dream_model_missing(cli_home: Path, monkeypatch, capsys) -> None:
-    """Model missing: rc 1 + pull hint, and the whole path spawns no
-    subprocess (cli must never silently `ollama pull`)."""
-    import subprocess
-
-    def _no_subprocess(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the up path must never spawn a subprocess")
-
+def test_up_boots_when_dream_model_is_missing_but_does_not_pull(cli_home: Path, monkeypatch, capsys) -> None:
+    """A missing dream model pauses only dream work; memory APIs still boot."""
     _write_up_config(cli_home)
     calls = _fake_up_runtime(monkeypatch)
     monkeypatch.setattr(
         "mnemoseed_local.cli._dream_model_check",
         lambda config: (False, "model 'qwen3.5:9b' not pulled; run: ollama pull qwen3.5:9b"),
     )
-    monkeypatch.setattr(subprocess, "run", _no_subprocess)
-    monkeypatch.setattr(subprocess, "Popen", _no_subprocess)
-    assert main(["up"]) == 1
-    err = capsys.readouterr().err
-    assert "ollama pull qwen3.5:9b" in err
-    assert "error: dream model 'qwen3.5:9b' not pulled" in err
-    assert calls == {"build_stores": 0, "run_server": 0}
+
+    assert main(["up"]) == 0
+    assert calls == {"build_stores": 1, "run_server": 1}
+    assert "daemon on http://127.0.0.1:7788" in capsys.readouterr().out
 
 
-def test_up_missing_model_message_comes_from_the_real_check(cli_home: Path, monkeypatch, capsys) -> None:
-    """Same evaluation as doctor, here through the deep router seam: the exact
-    pinned stderr line proves the shared helper wired the real report."""
-    _write_up_config(cli_home)
-    calls = _fake_up_runtime(monkeypatch)
-    monkeypatch.setattr(
-        "mnemoseed_local.llm.RoleRouter",
-        _router_class(HealthReport(ok=True, detail={"models": []})),
-    )
-    assert main(["up"]) == 1
-    err = capsys.readouterr().err
-    assert "error: dream model 'qwen3.5:9b' not pulled; run: ollama pull qwen3.5:9b" in err
-    assert calls == {"build_stores": 0, "run_server": 0}
-
-
-def test_up_refuses_to_boot_when_ollama_unreachable(cli_home: Path, monkeypatch, capsys) -> None:
+def test_up_boots_when_ollama_is_unreachable(cli_home: Path, monkeypatch, capsys) -> None:
     _write_up_config(cli_home)
     calls = _fake_up_runtime(monkeypatch)
     monkeypatch.setattr(
         "mnemoseed_local.llm.RoleRouter",
         _router_class(HealthReport(ok=False, detail={"error": "connection refused"})),
     )
-    assert main(["up"]) == 1
-    err = capsys.readouterr().err
-    assert "ollama" in err
-    assert "unreachable" in err
-    assert "start ollama" in err
-    assert "ollama pull" not in err
-    assert calls == {"build_stores": 0, "run_server": 0}
+
+    assert main(["up"]) == 0
+    assert calls == {"build_stores": 1, "run_server": 1}
+    assert "daemon on http://127.0.0.1:7788" in capsys.readouterr().out
 
 
 def test_up_proceeds_when_dream_model_present(cli_home: Path, monkeypatch, capsys) -> None:

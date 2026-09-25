@@ -73,7 +73,24 @@ class _FakeBackend:
         return dict(self._rows)
 
 
-def test_no_trigger_below_threshold() -> None:
+def test_unready_event_gate_keeps_pool_credit_and_emits_nothing() -> None:
+    clock = _Clock()
+    events, sink = _sink()
+    backend = _FakeBackend()
+    pool = ScorePool(
+        clock=clock,
+        sink=sink,
+        backend=backend,
+        dream_threshold=10.0,
+        idle_window_sec=0.0,
+        event_gate=lambda: False,
+    )
+
+    assert pool.add_points("p", 10.0, TurnRange(0, 0)) == ()
+    assert events == []
+    assert backend.drains == []
+    assert backend.credits == [("p", 10.0, TurnRange(0, 0))]
+
     clock = _Clock()
     events, sink = _sink()
     pool = ScorePool(clock=clock, sink=sink)

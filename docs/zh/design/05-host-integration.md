@@ -90,7 +90,7 @@ flowchart LR
 ```mermaid
 flowchart TB
     A["install.ps1 / install.sh<br/>--dry-run / -DryRun：打印编号计划+探测结果，零副作用"] --> B["1. 探测/安装 ollama"]
-    B --> C["Windows 专用：注册 OllamaHeadlessServe 登录任务（无头常驻；tray 只提示不搬迁）"]
+    B --> C["Windows 专用：注册 MnemoSeedLocalDaemon 登录任务（Ollama 原生 tray/startup 不变）"]
     C --> D["2. 探测/安装 uv（官方安装器）"]
     D --> E["3. uv tool install / upgrade mnemoseed-local"]
     E --> F["4. mnemoseed-local init（config.toml 已存在则跳过）"]
@@ -99,7 +99,7 @@ flowchart TB
     H --> I["7. doctor 复检 + 下一步（mnemoseed-local up；hook install opencode）"]
 ```
 
-**走查要点**：两脚本编排序完全一致（install.ps1 与 install.sh 注释互证）；每步「已就绪则跳过」（幂等），外部命令失败给单句原因 + 非零退出；doctor 的失败是就绪度报告、**不阻断编排**（新机器在拉模型前 dream model 检查本来就失败）。Windows 的差异只在第 2 步——用登录计划任务做无头 ollama 服务（`install.sh` 无需此步：ollama 自家安装器已带 systemd 服务）。
+**走查要点**：两脚本编排序完全一致（install.ps1 与 install.sh 注释互证）；每步「已就绪则跳过」（幂等），外部命令失败给单句原因 + 非零退出；doctor 的失败是就绪度报告、**不阻断编排**（新机器在拉模型前 dream model 检查本来就失败）。Windows 的差异只在第 2 步——只注册 MnemoSeed 自己的登录任务，Ollama 的原生 tray/startup 仍由 Ollama 自己管理；`install.sh` 无需此步。
 
 ---
 
@@ -208,11 +208,11 @@ flowchart TB
 | 动词 | 子谓词 | 说明 |
 |---|---|---|
 | `init` | — | 写默认配置（`--force` 覆写）+ 三行 next-steps（doctor / `ollama pull` / up）；本地操作 |
-| `up` | — | 启动 daemon；第一闸见 `daemon.off` 哨兵 → stderr 字节钉 + rc 1；ollama 路由先做 dream model 预检（缺失/不可达 → rc 1 + 附修复提示）；storage 栈预构建失败 → 单行错误 |
+| `up` | — | 启动 daemon；第一闸见 `daemon.off` 哨兵 → stderr 字节钉 + rc 1；Ollama route 离线/缺模型不阻断 daemon，dream 工作延后；storage 栈预构建失败 → 单行错误 |
 | `on` | — | 删哨兵；已运行则报 already on 不重启；否则委托 `up` 路径 |
-| `off` | — | marker-first → best-effort POST `/daemon/shutdown` → ≤15s 轮询监听消失 → 五分支存活感知报告；探针 1s 上限 |
+| `off` | — | marker-first → 最多 30s 协调锁 → best-effort POST `/daemon/shutdown` → 最多 15s 轮询监听消失；仍可能存活时 rc 非零；探针 1s 上限 |
 | `status` | — | `/healthz` + `/api/v1/config`（`--json`） |
-| `doctor` | — | 自检清单：config / loopback-only / dream ctx window / isolated graph / hardware tier（恒 ok）/ storage / dream llm / dream model / ensemble verifier / verifier ctx window |
+| `doctor` | — | 自检清单：config / loopback-only / dream ctx window / isolated graph / hardware tier（恒 ok）/ storage / dream llm / dream model / ensemble verifier / verifier ctx window；Ollama 不可达或模型缺失时仍为诊断项，不阻断 `up` |
 | `recall` | — | POST `/memory/recall`（`--top-k`） |
 | `remember` | — | POST `/memory/remember` |
 | `dream` | `once` / `status` | POST `/memory/dream_once` / `/memory/dream_status` |
@@ -222,24 +222,24 @@ flowchart TB
 | `hook` | `install` / `uninstall` / `status` | 宿主 hook 生命周期（`host` choices 只 pin `opencode`） |
 | `mcp` | — | 前台 stdio 网关循环（§3.2） |
 
-要点：状态变更动词统一经 `DaemonClient` 走 daemon REST（FR-7.12）；`init`/`up`/`doctor`/`uninstall` 为本地操作；`up` 的 preflight 与 doctor 的 dream model 检查**同源复用同一 `_role_model_check`**（单一文案源，绝不静默拉取）。
+要点：状态变更动词统一经 `DaemonClient` 走 daemon REST（FR-7.12）；`init`/`up`/`doctor`/`uninstall` 为本地操作；`up` 不以 Ollama readiness 或 dream model 存在性为前置，doctor 负责给出可行动诊断，绝不静默拉取。
 
 **eval 入口不是 CLI verb**（B3）：`uv run python -m mnemoseed_local.eval matrix|canary|rescore`——明确标注非产品面、无 CLI 动词、无 daemon 端点（`eval/__main__.py` 模块 docstring 原文）。
 
 ### 3.4 安装与首次体验（`install.ps1` / `install.sh` / `hardware.py`）
 
-**编排序**（两脚本一致，§1.3 图）：1 探测/安装 ollama → 2 探测/安装 uv → 3 `uv tool install`（已装则 `uv tool upgrade`）→ 4 `init`（已存在跳过）→ 5 `doctor` 首检 + 硬件档位提示 → 6 **用户确认后** `ollama pull <model>` → 7 doctor 复检 + 下一步。
+**编排序**（两脚本一致，§1.3 图）：1 探测/安装 ollama → 2 探测/安装 uv → 3 `uv tool install`（已装则 `uv tool upgrade`）→ 4 Windows 注册 MnemoSeed 当前用户登录任务（不接管 Ollama）→ 5 `init`（已存在跳过）→ 6 `doctor` 首检 + 硬件档位提示 → 7 **用户确认后** `ollama pull <model>` → 8 doctor 复检 + 下一步。
 
 - 拉取目标 = 当前配置 ACTIVE `[dream.llm.dream]` 的 `model` 键，缺席回退内置默认 `qwen3.5:9b`——与 doctor/up 的检查目标同源（「拉的就是查的」）；`-Yes`/`--yes` 跳确认；**模型绝不静默拉取**。
 - `--dry-run` / `-DryRun`：打印编号计划 + 命令存在性探测结果，零副作用（CI smoke 唯一可验证形态）。
 - 幂等：每步「已就绪则跳过」；任一外部命令失败单句原因 + 非零退出；`install.ps1` 硬拒 `param()` 之外的遗留参数（防 `-DryRunn` 类拼写错误滑入真实安装路径，PRD-A3 QA D-T1-1）。
-- Windows 专用第 2 步：注册 `OllamaHeadlessServe` 登录计划任务跑 `ollama serve`（无头常驻；API 未活时立即启动一次）；stock tray 自启快捷方式只给提示、**绝不动另一产品的自启项**；调度失败仅提示不失败。
+- Windows 专用第 2 步：只注册 `MnemoSeedLocalDaemon` 当前用户登录任务（隐藏、IgnoreNew、无周期触发、无 restart policy）；不注册 Ollama 任务、不修复 Ollama executable、不执行 `ollama serve`，Ollama tray/startup 保持原生。安装器在 CLI 安装完成后的 autostart 阶段才创建临时 helper staging；远程 module、bootstrap、registrar 均从同一 `main` raw base 解析，module 在脚本作用域 dot-source，所有成功/失败路径清理唯一 staging。
 - `--tier` / `-Tier` 是 hint-only：只打印 `config set dream.hardware_tier <tier>` 指引，**从不改 config 键**。
 - doctor 的 hardware tier detail 是钉死的机器可读契约：`recommended tier "standard" (vram=12GB, ram=32GB); current tier "standard"`——脚本按此提取并做提示。
 
 **硬件探测**（`hardware.py`，零新依赖、永不 raise、探针失败降级为 unknown）：`probe_ram_gb`（Windows ctypes `GlobalMemoryStatusEx` / Linux `/proc/meminfo` / macOS `sysctl -n hw.memsize` 2s 超时）；`probe_max_vram_gb`（`nvidia-smi --query-gpu=memory.total`，坏行不毒害其它 GPU、缺席视为 0.0）；`recommended_tier`（VRAM ≥ 22 GiB → `advanced`；VRAM ≥ 7 GiB 或 RAM ≥ 30 GiB → `standard`；否则 `lite`）。
 
-**dream model 检查**（`_role_model_check` / `models_contain`，cli.py:419-471）：名称规格化（`name` 与 `name:latest` 等价、pinned 非 latest tag 不匹配）；缺失 → FAIL 附 `ollama pull <model>`；服务器不可达 → FAIL 附启动 ollama 提示；非 ollama 路由显式 skip；`up` 预检同源复用，缺失/不可达 → rc 1 + stderr 单句错误，**绝无对 `ollama pull` 的子进程调用**。
+**dream model 检查**（`_role_model_check` / `models_contain`，cli.py:419-471）：名称规格化（`name` 与 `name:latest` 等价、pinned 非 latest tag 不匹配）；缺失 → FAIL 附 `ollama pull <model>`；服务器不可达 → FAIL 附启动 Ollama 提示；非 Ollama 路由不做本地 provider 探测。`up` 不执行该检查作为启动闸门，daemon 在 route 离线时仍服务 capture/recall/memory；自动 dream 由 scheduler 的 readiness 门控并保留 pending pool/retry，手动 dream 返回明确不可用原因，绝无对 `ollama pull` 的子进程调用。
 
 ---
 

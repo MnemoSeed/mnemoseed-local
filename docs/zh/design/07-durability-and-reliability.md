@@ -116,7 +116,7 @@ flowchart TD
 走查：
 
 - **哨兵文件 `CONFIG_DIR/daemon.off`**（`daemon_state.py`）：在场 = 禁用；缺席 = 默认开（安装后零配置）。注册键方案被否三锤：(i) `reconcile_boot` 的 DB-primary 覆写——registry 键以 DB 为准，而 off/on 须在 daemon **不在**时落盘，旧 DB 行会在下次 `up` 把禁用静默复活；(ii) 语义不合——`enabled` 只在 `up` 启动读一次，不是热应用旋钮，不配 configwrite 机制；(iii) 不新增 registry 键 → `_SLOT_KEYS = sorted(REGISTRY)` 不动 → **version_id 槽位移边界完全不重踏**。
-- **`off` 定序 marker-first → POST → ≤15s 轮询 → 报告**（`cli.py:145`）：写哨兵最先（写失败即 rc 1 诚实报错不再动作），watchatcher / `up` 复活窗封死；best-effort `POST /daemon/shutdown`（`DaemonUnavailableError` 吞掉 = 已停）；≤15s 轮询等监听消失，超时如实报 "may still be shutting down"；五分支存活感知报告（refused 存活 / 已死、轮询超时复活 / drain、already-off 有 / 无 daemon）。探针用 1s 上限客户端（`_probe_client`，`_OFF_PROBE_TIMEOUT_S = 1.0`），shutdown POST 保持标准 30s。意外异常宽捕获 → stderr 指引 + rc 1，哨兵保持（状态已收敛）。
+- **`off` 定序 marker-first → 独立协调锁（最多 30s）→ POST → ≤15s 轮询 → 报告**：写哨兵最先；协调锁覆盖最终 marker 检查到绑定/停止确认，daemon 生命周期不持锁。监听仍可能存活时返回非零，哨兵保留，绝不声称已停止。探针用 1s 上限客户端（`_probe_client`，`_OFF_PROBE_TIMEOUT_S = 1.0`），shutdown POST 保持标准 30s。`on` 与 `off` 共用该短锁，健康 daemon 只报告 already on，不重启。
 - **`on`**：删哨兵 → 若已在跑（healthz 可达）：报 "already on / already running"，不重启，rc 0；否则走 `cmd_up` 既有启动路径（前台阻塞）。
 - **`up` 早拒绝**：`cmd_up` 最前闸见哨兵 → stderr `"error: memory service is disabled (run 'mnemoseed-local on' to re-enable)"` + rc 1，`run_server` 不触。**不给 `up --force`**（KISS：`on` 是唯一显式许可通道）。
 - **关停端点 `POST /daemon/shutdown`**：respond-then-exit——handler 立即 200 `{"ok":true,"status":"shutting_down"}`，后台 `asyncio.create_task` 在响应冲刷后调注入的 shutdown hook；无 seam 降级 503（TestClient boot 永不 arm watchdog，可测性由此保住）。
