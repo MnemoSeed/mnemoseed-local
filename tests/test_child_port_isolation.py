@@ -66,6 +66,7 @@ JAVASCRIPT_NETWORK_PRIMITIVES = (
 )
 FETCH_OVERRIDE = "globalThis.fetch"
 GUARDED_OPERATIONS = ("bind", "connect", "connect_ex", "create_connection")
+CHILD_SOCKET_ROUTES = ("import-statement", "importlib")
 NETWORK_MODULE_ROOTS = ("http", "socket", "ssl", "urllib")
 HERMETIC_CHILD_SOURCE = """\
 import json
@@ -80,15 +81,6 @@ UNINSTALL_REFERENCE = re.compile(
     rf"{_GUARD_MODULE_NAME}\s*\.\s*uninstall\b"
     rf"|\bfrom\s+{_GUARD_MODULE_NAME}\s+import\b[^\n]*\buninstall\b"
 )
-IMPORT_ROOTS = ("http", "socket", "ssl", "urllib")
-FOOTPRINT_SOURCE = '''\
-"""Report the networking imports a child holds when it dials nothing."""
-
-import json
-import sys
-
-print(json.dumps(sorted(m for m in sys.modules if m.split(".")[0] in set(sys.argv[1:]))))
-'''
 CHILD_SOURCE = '''\
 """Report whether this interpreter refuses a reserved port.
 
@@ -172,11 +164,14 @@ def guard_uninstall_violations(text: str) -> list[str]:
     return [match.group(0) for match in UNINSTALL_REFERENCE.finditer(text)]
 
 
-def child_probe(tmp_path: Path, port: int, *flags: str, keep_pythonpath: bool = True) -> dict[str, object]:
+def child_probe(
+    tmp_path: Path, port: int, *flags: str, keep_pythonpath: bool = True, route: str = "import-statement"
+) -> dict[str, object]:
     """Report what a child interpreter does with a reserved port under the given flags.
 
     ``keep_pythonpath`` decides whether the child inherits the injected path entry,
-    which is what a test building its own environment controls.
+    which is what a test building its own environment controls. ``route`` decides
+    how the child reaches the socket module.
     """
     script = tmp_path / "attempt_reserved_port.py"
     script.write_text(CHILD_SOURCE, encoding="utf-8")
@@ -190,6 +185,7 @@ def child_probe(tmp_path: Path, port: int, *flags: str, keep_pythonpath: bool = 
             sys.executable,
             *flags,
             str(script),
+            route,
             str(port),
             port_guard.GUARD_MARKER,
             ",".join(GUARDED_OPERATIONS),
@@ -206,26 +202,6 @@ def child_probe(tmp_path: Path, port: int, *flags: str, keep_pythonpath: bool = 
     payload: dict[str, object] = json.loads(report)
     assert payload["shape_rejected"] is True
     return payload
-
-
-def child_import_footprint(tmp_path: Path) -> list[str]:
-    """The networking imports a child holds when nothing in it needs them."""
-    script = tmp_path / "import_nothing_networked.py"
-    script.write_text(FOOTPRINT_SOURCE, encoding="utf-8")
-    home = tmp_path / "footprint-home"
-    home.mkdir(exist_ok=True)
-    completed = subprocess.run(
-        [sys.executable, str(script), *IMPORT_ROOTS],
-        env={**os.environ, "MNEMOSEED_LOCAL_HOME": str(home)},
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    report: list[str] = json.loads(completed.stdout.strip().splitlines()[-1])
-    return report
 
 
 def assert_child_outside_boundary(payload: dict[str, object]) -> None:
@@ -262,18 +238,14 @@ def test_guard_delegates_a_port_outside_the_reserved_set() -> None:
 
 
 @pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
-def test_child_process_refuses_every_reserved_port(tmp_path: Path, port: int) -> None:
+@pytest.mark.parametrize("route", CHILD_SOCKET_ROUTES)
+def test_child_process_refuses_every_reserved_port(tmp_path: Path, port: int, route: str) -> None:
     """A child interpreter refuses a reserved port on every guarded entry point."""
-    payload = child_probe(tmp_path, port)
+    payload = child_probe(tmp_path, port, route=route)
 
     assert payload["guard_ports"] == sorted(EXPECTED_RESERVED_PORTS)
     for operation in GUARDED_OPERATIONS:
         assert payload[operation] == f"refused:{ReservedPortError.__name__}", operation
-
-
-def test_a_child_that_dials_nothing_carries_no_guard_footprint(tmp_path: Path) -> None:
-    """The guard loads without importing socket, so a child's import table stays its own."""
-    assert child_import_footprint(tmp_path) == []
 
 
 def test_a_child_that_never_imports_socket_keeps_no_socket(tmp_path: Path) -> None:

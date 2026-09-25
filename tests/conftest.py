@@ -14,29 +14,52 @@ GUARD_MODULE = Path(port_guard.__file__).resolve()
 # Installed on the child's first ``import socket`` rather than at startup: an
 # eager install would put ``socket`` in every child's ``sys.modules``, and a
 # child that must stay free of the network modules never imports it at all.
+# The watch sits on the import system rather than on ``builtins.__import__``, so
+# a child that reaches the socket module by any route still gets the guard.
 SITECUSTOMIZE = """\
-import builtins
+import importlib.util
+import sys
 
 _GUARD_MODULE = {module}
-_import = builtins.__import__
-_installed = False
 
 
-def _guarded_import(name, *args, **kwargs):
-    global _installed
-    module = _import(name, *args, **kwargs)
-    if not _installed and name == "socket":
-        import importlib.util
-
-        _installed = True
-        _spec = importlib.util.spec_from_file_location("port_guard", _GUARD_MODULE)
-        _guard = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_guard)
-        _guard.install()
-    return module
+def _install_guard():
+    spec = importlib.util.spec_from_file_location("port_guard", _GUARD_MODULE)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    guard.install()
 
 
-builtins.__import__ = _guarded_import
+class _GuardedLoader:
+    def __init__(self, loader):
+        self._loader = loader
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _install_guard()
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
+class _SocketImportWatcher:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "socket":
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec("socket")
+        if spec is not None and spec.loader is not None:
+            spec.loader = _GuardedLoader(spec.loader)
+        return spec
+
+
+if "socket" in sys.modules:
+    _install_guard()
+else:
+    sys.meta_path.insert(0, _SocketImportWatcher())
 """
 
 
