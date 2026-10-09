@@ -117,6 +117,7 @@ STREAM_OPERATIONS = sys.argv[4].split(",")
 ORIGINALS_ATTRIBUTE = sys.argv[5]
 DATAGRAM_OPERATIONS = sys.argv[6].split(",")
 BYPASS = sys.argv[7]
+SHAPE = sys.argv[8] if len(sys.argv) > 8 else "plain"
 
 if ROUTE == "importlib":
     import importlib
@@ -135,8 +136,8 @@ def stand_in(operation):
     if originals is None or operation not in originals:
         return None
 
-    def record(self, data, address):
-        transmits.append(address)
+    def record(self, data, *args):
+        transmits.append(args[-1] if args else None)
         return 0
 
     originals[operation] = record
@@ -168,7 +169,10 @@ def attempt_datagram(operation):
         setattr(socket.socket, operation, record)
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        getattr(probe, operation)(b"", ("127.0.0.1", PORT))
+        if SHAPE == "flags":
+            getattr(probe, operation)(b"", 0, ("127.0.0.1", PORT))
+        else:
+            getattr(probe, operation)(b"", ("127.0.0.1", PORT))
     except OSError as error:
         return "refused:" + type(error).__name__
     except (TypeError, ValueError):
@@ -263,8 +267,8 @@ def transmit_stand_in(*operations: str) -> Iterator[list[object]]:
     recorded: list[object] = []
     replaced = {name: originals[name] for name in operations}
 
-    def record(self: object, data: object, address: object) -> int:
-        recorded.append(address)
+    def record(self: object, data: object, *args: object) -> int:
+        recorded.append(args[-1] if args else None)
         return 0
 
     originals.update(dict.fromkeys(operations, record))
@@ -316,13 +320,15 @@ def child_probe(
     keep_pythonpath: bool = True,
     route: str = "import-statement",
     bypass: str = "",
+    shape: str = "plain",
 ) -> dict[str, object]:
     """Report what a child interpreter does with a reserved port under the given flags.
 
     ``keep_pythonpath`` decides whether the child inherits the injected path entry,
     which is what a test building its own environment controls. ``route`` decides
     how the child reaches the socket module. ``bypass`` names one operation whose
-    refusal the child drops, leaving the recorder in its place.
+    refusal the child drops, leaving the recorder in its place. ``shape`` decides
+    whether the datagram attempt names the destination alone or with flags.
     """
     script = tmp_path / "attempt_reserved_port.py"
     script.write_text(CHILD_SOURCE, encoding="utf-8")
@@ -343,6 +349,7 @@ def child_probe(
             port_guard.ORIGINALS,
             ",".join(DATAGRAM_OPERATIONS),
             bypass,
+            shape,
         ],
         env=environment,
         capture_output=True,
@@ -393,6 +400,40 @@ def test_session_refuses_every_reserved_port_on_a_datagram_send(port: int, opera
     assert recorded == []
 
 
+@pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
+@pytest.mark.parametrize("operation", DATAGRAM_OPERATIONS)
+def test_session_refuses_every_reserved_port_on_a_datagram_send_with_flags(port: int, operation: str) -> None:
+    """The flags form names the destination last, so the transmit is stood in for."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        with transmit_stand_in(operation) as recorded:
+            with pytest.raises(ReservedPortError) as caught:
+                getattr(probe, operation)(b"", 0, ("127.0.0.1", port))
+
+    assert str(port) in str(caught.value)
+    assert recorded == []
+
+
+def test_datagram_refusal_covers_both_sendto_shapes_without_reaching_the_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both sendto shapes refuse a runtime-reserved spare port and deliver nothing."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.settimeout(10)
+        listener.bind(("127.0.0.1", 0))
+        host, port = listener.getsockname()[:2]
+        assert port not in RESERVED_PORTS
+        monkeypatch.setattr(port_guard, "RESERVED_PORTS", frozenset({*RESERVED_PORTS, port}))
+        listener.settimeout(0.5)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.settimeout(10)
+            with pytest.raises(ReservedPortError):
+                sender.sendto(b"probe", (host, port))
+            with pytest.raises(ReservedPortError):
+                sender.sendto(b"probe", 0, (host, port))
+        with pytest.raises(socket.timeout):
+            listener.recvfrom(64)
+
+
 def test_guard_delegates_a_datagram_port_outside_the_reserved_set() -> None:
     """The datagram refusal is by port, not blanket: a spare loopback port still delivers."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
@@ -434,6 +475,17 @@ def test_the_datagram_probe_reports_a_transmit_the_guard_lets_through(tmp_path: 
     assert payload["transmits"] == 1
 
 
+@pytest.mark.parametrize("operation", DATAGRAM_OPERATIONS)
+def test_the_datagram_probe_with_flags_reports_a_transmit_the_guard_lets_through(
+    tmp_path: Path, operation: str
+) -> None:
+    """The flags probe has teeth: it counts a transmit instead of sending one."""
+    payload = child_probe(tmp_path, EXPECTED_RESERVED_PORTS[0], bypass=operation, shape="flags")
+
+    assert payload[operation] == "not-refused"
+    assert payload["transmits"] == 1
+
+
 def test_guard_delegates_a_port_outside_the_reserved_set() -> None:
     """The refusal is by port, not blanket: a spare loopback port still serves and dials."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -455,6 +507,20 @@ def test_child_process_refuses_every_reserved_port(tmp_path: Path, port: int, ro
 
     assert payload["guard_ports"] == sorted(EXPECTED_RESERVED_PORTS)
     for operation in GUARDED_OPERATIONS:
+        assert payload[operation] == f"refused:{ReservedPortError.__name__}", operation
+    assert payload["transmits"] == 0
+
+
+@pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
+@pytest.mark.parametrize("route", CHILD_SOCKET_ROUTES)
+def test_child_process_refuses_every_reserved_port_on_a_datagram_send_with_flags(
+    tmp_path: Path, port: int, route: str
+) -> None:
+    """A child interpreter refuses the flags form on every guarded datagram entry point."""
+    payload = child_probe(tmp_path, port, route=route, shape="flags")
+
+    assert payload["guard_ports"] == sorted(EXPECTED_RESERVED_PORTS)
+    for operation in DATAGRAM_OPERATIONS:
         assert payload[operation] == f"refused:{ReservedPortError.__name__}", operation
     assert payload["transmits"] == 0
 

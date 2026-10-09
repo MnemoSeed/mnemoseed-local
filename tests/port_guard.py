@@ -67,9 +67,9 @@ def install() -> None:
         _reject_reserved(_port_of(address))
         return int(_original("connect_ex")(self, address))
 
-    def sendto(self: socket.socket, data: object, address: object, *args: object) -> int:
-        _reject_reserved(_port_of(address))
-        return int(_original("sendto")(self, data, address, *args))
+    def sendto(self: socket.socket, data: object, *args: object) -> int:
+        _reject_reserved(_port_of(args[-1] if args else None))
+        return int(_original("sendto")(self, data, *args))
 
     def create_connection(address: object, *args: object, **kwargs: object) -> socket.socket:
         _reject_reserved(_port_of(address))
