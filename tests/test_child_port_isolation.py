@@ -105,8 +105,8 @@ def _sendto_keyword_flags_destination(probe: socket.socket, address: tuple[str, 
 
 # Every destination-bearing sendto form, listed once: the destination alone, the
 # destination behind flags, and both behind keywords. The guard reads the
-# destination from the keyword argument when the call names one, else from the
-# last positional argument, so an unhandled form is a missing entry here.
+# destination from the keyword argument when the call puts it there, else from
+# the last positional argument, so an unhandled form is a missing entry here.
 DATAGRAM_SEND_FORMS: dict[str, Callable[[socket.socket, tuple[str, int]], None]] = {
     "destination": _sendto_destination,
     "flags-destination": _sendto_flags_destination,
@@ -116,7 +116,7 @@ DATAGRAM_SEND_FORMS: dict[str, Callable[[socket.socket, tuple[str, int]], None]]
 # The keyword shapes the same two calls can take; the guard must inspect them as
 # surely as the positional ones.
 KEYWORD_DATAGRAM_SEND_FORMS = ("keyword-destination", "keyword-flags-destination")
-# The instance entry points whose address a caller may name by keyword.
+# The instance entry points whose address a caller may spell as a keyword.
 KEYWORD_ADDRESS_OPERATIONS = ("bind", "connect", "connect_ex")
 CHILD_SOCKET_ROUTES = ("import-statement", "importlib")
 NETWORK_MODULE_ROOTS = ("http", "socket", "ssl", "urllib")
