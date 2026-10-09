@@ -29,6 +29,7 @@ from mnemoseed_local.config import (
     default_config_toml,
     load_config,
 )
+from mnemoseed_local.dream.readiness import models_contain
 from mnemoseed_local.rest_client import DaemonClient
 
 #: Default profile at the application boundary (no identity in the local MVP).
@@ -61,7 +62,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_up(args: argparse.Namespace) -> int:
+def _up_locked(args: argparse.Namespace, ready_callback: Any = None) -> int:
+    """Boot while the caller owns the short-lived coordination lock."""
+    import inspect
+
     from mnemoseed_local.daemon.runner import run_server
     from mnemoseed_local.daemon_state import is_disabled
     from mnemoseed_local.storage.factory import build_stores
@@ -83,21 +87,12 @@ def cmd_up(args: argparse.Namespace) -> int:
     if config.preset == "embedded":
         print("embedded single-process daemon - all drivers in-process, zero external services")
 
-    # A3 T5 model-missing UX: an ollama dream route needs its model pulled
-    # before boot — fail fast with the fix hint, never a silent `ollama pull`
-    # (the bge-m3 lazy-load precedent). A non-ollama route skips the pre-flight
-    # entirely: the provider's model inventory is out of doctor's reach.
     if config.llm["dream"].driver == "ollama":
-        model_ok, model_detail = _dream_model_check(config)
-        if not model_ok:
-            if model_detail.startswith("model "):
-                print(f"error: dream {model_detail}", file=sys.stderr)
-            else:
-                print(f"error: {model_detail}", file=sys.stderr)
-            return 1
+        print(
+            "note: Ollama readiness does not gate the memory daemon; "
+            "dream work defers until the configured model is available"
+        )
 
-    # Resolve the storage stack up front so a bad driver key or invalid params
-    # fail with a clean one-line error instead of a uvicorn startup traceback.
     try:
         stores = build_stores(config)
         asyncio.run(stores.close())
@@ -107,7 +102,42 @@ def cmd_up(args: argparse.Namespace) -> int:
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"daemon on http://{host}:{port}")
-    return run_server(host, port)
+    if ready_callback is not None and "ready_callback" in inspect.signature(run_server).parameters:
+        return run_server(host, port, ready_callback=ready_callback)
+    result = run_server(host, port)
+    if ready_callback is not None:
+        ready_callback()
+    return result
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    from mnemoseed_local.daemon_state import (
+        CoordinationTimeout,
+        acquire_daemon_coordination,
+        is_disabled,
+    )
+
+    if is_disabled():
+        print(
+            "error: memory service is disabled (run 'mnemoseed-local on' to re-enable)",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        lock = acquire_daemon_coordination()
+    except CoordinationTimeout as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if is_disabled():
+            print(
+                "error: memory service is disabled (run 'mnemoseed-local on' to re-enable)",
+                file=sys.stderr,
+            )
+            return 1
+        return _up_locked(args, lock.release)
+    finally:
+        lock.release()
 
 
 #: The off poll waits this long for the listener to disappear; a longer drain
@@ -148,91 +178,133 @@ def _wait_for_daemon_gone(client: DaemonClient, timeout_s: float) -> bool:
 
 
 def cmd_off(args: argparse.Namespace) -> int:
-    """Stop the daemon and persist the disabled state. The marker lands FIRST
-    — during the poll a watcher / up must not boot a fresh daemon, and the
-    marker must never land on a revived one."""
-    from mnemoseed_local.daemon_state import is_disabled, set_disabled
+    """Stop the daemon and persist the disabled state.
+
+    The marker is written before coordination or shutdown. The coordination
+    lock then makes the final marker check and stop/start transition atomic; it
+    is released after the listener is confirmed gone (or after a truthful
+    timeout while the marker remains).
+    """
+    from mnemoseed_local.daemon_state import (
+        CoordinationTimeout,
+        acquire_daemon_coordination,
+        is_disabled,
+        set_disabled,
+    )
     from mnemoseed_local.rest_client import DaemonRestError, DaemonUnavailableError, resolve_client
 
-    if is_disabled():
-        print("already off: memory service is disabled")
-        try:
-            client = resolve_client(args)
-        except Exception as exc:
-            return _client_error(exc)
-        if _daemon_reachable(_probe_client(client)):
-            print(
-                "note: a daemon is currently running but the memory service is disabled; "
-                "it will not be restarted by 'up' (stop it manually or run 'mnemoseed-local on')"
-            )
-        return 0
-    try:
-        client = resolve_client(args)
-    except Exception as exc:
-        return _client_error(exc)
-    probe = _probe_client(client)
+    already_disabled = is_disabled()
     try:
         set_disabled()
     except OSError as exc:
         print(f"error: could not write the disabled marker: {exc}", file=sys.stderr)
         return 1
+    was_disabled = already_disabled
     try:
-        status: str
+        lock = acquire_daemon_coordination()
+    except CoordinationTimeout as exc:
+        print(f"error: {exc}; marker remains disabled and the daemon may still be running", file=sys.stderr)
+        return 1
+    try:
+        if was_disabled:
+            print("already off: memory service is disabled")
         try:
-            client.post("/daemon/shutdown")
-            status = "requested"
-        except DaemonUnavailableError:
-            status = "gone"  # already stopped: the POST is best-effort
-        except DaemonRestError:
-            status = "refused"  # answered but did not accept the request (older build)
-        if status == "requested":
+            client = resolve_client(args)
+        except Exception as exc:
+            return _client_error(exc)
+        probe = _probe_client(client)
+        if not is_disabled():
+            # ``on`` may have acquired the transition lock after off wrote
+            # the marker. Re-assert the marker while holding the lock so the
+            # marker-first stop still wins this race.
+            try:
+                set_disabled()
+            except OSError as exc:
+                print(f"error: could not restore the disabled marker: {exc}", file=sys.stderr)
+                return 1
+        if was_disabled:
+            if _daemon_reachable(probe):
+                print(
+                    "note: a daemon is currently running but the memory service is disabled; "
+                    "it will not be restarted by 'up' (stop it manually or run 'mnemoseed-local on')"
+                )
+                return 1
+            return 0
+        try:
+            try:
+                client.post("/daemon/shutdown")
+            except DaemonUnavailableError:
+                print("daemon not running; memory service disabled")
+                return 0
+            except DaemonRestError:
+                if _daemon_reachable(probe):
+                    print(
+                        "daemon is still running and did not accept the shutdown request; "
+                        "stop it manually (Ctrl+C in its console, or Task Manager); "
+                        "memory service disabled and stays off (run 'mnemoseed-local on' to re-enable)"
+                    )
+                    return 1
+                print("daemon did not accept the shutdown request; memory service disabled")
+                return 0
             if _wait_for_daemon_gone(probe, _OFF_POLL_TIMEOUT_S):
                 print("daemon stopped; memory service disabled")
-            elif _daemon_reachable(probe):
+                return 0
+            if _daemon_reachable(probe):
                 print(
                     "daemon is still running; memory service disabled "
                     "(stop it manually, or run 'mnemoseed-local on' to re-enable)"
                 )
-            else:
-                print("daemon may still be shutting down; memory service disabled")
-        elif status == "gone":
-            print("daemon not running; memory service disabled")
-        elif _daemon_reachable(probe):
+                return 1
+            print("daemon may still be shutting down; memory service disabled")
+            return 1
+        except Exception as exc:
             print(
-                "daemon is still running and did not accept the shutdown request; "
-                "stop it manually (Ctrl+C in its console, or Task Manager); "
-                "memory service disabled and stays off (run 'mnemoseed-local on' to re-enable)"
+                f"error: shutdown request failed: {exc}; memory service is disabled — "
+                "if the daemon is still running, stop it manually",
+                file=sys.stderr,
             )
-        else:
-            print("daemon did not accept the shutdown request; memory service disabled")
-    except Exception as exc:
-        # The marker is already written (state converged); an unexpected
-        # shutdown-flow failure must still end with honest guidance, not a
-        # traceback.
-        print(
-            f"error: shutdown request failed: {exc}; memory service is disabled — "
-            "if the daemon is still running, stop it manually",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+            return 1
+    finally:
+        lock.release()
 
 
 def cmd_on(args: argparse.Namespace) -> int:
-    """Re-enable the memory service and start the daemon unless it is already
-    running (a running daemon is reported, never restarted)."""
-    from mnemoseed_local.daemon_state import set_enabled
+    """Re-enable and start atomically with ``off``'s transition window."""
+    from mnemoseed_local.daemon_state import (
+        CoordinationTimeout,
+        acquire_daemon_coordination,
+        set_enabled,
+    )
     from mnemoseed_local.rest_client import resolve_client
 
-    set_enabled()
     try:
-        client = resolve_client(args)
-    except Exception as exc:
-        return _client_error(exc)
-    if _daemon_reachable(client):
-        print("already on: memory service is running")
-        return 0
-    return cmd_up(args)
+        lock = acquire_daemon_coordination()
+    except CoordinationTimeout as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        set_enabled()
+        try:
+            client = resolve_client(args)
+        except Exception as exc:
+            from mnemoseed_local.daemon_state import set_disabled
+
+            try:
+                set_disabled()
+            except OSError:
+                pass
+            return _client_error(exc)
+        if _daemon_reachable(client):
+            print("already on: memory service is running")
+            return 0
+        result = _up_locked(args, lock.release)
+        if result != 0:
+            from mnemoseed_local.daemon_state import set_disabled
+
+            set_disabled()
+        return result
+    finally:
+        lock.release()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -498,22 +570,6 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
         False,
         f"prefix+delta+margin={needed} > num_ctx={num_ctx}; lower the delta ceiling or raise num_ctx",
     )
-
-
-def models_contain(models: list[str], configured: str) -> bool:
-    """Ollama model-name normalization (A3 T5): is `configured` in the pulled list?
-
-    A configured name WITH a tag matches exactly ``name:tag`` (plus a bare
-    ``name`` server entry when the tag is ``latest`` — some ollama builds elide
-    the default tag in /api/tags). A configured name WITHOUT a tag matches
-    either ``name`` or ``name:latest``, but never a pinned non-latest tag.
-    """
-    if ":" not in configured:
-        wanted = {configured, f"{configured}:latest"}
-    else:
-        name, _, tag = configured.partition(":")
-        wanted = {configured, name} if tag == "latest" else {configured}
-    return any(model in wanted for model in models)
 
 
 def _role_model_check(config: Config, role: str) -> tuple[bool, str]:
@@ -796,6 +852,8 @@ def cmd_dream(args: argparse.Namespace) -> int:
             print(f"extraction failures: {failure_text}")
     else:
         print(f"launched: {body.get('launched')}")
+        if body.get("reason") is not None:
+            print(f"reason: {body['reason']}")
         print(f"state: {body.get('state')}")
     return 0
 
@@ -823,9 +881,63 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def _task_script_paths() -> tuple[Path, Path] | None:
+    """Locate the packaged task helper and bootstrap for source and wheel installs."""
+    source_root = Path(__file__).resolve().parents[2] / "scripts"
+    task = source_root / "windows-logon-task.ps1"
+    bootstrap = source_root / "windows-logon.ps1"
+    if task.is_file() and bootstrap.is_file():
+        return task, bootstrap
+    try:
+        from importlib.resources import files
+
+        packaged = files("mnemoseed_local").joinpath("windows")
+        task_path = Path(str(packaged / "windows-logon-task.ps1"))
+        bootstrap_path = Path(str(packaged / "windows-logon.ps1"))
+        if task_path.is_file() and bootstrap_path.is_file():
+            return task_path, bootstrap_path
+    except (ImportError, OSError, TypeError):
+        pass
+    return None
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Remove the local config home. ``--purge`` also deletes the data files
-    (the app's own directory only — never anything outside it)."""
+    """Remove the local config home and an owned Windows logon task."""
+    import subprocess
+
+    if sys.platform == "win32":
+        scripts = _task_script_paths()
+        if scripts is None:
+            print("error: MnemoSeed logon task helper is unavailable in this installation", file=sys.stderr)
+            return 1
+        task_script, bootstrap_script = scripts
+        try:
+            result = subprocess.run(
+                [
+                    "pwsh",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(task_script),
+                    "-TaskName",
+                    "MnemoSeedLocalDaemon",
+                    "-BootstrapSource",
+                    str(bootstrap_script),
+                    "-Uninstall",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            print(f"error: could not inspect the MnemoSeed logon task: {exc}", file=sys.stderr)
+            return 1
+        if result.stdout:
+            print(result.stdout.rstrip())
+        if result.returncode != 0:
+            print(result.stderr.rstrip(), file=sys.stderr)
+            return result.returncode
     target = CONFIG_DIR
     if not target.exists():
         print("no mnemoseed-local data directory; nothing to uninstall")

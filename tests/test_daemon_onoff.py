@@ -262,7 +262,7 @@ def test_off_already_off_reports_running_daemon(home: Path, monkeypatch, capsys)
     honest note that the daemon is running and will not be restarted by up."""
     set_disabled()
     monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _FakeDaemonClient())
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     out = capsys.readouterr().out
     assert "already off" in out
     assert "currently running" in out
@@ -276,7 +276,7 @@ def test_off_reports_still_running_when_listener_survives_the_poll(home: Path, m
     still running (a revived or never-stopping daemon), never 'shutting down'."""
     monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _StaysUpDaemonClient())
     monkeypatch.setattr("mnemoseed_local.cli._OFF_POLL_TIMEOUT_S", 0.2)
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     out = capsys.readouterr().out
     assert "daemon is still running" in out
     assert "may still be shutting down" not in out
@@ -289,7 +289,7 @@ def test_off_reports_shutting_down_when_listener_closes_after_poll(home: Path, m
     shutting down' — never 'still running'."""
     monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _DyingAfterPollClient())
     monkeypatch.setattr("mnemoseed_local.cli._OFF_POLL_TIMEOUT_S", 0.2)
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     out = capsys.readouterr().out
     assert "may still be shutting down" in out
     assert "daemon is still running" not in out
@@ -298,10 +298,10 @@ def test_off_reports_shutting_down_when_listener_closes_after_poll(home: Path, m
 
 def test_off_refused_live_daemon_reports_still_running_with_guidance(home: Path, monkeypatch, capsys) -> None:
     """A live daemon that does not serve the shutdown endpoint (older build):
-    rc 0, marker lands, and the report says the daemon is still running with
-    manual-stop guidance — the service is disabled and stays off."""
+    the marker lands and the command truthfully returns non-zero while it is
+    still running, with manual-stop guidance."""
     monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _RefusingDaemonClient())
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     out = capsys.readouterr().out
     assert "still running" in out
     assert "did not accept" in out
@@ -333,7 +333,7 @@ def test_off_refused_internal_error_still_converges(home: Path, monkeypatch, cap
         "mnemoseed_local.rest_client.resolve_client",
         lambda args: _RefusingDaemonClient(status=500),
     )
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     out = capsys.readouterr().out
     assert "still running" in out
     assert "did not accept" in out
@@ -422,7 +422,7 @@ def test_off_slow_probe_completes_in_bounded_time(home: Path, monkeypatch, capsy
     )
     monkeypatch.setattr("mnemoseed_local.cli._OFF_POLL_TIMEOUT_S", 0.2)
     start = time.monotonic()
-    assert main(["off"]) == 0
+    assert main(["off"]) == 1
     elapsed = time.monotonic() - start
     assert elapsed < 5.0, f"off took {elapsed:.1f}s with a slow /healthz"
     assert "daemon is still running" in capsys.readouterr().out

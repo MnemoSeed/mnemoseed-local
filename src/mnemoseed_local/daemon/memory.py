@@ -2513,6 +2513,7 @@ def _trigger_payload(status: TriggerStatus) -> dict[str, Any]:
         "state": status.state.value,
         "pending_queue": status.pending_queue,
         "pending_manual": status.pending_manual,
+        "pending_provider": status.pending_provider,
         "last_event": (
             {
                 "kind": last.kind.value,
@@ -2537,11 +2538,13 @@ async def memory_dream_once(req: DreamRequest, request: Request) -> dict[str, An
     ``state`` contract the synchronous path had.
     """
     worker: DreamWorker = request.app.state.dream_worker
-    launched = await worker.submit_dream_once(req.profile_id)
+    submission = await worker.submit_dream_once(req.profile_id)
     trigger: DreamTrigger = request.app.state.dream
     status = trigger.status(req.profile_id)
     payload = _trigger_payload(status)
-    payload["launched"] = launched
+    payload["launched"] = submission.launched
+    if submission.reason is not None:
+        payload["reason"] = submission.reason
     return payload
 
 

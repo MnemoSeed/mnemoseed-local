@@ -528,12 +528,11 @@ def test_scheduler_waits_for_deferred_resumes_before_first_tick(
     assert state.status_after_drain["pending_queue"] == 0
 
 
-def test_scheduler_starts_even_when_a_resume_job_raises(
+def test_scheduler_does_not_mark_failed_resume_drained(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pin (exception drain): a resume job that raises must still decrement
-    the drain counter (try/finally) — otherwise the scheduler would await the
-    drain event forever and never tick."""
+    """A failed journal resume remains pending for restart recovery; the
+    scheduler must not emit a duplicate over the same range."""
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + "[dream]\nauto_trigger = true\nfloor_pool_points = 0.1\nidle_min_sec = 0.0\n",
@@ -553,22 +552,12 @@ def test_scheduler_starts_even_when_a_resume_job_raises(
 
     with _boot() as client:
         worker = client.app.state.dream_worker
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not worker.resume_drained.is_set():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and worker.resume_drained.is_set():
             time.sleep(0.05)
-        assert worker.resume_drained.is_set(), "the drain signal never set after the failing resume"
-        # the scheduler's first tick runs once drained: the failed resume left
-        # the profile in flight, so the emitted dream queues behind it
-        deadline = time.monotonic() + 5.0
-        status: dict[str, Any] | None = None
-        while time.monotonic() < deadline:
-            status = client.post("/memory/dream_status", json={"profile_id": PROFILE}).json()
-            if status["pending_queue"] >= 1:
-                break
-            time.sleep(0.05)
-        assert status is not None and status["pending_queue"] >= 1, (
-            "the scheduler never ticked after the drain signal"
-        )
+        assert not worker.resume_drained.is_set(), "a failed resume was falsely marked recovered"
+        status = client.post("/memory/dream_status", json={"profile_id": PROFILE}).json()
+        assert status["pending_queue"] == 0, "a failed resume must not emit a duplicate"
 
 
 # ---------------------------------------------------------------- drain timeout (IMPORTANT-1)
@@ -604,22 +593,29 @@ class _EmptyStores:
     meta = _EmptyMeta()
 
 
-def test_scheduler_ticks_after_resume_drain_timeout(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_scheduler_refreshes_readiness_while_resume_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """IMPORTANT-1: a wedged resume executor must not stall the scheduler
-    forever. When the drain event never sets, the scheduler waits only the
-    bounded timeout, logs a warning, and ticks anyway."""
+    """A pending journal recovery blocks duplicate emission but not readiness
+    refresh, so an offline-to-online transition can resume in-process."""
     from mnemoseed_local.config import Config, DreamConfig
     from mnemoseed_local.dream import DreamScheduler
 
     never_drain = asyncio.Event()  # never set: the resume executor is wedged
+    readiness_calls = 0
+
+    def _ready() -> bool:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        return False
+
     scheduler = DreamScheduler(
         _EmptyStores(),
         Config(dream=DreamConfig()),
         # no pool exists behind this bare scheduler and nothing ever emits:
         # an explicit no-op fire-time drain keeps the required wiring honest
         drain=lambda profile_id, turn_range: 0.0,
+        ready=_ready,
         resume_drain=never_drain,
         resume_drain_timeout_s=0.05,
     )
@@ -635,21 +631,17 @@ def test_scheduler_ticks_after_resume_drain_timeout(
 
     monkeypatch.setattr(scheduler, "tick", _recording_tick)
 
-    import logging
-
     async def _run() -> None:
-        with caplog.at_level(logging.WARNING, logger="mnemoseed_local.dream.trigger"):
-            task = asyncio.create_task(scheduler.run_forever())
+        task = asyncio.create_task(scheduler.run_forever())
+        try:
+            await asyncio.sleep(0.2)
+            assert ticks == [], "scheduler emitted while journal recovery was pending"
+            assert readiness_calls > 0, "scheduler did not refresh provider readiness"
+        finally:
+            task.cancel()
             try:
-                await asyncio.wait_for(ticked.wait(), timeout=5.0)
-                assert len(ticks) >= 1, "the scheduler never ticked after the drain timeout"
-                assert caplog.text, "no warning was logged for the drain timeout"
-                assert "resume drain timed out" in caplog.text
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                await task
+            except asyncio.CancelledError:
+                pass
 
     asyncio.run(_run())

@@ -69,6 +69,7 @@ from mnemoseed_local.dream import (
     resume_boundary,
 )
 from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
+from mnemoseed_local.dream.readiness import DreamRouteReadiness
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -329,6 +330,14 @@ def _daemon_write_context(turn: Turn, config: Config) -> WriteContext:
 
 
 @dataclass(frozen=True)
+class DreamSubmission:
+    """Immutable result of one manual dream request."""
+
+    launched: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class _DreamJob:
     """One unit of dream work for the worker thread.
 
@@ -340,12 +349,18 @@ class _DreamJob:
 
     event: PoolEvent | None = None
     profile_id: str | None = None
-    future: asyncio.Future[bool] | None = None
+    future: asyncio.Future[DreamSubmission] | None = None
     pipeline: DreamPipeline | None = None
     snapshot: Snapshot | None = None
+    release_deferred: bool = False
 
     def run(self, trigger: DreamTrigger, config: Config | None = None) -> bool | None:
         """Execute on the worker thread; returns the manual launch decision."""
+        if self.release_deferred:
+            if config is not None:
+                trigger.set_auto_trigger(config.dream.auto_trigger)
+            trigger.release_provider_events()
+            return None
         if self.pipeline is not None and self.snapshot is not None:
             # Boot-recovery replay: no new LLM evidence, so the oversized-delta
             # parking guard must not arm on replayed verdicts (#97/#99).
@@ -383,13 +398,19 @@ class DreamWorker:
         trigger: DreamTrigger,
         *,
         config: Config | None = None,
+        ready: Callable[[], bool] | None = None,
+        provider_status: Callable[[], str] | None = None,
         stop_timeout: float = DREAM_STOP_TIMEOUT_S,
     ) -> None:
         self._trigger = trigger
         self._config = config
+        self._ready = ready
+        self._provider_status = provider_status
         self._stop_timeout = stop_timeout
         self._executor = DaemonExecutor(max_workers=1, thread_name_prefix="mnemoseed-dream")
         self._queue: asyncio.Queue[_DreamJob] = asyncio.Queue()
+        self._resume_backlog: deque[_DreamJob] = deque()
+        self._resume_backlog_wakeup = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._inflight: _DreamJob | None = None  # the job whose chain is running
         self._inflight_cf: ConcurrentFuture[bool | None] | None = None
@@ -413,15 +434,19 @@ class DreamWorker:
         """Synchronous event submission (the scheduler tick path)."""
         self._queue.put_nowait(_DreamJob(event=event, profile_id=None, future=None))
 
-    def enqueue_resume(self, pipeline: DreamPipeline, snapshot: Snapshot) -> None:
-        """Queue one boot-recovery resume for the worker.
+    def enqueue_release_deferred(self) -> None:
+        """Release provider-deferred events after readiness recovers."""
+        self._queue.put_nowait(_DreamJob(release_deferred=True))
 
-        The scheduler gate tracks the count: each resume completion decrements
-        it and the drain event fires at zero, so the scheduler's first tick
-        waits for the whole journaled recovery window to drain."""
+    def enqueue_resume(self, pipeline: DreamPipeline, snapshot: Snapshot) -> None:
+        """Queue one ordered boot-recovery resume, retaining it while offline."""
         self._resume_pending += 1
         self._resume_drained.clear()
-        self._queue.put_nowait(_DreamJob(pipeline=pipeline, snapshot=snapshot))
+        job = _DreamJob(pipeline=pipeline, snapshot=snapshot)
+        if self._ready is not None and not self._ready():
+            self._resume_backlog.append(job)
+        else:
+            self._queue.put_nowait(job)
 
     @property
     def resume_drained(self) -> asyncio.Event:
@@ -429,26 +454,62 @@ class DreamWorker:
         scheduler awaits it before its first tick."""
         return self._resume_drained
 
-    async def submit_dream_once(self, profile_id: str) -> bool:
-        """Run exactly one manual cycle; awaits the worker's launch decision."""
+    async def submit_dream_once(self, profile_id: str) -> DreamSubmission:
+        """Run one manual cycle and return its request-local launch result."""
+        if self._ready is not None and not self._ready():
+            return DreamSubmission(False, self._provider_reason_now())
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[bool] = loop.create_future()
+        future: asyncio.Future[DreamSubmission] = loop.create_future()
         await self._queue.put(_DreamJob(event=None, profile_id=profile_id, future=future))
         return await future
 
+    def provider_ready(self) -> bool:
+        return True if self._ready is None else self._ready()
+
+    def _provider_reason_now(self) -> str:
+        return self._provider_status() if self._provider_status is not None else "dream route unavailable"
+
     async def _run(self) -> None:
         while True:
+            if self._resume_backlog and (self._ready is None or self._ready()):
+                while self._resume_backlog:
+                    self._queue.put_nowait(self._resume_backlog.popleft())
             job = await self._queue.get()
             self._inflight = job
+            deferred_resume = False
+            resume_completed = False
+            submission = DreamSubmission(False)
             try:
+                if self._ready is not None and not self._ready():
+                    rejection = DreamSubmission(False, self._provider_reason_now())
+                    if job.pipeline is not None and job.snapshot is not None:
+                        self._resume_backlog.appendleft(job)
+                        deferred_resume = True
+                        continue
+                    if job.future is not None and not job.future.done():
+                        job.future.set_result(rejection)
+                    if job.event is not None:
+                        self._trigger.defer_provider_event(job.event)
+                        logger.info(
+                            "dream event deferred: configured dream route is unavailable; "
+                            "pending pool state remains for a later scheduler tick"
+                        )
+                    continue
                 cf = self._executor.submit(job.run, self._trigger, self._config)
                 self._inflight_cf = cf
                 result = await asyncio.wrap_future(cf)
+                submission = DreamSubmission(result is True)
+                if job.pipeline is not None and job.snapshot is not None:
+                    resume_completed = True
             except Exception:
                 logger.exception("dream worker job failed; the trigger state stays consistent")
-                result = None
             finally:
-                if job.pipeline is not None and job.snapshot is not None:
+                if (
+                    job.pipeline is not None
+                    and job.snapshot is not None
+                    and resume_completed
+                    and not deferred_resume
+                ):
                     self._resume_pending -= 1
                     if self._resume_pending <= 0:
                         self._resume_pending = 0
@@ -456,13 +517,14 @@ class DreamWorker:
             self._inflight = None
             self._inflight_cf = None
             if job.future is not None and not job.future.done():
-                job.future.set_result(result is True)
+                job.future.set_result(submission)
 
     async def stop(self) -> None:
         """Cancel the consumer, drain pending manual jobs, then wait bounded
         for the in-flight chain before shutdown.
 
-        Queued jobs never launched: their pending futures resolve False here.
+        Queued jobs never launched: their pending futures resolve immutable
+        ``DreamSubmission(False, reason)`` results here.
         The in-flight chain is awaited for at most ``stop_timeout`` WITHOUT
         jamming the event loop (the pre-fix shutdown(wait=True) blocked the
         loop for the whole wedge); on timeout the chain is ABANDONED — the
@@ -489,7 +551,8 @@ class DreamWorker:
                 break
             future = job.future
             if future is not None and not future.done():
-                future.set_result(False)
+                reason = None if self.provider_ready() else self._provider_reason_now()
+                future.set_result(DreamSubmission(False, reason))
         # bounded wait on the in-flight chain without jamming the loop
         inflight_cf = self._inflight_cf
         if inflight_cf is not None:
@@ -505,7 +568,7 @@ class DreamWorker:
         self._executor.close(timeout=0)
         inflight = self._inflight
         if inflight is not None and inflight.future is not None and not inflight.future.done():
-            inflight.future.set_result(self._inflight_launched())
+            inflight.future.set_result(DreamSubmission(self._inflight_launched()))
         self._inflight = None
         self._inflight_cf = None
 
@@ -710,6 +773,7 @@ def _build_capture(
     RoleRouter,
     list[tuple[DreamPipeline, Snapshot]],
     ScorePool,
+    DreamRouteReadiness,
 ]:
     """Serving capture funnel: strip -> score -> pool -> stamp/write over the
     resolved storage stack. /ingest stays submit-only; the funnel drains on
@@ -723,6 +787,7 @@ def _build_capture(
     pairs are returned for the worker to enqueue in order after start.
     """
     snapshotter = FileSnapshotter(store=stores.vector, meta=stores.meta)
+    readiness = DreamRouteReadiness(config.llm)
     trigger = DreamTrigger(
         snapshotter=snapshotter,
         auto_trigger=config.dream.auto_trigger,
@@ -844,7 +909,12 @@ def _build_capture(
         # chain when the user opted in (configwrite changes hot-apply).
         mode=lambda: config.dream.ensemble,
     )
-    worker = DreamWorker(trigger, config=config)
+    worker = DreamWorker(
+        trigger,
+        config=config,
+        ready=readiness.refresh,
+        provider_status=lambda: str(readiness.status()["detail"]),
+    )
     relay = _DreamRelay(worker)
     snapshotter.on_ready = pipeline.on_snapshot_ready
     deferred_resumes: list[tuple[DreamPipeline, Snapshot]] = []
@@ -876,6 +946,7 @@ def _build_capture(
         idle_window_sec=config.dream.idle_min_sec,
         forced_cap=config.dream.pool_forced_cap,
         config=config,
+        event_gate=readiness.is_ready,
     )
     for profile_id, state in stores.meta.pool_states().items():
         pool.restore(profile_id, state.balance, state.watermark)
@@ -902,6 +973,7 @@ def _build_capture(
         router,
         deferred_resumes,
         pool,
+        readiness,
     )
 
 
@@ -1008,6 +1080,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.role_router,
         deferred_resumes,
         app.state.score_pool,
+        app.state.dream_readiness,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
     # B6 (W-C): the drain lane runs WritingPipeline.drain off the event loop on
@@ -1045,6 +1118,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stores,
         config,
         trigger=scheduler_trigger,
+        ready=app.state.dream_readiness.refresh,
+        on_provider_ready=app.state.dream_worker.enqueue_release_deferred,
         resume_drain=app.state.dream_worker.resume_drained,
         # fire-time drain through the live pool: the persisted gauge files into
         # the lifetime ledger and the in-process gauge resets together, so a
@@ -1172,6 +1247,7 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, Any]:
         snap: HealthSnapshot = app.state.health
         elapsed_ms = (time.perf_counter() - snap.started_at) * 1000.0
+        readiness = getattr(app.state, "dream_readiness", None)
         return {
             "status": "ok",
             "uptime_ms": round(elapsed_ms, 3),
@@ -1183,6 +1259,7 @@ def create_app() -> FastAPI:
                 "degradations": snap.degradations,
                 "hard_missing": snap.hard_missing,
             },
+            "dream_route": readiness.status() if readiness is not None else None,
         }
 
     @app.get("/health")

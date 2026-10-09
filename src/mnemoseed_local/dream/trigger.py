@@ -99,6 +99,7 @@ class TriggerStatus:
     state: DreamState
     pending_queue: int  # events queued while a dream ran (forced / overflows)
     pending_manual: int  # events held while auto_trigger=False (FR-2.8)
+    pending_provider: int  # events held while the configured provider is unavailable
     last_event: PoolEvent | None
     current_range: TurnRange | None
 
@@ -110,6 +111,7 @@ class _Profile:
     state: DreamState = DreamState.IDLE
     queued: deque[PoolEvent] = field(default_factory=deque)
     pending_manual: deque[PoolEvent] = field(default_factory=deque)
+    deferred_provider: deque[PoolEvent] = field(default_factory=deque)
     last_event: PoolEvent | None = None
     current_range: TurnRange | None = None
     dream_in_flight: bool = False  # a background (post-interrupt) dream still runs
@@ -143,6 +145,25 @@ class DreamTrigger:
 
     def __call__(self, event: PoolEvent) -> None:
         self.handle_event(event)
+
+    def defer_provider_event(self, event: PoolEvent) -> None:
+        """Hold an automatic event until the configured provider recovers."""
+        rec = self._profiles.setdefault(event.profile_id, _Profile())
+        rec.last_event = event
+        if not self._auto_trigger:
+            rec.pending_manual.append(event)
+        else:
+            rec.deferred_provider.append(event)
+
+    def release_provider_events(self) -> None:
+        """Release events deferred by the worker's final readiness guard."""
+        for rec in self._profiles.values():
+            while rec.deferred_provider:
+                event = rec.deferred_provider.popleft()
+                if self._auto_trigger:
+                    self._deliver(event)
+                else:
+                    rec.pending_manual.append(event)
 
     def _deliver(self, event: PoolEvent) -> None:
         """Auto path: launch a dream, or queue it behind an in-flight one."""
@@ -355,6 +376,7 @@ class DreamTrigger:
             state=rec.state,
             pending_queue=len(rec.queued),
             pending_manual=len(rec.pending_manual),
+            pending_provider=len(rec.deferred_provider),
             last_event=rec.last_event,
             current_range=rec.current_range,
         )
@@ -476,6 +498,8 @@ class DreamScheduler:
         *,
         drain: Callable[[str, TurnRange], float],
         trigger: DreamTrigger | None = None,
+        ready: Callable[[], bool] | None = None,
+        on_provider_ready: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.time,
         resume_drain: asyncio.Event | None = None,
         resume_drain_timeout_s: float = RESUME_DRAIN_TIMEOUT_S,
@@ -484,6 +508,8 @@ class DreamScheduler:
         self._meta: _MetaProbe = _meta_of(stores)
         self._config = config
         self._trigger = trigger
+        self._ready = ready
+        self._on_provider_ready = on_provider_ready
         self._clock = clock
         self._resume_drain = resume_drain
         self._resume_drain_timeout_s = resume_drain_timeout_s
@@ -495,6 +521,7 @@ class DreamScheduler:
         self._last: dict[str, tuple[str, int, int]] = {}
         self._retry: dict[str, _RetryState] = {}
         self._outcomes: queue.Queue[tuple[str, TurnRange, bool, str | None, float]] = queue.Queue()
+        self._ready_state: bool | None = None
 
     # ------------------------------------------------------------ rules
 
@@ -526,6 +553,15 @@ class DreamScheduler:
             return None
         idle = max(0.0, now - last_activity)
         rng = TurnRange(min(start for start, _ in turns), max(end for _, end in turns))
+        if balance >= config.pool_forced_cap:
+            return DreamEligibility(
+                profile_id=profile_id,
+                reason="forced_cap",
+                pool_points=balance,
+                idle_sec=idle,
+                first_chunk_at=first_chunk_at,
+                turn_range=rng,
+            )
         if balance >= config.floor_pool_points and idle >= config.idle_min_sec:
             return DreamEligibility(
                 profile_id=profile_id,
@@ -571,6 +607,20 @@ class DreamScheduler:
         backoff below.
         """
         emitted: list[DreamEligibility] = []
+        provider_ready = True if self._ready is None else bool(self._ready())
+        if not provider_ready:
+            if self._ready_state is not False:
+                logger.info(
+                    "dream scheduling paused: configured provider is unavailable; "
+                    "pending windows and retry outcomes remain queued"
+                )
+            self._ready_state = False
+            return emitted
+        if self._ready_state is False:
+            logger.info("dream scheduling resumed: configured provider is available")
+            if self._on_provider_ready is not None:
+                self._on_provider_ready()
+        self._ready_state = True
         self._drain_outcomes()
         for eligible in self.due_profiles():
             fingerprint = (eligible.reason, eligible.turn_range.start, eligible.turn_range.end)
@@ -601,7 +651,11 @@ class DreamScheduler:
         if self._trigger is not None:
             self._trigger.handle_event(
                 PoolEvent(
-                    kind=PoolEventKind.DREAM_TRIGGER,
+                    kind=(
+                        PoolEventKind.FORCED_CONSOLIDATION
+                        if eligible.reason == "forced_cap"
+                        else PoolEventKind.DREAM_TRIGGER
+                    ),
                     profile_id=eligible.profile_id,
                     turn_range=eligible.turn_range,
                     balance=eligible.pool_points,
@@ -741,16 +795,16 @@ class DreamScheduler:
         immediately.
         """
         drain = self._resume_drain
-        if drain is not None:
-            try:
-                await asyncio.wait_for(drain.wait(), timeout=self._resume_drain_timeout_s)
-            except TimeoutError:
-                logger.warning(
-                    "resume drain timed out after %gs; ticking anyway (bounded duplicate "
-                    "risk absorbed by in-flight queueing + fingerprint dedup)",
-                    self._resume_drain_timeout_s,
-                )
         while True:
+            if drain is not None and not drain.is_set():
+                # Refresh readiness while recovery is parked. The worker owns
+                # the ordered journal jobs; emitting from this loop would race
+                # the same window. A failed recovery intentionally remains
+                # pending until the journal is retried by a later process.
+                if self._ready is not None:
+                    self._ready()
+                await asyncio.sleep(SCHEDULER_INTERVAL_S)
+                continue
             try:
                 self.tick()
             except Exception:

@@ -19,7 +19,7 @@
 ### 命令面
 
 - **平铺 `off` / `on`**（与既有平铺 `up` 对称；`config`/`dream`/`hook` 用子命令只因多子谓词，on/off 各一）。
-- **`off`**：写哨兵文件（最先，写失败即 rc 1 诚实报错不再动作）→ best-effort `POST /daemon/shutdown`（`DaemonUnavailableError` 吞掉=已停）→ ≤15s 轮询等监听消失（超时如实报"may still be shutting down"）→ 报告 + rc 0。幂等：已停 + 哨兵已在 → "already off"，rc 0，哨兵重写。
+- **`off`**：先写哨兵文件（写失败即 rc 1）→ 获取独立跨进程协调锁（最多 30s）→ best-effort `POST /daemon/shutdown`（`DaemonUnavailableError` 吞掉=已停）→ ≤15s 轮询等监听消失；协调锁在确认停止或超时后释放，不覆盖 daemon 生命周期。只要仍可能存活就返回非零并保留哨兵，不声称已停止。幂等：已停 + 哨兵已在 → "already off"，rc 0，哨兵重写。
 - **探针与 POST 客户端时限**：存活探测用 1s 上限的探针客户端（`_probe_client`，`_OFF_PROBE_TIMEOUT_S = 1.0`）；shutdown POST 保持标准 30s 客户端。
 - **意外异常宽捕获**：非 `Daemon*` 的 POST/轮询意外异常宽捕获 → stderr 指引 + **rc 1**；哨兵**保持**（状态已收敛）。
 - **`on`**：删哨兵 → 若已在跑（healthz 可达）：报 "already on / already running"，**不重启**，rc 0；否则走 `cmd_up` 既有启动路径（前台阻塞）。
@@ -65,7 +65,7 @@ app.state.shutdown_hook = _intentional_shutdown
 
 ## 边界（如实）
 
-1. off 收敛 best-effort：shutdown POST 应答 200 即 respond-then-exit，daemon 在 drain；CLI ≤15s 轮询，超时后再探一次 /healthz：存活 → 报 "daemon is still running"（复活/拒停，附手工停止指引）；不可达 → 报 "may still be shutting down"（drain 中）。数据包络 = 正常优雅关停（QA-4 drain 在位），非崩溃包络。
+1. off 收敛 best-effort：shutdown POST 应答 200 即 respond-then-exit，daemon 在 drain；CLI ≤15s 轮询，超时后再探一次 /healthz：存活或仍不可确认停止 → rc 非零并报 "daemon is still running" / "daemon may still be shutting down"；只有确认不可达才收敛 rc 0。协调锁最多等待 30s，不能把 marker-first 变成仅靠二次 marker 检查的竞态。
 2. disarm 摘网 tradeoff（见上，已记档）。
 3. gateway hint 陈旧窗（启动读一次）。
 4. supervision wrapper 在 disabled 下零启动、rc 0 退出；重新启用后需由 `on` 或下一次登录启动服务。
@@ -78,9 +78,9 @@ app.state.shutdown_hook = _intentional_shutdown
 
 | # | 预言 | 反变异体 |
 |---|---|---|
-| 1 | off 且 daemon 在跑：shutdown POST 被调 + 哨兵落盘 + rc 0 | 只写哨兵不调关停 → 红 |
+| 1 | off 且 daemon 在跑：shutdown POST 被调 + 哨兵落盘；确认停止才 rc 0，仍存活则 rc 非零 | 只写哨兵不调关停 → 红 |
 | 2 | off 且 daemon 不可达：不炸、哨兵落盘、如实报、rc 0 | 不可达就抛错 → 红 |
-| 3 | off 幂等：哨兵已在 → rc 0、不重复关停 | 已有哨兵报错 → 红 |
+| 3 | off 幂等：哨兵已在 → 无重复关停；仍有 daemon 时 rc 非零 | 已有哨兵报错 → 红 |
 | 4 | on 且未跑：哨兵删 + `run_server` 被调 | 不删哨兵 → 红 |
 | 5 | on 且已跑：哨兵删、不调 `run_server`、如实报 | 重启在跑 daemon → 红 |
 | 6 | up 且哨兵在：rc 1、stderr 有 disabled + "on"、run_server 不触 | 见哨兵仍启动 → 红 |

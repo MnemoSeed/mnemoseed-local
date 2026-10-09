@@ -222,7 +222,12 @@ def intentional_shutdown(watchdog: Watchdog, server: MnemoseedServer) -> None:
     server.request_shutdown()
 
 
-def run_server(host: str, port: int) -> int:
+def run_server(
+    host: str,
+    port: int,
+    *,
+    ready_callback: Callable[[], None] | None = None,
+) -> int:
     """Boot the daemon app and block until shutdown; returns the exit code.
 
     The app is referenced by import string so uvicorn imports it lazily after
@@ -239,9 +244,14 @@ def run_server(host: str, port: int) -> int:
         loop=select_uvicorn_loop(),  # type: ignore[arg-type]
     )
     server = MnemoseedServer(config)
+
+    def announce_and_release() -> None:
+        server.announce_ready(host, port)
+        if ready_callback is not None and server.ready.is_set():
+            ready_callback()
+
     announcer = threading.Thread(
-        target=server.announce_ready,
-        args=(host, port),
+        target=announce_and_release,
         daemon=True,
         name="mnemoseed-announce",
     )

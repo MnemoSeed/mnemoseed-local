@@ -101,6 +101,7 @@ class ScorePool:
         forced_cap: float = 50.0,
         idle_window_sec: float = 5.0,
         config: Config | None = None,
+        event_gate: Callable[[], bool] | None = None,
     ) -> None:
         self._clock = clock
         self._sink = sink
@@ -109,6 +110,7 @@ class ScorePool:
         self._forced_cap = forced_cap
         self._idle_window_sec = idle_window_sec
         self._config = config
+        self._event_gate = event_gate
         self._ledgers: dict[str, _Ledger] = {}
         # one lock for every ledger mutation: add_points runs on the capture
         # drain-lane threads while the scheduler-fire drain runs on the tick
@@ -158,6 +160,12 @@ class ScorePool:
             ledger.range_end = end
             ledger.last_add = now
 
+            if self._backend is not None:
+                self._backend.pool_credit(profile_id, accumulator, span)
+
+            if self._event_gate is not None and not self._event_gate():
+                return ()
+
             event: PoolEvent | None = None
             forced_cap = self._forced_cap_value()
             if accumulator >= forced_cap:
@@ -178,9 +186,6 @@ class ScorePool:
                     fired_at=now,
                 )
                 ledger.dream_triggers += 1
-
-            if self._backend is not None:
-                self._backend.pool_credit(profile_id, accumulator, span)
 
             if event is not None:
                 ledger.balance = 0.0
