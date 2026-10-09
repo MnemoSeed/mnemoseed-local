@@ -24,7 +24,9 @@ honoured by the kernel: a two-element tuple binds 7788 outright on a host where
 nothing listens there, which is the hazard the guard exists to prevent. A
 datagram send has no such unusable shape, so its probe stands a recorder in for
 the guarded transmit and a refusal that never happens is counted rather than
-sent.
+sent. A datagram call can name the destination by keyword too, and the guard
+reads it from the keyword argument when the call puts it there, else from the
+last positional argument.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import re
 import socket
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -83,6 +85,39 @@ DATAGRAM_OPERATIONS = ("sendto",)
 # offers it keeps a datagram path this guard does not wrap.
 DESTINATION_ADDRESSING = ("sendto", "sendmsg")
 UNGUARDED_DESTINATION_CALLS = frozenset({"sendmsg"})
+
+
+def _sendto_destination(probe: socket.socket, address: tuple[str, int]) -> None:
+    probe.sendto(b"", address)
+
+
+def _sendto_flags_destination(probe: socket.socket, address: tuple[str, int]) -> None:
+    probe.sendto(b"", 0, address)
+
+
+def _sendto_keyword_destination(probe: socket.socket, address: tuple[str, int]) -> None:
+    probe.sendto(b"", address=address)
+
+
+def _sendto_keyword_flags_destination(probe: socket.socket, address: tuple[str, int]) -> None:
+    probe.sendto(b"", flags=0, address=address)
+
+
+# Every destination-bearing sendto form, listed once: the destination alone, the
+# destination behind flags, and both behind keywords. The guard reads the
+# destination from the keyword argument when the call names one, else from the
+# last positional argument, so an unhandled form is a missing entry here.
+DATAGRAM_SEND_FORMS: dict[str, Callable[[socket.socket, tuple[str, int]], None]] = {
+    "destination": _sendto_destination,
+    "flags-destination": _sendto_flags_destination,
+    "keyword-destination": _sendto_keyword_destination,
+    "keyword-flags-destination": _sendto_keyword_flags_destination,
+}
+# The keyword shapes the same two calls can take; the guard must inspect them as
+# surely as the positional ones.
+KEYWORD_DATAGRAM_SEND_FORMS = ("keyword-destination", "keyword-flags-destination")
+# The instance entry points whose address a caller may name by keyword.
+KEYWORD_ADDRESS_OPERATIONS = ("bind", "connect", "connect_ex")
 CHILD_SOCKET_ROUTES = ("import-statement", "importlib")
 NETWORK_MODULE_ROOTS = ("http", "socket", "ssl", "urllib")
 HERMETIC_CHILD_SOURCE = """\
@@ -136,8 +171,8 @@ def stand_in(operation):
     if originals is None or operation not in originals:
         return None
 
-    def record(self, data, *args):
-        transmits.append(args[-1] if args else None)
+    def record(self, data, *args, **kwargs):
+        transmits.append(args[-1] if args else kwargs.get("address"))
         return 0
 
     originals[operation] = record
@@ -171,6 +206,8 @@ def attempt_datagram(operation):
     try:
         if SHAPE == "flags":
             getattr(probe, operation)(b"", 0, ("127.0.0.1", PORT))
+        elif SHAPE == "keyword":
+            getattr(probe, operation)(b"", address=("127.0.0.1", PORT))
         else:
             getattr(probe, operation)(b"", ("127.0.0.1", PORT))
     except OSError as error:
@@ -267,8 +304,8 @@ def transmit_stand_in(*operations: str) -> Iterator[list[object]]:
     recorded: list[object] = []
     replaced = {name: originals[name] for name in operations}
 
-    def record(self: object, data: object, *args: object) -> int:
-        recorded.append(args[-1] if args else None)
+    def record(self: object, data: object, *args: object, **kwargs: object) -> int:
+        recorded.append((data, args, kwargs))
         return 0
 
     originals.update(dict.fromkeys(operations, record))
@@ -434,6 +471,68 @@ def test_datagram_refusal_covers_both_sendto_shapes_without_reaching_the_network
             listener.recvfrom(64)
 
 
+@pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
+@pytest.mark.parametrize("form", KEYWORD_DATAGRAM_SEND_FORMS)
+def test_session_refuses_every_reserved_port_on_a_keyword_datagram_send(port: int, form: str) -> None:
+    """A keyword form is inspected: the reserved port raises the port refusal, not a signature error."""
+    send = DATAGRAM_SEND_FORMS[form]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        with transmit_stand_in("sendto") as recorded:
+            with pytest.raises(ReservedPortError) as caught:
+                send(probe, ("127.0.0.1", port))
+
+    assert str(port) in str(caught.value)
+    assert recorded == []
+
+
+@pytest.mark.parametrize(
+    ("form", "forwarded"),
+    (
+        ("keyword-destination", lambda address: (b"", (), {"address": address})),
+        ("keyword-flags-destination", lambda address: (b"", (), {"flags": 0, "address": address})),
+    ),
+)
+def test_a_keyword_datagram_form_forwarded_to_a_spare_port_is_unchanged(
+    form: str, forwarded: Callable[[tuple[str, int]], object]
+) -> None:
+    """A keyword form naming a spare port reaches the original with every argument unchanged."""
+    send = DATAGRAM_SEND_FORMS[form]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.settimeout(10)
+        listener.bind(("127.0.0.1", 0))
+        host, port = listener.getsockname()[:2]
+        assert port not in RESERVED_PORTS
+        listener.settimeout(0.5)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(10)
+            with transmit_stand_in("sendto") as recorded:
+                send(probe, (host, port))
+        with pytest.raises(socket.timeout):
+            listener.recvfrom(64)
+
+    assert recorded == [forwarded((host, port))]
+
+
+def test_a_connected_datagram_send_names_no_destination_and_stays_unrefused() -> None:
+    """A connected socket sends with no destination, so there is nothing to inspect and nothing to refuse."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        with transmit_stand_in("sendto") as recorded:
+            probe.sendto(b"")
+
+    assert recorded == [(b"", (), {})]
+
+
+@pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
+@pytest.mark.parametrize("operation", KEYWORD_ADDRESS_OPERATIONS)
+def test_session_refuses_every_reserved_port_on_a_keyword_stream_call(port: int, operation: str) -> None:
+    """A keyword address on a stream entry point is inspected as surely as the positional one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        with pytest.raises(ReservedPortError) as caught:
+            getattr(probe, operation)(address=unconstructible_address(port))
+
+    assert str(port) in str(caught.value)
+
+
 def test_guard_delegates_a_datagram_port_outside_the_reserved_set() -> None:
     """The datagram refusal is by port, not blanket: a spare loopback port still delivers."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
@@ -481,6 +580,31 @@ def test_the_datagram_probe_with_flags_reports_a_transmit_the_guard_lets_through
 ) -> None:
     """The flags probe has teeth: it counts a transmit instead of sending one."""
     payload = child_probe(tmp_path, EXPECTED_RESERVED_PORTS[0], bypass=operation, shape="flags")
+
+    assert payload[operation] == "not-refused"
+    assert payload["transmits"] == 1
+
+
+@pytest.mark.parametrize("port", EXPECTED_RESERVED_PORTS)
+@pytest.mark.parametrize("route", CHILD_SOCKET_ROUTES)
+def test_child_process_refuses_every_reserved_port_on_a_datagram_send_with_a_keyword(
+    tmp_path: Path, port: int, route: str
+) -> None:
+    """A child interpreter refuses the keyword form on every guarded datagram entry point."""
+    payload = child_probe(tmp_path, port, route=route, shape="keyword")
+
+    assert payload["guard_ports"] == sorted(EXPECTED_RESERVED_PORTS)
+    for operation in DATAGRAM_OPERATIONS:
+        assert payload[operation] == f"refused:{ReservedPortError.__name__}", operation
+    assert payload["transmits"] == 0
+
+
+@pytest.mark.parametrize("operation", DATAGRAM_OPERATIONS)
+def test_the_datagram_probe_with_a_keyword_reports_a_transmit_the_guard_lets_through(
+    tmp_path: Path, operation: str
+) -> None:
+    """The keyword probe has teeth: it counts a transmit instead of sending one."""
+    payload = child_probe(tmp_path, EXPECTED_RESERVED_PORTS[0], bypass=operation, shape="keyword")
 
     assert payload[operation] == "not-refused"
     assert payload["transmits"] == 1

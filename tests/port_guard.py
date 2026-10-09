@@ -9,6 +9,7 @@ RESERVED_PORTS = frozenset({7788, 4096})
 GUARD_MARKER = "_mnemoseed_reserved_ports"
 ORIGINALS = "_mnemoseed_reserved_port_originals"
 _MODULE_PATCH = "create_connection"
+_ADDRESS_KEYWORD = "address"
 
 
 class ReservedPortError(OSError):
@@ -36,6 +37,13 @@ def _port_of(address: object) -> int | None:
     return None
 
 
+def _named_address(args: tuple[object, ...], kwargs: dict[str, object]) -> object:
+    """The address a wrapped call named: its keyword argument, else its last positional argument."""
+    if _ADDRESS_KEYWORD in kwargs:
+        return kwargs[_ADDRESS_KEYWORD]
+    return args[-1] if args else None
+
+
 def _reject_reserved(port: int | None) -> None:
     if port in RESERVED_PORTS:
         raise ReservedPortError(f"tests must not use the reserved port {port}")
@@ -55,21 +63,21 @@ def install() -> None:
     if installed_ports():
         return
 
-    def bind(self: socket.socket, address: object) -> None:
-        _reject_reserved(_port_of(address))
-        _original("bind")(self, address)
+    def bind(self: socket.socket, *args: object, **kwargs: object) -> None:
+        _reject_reserved(_port_of(_named_address(args, kwargs)))
+        _original("bind")(self, *args, **kwargs)
 
-    def connect(self: socket.socket, address: object) -> None:
-        _reject_reserved(_port_of(address))
-        _original("connect")(self, address)
+    def connect(self: socket.socket, *args: object, **kwargs: object) -> None:
+        _reject_reserved(_port_of(_named_address(args, kwargs)))
+        _original("connect")(self, *args, **kwargs)
 
-    def connect_ex(self: socket.socket, address: object) -> int:
-        _reject_reserved(_port_of(address))
-        return int(_original("connect_ex")(self, address))
+    def connect_ex(self: socket.socket, *args: object, **kwargs: object) -> int:
+        _reject_reserved(_port_of(_named_address(args, kwargs)))
+        return int(_original("connect_ex")(self, *args, **kwargs))
 
-    def sendto(self: socket.socket, data: object, *args: object) -> int:
-        _reject_reserved(_port_of(args[-1] if args else None))
-        return int(_original("sendto")(self, data, *args))
+    def sendto(self: socket.socket, data: object, *args: object, **kwargs: object) -> int:
+        _reject_reserved(_port_of(_named_address(args, kwargs)))
+        return int(_original("sendto")(self, data, *args, **kwargs))
 
     def create_connection(address: object, *args: object, **kwargs: object) -> socket.socket:
         _reject_reserved(_port_of(address))
