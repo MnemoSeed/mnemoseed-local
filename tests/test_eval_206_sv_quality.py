@@ -402,13 +402,57 @@ def test_run_root_traversal_and_live_home_rejected(tmp_path: Path, monkeypatch: 
             repository_sha="abc123",
             port=17891,
         )
-    monkeypatch.setenv("MNEMOSEED_HOME", str(tmp_path / "live-home"))
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "live-home"))
     with pytest.raises(ValueError):
         build_config(
             run_root=tmp_path / "live-home",
             repository_sha="abc123",
             port=17891,
         )
+
+
+def test_live_home_env_var_rejects_run_root_inside_live_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import build_config
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "live-home"))
+    with pytest.raises(ValueError, match="live home"):
+        build_config(run_root=tmp_path / "live-home" / "run", repository_sha="abc123", port=17891)
+    with pytest.raises(ValueError, match="live home"):
+        build_config(run_root=tmp_path / "live-home", repository_sha="abc123", port=17891)
+
+
+def test_executor_guard_rejects_run_root_inside_live_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_execute import LunaSeat, build_executor_config
+
+    def seat(model: str) -> LunaSeat:
+        return LunaSeat(model=model, base_url="https://luna.example/v1", api_key_env="LUNA_API_KEY")
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "live-home"))
+    with pytest.raises(ValueError):
+        build_executor_config(
+            run_root=tmp_path / "live-home" / "run",
+            repository_sha="abc123",
+            port=17891,
+            reflect_a=seat("luna-a"),
+            reflect_b=seat("luna-a"),
+            vote_b=seat("luna-b"),
+            verifier=seat("luna-v"),
+        )
+
+
+def test_installed_runtime_default_is_live_home_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import build_config
+
+    monkeypatch.delenv("MNEMOSEED_LOCAL_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with pytest.raises(ValueError, match="live home"):
+        build_config(run_root=tmp_path / ".mnemoseed-local" / "run", repository_sha="abc123", port=17891)
 
 
 def test_pong_order_single_then_dual_and_quota_stops(tmp_path: Path) -> None:

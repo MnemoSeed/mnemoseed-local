@@ -61,6 +61,7 @@ from mnemoseed_local.eval.sv_quality_metrics import (
     decide,
     extraction_micro_f1,
 )
+from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
 from mnemoseed_local.llm.types import LLMUnavailable
 from mnemoseed_local.storage.ports import Disposition
 
@@ -129,25 +130,6 @@ def _check_luna_seat(seat: LunaSeat) -> None:
         raise ValueError("Luna seat timeout and max_tokens must be positive")
 
 
-def _canonical_run_root(run_root: Path) -> str:
-    text = str(run_root).replace("\\", "/")
-    if ".." in Path(text).parts or ".." in text.casefold().split("/"):
-        raise ValueError("run root traversal is rejected")
-    resolved = Path(os.path.abspath(os.path.expanduser(str(run_root))))
-    try:
-        canonical = str(resolved.resolve())
-    except OSError as exc:
-        raise ValueError(f"run root cannot be canonicalized: {exc}") from exc
-    live_home = os.environ.get("MNEMOSEED_HOME", "")
-    if live_home:
-        live_resolved = str(Path(os.path.abspath(os.path.expanduser(live_home))).resolve())
-        if canonical == live_resolved or canonical.startswith(live_resolved.rstrip("/\\") + os.sep):
-            raise ValueError("run root must stay isolated from the live home")
-    if ".mnemoseed-local" in canonical.replace("\\", "/").casefold():
-        raise ValueError("configured run root must stay isolated from the installed runtime")
-    return canonical
-
-
 def build_executor_config(
     *,
     run_root: Path,
@@ -173,7 +155,7 @@ def build_executor_config(
         raise ValueError("vote-B must differ from reflect and verifier routes")
     if vote_b.model in (reflect_a.model, reflect_b.model, verifier.model):
         raise ValueError("vote-B must differ from reflect and verifier routes")
-    canonical = _canonical_run_root(run_root)
+    canonical = canonical_run_root(run_root)
     return ExecutorConfig(
         run_root=run_root,
         canonical_run_root=canonical,

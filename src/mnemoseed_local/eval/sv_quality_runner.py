@@ -76,7 +76,8 @@ def _reject_muse_model(value: str) -> None:
         raise ValueError(f"execution model {value!r} must never enter eval output")
 
 
-def _canonical_run_root(run_root: Path) -> str:
+def canonical_run_root(run_root: Path) -> str:
+    """Canonicalize a run root, rejecting the live home and the installed runtime."""
     text = str(run_root).replace("\\", "/")
     lowered = text.casefold()
     if ".." in Path(text).parts or ".." in lowered.split("/"):
@@ -86,11 +87,10 @@ def _canonical_run_root(run_root: Path) -> str:
         canonical = str(resolved.resolve())
     except OSError as exc:
         raise ValueError(f"run root cannot be canonicalized: {exc}") from exc
-    live_home = os.environ.get("MNEMOSEED_HOME", "")
-    if live_home:
-        live_resolved = str(Path(os.path.abspath(os.path.expanduser(live_home))).resolve())
-        if canonical == live_resolved or canonical.startswith(live_resolved.rstrip("/\\") + os.sep):
-            raise ValueError("run root must stay isolated from the live home")
+    live_home = os.environ.get("MNEMOSEED_LOCAL_HOME", Path.home() / ".mnemoseed-local")
+    live_resolved = str(Path(os.path.abspath(os.path.expanduser(str(live_home)))).resolve())
+    if canonical == live_resolved or canonical.startswith(live_resolved.rstrip("/\\") + os.sep):
+        raise ValueError("run root must stay isolated from the live home")
     if ".mnemoseed-local" in canonical.replace("\\", "/").casefold():
         raise ValueError("configured run root must stay isolated from the installed runtime")
     return canonical
@@ -121,7 +121,7 @@ def build_config(
         _reject_muse_model(value)
     if vote_b_model in (cell_a_model, cell_b_model, verifier_model):
         raise ValueError("vote-B must differ from reflect and verifier routes")
-    canonical = _canonical_run_root(run_root)
+    canonical = canonical_run_root(run_root)
     return SvQualityConfig(
         run_root=run_root,
         canonical_run_root=canonical,
