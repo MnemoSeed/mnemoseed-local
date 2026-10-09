@@ -1,6 +1,11 @@
 """Config loading: preset resolution, per-layer override, named instances,
 STORAGE_MODE shortcut, and validation errors that name the offending key."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from mnemoseed_local.config import (
@@ -9,6 +14,7 @@ from mnemoseed_local.config import (
     ConfigError,
     LayerSpec,
     default_config_toml,
+    live_home_dir,
     load_config,
 )
 
@@ -370,3 +376,56 @@ def test_profiles_profile_for_empty_map_returns_none(tmp_path, monkeypatch):
     cfg = load_config(tmp_path / "missing.toml")
     assert cfg.profiles.profile_for("planner") is None
     assert cfg.profiles.profile_for(None) is None
+
+
+def test_live_home_dir_resolves_override_and_blank_means_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("MNEMOSEED_LOCAL_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user-home")
+    installed = tmp_path / "user-home" / ".mnemoseed-local"
+    assert live_home_dir() == installed
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", "")
+    assert live_home_dir() == installed
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", "   ")
+    assert live_home_dir() == installed
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "home"))
+    assert live_home_dir() == tmp_path / "home"
+
+
+def test_config_dir_ignores_a_blank_live_home_env(tmp_path, monkeypatch):
+    home = tmp_path / "user-home"
+    installed = home / ".mnemoseed-local"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "MNEMOSEED_LOCAL_HOME": "",
+    }
+    blank = subprocess.run(
+        [sys.executable, "-c", "import mnemoseed_local.config as c; print(c.CONFIG_DIR)"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+    assert Path(blank.stdout.strip()) == installed
+
+    override = tmp_path / "override-home"
+    explicit = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import mnemoseed_local.config as c; print(c.CONFIG_DIR)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "MNEMOSEED_LOCAL_HOME": str(override),
+        },
+        cwd=str(tmp_path),
+    )
+    assert Path(explicit.stdout.strip()) == override

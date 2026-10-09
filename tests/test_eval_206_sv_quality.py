@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import inspect
+import sys
 from pathlib import Path
 
 import pytest
 
 FROZEN_STAGED_HASH = "FDDEA62462EEC219EFDC291E8F6C924484361194D1E95A7C81CAA3FC4BC0CED2"
+
+WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32", reason="extended-length path spellings exist on Windows"
+)
 
 
 def test_staged_excluded_hash_is_owner_frozen_literal() -> None:
@@ -453,6 +458,110 @@ def test_installed_runtime_default_is_live_home_when_env_unset(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     with pytest.raises(ValueError, match="live home"):
         build_config(run_root=tmp_path / ".mnemoseed-local" / "run", repository_sha="abc123", port=17891)
+
+
+@WINDOWS_ONLY
+def test_extended_length_run_root_inside_live_home_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    live_home = tmp_path / "live-home"
+    run_root = live_home / "run"
+    run_root.mkdir(parents=True)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(live_home))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(f"\\\\?\\{run_root}"))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(f"\\\\?\\{live_home}"))
+    outside = tmp_path / "live-home-other" / "run"
+    outside.mkdir(parents=True)
+    assert canonical_run_root(Path(f"\\\\?\\{outside}")) == str(outside.resolve())
+
+
+@WINDOWS_ONLY
+def test_extended_length_live_home_rejects_plain_run_root_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    live_home = tmp_path / "live-home"
+    run_root = live_home / "run"
+    run_root.mkdir(parents=True)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", f"\\\\?\\{live_home}")
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(run_root)
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(f"\\\\?\\{run_root}"))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(f"\\\\?\\{live_home}"))
+    assert canonical_run_root(tmp_path / "outside") == str((tmp_path / "outside").resolve())
+
+
+@WINDOWS_ONLY
+def test_unc_spelling_of_either_side_stays_inside_the_live_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", r"\\?\UNC\some-server\some-share\live-home")
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(r"\\?\UNC\some-server\some-share\live-home\run"))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(r"\\some-server\some-share\live-home\run"))
+
+
+@WINDOWS_ONLY
+def test_extended_length_spelling_of_the_unc_run_root_is_rejected_against_a_plain_unc_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", r"\\some-server\some-share\live-home")
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(r"\\?\UNC\some-server\some-share\live-home\run"))
+
+
+def test_case_varied_run_root_is_rejected_against_an_absent_live_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "NOEXIST-home"))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(tmp_path / "noexist-HOME" / "run")
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(tmp_path / "NOEXIST-HOME" / "run")
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(tmp_path / "noexist-home")
+
+
+def test_blank_live_home_env_means_unset_not_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", "")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "installed-home")
+    installed_home = tmp_path / "installed-home" / ".mnemoseed-local"
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(installed_home / "run")
+    monkeypatch.chdir(tmp_path)
+    assert canonical_run_root(tmp_path / "run") == str((tmp_path / "run").resolve())
+
+
+def test_live_home_guard_accepts_sibling_prefix_shared_and_parent_run_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "live-home"))
+    for run_root in (
+        tmp_path,
+        tmp_path / "live-home-sibling",
+        tmp_path / "live-home-other" / "run",
+    ):
+        assert canonical_run_root(run_root) == str(run_root.resolve())
 
 
 def test_pong_order_single_then_dual_and_quota_stops(tmp_path: Path) -> None:
