@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mnemoseed_local.config import live_home_dir
 from mnemoseed_local.eval.sv_quality_fixtures import (
     SV_QUALITY_CANARY_SEED,
     SV_QUALITY_PROMPT_VERSION,
@@ -76,20 +77,53 @@ def _reject_muse_model(value: str) -> None:
         raise ValueError(f"execution model {value!r} must never enter eval output")
 
 
+_EXTENDED_LENGTH_PREFIX = "\\\\?\\"
+_EXTENDED_LENGTH_UNC_PREFIX = "\\\\?\\UNC\\"
+
+
+def _strip_extended_length(text: str) -> str:
+    """Drop an extended-length prefix so one directory keeps one spelling."""
+    slashed = text.replace("/", "\\")
+    upper = slashed.upper()
+    if upper.startswith(_EXTENDED_LENGTH_UNC_PREFIX):
+        return "\\\\" + slashed[len(_EXTENDED_LENGTH_UNC_PREFIX) :]
+    if upper.startswith(_EXTENDED_LENGTH_PREFIX):
+        return slashed[len(_EXTENDED_LENGTH_PREFIX) :]
+    return text
+
+
+def _resolved_text(text: str | Path) -> str:
+    """Absolute, fully resolved path text without an extended-length prefix."""
+    resolved = Path(os.path.abspath(os.path.expanduser(_strip_extended_length(str(text)))))
+    return str(resolved.resolve())
+
+
+def _isolation_parts(text: str) -> tuple[str, ...]:
+    """Case-folded directory components: one directory has one comparable form."""
+    return tuple(part for part in text.casefold().replace("\\", "/").split("/") if part)
+
+
+def _is_within(text: str, directory: str) -> bool:
+    """True when text is the directory itself or lies inside it."""
+    parts = _isolation_parts(text)
+    prefix = _isolation_parts(directory)
+    return parts[: len(prefix)] == prefix
+
+
 def canonical_run_root(run_root: Path) -> str:
     """Canonicalize a run root, rejecting the live home and the installed runtime."""
     text = str(run_root).replace("\\", "/")
     lowered = text.casefold()
     if ".." in Path(text).parts or ".." in lowered.split("/"):
         raise ValueError("run root traversal is rejected")
-    resolved = Path(os.path.abspath(os.path.expanduser(str(run_root))))
     try:
-        canonical = str(resolved.resolve())
+        canonical = _resolved_text(run_root)
     except OSError as exc:
         raise ValueError(f"run root cannot be canonicalized: {exc}") from exc
-    live_home = os.environ.get("MNEMOSEED_LOCAL_HOME", Path.home() / ".mnemoseed-local")
-    live_resolved = str(Path(os.path.abspath(os.path.expanduser(str(live_home)))).resolve())
-    if canonical == live_resolved or canonical.startswith(live_resolved.rstrip("/\\") + os.sep):
+    # The live-home check runs before the installed-runtime substring check so a
+    # run root inside the live home is named as a live-home breach first.
+    live_resolved = _resolved_text(live_home_dir())
+    if _is_within(canonical, live_resolved):
         raise ValueError("run root must stay isolated from the live home")
     if ".mnemoseed-local" in canonical.replace("\\", "/").casefold():
         raise ValueError("configured run root must stay isolated from the installed runtime")

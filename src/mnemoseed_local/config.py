@@ -22,7 +22,16 @@ from mnemoseed_local.secrets.refs import SECRETS_REF_RE, is_secrets_ref
 
 logger = logging.getLogger("mnemoseed_local.config")
 
-CONFIG_DIR = Path(os.environ.get("MNEMOSEED_LOCAL_HOME", Path.home() / ".mnemoseed-local"))
+
+def live_home_dir() -> Path:
+    """The live home from MNEMOSEED_LOCAL_HOME; a blank value means unset."""
+    override = os.environ.get("MNEMOSEED_LOCAL_HOME")
+    if override is None or not override.strip():
+        return Path.home() / ".mnemoseed-local"
+    return Path(override)
+
+
+CONFIG_DIR = live_home_dir()
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 
 LAYER_TYPES: tuple[str, ...] = ("vector", "graph", "meta", "embed")
