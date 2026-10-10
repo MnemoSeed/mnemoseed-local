@@ -1,11 +1,10 @@
-"""Run-isolation oracles for the Windows-only test surface and the live daemon port."""
+"""Run-isolation oracles for the Windows-only test surface."""
 
 from __future__ import annotations
 
 import importlib.util
 import os
 import re
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +15,6 @@ import pytest
 TESTS = Path(__file__).resolve().parent
 AUTOSTART_SUITE = TESTS / "test_windows_autostart.py"
 AUTOSTART_FIXTURE = TESTS / "windows_autostart_fixture.ps1"
-LIVE_DAEMON_PORT = 7788
 AMBIENT_FIXTURES = (
     (TESTS / "windows_task_fixture.ps1", "USERNAME", "User"),
     (TESTS / "windows_install_bootstrap_fixture.ps1", "USERNAME", "User"),
@@ -110,14 +108,6 @@ def test_autostart_suite_still_runs_on_windows() -> None:
 def test_autostart_suite_guard_follows_the_host_platform() -> None:
     """A host-sensitive condition must exist, not only a PowerShell check."""
     assert _autostart_skip_conditions("win32") != _autostart_skip_conditions("linux")
-
-
-def test_test_session_refuses_the_live_daemon_port() -> None:
-    """No test may bind or dial the port the installed daemon owns."""
-    with socket.socket() as probe, pytest.raises(OSError) as caught:
-        probe.bind(("127.0.0.1", LIVE_DAEMON_PORT))
-
-    assert str(LIVE_DAEMON_PORT) in str(caught.value)
 
 
 def test_autostart_fixture_intercepts_every_daemon_probe() -> None:

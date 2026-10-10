@@ -180,3 +180,6 @@ pip-wheel-metadata/
 .verification-runs/
 __pycache__/
 *.pyc
+
+# Workflow ledger directory (mnemoseeding batches/worktrees)
+.mnemoseeding/
