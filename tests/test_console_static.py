@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.staticfiles import StaticFiles
-from fastapi.testclient import TestClient
 from starlette.routing import Mount
 
 from mnemoseed_local.daemon.app import create_app
@@ -52,7 +52,7 @@ def test_console_static_mount_registered_at_root() -> None:
 
 
 def test_console_mount_does_not_shadow_routes(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         assert _console_mounts(), "the console mount was not registered"
 
         healthz = client.get("/healthz")
@@ -65,6 +65,11 @@ def test_console_mount_does_not_shadow_routes(config_path: Path) -> None:
 
         recall = client.post("/memory/recall", json={})
         assert recall.status_code == 422, recall.text
+
+        # reverse assertion: the console mount shadows nothing, and a caller
+        # without the credential is refused even on the open documents
+        refused = client.get("/api/v1/audit", headers={"Authorization": "Bearer not-the-credential"})
+        assert refused.status_code == 401
 
         # "/" belongs to the console mount (StaticFiles html=True). When index.html
         # exists it serves 200 with the console; when only .gitkeep exists it

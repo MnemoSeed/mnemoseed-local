@@ -21,14 +21,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import auth_support
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from mnemoseed_local.cli import main
 from mnemoseed_local.daemon.actor import resolve_actor
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.hosts.claude_code import events
 from mnemoseed_local.hosts.claude_code import install as cc_install
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
@@ -55,6 +54,7 @@ ENV_VARS = (
     "MNEMOSEED_LOCAL_PROFILE_ID",
     "MNEMOSEED_LOCAL_DEBUG",
     "MNEMOSEED_LOCAL_DATA_DIR",
+    "MNEMOSEED_LOCAL_HOME",
 )
 
 
@@ -151,22 +151,29 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.parametrize("name", INGEST_FIXTURES)
 def test_ingest_fixtures_accepted_by_daemon(config_path: Path, name: str) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post("/ingest", json=_fixture(name))
         assert response.status_code == 202, response.text
 
 
 def test_session_end_fixture_accepted_by_daemon(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post("/ingest", json=_fixture("user_prompt.json"))
         assert opened.status_code == 202, opened.text
         settled = client.post("/session/end", json=_fixture("session_end.json"))
         assert settled.status_code == 200, settled.text
         assert settled.json()["status"] == "settled"
+        # reverse assertion: the same ingest without the credential is refused
+        refused = client.post(
+            "/ingest",
+            json=_fixture("user_prompt.json"),
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_flush_fixture_accepted_by_daemon(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post("/ingest", json=_fixture("user_prompt.json"))
         assert opened.status_code == 202, opened.text
         flushed = client.post("/flush", json=_fixture("flush.json"))
@@ -832,7 +839,7 @@ class _CaptureServer:
         self.server.server_close()
 
 
-def test_process_level_stdin_roundtrips_utf8_and_stays_silent() -> None:
+def test_process_level_stdin_roundtrips_utf8_and_stays_silent(tmp_path: Path) -> None:
     """Subprocess-level UTF-8 oracle: real bytes piped into the REAL verb.
     The child's hostile stdin text layer is forced via PYTHONIOENCODING=gbk,
     so any sys.stdin.read()-based decode corrupts non-ASCII prompts — the
@@ -848,6 +855,9 @@ def test_process_level_stdin_roundtrips_utf8_and_stays_silent() -> None:
         }
         env = {k: v for k, v in os.environ.items() if k not in ENV_VARS}
         env["MNEMOSEED_LOCAL_BASEURL"] = server.url
+        # An explicit temporary home: the child must never resolve the installed
+        # one, or a subprocess-level test reads real memory state.
+        env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path)
         env["PYTHONIOENCODING"] = "gbk"
         result = subprocess.run(
             [sys.executable, "-m", "mnemoseed_local.cli", "_hook-event", "--host", "claude_code"],

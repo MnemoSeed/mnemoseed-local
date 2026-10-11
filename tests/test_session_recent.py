@@ -13,10 +13,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.daemon.memory import _group_session_tails
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.schema.turn import HostId
@@ -211,7 +211,7 @@ def test_session_recent_returns_both_session_tails_verbatim_in_order(config_path
     """The new-session seam: two drained sessions come back newest-group-first,
     chunks ascending, text verbatim — exactly what an agent needs to re-anchor
     on the previous conversation's tail."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-old", 1.0, "上次我们敲定了 verify 回退语义")
         _ingest(client, "sess-old", 2.0, "还给 gemma4:e4b 定了校验位")
         client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
@@ -224,6 +224,13 @@ def test_session_recent_returns_both_session_tails_verbatim_in_order(config_path
         assert payload["profile_id"] == PROFILE
         sessions = payload["sessions"]
         assert [s["session_id"] for s in sessions] == ["sess-new", "sess-old"]
+        # reverse assertion: the same read without the credential is refused
+        refused = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
         # the verbatim channel stores turns with their role label — the prefix
         # is exactly what an agent re-anchoring on a conversation tail wants
         assert [c["text"] for c in sessions[0]["chunks"]] == ["user: 现在开始做窗口守卫"]
@@ -242,7 +249,7 @@ def test_session_recent_items_carry_origin_agent_and_host_end_to_end(config_path
     """Full chain through ingest -> segmenter -> stamper -> store: the canonical
     `agent` on the payload reaches the read-back item alongside the encoding
     host; a session without one reports consistent nulls."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         attributed = client.post(
             "/ingest",
             json={
@@ -274,7 +281,7 @@ def test_session_recent_items_carry_origin_agent_and_host_end_to_end(config_path
 def test_session_recent_chunks_expose_pin_source(config_path: Path) -> None:
     """R2 provenance-trust injection wire: each recent tail chunk carries its
     pin/source signal so the injection host can mark pins (source == memory.remember)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         stores = client.app.state.stores
         stamp = ChunkStamp(
             chunk_id="src-pin",
@@ -297,7 +304,7 @@ def test_session_recent_chunks_expose_pin_source(config_path: Path) -> None:
 def test_blank_agent_ingests_and_serves_as_null(config_path: Path) -> None:
     """Capture success outranks attribution completeness: a whitespace-only
     agent never fails ingest and serves as the honest null."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post(
             "/ingest",
             json={
@@ -320,7 +327,7 @@ def test_blank_agent_ingests_and_serves_as_null(config_path: Path) -> None:
 
 
 def test_session_recent_honors_the_caps(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         for i in range(3):
             _ingest(client, f"s{i}", float(i + 1), f"turn {i}")
             client.post("/session/end", json={"session_id": f"s{i}", "profile_id": PROFILE})
@@ -334,7 +341,7 @@ def test_session_recent_honors_the_caps(config_path: Path) -> None:
 
 
 def test_session_recent_empty_profile_returns_no_groups(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
         payload = body.json()
@@ -344,7 +351,7 @@ def test_session_recent_empty_profile_returns_no_groups(config_path: Path) -> No
 
 
 def test_session_recent_rejects_out_of_range_caps(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE, "per_session": 0})
         assert body.status_code == 422
         body = client.post("/session/recent", json={"profile_id": PROFILE, "sessions": 99})
@@ -356,7 +363,7 @@ def test_session_recent_excludes_the_named_session(config_path: Path) -> None:
     own session (a race can land the current session's turn 0 before the
     transform fires) — only the older session's tail comes back. An unknown
     exclusion id leaves the order and shape untouched."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-old", 1.0, "老session内容")
         client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
         _ingest(client, "sess-new", 2.0, "新session内容")
@@ -409,7 +416,7 @@ def test_session_recent_group_windows_are_exact_not_page_visible(config_path: Pa
     """A long old session's true first chunk sits beyond the recent discovery
     page; the group window must come from an exact per-session scan, never a
     page-visible approximation."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _write_chunk(client, "new-1", "s-new", 1000.0, "newest turn")
         _write_chunk(client, "new-2", "s-new", 1001.0, "newer turn")
         for i in range(1, 251):
@@ -434,7 +441,7 @@ def test_session_recent_group_windows_are_exact_not_page_visible(config_path: Pa
 def test_session_recent_self_window_exact_window_only_keys(config_path: Path) -> None:
     """The top-level self_window carries the exact window and the active flag —
     and nothing else: no chunk text may leak into the window surface."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-self", 1.0, "self session turn")
         flushed = client.post("/flush", json={"session_id": "sess-self", "profile_id": PROFILE})
         assert flushed.status_code == 200, flushed.text
@@ -454,7 +461,7 @@ def test_session_recent_self_window_exact_window_only_keys(config_path: Path) ->
 
 
 def test_session_recent_self_window_null_when_absent_or_unknown(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-x", 1.0, "some turn")
         client.post("/session/end", json={"session_id": "sess-x", "profile_id": PROFILE})
 
@@ -474,7 +481,7 @@ def test_session_recent_window_truncated_only_for_exceeding_group(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("mnemoseed_local.daemon.memory.SESSION_WINDOW_SCAN_LIMIT", 2)
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         for i in range(1, 4):
             _write_chunk(client, f"big-{i}", "s-big", float(i), f"big turn {i}")
         _write_chunk(client, "small-1", "s-small", 4.0, "small turn")
@@ -494,7 +501,7 @@ def test_session_recent_window_truncated_only_for_exceeding_group(
 def test_session_recent_question_group_window_is_null(config_path: Path) -> None:
     """The shared '?' group has no session identity to scan; its window is the
     honest null, never a guessed session window."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _write_chunk(client, "c1", "s-a", 2.0, "labeled turn")
         _write_chunk(client, "c2", None, 1.0, "manual pin")
 
@@ -515,7 +522,7 @@ def test_session_recent_flags_active_sessions_and_embeds_anti_adoption_guidance(
     expose staleness in seconds) plus embed explicit do-not-adopt guidance, so
     a resuming agent never mistakes another session's open work for its own
     todo list."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-old", 1.0, "早已结束的旧会话")
         client.post("/session/end", json={"session_id": "sess-old", "profile_id": PROFILE})
         _ingest(client, "sess-live", 2.0, "另一条线还在进行中")

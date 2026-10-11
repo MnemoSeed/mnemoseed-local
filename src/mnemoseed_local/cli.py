@@ -2,10 +2,10 @@
 
 Verbs: init / up / on / off / status / doctor / recall / remember / dream
 (--once, status) / forget / profile (create | list | archive | unarchive) /
-config (get | set | rollback) / uninstall (--purge) / hook (install |
-uninstall | status) / mcp (MCP stdio gateway). Local loopback by default;
-every state-changing verb talks to the daemon REST (FR-7.12); no
-identity/accounts/tokens in the local MVP.
+config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
+hook (install | uninstall | status) / mcp (MCP stdio gateway). Local loopback
+by default; every state-changing verb talks to the daemon REST (FR-7.12); no
+identity/accounts in the local MVP.
 """
 
 from __future__ import annotations
@@ -30,7 +30,11 @@ from mnemoseed_local.config import (
     load_config,
 )
 from mnemoseed_local.dream.readiness import models_contain
-from mnemoseed_local.rest_client import DaemonClient
+from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
+
+#: The status the daemon answers a caller without a valid credential.
+_HTTP_UNAUTHORIZED = 401
 
 #: Default profile at the application boundary (no identity in the local MVP).
 DEFAULT_PROFILE = "default"
@@ -236,7 +240,12 @@ def cmd_off(args: argparse.Namespace) -> int:
             except DaemonUnavailableError:
                 print("daemon not running; memory service disabled")
                 return 0
-            except DaemonRestError:
+            except DaemonRestError as exc:
+                if exc.status == _HTTP_UNAUTHORIZED:
+                    # A refused credential is not "did not accept": the daemon
+                    # is reachable and simply will not take the request.
+                    print(f"error: {DAEMON_AUTH_HINT}", file=sys.stderr)
+                    return 1
                 if _daemon_reachable(probe):
                     print(
                         "daemon is still running and did not accept the shutdown request; "
@@ -405,6 +414,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # judging load — the check that would have caught the 16384-vs-18287 gap.
     checks.append(_verifier_ctx_window_check(config))
 
+    stale_plugin = _stale_installed_plugin_warning()
+    if stale_plugin is not None:
+        warnings.append(stale_plugin)
+
     # B2.12 (#117): a registered MCP server that never connected while the
     # capture hooks clearly work is the silent missing-tools state — surface
     # it. The since-boot qualifier keeps a daemon restart from crying wolf
@@ -471,11 +484,38 @@ def _opencode_mcp_registered(path: Path) -> bool:
     return entry.get("enabled") is not False
 
 
+def _stale_installed_plugin_warning() -> tuple[str, str] | None:
+    """An installed plugin whose bytes differ from the shipped ones.
+
+    A stale plugin does not error — it keeps calling the daemon the old way,
+    which the credential boundary refuses. The result is silent stopped capture,
+    so the doctor names it: reinstalling restores the shipped bytes (and the
+    credential header they carry).
+    """
+    from mnemoseed_local.hosts import install as hook
+
+    try:
+        info = hook.hook_status()
+    except Exception:  # noqa: BLE001 - a probe failure says nothing about the plugin
+        return None
+    if info.state != "differs":
+        return None
+    return (
+        "stale plugin",
+        f"the installed plugin at {info.path} differs from the shipped one; "
+        "run 'mnemoseed-local hook install opencode' to reinstall it "
+        "(a stale plugin's daemon calls are refused and its capture stops silently)",
+    )
+
+
 def _daemon_activity(config: Config) -> dict[str, Any] | None:
     """The daemon's since-boot observability counters; None when unreachable
     (a down daemon says nothing about MCP injection)."""
+    from mnemoseed_local.credential import read_credential_or_none
+
     try:
-        return DaemonClient(base_url=config.baseurl).get("/api/v1/observability")
+        client = DaemonClient(base_url=config.baseurl, token=read_credential_or_none())
+        return client.get("/api/v1/observability")
     except Exception:  # noqa: BLE001 - any transport failure means "unknown"
         return None
 
@@ -901,6 +941,29 @@ def _task_script_paths() -> tuple[Path, Path] | None:
     return None
 
 
+def cmd_credential(args: argparse.Namespace) -> int:
+    """Daemon-credential lifecycle (no HTTP route: the file is the authority).
+
+    ``rotate`` writes a fresh credential into the config home. The daemon
+    resolves it per request, so the new value is live immediately; a request
+    that raced the write is refused once and succeeds on the next one.
+    """
+    from mnemoseed_local.credential import DaemonCredentialError, credential_path, rotate_credential
+    from mnemoseed_local.secrets.store import SecretsError
+
+    if args.credential_command != "rotate":
+        print(f"error: unknown credential command {args.credential_command!r}", file=sys.stderr)
+        return 2
+    try:
+        rotate_credential()
+    except (DaemonCredentialError, SecretsError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"daemon credential rotated: {credential_path(CONFIG_DIR)}")
+    print("every client holding the previous credential is refused until it restarts")
+    return 0
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
     """Remove the local config home and an owned Windows logon task."""
     import subprocess
@@ -1259,8 +1322,10 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
         events.debug(f"dropped unmapped or identity-less event {payload.get('hook_event_name')!r}")
         return 0
     kind, body = action
-    client = DaemonClient(
-        base_url=shared.resolve_base_url(),
+    from mnemoseed_local.rest_client import client_for
+
+    client = client_for(
+        shared.resolve_base_url(),
         profile_id=events.profile_id(),
         actor="hook",
         timeout=events.endpoint_budget(kind),
@@ -1304,6 +1369,11 @@ def _emit_json(payload: Any) -> int:
 
 
 def _client_error(exc: Exception) -> int:
+    """One honest failure line. A refused credential names its real causes
+    instead of being reported as a connectivity problem."""
+    if isinstance(exc, DaemonRestError) and exc.status == _HTTP_UNAUTHORIZED:
+        print(f"error: {DAEMON_AUTH_HINT}", file=sys.stderr)
+        return 1
     print(f"error: {exc}", file=sys.stderr)
     return 1
 
@@ -1386,6 +1456,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_config_rollback.add_argument("--baseurl", default=None)
     p_config_rollback.add_argument("--json", action="store_true")
 
+    p_credential = sub.add_parser("credential", help="daemon credential lifecycle: rotate")
+    credential_sub = p_credential.add_subparsers(dest="credential_command", required=True)
+    credential_sub.add_parser(
+        "rotate",
+        help="write a fresh daemon credential into the config home (the daemon and "
+        "every client pick it up on the next request)",
+    )
+
     p_uninstall = sub.add_parser("uninstall", help="remove the local daemon / data directory")
     p_uninstall.add_argument("--purge", action="store_true", help="delete the data files too")
     p_uninstall.add_argument("--yes", action="store_true", help="skip the purge confirmation")
@@ -1461,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_config(args) if args.config_command != "rollback" else cmd_config_rollback(args)
     if args.command == "profile":
         return cmd_profile(args)
+    if args.command == "credential":
+        return cmd_credential(args)
     if args.command == "uninstall":
         return cmd_uninstall(args)
     if args.command == "hook":

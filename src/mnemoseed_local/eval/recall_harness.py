@@ -203,6 +203,20 @@ def _config_toml(root: Path, focal_floor: float, budget_chars: int) -> str:
     )
 
 
+def rig_client() -> TestClient:
+    """The rig's daemon client: the real app, presenting the daemon credential.
+
+    A rig is a client like any other, so it attaches the credential through the
+    same channel the product uses. The value is resolved BEFORE the client is
+    built: the TestClient's default headers are fixed at construction, while the
+    lifespan that would issue the credential only runs on entry.
+    """
+    from mnemoseed_local.credential import issue_credential
+    from mnemoseed_local.rest_client import credential_headers
+
+    return TestClient(create_app(), headers=credential_headers(issue_credential()))
+
+
 def release_daemon_log_handler(root: Path) -> None:
     """Hand the process-global daemon logger back to rigs rooted at ``root``.
 
@@ -269,7 +283,7 @@ class RecallRig:
         stack = ExitStack()
         try:
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
-            self._client = stack.enter_context(TestClient(create_app()))
+            self._client = stack.enter_context(rig_client())
         except BaseException:
             # Startup can fail after the lifespan attached the global daemon.log
             # handler: unwind the seam and release the pin before propagating,

@@ -8,9 +8,10 @@ end-to-end /ingest -> segmenter -> F1 -> buffer path with a hot-reload swap.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture import (
     ContentTarget,
@@ -145,7 +146,7 @@ def test_sessions_exposed_after_drain() -> None:
     assert pipeline.sessions() == (SESSION,)
 
 
-def test_http_end_to_end_ingest_to_f1_buffer() -> None:
+def test_http_end_to_end_ingest_to_f1_buffer(tmp_path: Path) -> None:
 
     pipeline = StrippingPipeline()
 
@@ -155,8 +156,7 @@ def test_http_end_to_end_ingest_to_f1_buffer() -> None:
         application.state.segmenter = TurnSegmenter(pipeline)
         yield
 
-    app = create_app()
-    app.router.lifespan_context = fake_lifespan
+    boot_lifespan = fake_lifespan
     drained: list = []
     original_drain = pipeline.drain
 
@@ -166,7 +166,7 @@ def test_http_end_to_end_ingest_to_f1_buffer() -> None:
         return results
 
     pipeline.drain = recording_drain
-    with TestClient(app) as client:
+    with auth_support.boot(tmp_path, lifespan=boot_lifespan) as client:
         assert (
             client.post(
                 "/ingest",
@@ -188,6 +188,20 @@ def test_http_end_to_end_ingest_to_f1_buffer() -> None:
             ).status_code
             == 200
         )
+        # reverse assertion: the ingest refuses a caller with no credential
+        refused = client.post(
+            "/ingest",
+            json={
+                "host": "claude_code",
+                "event": "tool_use",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"tool_name": "Bash", "input": {"cmd": "npm i"}, "output": NPM_LOG},
+            },
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
     # the HTTP-triggered drain stripped the turn exactly once (F1 verified)
     assert drained[0].turn.steps[0].content == EXPECTED_NPM

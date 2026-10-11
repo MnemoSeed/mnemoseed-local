@@ -17,10 +17,9 @@ import time
 from importlib import resources
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import IngestEvent, IngestEventType
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -121,7 +120,7 @@ def _provider_body(session_id: str, **over: object) -> dict:
 
 
 def test_session_A_error_never_arms_session_B(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         resp = client.post("/ingest", json=_provider_body("sess-A"))
         assert resp.status_code == 202, resp.text
         data = client.post(
@@ -134,7 +133,7 @@ def test_session_A_error_never_arms_session_B(b1_config: Path) -> None:
 
 
 def test_same_session_first_pull_arms(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post("/ingest", json=_provider_body("sess-1"))
         data = client.post(
             "/session/recall-pending", json={"profile_id": PROFILE, "session_id": "sess-1"}
@@ -142,10 +141,17 @@ def test_same_session_first_pull_arms(b1_config: Path) -> None:
         assert data["detector_fired"] is True
         assert data["unresolved"] is True
         assert data["provider"] == "openai"
+        # reverse assertion: the same pull without the credential is refused
+        refused = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-1"},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_same_session_consumption_second_pull_quiet(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post("/ingest", json=_provider_body("sess-1"))
         first = client.post(
             "/session/recall-pending", json={"profile_id": PROFILE, "session_id": "sess-1"}
@@ -159,7 +165,7 @@ def test_same_session_consumption_second_pull_quiet(b1_config: Path) -> None:
 
 
 def test_session_end_clears_event_arm(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post("/ingest", json=_provider_body("sess-1"))
         end = client.post("/session/end", json={"profile_id": PROFILE, "session_id": "sess-1"})
         assert end.status_code == 200, end.text
@@ -171,7 +177,7 @@ def test_session_end_clears_event_arm(b1_config: Path) -> None:
 
 
 def test_stale_event_does_not_arm_forever(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         meta.append_error_event(
             ErrorEvent(
@@ -196,7 +202,7 @@ def test_stale_event_does_not_arm_forever(b1_config: Path) -> None:
 
 
 def test_storage_filter_supports_session_scope(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         for sess in ("sess-A", "sess-B"):
             meta.append_error_event(
@@ -355,7 +361,7 @@ def test_joined_hook_body_through_ingest_persists_row(tmp_path: Path, b1_config:
     body["profile_id"] = PROFILE
     evt = IngestEvent.model_validate(body)
     assert evt.event == IngestEventType.PROVIDER_ERROR
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         resp = client.post("/ingest", json=json.loads(evt.model_dump_json()))
         assert resp.status_code == 202, resp.text
         meta = client.app.state.stores.meta
@@ -377,7 +383,7 @@ def test_secret_bearing_hook_input_leaves_no_secret_anywhere(
     bodies = _provider_bodies(transcript)
     assert bodies, "secret scenario emitted no provider_error POST"
     secrets = ("sk-live-", "Bearer ", "token=hunter2")
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         with caplog.at_level("DEBUG", logger="mnemoseed_local.daemon.ingest"):
             body = dict(bodies[0])
             body["profile_id"] = PROFILE

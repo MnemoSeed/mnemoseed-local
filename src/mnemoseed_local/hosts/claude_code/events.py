@@ -398,6 +398,7 @@ def pull_pending_recall(session_id: str, client: DaemonClient) -> dict[str, Any]
         profile_id=client.profile_id,
         actor=client.actor,
         timeout=Timeout(RECALL_PULL_TIMEOUT_SECONDS),
+        token=client.token,
     )
     try:
         return pull_client.post(

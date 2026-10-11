@@ -42,6 +42,16 @@ DAEMON_DISABLED_HINT = (
 #: Honest shape for a timeout-caused unavailability.
 DAEMON_TIMEOUT_HINT = "cannot reach {base_url}: daemon timed out after 30s (busy or hung; try again shortly)"
 
+#: Honest shape for a refused daemon credential (HTTP 401). The two causes that
+#: actually happen: the client resolves a different config home than the daemon,
+#: or the credential was rotated under it.
+DAEMON_AUTH_HINT = (
+    "the daemon refused the daemon credential (HTTP 401): this process and the "
+    "daemon resolve different config homes (check MNEMOSEED_LOCAL_HOME on both), "
+    "or the credential was rotated (run 'mnemoseed-local credential rotate' and "
+    "restart the daemon)"
+)
+
 
 class GatewayClient:
     """Duck-typed wrapper that retries a ConnectError-caused refusal once."""

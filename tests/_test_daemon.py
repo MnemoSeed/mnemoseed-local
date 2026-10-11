@@ -30,6 +30,7 @@ import session_sweeper
 from _ports import LOOPBACK_HOST, unused_loopback_port
 
 from mnemoseed_local.cli import _OFF_POLL_TIMEOUT_S
+from mnemoseed_local.credential import DaemonCredentialError, read_credential_at
 from mnemoseed_local.daemon.watchdog import Watchdog, default_probe
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 
@@ -162,10 +163,23 @@ def _tear_down(daemon: DaemonUnderTest) -> None:
         if daemon.health is None:
             session_sweeper.register(daemon.proc.pid)
         else:
-            answer = DaemonClient(base_url=daemon.base_url, actor=TEST_ACTOR).post("/daemon/shutdown")
+            answer = _shutdown_client(daemon).post("/daemon/shutdown")
             assert answer == _SHUTDOWN_ANSWER, answer
             daemon.shutdown_answer = answer
             _assert_exited(daemon)
+
+
+def _shutdown_client(daemon: DaemonUnderTest) -> DaemonClient:
+    """The child's own client, carrying the credential the child issued.
+
+    The credential lives in the child's isolated home, so it is read from that
+    path — never from the config home of the process running the test.
+    """
+    try:
+        credential = read_credential_at(daemon.home)
+    except DaemonCredentialError as exc:
+        raise AssertionError(f"the daemon child issued no credential: {exc}") from None
+    return DaemonClient(base_url=daemon.base_url, actor=TEST_ACTOR, token=credential)
 
 
 def _assert_exited(daemon: DaemonUnderTest) -> None:

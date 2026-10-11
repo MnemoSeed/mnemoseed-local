@@ -10,10 +10,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers import (
@@ -116,7 +116,7 @@ def _ingest(client: TestClient, session_id: str, ts: float, text: str) -> None:
 
 
 def test_session_windows_exact_windows_newest_first_with_question_group(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _write_chunk(client, "c1", "s-old", 1.0, "old turn one")
         _write_chunk(client, "c2", "s-old", 2.0, "old turn two")
         _write_chunk(client, "c3", "s-old", 3.0, "old turn three")
@@ -130,6 +130,13 @@ def test_session_windows_exact_windows_newest_first_with_question_group(config_p
         assert payload["profile_id"] == PROFILE
         sessions = payload["sessions"]
         assert [s["session_id"] for s in sessions] == ["s-new", "s-old", "?"]
+        # reverse assertion: the same read without the credential is refused
+        refused = client.post(
+            "/session/windows",
+            json={"profile_id": PROFILE, "sessions": 5},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
         new_entry = sessions[0]
         assert new_entry["window"] == {"first": iso8601_utc(4.0), "latest": iso8601_utc(5.0)}
@@ -156,7 +163,7 @@ def test_session_windows_exact_windows_newest_first_with_question_group(config_p
 
 
 def test_session_windows_active_flags_only_unsettled_session(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-active", 1.0, "buffered session turn")
         flushed = client.post("/flush", json={"session_id": "sess-active", "profile_id": PROFILE})
         assert flushed.status_code == 200, flushed.text
@@ -178,7 +185,7 @@ def test_session_windows_truncated_when_session_exceeds_scan_limit(
     config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("mnemoseed_local.daemon.memory.SESSION_WINDOW_SCAN_LIMIT", 3)
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         for i in range(1, 5):
             _write_chunk(client, f"big-{i}", "s-big", float(i), f"big turn {i}")
         _write_chunk(client, "small-1", "s-small", 5.0, "small turn")
@@ -205,7 +212,7 @@ def test_session_windows_exactly_at_scan_limit_is_not_truncated(
     """A session with exactly SESSION_WINDOW_SCAN_LIMIT rows is complete: the
     truncation flag is true only when the scan-limit rows are exceeded."""
     monkeypatch.setattr("mnemoseed_local.daemon.memory.SESSION_WINDOW_SCAN_LIMIT", 3)
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         for i in range(1, 4):
             _write_chunk(client, f"c{i}", "s-exact", float(i), f"turn {i}")
 
@@ -221,7 +228,7 @@ def test_session_windows_exactly_at_scan_limit_is_not_truncated(
 def test_session_windows_non_positive_epoch_window_is_null(config_path: Path) -> None:
     """A zero or negative first epoch has no meaningful timestamp; the window
     renders as honest null instead of the 1970-01-01 epoch-leak trap."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _write_chunk(client, "c0", "s-zero", 0.0, "zero epoch")
         _write_chunk(client, "cneg", "s-neg", -5.0, "negative epoch")
         _write_chunk(client, "cpos", "s-pos", 5.0, "positive epoch")
@@ -236,7 +243,7 @@ def test_session_windows_non_positive_epoch_window_is_null(config_path: Path) ->
 
 
 def test_session_windows_rejects_out_of_range_sessions(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         body = client.post("/session/windows", json={"profile_id": PROFILE, "sessions": 0})
         assert body.status_code == 422
         body = client.post("/session/windows", json={"profile_id": PROFILE, "sessions": 11})
@@ -244,7 +251,7 @@ def test_session_windows_rejects_out_of_range_sessions(config_path: Path) -> Non
 
 
 def test_session_windows_empty_profile_and_default_cap(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         empty = client.post("/session/windows", json={"profile_id": PROFILE})
         assert empty.status_code == 200, empty.text
         assert empty.json() == {"profile_id": PROFILE, "sessions": []}

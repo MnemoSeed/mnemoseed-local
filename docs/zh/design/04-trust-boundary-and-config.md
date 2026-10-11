@@ -16,7 +16,7 @@
 
 范围四块：
 
-1. **信任边界**：daemon 仅 loopback 绑定、非回环 baseurl 拒绝启动；localhost 隐式信任 = 正确性前提（无账号/令牌层）；CLI / MCP / 宿主 hook 一律经 REST loopback 进入；本地单用户默认 default profile，多 profile 运行时的管理面（生命周期 + agent 绑定）见 §3.6。
+1. **信任边界**：daemon 仅 loopback 绑定、非回环 baseurl 拒绝启动；HTTP 面由本地 daemon 凭据把守（默认拒绝 + 精确路径集合，§3.1.1）；凭据不区分客户端身份（持 credential 即等价）；CLI / MCP / 宿主 hook 一律经 REST loopback 进入；本地单用户默认 default profile，多 profile 运行时的管理面（生命周期 + agent 绑定）见 §3.6。
 2. **secrets 三件套**：`FileSecretStore` + `ChainSecretStore` + `KeyringSecretStore`（`src/mnemoseed_local/secrets/`）；config 只存**引用**（`secrets:mnemoseed/dream/<role>` 或 env-var 名）；一切展示面 redaction（字面量 `<redacted>`、写入侧校验失败）。
 3. **configwrite 单一写者管线**：registry → 校验 → 外科式 TOML patch → 版本化 meta-store → 审计（actor 归因）→ 热生效；config.toml 是生成镜像，手改漂移侦测；DB-primary boot 覆层。
 4. **isolated 必需化 + 硬件档位/退阶**：isolated graph 实例四层强制（init 模板 / 加载校验 / boot 硬停 / doctor 硬查）；`dream.hardware_tier` 三档与 `dream.core_confidence_floor` 确定性降级。
@@ -179,9 +179,39 @@ flowchart TB
 |---|---|---|
 | daemon 仅 loopback | `daemon/app.py` `lifespan`（`app.py:659-664`）：`urlparse(config.baseurl).hostname` 非回环 → `RuntimeError` "the local MVP is localhost-only" | 非回环地址**拒绝启动**，不是告警后继续 |
 | 写面 loopback 纵深 | `configwrite/routes.py:40-59`：`_is_loopback`（含 `127.*` 前缀与 IPv4-mapped IPv6）+ `_reject_remote_writes` → 403 | 读面随 daemon 绑定天然受限；写面再设一道 403 纵深 |
-| 隐式信任 = 正确性前提 | `daemon/actor.py:15-19`：`X-MnemoSeed-Actor` 仅归因，`_VALID_ACTORS = cli/console/mcp`，wire 值不参与授权 | 无账号/令牌层是**有意的**（MVP §1 裁掉账号体系）；任何能到达本机回环的进程在信任模型内 |
+| 隐式信任 = 正确性前提 | `daemon/actor.py:15-19`：`X-MnemoSeed-Actor` 仅归因，`_VALID_ACTORS = cli/console/mcp`，wire 值不参与授权 | 无账号体系是**有意的**（MVP §1 裁掉账号体系）；凭据不区分客户端身份——持 credential 即等价，actor 仍是自声明归因、不参与授权（§3.1.1） |
 | 多 profile 运行时 | 全部内存/摄取路由显式携带 `profile_id`（schema/turn、daemon/memory、ingest）；存储各层按 profile_id 键控 | 数据面是 N 个隐式隔离命名空间（惯例单个 `default`，无需表行）；生命周期与 agent→profile 绑定管理面见 §3.6 |
 | 记忆明文不出本机 | 无任何出站内存路径；`openai_compatible` 驱动仅作代码内保留（MVP §4.8"BYOK 推迟"） | 纯本地；BYOK 属 Phase B 后显式 opt-in（§4.1「未实施/在途」） |
+
+#### 3.1.1 daemon 凭据边界（本地 bearer）
+
+**命名约定（B6）**：本机制一律称 **credential / daemon credential（daemon 凭据）**。本仓 "token" 一词专指 LLM token（上下文窗口、`max_tokens`、`num_predict`、token 预算），**不得**用来指这个 bearer 凭据；唯一的历史残留是 `credential.py` 的 `TokenVerifier` Protocol 名（签发方校验 seam，不指凭据值本身）。
+
+三条机械规则（B1）：
+
+1. **默认拒绝**：未命中开放集合的请求一律 401（常量 detail + `WWW-Authenticate: Bearer`），不回显任何请求材料。
+2. **精确等值匹配、零路径规范化**：禁前缀匹配，禁 `rstrip` / `normpath` / 大小写折叠——`/healthz/../api/v1/audit` 因此**不在**开放集合内，与其它未知路径一样被拒。
+3. **开放集合 = enumerated set**：`/healthz`、`/health`（liveness 探针，四个真实消费者依赖它）+ console 三文件（`/`、`/index.html`、`/app.js`、`/style.css`，lifespan 启动时从 `console/static/` 枚举）。新增文件未枚举 = console 白屏：fail-closed 且当场可见。关闭：`/mcp/handshake`（任意进程可写的自增计数）、`/daemon/shutdown`（DoS 面）、全部 `/api/v1/*`、`/ingest` `/session/*` `/memory/*`、configwrite 路由。
+
+实现锚点：`credential.py`（`TokenVerifier` Protocol + `LocalFileTokenVerifier` + `read_credential` / `issue_credential` / `rotate_credential`；`CONFIG_DIR` **函数内 call-time 解析**——`create_app()` 是模块级的，解析时机放错 = import 即写真实 home）；`daemon/auth.py`（纯 ASGI 中间件——禁 `BaseHTTPMiddleware`，它的 task-group 调度会重排 respond-then-run 接缝，`/daemon/shutdown` 依赖该接缝；认证中间件包住日志中间件，故 401 不产生日志行）；`rest_client.py` `DaemonClient.token`（frozen dataclass 末位字段）+ `client_for`（客户端唯一入口，凭据只在这一处附加）。
+
+凭据本身：`<config home>/secrets/daemon.credential.key`，复用 `FileSecretStore`（原子替换 + POSIX 0700/0600；Windows 上"用户 profile ACL 是强制边界、不 chmod/不 icacls"的既有表述不变）。daemon lifespan 启动时 create-if-absent（**只在 daemon 侧写**）；重启不重签；轮换 = `mnemoseed-local credential rotate`（不新增 HTTP 路由，每请求解析让新值下次请求即生效）；在途窗口如实记录：恰好跨在写盘前后的那一个请求会被拒一次（401），随后即通——这是已接受的窗口，不是缺陷；`uninstall --purge` 连带删除（隐性轮换路径）。
+
+console 认证（B3，同源 cookie）：中间件在**文档响应**上种 cookie，条件 = 路径 ∈ 文档集合 且 `Host` 主机名 ∈ `{127.0.0.1, ::1, localhost, 127.*}` 且（无 `Origin` 头或 `Origin` 与 `Host` 同源）；cookie = `<credential>`，`HttpOnly; SameSite=Strict; Path=/`；中间件认该 cookie 为 bearer 等价物。三段机制收益：跨站 fetch 不带 cookie（SameSite=Strict）→ 401；`Authorization: Bearer` 非 CORS-safelisted → 跨源必 preflight 且无凭据 preflight 返 401；DNS-rebinding 页 Host 非回环 → 拿不到 cookie 且被拒。**凭据从不进 DOM。**
+
+失败语义：客户端侧 `DaemonCredentialError`（文件缺失/损坏，文案给动作）；daemon 侧 401 走 `DAEMON_AUTH_HINT`（点名两个最常见真实原因：client 与 daemon 用不同 `MNEMOSEED_LOCAL_HOME`，或凭据被轮换）——**401 永不被说成"daemon 没起"**；`GatewayClient` 只对 `ConnectError` 重试，401 不重试（测试钉死）。
+
+issuer-swap seam（I6）：`create_app(*, token_verifier=None)`；None = 每请求 CONFIG_DIR 解析的本地 verifier，显式传入即换签发方（测试用一个只认自己 token 的 stub verifier 模拟未来云端 AS）。客户端无任何"哪种签发方"分支：`_headers()` 除 `Authorization` 外不新增任何签发方相关头（反向钉死）。
+
+泄露守门（I9）：canary 测试（已知凭据起 app，断言它不出现在 daemon.log、`/api/v1/audit` 与 `/memory/audit` 行、401 响应体、`GET /` 与 `/app.js` 返回体）；401 detail 常量；中间件日志只写 method+path+status；`credential.py` 与中间件内无任何 logger/print 调用（源级禁令测试）。
+
+#### 3.1.2 威胁模型诚实边界（原样写下）
+
+**不防**：①同用户恶意软件/任意同用户进程可读凭据文件并冒充客户端（§3.2 secret 文件同款边界）；②root/admin/SeDebug、home 备份、内存与 pagefile；③**不区分客户端身份**——持 credential 即等价，`X-MnemoSeed-Actor` 仍是自声明归因、不参与授权；④静态数据（meta.db/chunks.lance）仍明文；⑤console 同源 JS（XSS）等于用户本人；⑥**通配符 bind + 无 TLS = 凭据局域网裸奔**（今天是完全无认证暴露；有凭据后至少是有认证的；非回环 `--host` 拒绝启动属单独切片，本节仅如实记录）。
+
+**开放 `/healthz` 的取舍**：watchdog 走裸 TCP connect、`announce_ready` / `daemon_reachable` / CLI 与 console 圆点四个消费者依赖它；代价 = 基建元数据（preset/drivers/migrations/gate/uptime）对同机进程与可 DNS-rebinding 的网页可见——侦察价值，非记忆内容，其上无写。
+
+**测试面**：`tests/auth_support.py` 是唯一入口（`seed_credential` / `credential_headers` / `boot`），没有也不允许有任何"测试模式跳过认证"的开关；每个迁移组自带"去掉 header 就 401"的反向断言防假绿。
 
 ### 3.2 secrets 三件套
 
@@ -292,7 +322,7 @@ flowchart TB
 
 **诚实边界（B2.5 式不借清单，工程控制面如实标注）**：
 
-- **非 loopback 信任的 auth/token 未实施**（#109 item 3，PRD-06 仅保留端口形状）：loopback 隐式信任仍是唯一信任模型，绑定故事最终需要的令牌层属 Phase B 后显式 opt-in。
+- **凭据边界已落地，完整 OAuth 仍未实施**（#239）：本地 daemon 凭据 + `TokenVerifier` seam 已把住 HTTP 面（§3.1.1）；#217 的 loopback HTTP MCP transport 与完整 OAuth 2.1（PKCE / 动态客户端注册 / token 与 refresh 端点）属后续，凭据的签发方可在不改客户端的前提下替换。
 - **绑定不改变路由**：v1 中跨 profile 隔离仍由 hook/客户端显式携带的 `profile_id`（env-var 或宿主配置）承担；"第二 agent 经产品面指到第二 profile 并自动改道摄取" 属设计后续，不在本节交付内。
 - **hook 载荷父子 session 关联不在范围**：#75 P1 门未关，v1 保持 flat sessions 如实入账。
 - **无理论借用**：生命周期动词、绑定注册表、persona 标签都是工程控制面，照 PRD-B2.5 措辞纪律不给任何机制穿认知词汇。

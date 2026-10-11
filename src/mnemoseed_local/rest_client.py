@@ -2,10 +2,15 @@
 
 Every state-changing CLI verb talks to the daemon through this client instead
 of touching ``config.toml`` or the storage layers directly: base URL comes from
-``--baseurl`` / ``config.baseurl``; the profile is ``MNEMOSEED_LOCAL_PROFILE_ID``
-or the ``default`` profile (no identity/accounts in the local MVP); and every
-call forwards ``X-MnemoSeed-Actor: cli`` so the daemon attributes audit entries
-to the CLI surface.
+``--baseurl`` / ``config.baseurl``; the profile is
+``MNEMOSEED_LOCAL_PROFILE_ID`` or the ``default`` profile (no identity/accounts
+in the local MVP); and every call forwards ``X-MnemoSeed-Actor: cli`` so the
+daemon attributes audit entries to the CLI surface.
+
+The daemon credential rides the same client: :func:`client_for` is the one
+place a client picks it up, and it attaches it as a bearer header. Which issuer
+signed the value is none of the client's business — that is the seam that lets
+a cloud authorization server replace the local one without touching a caller.
 """
 
 from __future__ import annotations
@@ -19,9 +24,20 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from mnemoseed_local.credential import read_credential_or_none
+
 #: Audit-attribution header the daemon trusts (actor cli|console|mcp|hook).
 ACTOR_HEADER = "X-MnemoSeed-Actor"
 DEFAULT_ACTOR = "cli"
+
+#: The bearer header carrying the daemon credential.
+AUTHORIZATION_HEADER = "Authorization"
+
+
+def credential_headers(credential: str) -> dict[str, str]:
+    """The header set that presents a daemon credential (the client contract)."""
+    return {AUTHORIZATION_HEADER: f"Bearer {credential}"}
+
 
 #: The local MVP's single profile at the application boundary.
 DEFAULT_PROFILE_ID = "default"
@@ -55,9 +71,16 @@ class DaemonClient:
     # httpx.Timeout allowed so per-phase budgets (hook SessionEnd lane) ride
     # the same client without a second request path.
     timeout: float | httpx.Timeout = REQUEST_TIMEOUT_SECONDS
+    # The daemon credential this client presents. None means nothing is
+    # attached; every production client picks the value up through
+    # :func:`client_for`, so no call site drifts into forgetting it.
+    token: str | None = None
 
     def _headers(self) -> dict[str, str]:
-        return {ACTOR_HEADER: self.actor}
+        headers = {ACTOR_HEADER: self.actor}
+        if self.token:
+            headers.update(credential_headers(self.token))
+        return headers
 
     def _decode(self, response: httpx.Response) -> dict[str, Any]:
         if response.status_code >= 400:
@@ -113,6 +136,27 @@ def _arg_baseurl(args: Any) -> str | None:
     return str(value).rstrip("/") if value else None
 
 
+def client_for(
+    base_url: str,
+    *,
+    profile_id: str = DEFAULT_PROFILE_ID,
+    actor: str = DEFAULT_ACTOR,
+    timeout: float | httpx.Timeout = REQUEST_TIMEOUT_SECONDS,
+) -> DaemonClient:
+    """The single channel every daemon HTTP client is built through.
+
+    The daemon credential is attached here and nowhere else, so a client that
+    stands itself up still presents it instead of being refused at the gate.
+    """
+    return DaemonClient(
+        base_url=base_url,
+        profile_id=profile_id,
+        actor=actor,
+        timeout=timeout,
+        token=read_credential_or_none(),
+    )
+
+
 def resolve_client(args: Any, *, require_session: bool = False) -> DaemonClient:
     """Build a client from the CLI args + config.
 
@@ -130,7 +174,7 @@ def resolve_client(args: Any, *, require_session: bool = False) -> DaemonClient:
     profile_id = os.environ.get("MNEMOSEED_LOCAL_PROFILE_ID") or DEFAULT_PROFILE_ID
     if require_session and not profile_id:
         raise DaemonUnavailableError("no profile selected: set MNEMOSEED_LOCAL_PROFILE_ID")
-    return DaemonClient(base_url=base_url, profile_id=profile_id)
+    return client_for(base_url, profile_id=profile_id)
 
 
 # ---------------------------------------------------------------- config --force offline escape

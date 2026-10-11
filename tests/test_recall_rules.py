@@ -17,10 +17,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.stamp import CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -85,8 +84,7 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_remember_new_branch_stores_rules(config_path: Path) -> None:
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         rules = [
             {
                 "kind": "exclude_entities",
@@ -101,16 +99,22 @@ def test_remember_new_branch_stores_rules(config_path: Path) -> None:
         )
         assert body.status_code == 200, body.text
         assert body.json()["outcome"] == "new_chunk"
-        got = app.state.stores.vector.get_chunk(body.json()["chunk_id"])
+        got = client.app.state.stores.vector.get_chunk(body.json()["chunk_id"])
         assert got is not None
         assert got.rules == rules
+        # reverse assertion: the pin refuses a caller with no credential
+        refused = client.post(
+            "/memory/remember",
+            json={"profile_id": PROFILE, "text": "pin a fresh fact", "rules": rules},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_remember_reinforce_branch_merges_rules(config_path: Path) -> None:
     """Identical re-pin hits the strong-consistent branch; the new rules merge
     with the stored ones (union, ttl_turns takes the larger value)."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         r1 = {
             "kind": "exclude_entities",
             "value": ["a"],
@@ -135,7 +139,7 @@ def test_remember_reinforce_branch_merges_rules(config_path: Path) -> None:
         ).json()
         assert b2["outcome"] == "reinforced"
         assert b2["chunk_id"] == cid
-        got = app.state.stores.vector.get_chunk(cid)
+        got = client.app.state.stores.vector.get_chunk(cid)
         assert got is not None
         assert {(tuple(rule["value"]), rule["scope"]) for rule in got.rules} == {
             (("a",), "session"),
@@ -152,8 +156,7 @@ def test_remember_conflict_branch_merges_rules_and_marks_reconcile(
     from mnemoseed_local.schema.stamp import ChunkStamp
     from mnemoseed_local.storage.ports import ChunkFilter, Page
 
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         stores = client.app.state.stores
         emb = stores.embed.embed("conflict fact text")
         stores.vector.upsert_chunk(
@@ -221,7 +224,7 @@ def test_remember_conflict_branch_merges_rules_and_marks_reconcile(
 def test_session_recent_rules_budget_absent_when_no_rules(config_path: Path) -> None:
     """Absent semantics: with no rules the ``rules_budget`` key is OMITTED, so
     the exact-match empty-profile pin is preserved."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
         payload = body.json()
@@ -232,8 +235,7 @@ def test_session_recent_rules_budget_absent_when_no_rules(config_path: Path) -> 
 def test_session_recent_rules_budget_aggregates_and_scopes(config_path: Path) -> None:
     """Session/profile/global rules aggregate; another session's session-scoped
     rules never leak in. exclude_entities unions, entity_boost takes the max."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         client.post(
             "/memory/remember",
             json={
@@ -365,8 +367,7 @@ def test_upsert_chunk_merges_rules_keeps_larger_ttl_when_old_larger_via_remember
     config_path: Path,
 ) -> None:
     """Daemon merge path: old ttl=9, new ttl=1 -> stored ttl stays 9 (max)."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         rule_old = {
             "kind": "exclude_entities",
             "value": ["a"],
@@ -389,15 +390,14 @@ def test_upsert_chunk_merges_rules_keeps_larger_ttl_when_old_larger_via_remember
             "/memory/remember", json={"profile_id": PROFILE, "text": "ttl keep old", "rules": [rule_new]}
         ).json()
         assert r2["chunk_id"] == cid
-        got = app.state.stores.vector.get_chunk(cid)
+        got = client.app.state.stores.vector.get_chunk(cid)
         assert got is not None
         assert got.rules == [{**rule_old, "ttl_turns": 9}]
 
 
 def test_session_recent_malformed_rules_does_not_crash(config_path: Path) -> None:
     """A chunk with an invalid rule kind must not crash /session/recent."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         stores = client.app.state.stores
         from mnemoseed_local.schema.stamp import ChunkStamp
 
@@ -424,8 +424,7 @@ def test_session_recent_malformed_rules_does_not_crash(config_path: Path) -> Non
 
 
 def test_session_recent_includes_global_scope(config_path: Path) -> None:
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         client.post(
             "/memory/remember",
             json={
@@ -464,7 +463,7 @@ def test_mcp_remember_omits_rules_when_absent() -> None:
 
 def test_session_recent_never_emits_rules_budget_null(config_path: Path) -> None:
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
         raw = body.text
@@ -536,8 +535,7 @@ def test_session_recent_on_pre_b27_table_succeeds(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(tmp_path) as client:
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
         assert body.json()["sessions"] == []

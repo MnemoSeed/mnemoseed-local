@@ -16,10 +16,9 @@ import subprocess
 from importlib import resources
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
-
-from mnemoseed_local.daemon.app import create_app
 
 PROFILE = "default"
 DRIVER = Path(__file__).parent / "ts_hook" / "hook_driver.mjs"
@@ -227,7 +226,7 @@ def test_b2_1_non_ascii_oracle_matches_json_stringify_semantics(b2_hook_config: 
     assert "\\u" in escaped
     # (c) daemon wire carries the literal-Unicode advisory verbatim (HTTP/JSON is
     # utf-8-safe, unlike the Node subprocess pipe used only for structural checks):
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_hook_config.parent) as client:
         _author_standing(client, advisory)
         _fire_quota(client, "sess-uni")
         data = client.post(
@@ -241,7 +240,7 @@ def test_b2_1_quota_event_serves_exact_advisory_from_daemon(b2_hook_config: Path
     """M-B2-1 (daemon side): a quota event -> /ingest -> recall_pending returns
     rule_served=true + the exact ruling advisory + provenance."""
     advisory = _canonical_advisory()
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_hook_config.parent) as client:
         _author_standing(client, advisory)
         _fire_quota(client, "sess-e2e")
         data = client.post(
@@ -252,6 +251,13 @@ def test_b2_1_quota_event_serves_exact_advisory_from_daemon(b2_hook_config: Path
         assert data["rule_advisory"] == advisory
         assert data["matched_rule_source"] == "memory.remember"
         assert data["reason"] is None
+        # reverse assertion: the same pull without the credential is refused
+        refused = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-e2e"},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_b2_1_joined_hook_budget_unchanged_when_advisory_renders(
@@ -265,7 +271,7 @@ def test_b2_1_joined_hook_budget_unchanged_when_advisory_renders(
     fenced = _expected_fenced_block(advisory)
     # the fenced advisory is the ONLY injected fence here (items empty); ensure
     # it does not exceed the per-turn total and the daemon budget stayed 2400.
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_hook_config.parent) as client:
         _author_standing(client, advisory)
         _fire_quota(client, "sess-bud")
         data = client.post(
@@ -311,7 +317,7 @@ def test_b2_22_advisory_content_capped(b2_hook_config: Path) -> None:
     the NEW code constant, not a config key (verified structurally via the
     truncate scenario's 1200-char bound)."""
     advisory = _canonical_advisory()
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_hook_config.parent) as client:
         _author_standing(client, advisory)
         _fire_quota(client, "sess-cap")
         data = client.post(
@@ -326,7 +332,7 @@ def test_b2_23_daemon_selection_offer_only_no_render_roundtrip(b2_hook_config: P
     """M-B2-23: the daemon reports selection/offer only (rule_served=true) and
     never round-trips a hook render-receipt or disposition."""
     advisory = _canonical_advisory()
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_hook_config.parent) as client:
         _author_standing(client, advisory)
         _fire_quota(client, "sess-hon")
         data = client.post(

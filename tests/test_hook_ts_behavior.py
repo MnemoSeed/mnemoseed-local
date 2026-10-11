@@ -157,6 +157,22 @@ def test_outage_hole_is_replayed_in_process_before_later_acks_leapfrog_it(tmp_pa
 # ---------------------------------------------------------------- B2.1 T1/T3 (auto recall)
 
 
+def test_every_daemon_fetch_carries_the_daemon_credential(tmp_path: Path) -> None:
+    """The plugin reads the credential the daemon wrote and attaches it to
+    every daemon call — and attaches nothing when the home has none."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "credential-header")
+
+    authorized = transcript["authorized"]
+    assert authorized, "the seeded authorized turn produced no daemon request"
+    for post in authorized:
+        assert post["authorization"] == "Bearer driver-issued-credential"
+        assert post["contentType"] == "application/json"
+
+    assert transcript["unauthenticatedCount"] == 1
+    assert transcript["unauthenticatedAuthorization"] == [None]
+
+
 def test_inject_once_injects_a_fenced_recall_block_and_is_attempt_once(tmp_path: Path) -> None:
     """PRD-B2.1 T1 (TA-3/TA-5): the session-start transform injects a fenced
     memory-replay block exactly once per session. An invalid system shape

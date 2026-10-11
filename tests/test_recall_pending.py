@@ -20,10 +20,10 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.graph import GraphNode, NodeType
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.schema.turn import HostId
@@ -147,7 +147,7 @@ def _store_chunks(client: TestClient) -> dict[str, str]:
 def test_recall_pending_gated_off_answers_disabled_and_consumes_nothing(config_path: Path) -> None:
     """capture.auto_recall = false: the pull answers enabled:false with
     an empty selection, never scans, and never consumes anything."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -167,7 +167,7 @@ def test_recall_pending_serves_focal_entities_once_and_marks_seen(recall_config_
     a second pull finds the slot consumed (serve = mark-seen): the consumed
     tombstone answers slot_consumed:true with an empty selection so the hook
     clears its arm (QA BLOCKER-2)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -189,7 +189,7 @@ def test_recall_pending_serves_focal_entities_once_and_marks_seen(recall_config_
 def test_recall_pending_items_carry_pin_source_for_injection(recall_config_path: Path) -> None:
     """R2 provenance-trust injection wire: each served pending item carries its
     pin/source signal so the T2 injection host can mark pins (source == memory.remember)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         store = client.app.state.stores
         stamp = ChunkStamp(
             chunk_id="pin-src",
@@ -219,7 +219,7 @@ def test_recall_pending_consumed_tombstone_survives_until_session_end(recall_con
     lifecycle state (a later pull answers slot_consumed:false and materializes
     nothing per NIT-6); a fresh scan afterwards parks a NEW slot that serves
     normally — the tombstone never leaks across the epoch."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -227,6 +227,13 @@ def test_recall_pending_consumed_tombstone_survives_until_session_end(recall_con
         assert first["enabled"] is True
         assert first["slot_consumed"] is True
         assert len(first["items"]) == 1
+        # reverse assertion: the same pull without the credential is refused
+        refused = client.post(
+            "/session/recall-pending",
+            json={"profile_id": PROFILE, "session_id": "sess-b"},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
         # the retry after a serve: the slot is gone, the tombstone answers
         retry = _pull(client, "sess-b")
         for k, v in {
@@ -260,7 +267,7 @@ def test_recall_pending_merges_hook_seen_ids_before_selecting(recall_config_path
     """D2: the hook's T1-seen chunk ids are merged into the selection — a
     chunk the caller already saw is filtered out; the slot survives an empty
     serve so a fresh pull can still consume it."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -273,7 +280,7 @@ def test_recall_pending_excludes_the_requesting_session(recall_config_path: Path
     """The scan never serves the requesting session's own chunks — the older
     session's LanceDb decision comes back, the in-flight session's turn 0
     does not."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "我们继续做 LanceDb 的接入")
@@ -288,7 +295,7 @@ def test_recall_pending_excludes_the_requesting_session(recall_config_path: Path
 def test_recall_pending_assistant_message_does_not_scan(recall_config_path: Path) -> None:
     """D1: only user_prompt ingests run the focal scan — an assistant reply
     leaves the slot empty."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 相关的说明", event="assistant_message")
@@ -303,7 +310,7 @@ def test_recall_pending_assistant_message_does_not_scan(recall_config_path: Path
 def test_recall_pending_reports_non_focal_above_floor(recall_config_path: Path) -> None:
     """D3/T4: decay-healthy chunks the focal scan did NOT select (no entity
     overlap) ride along as the non_focal_above_floor calibration count."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb 作为向量存储")
         _ingest(client, "sess-a", 1.5, "please keep the design simple and honest")
         _settle(client, "sess-a")
@@ -318,7 +325,7 @@ def test_recall_pending_reports_non_focal_above_floor(recall_config_path: Path) 
 def test_recall_pending_below_focal_floor_is_excluded(recall_config_path: Path) -> None:
     """The focal scan honors the decay floor: a decayed-away chunk is neither
     selected nor counted."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb 相关内容")
         _settle(client, "sess-a")
         chunk_id = _store_chunks(client)["user: LanceDb 相关内容"]
@@ -350,7 +357,7 @@ def test_recall_pending_same_stamp_tie_breaks_by_turn_start(recall_config_path: 
     """D4 tie-break three-key pin: two chunks with the SAME decay_weight and
     the SAME ingested_at (a B6 batch drain stamps one clock tick) are selected
     by turn_start desc — the tie no longer depends on timestamp uniqueness."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         stores = client.app.state.stores
         for turn_start, chunk_id, text in [
             (1, "tie-newer", "LanceDb 平局的新轮"),
@@ -384,7 +391,7 @@ def test_recall_pending_budget_admits_greedy_decay_and_drops_the_rest(
     is dropped wholesale (T1 slice semantics: a slice below 200 chars is
     dropped entirely)."""
     _budget_config(tmp_path, monkeypatch, budget=300)
-    with TestClient(create_app()) as client:
+    with auth_support.boot(tmp_path) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb " + "甲" * 200)
         _ingest(client, "sess-a", 2.0, "LanceDb " + "乙" * 200)
         _ingest(client, "sess-a", 3.0, "LanceDb " + "丙" * 150)
@@ -412,7 +419,7 @@ def test_recall_pending_budget_tail_slices_the_boundary_item(
     sized at remaining-budget minus the 2-char marker/newline — and the total
     never exceeds the budget."""
     _budget_config(tmp_path, monkeypatch, budget=560)
-    with TestClient(create_app()) as client:
+    with auth_support.boot(tmp_path) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb " + "甲" * 300)
         _ingest(client, "sess-a", 2.0, "LanceDb " + "乙" * 300)
         _settle(client, "sess-a")
@@ -436,7 +443,7 @@ def test_recall_pending_budget_tail_slices_the_boundary_item(
 def test_recall_pending_session_end_drops_the_pending_slot(recall_config_path: Path) -> None:
     """/session/end settles the session and drops its pending slot — a pull
     after the settle finds nothing to serve."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -450,7 +457,7 @@ def test_recall_pending_session_end_drops_the_pending_slot(recall_config_path: P
 def test_recall_pending_hot_applies_via_configwrite(config_path: Path) -> None:
     """D5: capture.auto_recall hot-applies through the configwrite surface —
     the daemon's pull answers enabled:false until the key flips true."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -468,7 +475,7 @@ def test_recall_pending_hot_applies_via_configwrite(config_path: Path) -> None:
 def test_recall_pending_rejects_bad_bodies(config_path: Path) -> None:
     """Wire validation mirrors the sibling surfaces: a blank profile or a
     seen list over the 16-id cap is a 422."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post("/session/recall-pending", json={"profile_id": "", "session_id": "sess-b"})
         assert response.status_code == 422
         response = client.post(
@@ -488,7 +495,7 @@ def test_recall_pending_rejects_bad_bodies(config_path: Path) -> None:
 def test_recall_pending_admits_decay_exactly_at_the_focal_floor(recall_config_path: Path) -> None:
     """The focal floor is a >= gate: decay_weight == 0.5 (the default floor)
     IS admitted — the 0.3-excluded pin above pins the other side."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb 相关内容")
         _settle(client, "sess-a")
         chunk_id = _store_chunks(client)["user: LanceDb 相关内容"]
@@ -503,7 +510,7 @@ def test_recall_pending_config_off_pull_consumes_nothing_and_marks_nothing(confi
     """NIT-4: the serve+mark is gated on `enabled` — a config-off pull returns
     enabled:false / empty WITHOUT consuming the parked slot or marking its ids
     seen; flipping the config back on serves the parked selection."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         _ingest(client, "sess-b", 2.0, "LanceDb 现在处于什么阶段")
@@ -542,7 +549,7 @@ def test_recall_pending_unknown_session_materializes_no_seen_set(recall_config_p
     """NIT-6: a pull for a session with no slot must not materialize an empty
     seen-set, a tombstone, or any other lifecycle state (setdefault leak —
     white-box on the service attribute)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         payload = _pull(client, "never-seen")
         assert payload["items"] == []
         memory = client.app.state.memory
@@ -555,7 +562,7 @@ def test_recall_pending_stale_scan_cannot_overwrite_a_newer_slot(recall_config_p
     """NIT-5a: two in-flight scans for one session — the LAST to START wins;
     a scan that captured its sequence before a newer scan wrote must NOT
     overwrite the newer selection."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         service = client.app.state.memory
@@ -591,7 +598,7 @@ def test_recall_pending_scan_before_end_session_cannot_repark(recall_config_path
     """NIT-5b: a scan started BEFORE /session/end settles the session must not
     re-park a slot afterwards (the settle is terminal — no pull will ever
     come)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         service = client.app.state.memory
@@ -628,7 +635,7 @@ def test_recall_pending_concurrent_pulls_serve_each_item_exactly_once(
     """Lock-removal mutant: two concurrent pulls of one slot must partition it
     exactly — the union of served ids has N distinct items and no id appears
     twice across the responses (serve = mark-seen is atomic under the lock)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "LanceDb " + "甲" * 200)
         _ingest(client, "sess-a", 2.0, "LanceDb " + "乙" * 200)
         _settle(client, "sess-a")
@@ -662,7 +669,7 @@ def test_recall_pending_chunk_precedes_node_on_identical_decay_and_stamp(
     """Admission order at an identical (decay, stamp) tie is page-order-stable:
     the vector-page chunk precedes the graph-page node (the candidate list
     appends chunks first, and Python's sort is stable)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(recall_config_path.parent) as client:
         _ingest(client, "sess-a", 1.0, "上一轮我们把 LanceDb 定为向量存储")
         _settle(client, "sess-a")
         chunk_id = _store_chunks(client)["user: 上一轮我们把 LanceDb 定为向量存储"]

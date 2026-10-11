@@ -26,7 +26,7 @@
 **边界**：
 
 - 宿主面今日只有一个：`hook` 动词的 `host` 参数 choices 只 pin `"opencode"`（cli.py:957-963），`claude_code`/`codex` 仅列于帮助文案为规划项。
-- 本层纯本地：daemon 只绑 loopback（非回环 baseurl 启动/doctor/config 操作一律拒绝），无账号/token；profile 仅 `MNEMOSEED_LOCAL_PROFILE_ID` 或 `default` 单值。
+- 本层纯本地：daemon 只绑 loopback（非回环 baseurl 启动/doctor/config 操作一律拒绝）；HTTP 面由**本地 daemon 凭据**把守（默认拒绝 + 精确路径集合，未带凭据一律 401，见 design/04 §3.1.1），hook / MCP / CLI / console 各自经同一条"取凭据 → 带 bearer header"通道取用，**没有账号体系、也没有 OAuth 流程**；profile 仅 `MNEMOSEED_LOCAL_PROFILE_ID` 或 `default` 单值。
 - 神经科学映射沿用主仓 06：hook 是**反射弧**（宿主自动触发、零 token 捕获），MCP 是**语言通路**（模型自觉询问与陈述）——本仓移植同构，但映射只作文案框架，不构成理论借用（见 §2）。
 
 ---

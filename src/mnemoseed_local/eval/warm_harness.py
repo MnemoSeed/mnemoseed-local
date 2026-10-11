@@ -27,8 +27,7 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
-from mnemoseed_local.eval.recall_harness import _point_config, release_daemon_log_handler
+from mnemoseed_local.eval.recall_harness import _point_config, release_daemon_log_handler, rig_client
 
 # re-export: the shared freshness contract keeps its historical import path
 from mnemoseed_local.eval.rig_freshness import RigRootNotFresh as RigRootNotFresh
@@ -102,7 +101,7 @@ class WarmRig:
         stack = ExitStack()
         try:
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
-            self._client = stack.enter_context(TestClient(create_app()))
+            self._client = stack.enter_context(rig_client())
             if self.activation_enabled:
                 self._state.memory._activation = ShortTermActivation(
                     enabled=True,

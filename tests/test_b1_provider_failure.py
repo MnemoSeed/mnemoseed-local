@@ -11,10 +11,9 @@ import re
 import time
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import HostId, IngestEvent, IngestEventType
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -154,16 +153,20 @@ def test_migration_head_is_version_15() -> None:
 
 
 def test_error_events_has_v12_columns(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         conn = meta._conn  # type: ignore[attr-defined]
         cols = [row[1] for row in conn.execute("PRAGMA table_info(error_events)")]
         for col in ("provider", "model", "status", "reason", "retryable"):
             assert col in cols
+        # reverse assertion: the store is reachable only behind the credential
+        assert client.get("/api/v1/audit").status_code == 200
+        refused = client.get("/api/v1/audit", headers={"Authorization": "Bearer not-the-credential"})
+        assert refused.status_code == 401
 
 
 def test_append_error_event_persists_v12_fields(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         evt = ErrorEvent(
             profile_id=PROFILE,
@@ -194,7 +197,7 @@ def test_append_error_event_persists_v12_fields(b1_config: Path) -> None:
 
 
 def test_ingest_provider_error_nominates_row(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         resp = client.post(
             "/ingest",
             json={
@@ -217,10 +220,24 @@ def test_ingest_provider_error_nominates_row(b1_config: Path) -> None:
         page = meta.query_error_events(ErrorEventFilter(profile_id=PROFILE), Page(0, 10))
         assert len(page.items) == 1
         assert page.items[0].signal_type == ErrorSignalType.PROVIDER_FAILURE
+        # reverse assertion: the same ingest without the credential is refused
+        refused = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "provider_error",
+                "session_id": "sess-1",
+                "profile_id": PROFILE,
+                "ts": time.time(),
+                "content": {"provider": "openai", "model": "gpt-4o", "status": "quota"},
+            },
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_ingest_provider_error_invalid_status_dropped_not_500(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         resp = client.post(
             "/ingest",
             json={
@@ -265,7 +282,7 @@ def test_hook_body_passes_daemon_validator(b1_config: Path) -> None:
     evt = IngestEvent.model_validate(body)
     assert evt.event == IngestEventType.PROVIDER_ERROR
     # also POST through real handler
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         resp = client.post("/ingest", json=body)
         assert resp.status_code == 202, resp.text
 
@@ -274,7 +291,7 @@ def test_hook_body_passes_daemon_validator(b1_config: Path) -> None:
 
 
 def test_serve_explicit_unresolved_when_no_rule(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post(
             "/ingest",
             json={
@@ -305,7 +322,7 @@ def test_serve_explicit_unresolved_when_no_rule(b1_config: Path) -> None:
 
 
 def test_serve_flags_wire_shape(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post(
             "/ingest",
             json={
@@ -341,7 +358,7 @@ def test_serve_flags_wire_shape(b1_config: Path) -> None:
 
 
 def test_btype_event_outcome_does_not_arm_serve(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         # B-type EVENT_OUTCOME row (build failure) must NOT arm provider serve
         meta.append_error_event(
@@ -384,7 +401,7 @@ def test_btype_event_outcome_does_not_arm_serve(b1_config: Path) -> None:
 
 
 def test_error_read_roundtrip(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post(
             "/ingest",
             json={
@@ -415,7 +432,7 @@ def test_error_read_roundtrip(b1_config: Path) -> None:
 
 
 def test_redaction_keeps_fingerprint_not_empty(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         # secret-bearing payload: raw message contains token-like substring
         resp = client.post(
             "/ingest",
@@ -462,7 +479,7 @@ def test_alternate_bucket_storm_debounce(b1_config: Path) -> None:
 
 def test_cross_session_isolation_debounce(b1_config: Path) -> None:
     # same provider/model/error_id in different sessions must each nominate
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         for sess in ("sess-a", "sess-b"):
             client.post(
                 "/ingest",
@@ -490,7 +507,7 @@ def test_cross_session_isolation_debounce(b1_config: Path) -> None:
 
 
 def test_error_order_under_clock_ack(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         meta = client.app.state.stores.meta
         # insert with out-of-order observed_at but id order is monotonic
         for i in range(3):
@@ -515,7 +532,7 @@ def test_error_order_under_clock_ack(b1_config: Path) -> None:
 
 
 def test_negative_no_event_no_nomination(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         data = client.post(
             "/session/recall-pending", json={"profile_id": PROFILE, "session_id": "sess-none"}
         ).json()
@@ -525,7 +542,7 @@ def test_negative_no_event_no_nomination(b1_config: Path) -> None:
 
 
 def test_global_disable_via_auto_recall(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         client.post(
             "/ingest",
             json={
@@ -554,7 +571,7 @@ def test_global_disable_via_auto_recall(b1_config: Path) -> None:
 
 
 def test_forget_via_existing_endpoint(b1_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b1_config.parent) as client:
         # create a pin chunk via /memory/remember to have something to forget
         remember = client.post("/memory/remember", json={"profile_id": PROFILE, "text": "LanceDb is great"})
         assert remember.status_code == 200, remember.text

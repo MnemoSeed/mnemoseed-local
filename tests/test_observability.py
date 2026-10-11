@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -85,8 +86,8 @@ def recall_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return _write_config(tmp_path, monkeypatch, "[capture]\nauto_recall = true\n")
 
 
-def _boot(config_path: Path) -> TestClient:
-    return TestClient(create_app())
+def _boot(config_path: Path) -> Any:
+    return auth_support.boot(config_path.parent)
 
 
 def _ingest_body(session: str = SESSION, profile: str = PROFILE) -> dict:
@@ -132,6 +133,9 @@ def test_capture_ingest_counter_counts_only_hook_actor(config_path: Path) -> Non
         client.post("/ingest", json=_ingest_body())
         client.post("/ingest", json=_ingest_body(), headers={"X-MnemoSeed-Actor": "cli"})
         assert client.get("/api/v1/observability").json()["capture_ingest_count"] == 1
+        # reverse assertion: the counter read refuses a caller with no credential
+        refused = client.get("/api/v1/observability", headers={"Authorization": "Bearer not-the-credential"})
+        assert refused.status_code == 401
 
 
 # ---------------------------------------------------------------- first-sighting hygiene (#110)
