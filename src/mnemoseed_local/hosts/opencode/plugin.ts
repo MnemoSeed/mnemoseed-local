@@ -44,6 +44,7 @@
 // plugin and config-hook cfg.mcp mutations stick (B2.6 probe rounds 1+2).
 
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -313,6 +314,33 @@ const DEBUG_LOG_PATH: string = join(DATA_DIR, "hook-debug.jsonl")
 const _HOOK_DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
 const DEBUG_LOG_ARCHIVE_PATH: string = DEBUG_LOG_PATH + ".1"
 
+// ---- daemon credential (design/04 trust boundary): the daemon HTTP surface
+// refuses every caller that cannot present the credential it issued. The plugin
+// reads the file the daemon writes — read-only, never issuing one itself — and
+// attaches it as a bearer header on the daemon calls below. A missing file means
+// the daemon never booted (or the home moved): the requests are refused, which
+// is the honest answer, and the capture lanes fail open as they always have.
+// Which issuer signed the value is none of this file's business; that is the
+// seam that lets a cloud authorization server replace the local one.
+const CREDENTIAL_PATH: string = join(DATA_DIR, "secrets", "daemon.credential.key")
+
+function credentialHeaders(): Record<string, string> {
+  let credential = ""
+  try {
+    credential = readFileSync(CREDENTIAL_PATH, "utf8").trim()
+  } catch {
+    return {}
+  }
+  if (!credential) return {}
+  return { authorization: `Bearer ${credential}` }
+}
+
+// The one header set every daemon fetch carries: the content type plus the
+// credential when the home has one.
+function daemonHeaders(): Record<string, string> {
+  return { "content-type": "application/json", ...credentialHeaders() }
+}
+
 async function rotateDebugLogIfOversized(): Promise<void> {
   try {
     const info = await stat(DEBUG_LOG_PATH)
@@ -358,7 +386,7 @@ function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () =>
   try {
     void fetch(BASE_URL + endpoint, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: daemonHeaders(),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
@@ -816,7 +844,7 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
   try {
     const response = await fetch(BASE_URL + "/session/recent", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: daemonHeaders(),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
@@ -847,7 +875,7 @@ async function pullPendingRecall(sessionID: string): Promise<any | null> {
   try {
     const response = await fetch(BASE_URL + "/session/recall-pending", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: daemonHeaders(),
       body: JSON.stringify({
         profile_id: PROFILE_ID,
         session_id: sessionID,

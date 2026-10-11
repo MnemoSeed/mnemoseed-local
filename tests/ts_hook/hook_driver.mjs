@@ -6,7 +6,7 @@
 import { pathToFileURL } from "node:url"
 import { mkdir, mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 const [bundle, scenario, fixtureDirArg] = process.argv.slice(2)
 if (!bundle || !scenario) {
@@ -29,10 +29,18 @@ const WATERMARKS = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-watermarks.j
 const posts = []
 const failing = new Set()
 const throwing = new Set()
+// The daemon credential lane: the driver seeds the same file the daemon would
+// write (inside the plugin's own data dir), so the recorded requests prove the
+// plugin attaches the credential header rather than merely promising to.
+const CREDENTIAL_PATH = join(
+  process.env.MNEMOSEED_LOCAL_DATA_DIR,
+  "secrets",
+  "daemon.credential.key",
+)
 globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init.body)
   const accepted = !failing.has(url)
-  posts.push({ url, body, accepted })
+  posts.push({ url, body, headers: init?.headers ?? null, accepted })
   // thrown failures ("network down") take precedence over the 503 lane
   if (throwing.has(url)) throw new Error("network down")
   if (!accepted) return { ok: false, status: 503 }
@@ -379,6 +387,47 @@ async function main() {
   const hooks = await pluginFactory({ client: fakeClient })
 
   switch (scenario) {
+    case "credential-header": {
+      // The daemon credential lane: the file the daemon would write is seeded
+      // inside the plugin's own data dir, so the recorded requests prove every
+      // daemon fetch carries the bearer header. The negative leg clears the
+      // file afterwards: without it the header must be absent (the daemon then
+      // refuses the request, which is the honest answer for a daemon that
+      // never booted).
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "driver-issued-credential\n", "utf8")
+      recentPayload = RECENT_PAYLOAD
+      recallPayload = RECALL_PAYLOAD
+      await hooks["chat.system.transform"]({ sessionID: SES }, { system: ["BASE"] })
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_cred_1" },
+        { parts: [{ type: "text", text: "带凭据的一轮" }] },
+      )
+      await delay(100)
+      await unlink(CREDENTIAL_PATH)
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_cred_2" },
+        { parts: [{ type: "text", text: "没有凭据的一轮" }] },
+      )
+      await delay(100)
+      const authorized = posts.filter((post) => post.body.content?.text === "带凭据的一轮")
+      const unauthenticated = posts.filter((post) => post.body.content?.text === "没有凭据的一轮")
+      console.log(
+        JSON.stringify({
+          authorized: authorized.map((post) => ({
+            url: post.url,
+            authorization: post.headers?.authorization ?? post.headers?.Authorization ?? null,
+            contentType: post.headers?.["content-type"] ?? null,
+          })),
+          unauthenticatedCount: unauthenticated.length,
+          unauthenticatedAuthorization: unauthenticated.map(
+            (post) => post.headers?.authorization ?? post.headers?.Authorization ?? null,
+          ),
+        }),
+      )
+      break
+    }
+
     case "ack-watermark": {
       // seed a watermark so reconcile considers the session known
       await writeFile(WATERMARKS, JSON.stringify({ [SES]: 500 }), "utf8")

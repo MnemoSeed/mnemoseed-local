@@ -4,7 +4,8 @@
 
 MnemoSeed Local is the local-first edition of MnemoSeed: one machine,
 CLI-first, no accounts, no cloud defaults, with a local web console served at
-the daemon root. Memory lives in isolated per-profile namespaces: the
+the daemon root. The daemon's HTTP surface is guarded by a local daemon
+credential it issues itself: no accounts, no OAuth flow, no cloud round-trip. Memory lives in isolated per-profile namespaces: the
 conventional `default` namespace works out of the box, and extra profiles can
 be registered for other agents
 (`mnemoseed-local profile {create|list|archive|unarchive}`, bound via the
@@ -38,9 +39,9 @@ Phase A (MVP core) including its A3 packaging batch is fully shipped: config +
 secrets + storage ports + embedded drivers (sqlite_meta / sqlite_graph /
 lancedb_embedded / bge_m3_onnx / synthetic_embedder), schema, migrations,
 capture/retrieve/dream/decay pipelines with a config-driven dream scheduler
-(pool-score floor + idle window + 24h hard deadline), no-accounts loopback
-daemon, the `mnemoseed-local` CLI, install orchestration, the OpenCode host
-hook adapter, the MCP gateway, and the local web console.
+(pool-score floor + idle window + 24h hard deadline), a credential-guarded
+loopback daemon, the `mnemoseed-local` CLI, install orchestration, the OpenCode
+host hook adapter, the MCP gateway, and the local web console.
 
 Phase B has landed through main:
 
@@ -235,6 +236,37 @@ checkout:
 ## License
 
 MIT.
+
+## Daemon credential
+
+The daemon's HTTP surface refuses every caller that cannot present the
+**daemon credential** it issues for itself. There is no account, no OAuth flow,
+and no cloud round-trip: the daemon writes one high-entropy value to
+`~/.mnemoseed-local/secrets/daemon.credential.key` on its first boot (restarting
+never re-signs it), the CLI / MCP gateway / host hooks / console read it from
+there, and it rides the wire as a bearer header.
+
+- `mnemoseed-local credential rotate` writes a fresh credential. The daemon
+  resolves it per request, so the new value is live at once; a request that raced
+  the write is refused once. Every client holding the previous value is refused
+  until it restarts.
+- `mnemoseed-local uninstall --purge` deletes the config home, the credential
+  included — an implicit rotation path: the next `up` issues a new one.
+- The liveness probes (`/healthz`, `/health`) stay open so the installer, the
+  watchdog, and the CLI can still tell "daemon is up" from "daemon is down".
+  Everything else — `/api/v1/*`, `/ingest`, `/session/*`, `/memory/*`,
+  `/mcp/handshake`, `/daemon/shutdown` — is closed to a caller without the
+  credential. The console authenticates with a same-origin `HttpOnly` cookie
+  granted only on loopback; the value never enters the page.
+- A refused credential is reported as an authentication failure and names the
+  two causes that actually happen: the client and the daemon resolving different
+  config homes (`MNEMOSEED_LOCAL_HOME`), or a rotated credential.
+
+What this does **not** defend against: another process running as the same user
+can read the credential file and impersonate a client; root/admin can read
+anything; the stored data itself (meta.db / chunks.lance) stays plaintext; and
+binding the daemon to a wildcard address without TLS would put the credential on
+the LAN in the clear (loopback-only is the supported configuration).
 
 ## Daemon lifecycle
 

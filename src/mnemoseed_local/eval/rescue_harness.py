@@ -18,9 +18,8 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.decay.reinforce import CANDIDATE_FLOOR
-from mnemoseed_local.eval.recall_harness import _point_config, release_daemon_log_handler
+from mnemoseed_local.eval.recall_harness import _point_config, release_daemon_log_handler, rig_client
 from mnemoseed_local.eval.rescue_materials import DEAD_PIN_DECAY, RescueMaterial
 from mnemoseed_local.eval.rescue_matrix import RescuePointMetrics, pin_is_eligible
 
@@ -95,7 +94,7 @@ class RescueRig:
         stack = ExitStack()
         try:
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
-            self._client = stack.enter_context(TestClient(create_app()))
+            self._client = stack.enter_context(rig_client())
         except BaseException:
             stack.close()
             release_daemon_log_handler(self.root)

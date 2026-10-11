@@ -13,10 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.graph import GraphNode, NodeType
 from mnemoseed_local.schema.stamp import Provenance
 from mnemoseed_local.schema.turn import HostId
@@ -99,8 +99,7 @@ def _ingest_and_settle(client: TestClient, session_id: str, ts: float, text: str
 def test_reinforce_chunk_path_marks_last_reinforced(config_path: Path) -> None:
     """The hook's attested chunk usage lands on the store: the exact chunks it
     named come back with a refreshed ``last_reinforced`` baseline."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest_and_settle(client, "sess-a", 1.0, "消费证据守卫验证")
         body = client.post("/session/recent", json={"profile_id": PROFILE})
         assert body.status_code == 200, body.text
@@ -115,16 +114,22 @@ def test_reinforce_chunk_path_marks_last_reinforced(config_path: Path) -> None:
         assert response.json() == {"status": "ok"}
 
         for chunk_id in chunk_ids:
-            chunk = app.state.stores.vector.get_chunk(chunk_id)
+            chunk = client.app.state.stores.vector.get_chunk(chunk_id)
             assert chunk is not None
             assert chunk.last_reinforced is not None, "a hit must refresh the reinforcement baseline"
+        # reverse assertion: the reinforcement refuses a caller with no credential
+        refused = client.post(
+            "/memory/reinforce",
+            json={"profile_id": PROFILE, "chunk_ids": chunk_ids, "node_ids": []},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_reinforce_node_path_counts_hit(config_path: Path) -> None:
     """The graph side of a consumption event counts the usage (FR-3.7
     hit_count) and refreshes the node's baseline through the full-node port."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         node = GraphNode(
             profile_id=PROFILE,
             node_type=NodeType.PREFERENCE,
@@ -138,14 +143,14 @@ def test_reinforce_node_path_counts_hit(config_path: Path) -> None:
             },
             provenance=Provenance(asserted_by="user", source="test"),
         )
-        app.state.stores.graph.upsert_node(node)
+        client.app.state.stores.graph.upsert_node(node)
         response = client.post(
             "/memory/reinforce",
             json={"profile_id": PROFILE, "chunk_ids": [], "node_ids": [node.node_id]},
         )
         assert response.status_code == 200, response.text
         assert response.json() == {"status": "ok"}
-        refreshed = app.state.stores.graph.get_node(node.node_id)
+        refreshed = client.app.state.stores.graph.get_node(node.node_id)
         assert refreshed is not None
         assert refreshed.hit_count == 1
 
@@ -153,7 +158,7 @@ def test_reinforce_node_path_counts_hit(config_path: Path) -> None:
 def test_reinforce_unknown_ids_is_silently_tolerated(config_path: Path) -> None:
     """A concurrently-purged target must never fail the caller: unknown ids
     are ignored silently by the Reinforcer (standing contract)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post(
             "/memory/reinforce",
             json={"profile_id": PROFILE, "chunk_ids": ["no-such-chunk"], "node_ids": []},
@@ -165,7 +170,7 @@ def test_reinforce_unknown_ids_is_silently_tolerated(config_path: Path) -> None:
 def test_reinforce_rejects_empty_targets_and_oversized_lists(config_path: Path) -> None:
     """Both target lists empty is a validation error (422); each list is
     capped at 64 ids."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         empty = client.post(
             "/memory/reinforce",
             json={"profile_id": PROFILE, "chunk_ids": [], "node_ids": []},

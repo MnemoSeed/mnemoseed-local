@@ -18,11 +18,10 @@ import threading
 import time
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture import InMemoryCapturePipeline, ScoringPipeline, TurnSegmenter
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import (
     HostId,
     IngestEvent,
@@ -230,8 +229,7 @@ def test_daemon_shutdown_flushes_open_turns_and_drains(config_path: Path) -> Non
     teardown must close every in-flight turn and drain it — silently losing
     the last exchange of every restart is exactly the class of bug this
     batch exists to kill."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post(
             "/ingest",
             json={
@@ -245,13 +243,27 @@ def test_daemon_shutdown_flushes_open_turns_and_drains(config_path: Path) -> Non
         )
         assert opened.status_code == 202, opened.text
         drain_calls: list[str] = []
-        original_drain = app.state.capture.drain
+        original_drain = client.app.state.capture.drain
+        # reverse assertion: the ingest refuses a caller with no credential
+        refused = client.post(
+            "/ingest",
+            json={
+                "host": "opencode",
+                "event": "user_prompt",
+                "session_id": "sess-shutdown",
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "重启前最后一句"},
+            },
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
         def recording_drain(session_id: str):
             drain_calls.append(session_id)
             return original_drain(session_id)
 
-        app.state.capture.drain = recording_drain
+        client.app.state.capture.drain = recording_drain
     # context exit == daemon shutdown: open turn closed, its buffer drained
     assert "sess-shutdown" in drain_calls
 
@@ -260,8 +272,7 @@ def test_teardown_completes_queued_drains_before_stores_close(config_path: Path)
     """B6 (W-C): teardown completes every queued drain BEFORE the stores close —
     a slow drain still finishes first, so a restart mid-session cannot lose the
     last exchange to a closing store (QA-4 order extended to the drain lane)."""
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post(
             "/ingest",
             json={
@@ -275,22 +286,22 @@ def test_teardown_completes_queued_drains_before_stores_close(config_path: Path)
         )
         assert opened.status_code == 202, opened.text
         finished = threading.Event()
-        original_drain = app.state.capture.drain
+        original_drain = client.app.state.capture.drain
 
         def slow_drain(session_id: str) -> None:
             time.sleep(0.5)
             finished.set()
             original_drain(session_id)
 
-        app.state.capture.drain = slow_drain
+        client.app.state.capture.drain = slow_drain
         close_saw_finished: list[bool] = []
-        original_close = app.state.stores.close
+        original_close = client.app.state.stores.close
 
         async def recording_close() -> None:
             close_saw_finished.append(finished.is_set())
             await original_close()
 
-        app.state.stores.close = recording_close
+        client.app.state.stores.close = recording_close
     assert close_saw_finished, "stores.close never ran during teardown"
     assert close_saw_finished[0] is True, "stores closed before the queued drain finished"
 
@@ -361,13 +372,13 @@ def test_crash_replay_of_host_history_is_absorbed_and_never_duplicated(config_pa
     the 'repeats must be absorbed' half of the 宁可重复不丢 contract."""
     session = "sess-crash"
     # ---- pre-crash: one drained turn
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _post(client, "user_prompt", session, 1.0, "崩溃前的用户消息")
         _post(client, "assistant_message", session, 2.0, "崩溃前的助手回复")
         _flush(client, session)
         assert _tail_texts(client, session) == ["user: 崩溃前的用户消息\nassistant: 崩溃前的助手回复"]
     # ---- daemon restarted over the same stores; the hook replays the tail
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _post(client, "user_prompt", session, 1.0, "崩溃前的用户消息")
         _post(client, "assistant_message", session, 2.0, "崩溃前的助手回复")
         _flush(client, session)
@@ -391,7 +402,7 @@ def test_batch_drain_tail_keeps_ascending_reading_order(config_path: Path) -> No
     (now + i * 1ms), so the tail stays ascending even though every stamp shares
     the same real clock tick."""
     session = "sess-batch"
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         for i in range(3):
             _post(client, "user_prompt", session, float(i + 1), f"批写第{i + 1}轮提问")
             _post(client, "assistant_message", session, float(i + 1) + 0.5, f"批写第{i + 1}轮回答")

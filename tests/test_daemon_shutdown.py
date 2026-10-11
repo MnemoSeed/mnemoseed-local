@@ -12,10 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
-
-from mnemoseed_local.daemon.app import create_app
 
 
 @pytest.fixture
@@ -48,7 +46,6 @@ def test_shutdown_endpoint_responds_then_runs_hook(config_path: Path) -> None:
     before flushing the response, the POST could never complete while the hook
     was blocked — the ordering is pinned by construction, not by timing luck.
     """
-    app = create_app()
     hook_entered = threading.Event()
     release_hook = threading.Event()
     hook_done = threading.Event()
@@ -61,8 +58,8 @@ def test_shutdown_endpoint_responds_then_runs_hook(config_path: Path) -> None:
         calls.append("exit")
         hook_done.set()
 
-    app.state.shutdown_hook = _fake_hook
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
+        client.app.state.shutdown_hook = _fake_hook
         result: dict[str, Any] = {}
 
         def _post() -> None:
@@ -90,7 +87,7 @@ def test_shutdown_endpoint_responds_then_runs_hook(config_path: Path) -> None:
 def test_shutdown_endpoint_without_seam_is_503(config_path: Path) -> None:
     """No seam (TestClient boot never injects the hook): a clear 503, never
     500, and no shutdown hook may exist on the app."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         resp = client.post("/daemon/shutdown")
         assert resp.status_code == 503
         detail = resp.json().get("detail", "")

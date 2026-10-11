@@ -35,7 +35,11 @@ from dataclasses import replace
 from typing import Any, TextIO
 
 from mnemoseed_local import __version__, daemon_state
-from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_DISABLED_HINT, GatewayClient
+from mnemoseed_local.mcp_gateway.reliable_client import (
+    DAEMON_AUTH_HINT,
+    DAEMON_DISABLED_HINT,
+    GatewayClient,
+)
 from mnemoseed_local.rest_client import (
     DaemonClient,
     DaemonRestError,
@@ -241,7 +245,13 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             payload = client.post("/session/windows", windows_body)
         else:
             return _error_result(f"unknown tool: {name!r}")
-    except (DaemonUnavailableError, DaemonRestError) as exc:
+    except DaemonRestError as exc:
+        if exc.status == 401:
+            # A refused credential is its own failure shape: it must never
+            # read as a connectivity problem.
+            return _error_result(DAEMON_AUTH_HINT)
+        return _error_result(f"daemon error: {exc}")
+    except DaemonUnavailableError as exc:
         return _error_result(f"daemon error: {exc}")
     except Exception as exc:  # never kill the loop on a tool call
         return _error_result(f"tool {name!r} failed: {exc}")

@@ -17,10 +17,9 @@ import subprocess
 from importlib import resources
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.turn import FlushRequest, HostId, IngestEvent, SessionEndRequest
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "opencode_hook"
@@ -129,13 +128,20 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.parametrize("name", INGEST_FIXTURES)
 def test_ingest_fixtures_accepted_by_daemon(config_path: Path, name: str) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post("/ingest", json=_fixture(name))
         assert response.status_code == 202, response.text
+        # reverse assertion: the same ingest without the credential is refused
+        refused = client.post(
+            "/ingest",
+            json=_fixture(name),
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_session_end_fixture_accepted_by_daemon(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post("/ingest", json=_fixture("user_prompt.json"))
         assert opened.status_code == 202, opened.text
         settled = client.post("/session/end", json=_fixture("session_end.json"))
@@ -144,7 +150,7 @@ def test_session_end_fixture_accepted_by_daemon(config_path: Path) -> None:
 
 
 def test_flush_fixture_accepted_by_daemon(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         opened = client.post("/ingest", json=_fixture("user_prompt.json"))
         assert opened.status_code == 202, opened.text
         flushed = client.post("/flush", json=_fixture("flush.json"))
@@ -176,7 +182,7 @@ def test_opencode_idle_flush_lifecycle_keeps_the_session_ingestable(config_path:
         )
         assert response.status_code == 202, response.text
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         # turn 0 completes -> host fires session.idle -> flush (NOT settle)
         post_ingest("user_prompt", 1.0, "第一条用户消息")
         post_ingest("assistant_message", 2.0, "第一条助手回复")

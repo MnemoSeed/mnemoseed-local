@@ -16,12 +16,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
 from mnemoseed_local.config import Config
-from mnemoseed_local.daemon.app import DreamSubmission, DreamWorker, create_app
+from mnemoseed_local.daemon.app import DreamSubmission, DreamWorker
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult, load_snapshot_file
 from mnemoseed_local.schema.graph import GraphNode, NodeType
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
@@ -58,8 +59,8 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cfg
 
 
-def _boot(config_path: Path) -> TestClient:
-    return TestClient(create_app())
+def _boot(config_path: Path) -> Any:
+    return auth_support.boot(config_path.parent)
 
 
 def test_healthz_after_real_boot(config_path: Path) -> None:
@@ -71,6 +72,9 @@ def test_healthz_after_real_boot(config_path: Path) -> None:
         assert body["gate"]["ok"] is True
         health = client.get("/health").json()
         assert health["drivers"]["embed"] == "synthetic"
+        # reverse assertion: the audit read behind it refuses a caller with no credential
+        refused = client.get("/api/v1/audit", headers={"Authorization": "Bearer not-the-credential"})
+        assert refused.status_code == 401
 
 
 def test_dream_once_reports_provider_unavailable_without_queueing(config_path: Path) -> None:
@@ -157,9 +161,8 @@ def test_non_loopback_baseurl_is_refused(tmp_path: Path, monkeypatch: pytest.Mon
     )
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
-    app = create_app()
     with pytest.raises(RuntimeError, match="non-loopback"):
-        with TestClient(app):
+        with auth_support.boot(tmp_path):
             pass
 
 
@@ -183,9 +186,8 @@ def test_boot_refuses_without_isolated_graph_instance(
     )
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", cfg)
-    app = create_app()
     with pytest.raises(RuntimeError, match="isolated"):
-        with TestClient(app):
+        with auth_support.boot(tmp_path):
             pass
 
 

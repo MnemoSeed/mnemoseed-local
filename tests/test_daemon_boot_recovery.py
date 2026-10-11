@@ -28,12 +28,12 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
 import mnemoseed_local.dream.reflect as reflect_module
 from mnemoseed_local.config import load_config
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.dream import (
     DreamPipeline,
     Snapshot,
@@ -98,8 +98,11 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _detach_daemon_log_handler()
 
 
-def _boot() -> TestClient:
-    return TestClient(create_app())
+def _boot() -> Any:
+    """The authenticated boot in the ambient config home (already isolated)."""
+    from mnemoseed_local.config import CONFIG_DIR
+
+    return auth_support.boot(CONFIG_DIR)
 
 
 # ---------------------------------------------------------------- seeding

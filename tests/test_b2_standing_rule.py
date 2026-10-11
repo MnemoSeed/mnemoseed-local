@@ -15,10 +15,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -183,7 +183,7 @@ def recall(client: TestClient, session_id: str, profile_id: str = PROFILE) -> di
 
 def test_b2_5_import_persists_rules_json_with_provenance(b2_config: Path) -> None:
     """Importing a standing_rule stores rules_json + provenance; get_chunk reads it."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         resp = remember_standing(client, standing_rule_dict(value=standing_value()))
         assert resp.status_code == 200, resp.text
         payload = resp.json()
@@ -200,20 +200,27 @@ def test_b2_5_import_persists_rules_json_with_provenance(b2_config: Path) -> Non
 
 def test_b2_2_standing_rule_never_appears_in_session_recent_rules_budget(b2_config: Path) -> None:
     """A stored standing_rule never leaks onto /session/recent rules_budget."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         resp = remember_standing(client, standing_rule_dict(value=standing_value()))
         assert resp.status_code == 200, resp.text
         data = client.post(
             "/session/recent", json={"profile_id": PROFILE, "self_session_id": "sess-x"}
         ).json()
         assert "rules_budget" not in data
+        # reverse assertion: the same read without the credential is refused
+        refused = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "self_session_id": "sess-x"},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_b2_22_t1_rules_budget_bytes_identical_with_standing_rule(b2_config: Path) -> None:
     """M-B2-22 (T1 clause, behavioral): /session/recent rules_budget bytes are
     byte-identical before vs after an in-profile standing_rule exists — the
     procedural rule never clips, caps, counts, or leaks into the T1 budget."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         # B1 rules over a LONG exclude/boost surface so any clip/cap mutation
         # visibly truncates the serialized bytes.
         exclude_widgets = [f"secret-{i:04d}" for i in range(50)]
@@ -271,7 +278,7 @@ def test_b2_22_t1_rules_budget_bytes_identical_with_standing_rule(b2_config: Pat
 
 def test_b2_6_armed_event_no_standing_rule_unresolved_no_rule(b2_config: Path) -> None:
     """No-match armed event -> unresolved=true reason=no-rule."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         append_raw_event(client, "sess-1", status="quota", retryable=0)
         data = recall(client, "sess-1")
         assert data["detector_fired"] is True
@@ -282,7 +289,7 @@ def test_b2_6_armed_event_no_standing_rule_unresolved_no_rule(b2_config: Path) -
 
 def test_b2_7_wrong_fingerprint_no_match(b2_config: Path) -> None:
     """Provider mismatch -> no serve, unresolved."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-p", provider="anthropic", status="quota", retryable=0)
         data = recall(client, "sess-p")
@@ -293,7 +300,7 @@ def test_b2_7_wrong_fingerprint_no_match(b2_config: Path) -> None:
 
 def test_b2_13_no_event_no_serve(b2_config: Path) -> None:
     """No event -> no serve, detector_fired=false (B1 M8 preserved)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         data = recall(client, "sess-none")
         assert data["detector_fired"] is False
@@ -305,7 +312,7 @@ def test_b2_13_no_event_no_serve(b2_config: Path) -> None:
 
 def test_b2_17_matched_serve_flag_contract(b2_config: Path) -> None:
     """A matched serve always sets rule_served=true and unresolved=false."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-ok", status="quota", retryable=0)
         data = recall(client, "sess-ok")
@@ -320,7 +327,7 @@ def test_b2_17_disabled_flag_contract(b2_config: Path) -> None:
     """auto_recall off -> enabled=false rule_served=false unresolved=false."""
     import dataclasses
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-d", status="quota", retryable=0)
         svc = client.app.state.memory
@@ -338,7 +345,7 @@ def test_b2_17_disabled_flag_contract(b2_config: Path) -> None:
 
 def test_b2_16_specific_precedence_over_wildcard(b2_config: Path) -> None:
     """Specific (provider=openai) beats broad (provider=null)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         broad = standing_value(
             over={
                 "then": "broad advisory",
@@ -362,7 +369,7 @@ def test_b2_16_specific_precedence_over_wildcard(b2_config: Path) -> None:
 
 def test_b2_16_tie_is_conflict_not_first_row(b2_config: Path) -> None:
     """Two truly-tied rules (same chunk, identical specificity) -> conflict."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         v1 = standing_value(over={"then": "advisory alpha"})
         v2 = standing_value(over={"then": "advisory beta"})
         # both on the SAME chunk -> identical ingested_at + chunk_id; byte-same
@@ -391,7 +398,7 @@ def test_b2_16_tie_is_conflict_not_first_row(b2_config: Path) -> None:
 
 
 def test_b2_8_session_scope_never_crosses_session(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(
             client,
             standing_rule_dict(value=standing_value(), scope="session", session_id="sess-a"),
@@ -404,7 +411,7 @@ def test_b2_8_session_scope_never_crosses_session(b2_config: Path) -> None:
 
 
 def test_b2_8_profile_scope_never_crosses_profile(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value(), scope="profile"), PROFILE)
         append_raw_event(client, "sess-b", profile_id=PROFILE_B, status="quota", retryable=0)
         data = recall(client, "sess-b", PROFILE_B)
@@ -414,7 +421,7 @@ def test_b2_8_profile_scope_never_crosses_profile(b2_config: Path) -> None:
 
 
 def test_b2_8_global_serves_all_sessions_of_own_profile(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value(), scope="global"))
         append_raw_event(client, "g1", status="quota", retryable=0)
         data1 = recall(client, "g1")
@@ -427,7 +434,7 @@ def test_b2_8_global_serves_all_sessions_of_own_profile(b2_config: Path) -> None
 
 
 def test_b2_8_global_never_serves_other_profile(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value(), scope="global"), PROFILE)
         append_raw_event(client, "sess-x", profile_id=PROFILE_B, status="quota", retryable=0)
         data = recall(client, "sess-x", PROFILE_B)
@@ -440,7 +447,7 @@ def test_b2_8_global_never_serves_other_profile(b2_config: Path) -> None:
 
 
 def test_b2_9_byte_same_reimport_single_artifact(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         r1 = remember_standing(client, standing_rule_dict(value=standing_value()))
         r2 = remember_standing(client, standing_rule_dict(value=standing_value()))
         assert r1.json()["chunk_id"] == r2.json()["chunk_id"]
@@ -460,7 +467,7 @@ def test_b2_9_byte_same_reimport_single_artifact(b2_config: Path) -> None:
 
 def test_b2_10_malformed_standing_rule_no_match_unresolved(b2_config: Path) -> None:
     """Malformed match JSON on a standing_rule -> no-match unresolved (never crash/false-serve)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         malformed = standing_value(over={"match": "not-an-object"})
         remember_standing(client, standing_rule_dict(value=malformed))
         append_raw_event(client, "sess-m", status="quota", retryable=0)
@@ -474,7 +481,7 @@ def test_b2_10_future_kind_loud_skip_no_crash(b2_config: Path, caplog: pytest.Lo
     """A future/unknown kind is loud-skipped on the NEW daemon; no crash, no false-serve."""
     from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         vec = client.app.state.stores.vector
         emb = client.app.state.stores.embed.embed("future rule chunk")
         stamp = ChunkStamp(
@@ -498,7 +505,7 @@ def test_b2_10_future_kind_loud_skip_no_crash(b2_config: Path, caplog: pytest.Lo
 
 def test_b2_15_other_provider_null_retryable_fail_closed(b2_config: Path) -> None:
     """other_provider (retryable NULL) does NOT match a rule bound to retryable:0."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         rule_value = standing_value(
             over={
                 "match": {
@@ -520,7 +527,7 @@ def test_b2_15_other_provider_null_retryable_fail_closed(b2_config: Path) -> Non
 
 def test_b2_15_retryable_null_wildcard_matches_null_event(b2_config: Path) -> None:
     """Rule retryable:null wildcard matches an other_provider (retryable NULL) event."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(
             client,
             standing_rule_dict(
@@ -547,7 +554,7 @@ def test_b2_15_retryable_null_wildcard_matches_null_event(b2_config: Path) -> No
 
 
 def test_b2_18_matched_rule_source_is_provenance_of_winner(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value(over={"then": "winner"})))
         append_raw_event(client, "sess-pv", status="quota", retryable=0)
         data = recall(client, "sess-pv")
@@ -559,7 +566,7 @@ def test_b2_18_matched_rule_source_is_provenance_of_winner(b2_config: Path) -> N
 
 
 def test_b2_19_forget_hard_deletes_chunk_and_stops_serve_row_remains(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         resp = remember_standing(client, standing_rule_dict(value=standing_value()))
         chunk_id = resp.json()["chunk_id"]
         append_raw_event(client, "sess-f", status="quota", retryable=0)
@@ -586,7 +593,7 @@ def test_b2_19_forget_hard_deletes_chunk_and_stops_serve_row_remains(b2_config: 
 
 def test_b2_11_no_provider_switch_side_effect(b2_config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Serve performs no provider-switch / host-config mutation (advisory-only)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-ns", status="quota", retryable=0)
         svc = client.app.state.memory
@@ -616,7 +623,7 @@ def test_b2_11_no_provider_switch_side_effect(b2_config: Path, monkeypatch: pyte
 
 def test_b2_12_zero_model_calls_on_serve(b2_config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No embedder/model call during recall_pending serve/flag."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-z", status="quota", retryable=0)
         svc = client.app.state.memory
@@ -635,7 +642,7 @@ def test_b2_12_zero_model_calls_on_serve(b2_config: Path, monkeypatch: pytest.Mo
 
 
 def test_b2_20_budget_chars_unchanged_and_consume_once(b2_config: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-bu", status="quota", retryable=0)
         first = recall(client, "sess-bu")
@@ -653,7 +660,7 @@ def test_b2_20_budget_chars_unchanged_and_consume_once(b2_config: Path) -> None:
 
 def test_b2_24_nonzero_ttl_standing_rule_fails_closed(b2_config: Path) -> None:
     """A standing_rule with nonzero ttl_turns is not served (fail-closed)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         resp = remember_standing(
             client,
             standing_rule_dict(value=standing_value(), ttl_turns=3),
@@ -672,7 +679,7 @@ def test_b2_24_nonzero_ttl_standing_rule_fails_closed(b2_config: Path) -> None:
 
 def test_b2_7_model_mismatch_no_match(b2_config: Path) -> None:
     """Model mismatch -> no serve, unresolved (fail-closed)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-m", model="other-model", status="quota", retryable=0)
         data = recall(client, "sess-m")
@@ -683,7 +690,7 @@ def test_b2_7_model_mismatch_no_match(b2_config: Path) -> None:
 
 def test_b2_7_status_mismatch_no_match(b2_config: Path) -> None:
     """Status mismatch -> no serve, unresolved (fail-closed)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-s", status="rate_limit", retryable=1)
         data = recall(client, "sess-s")
@@ -694,7 +701,7 @@ def test_b2_7_status_mismatch_no_match(b2_config: Path) -> None:
 
 def test_b2_7_retryable_mismatch_no_match(b2_config: Path) -> None:
     """Retryable 0-rule vs 1-event -> no serve, unresolved (fail-closed)."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-r", status="rate_limit", retryable=1)
         data = recall(client, "sess-r")
@@ -705,7 +712,7 @@ def test_b2_7_retryable_mismatch_no_match(b2_config: Path) -> None:
 
 def test_b2_7_wildcards_match_any_event(b2_config: Path) -> None:
     """Null provider/model/status wildcards match any concrete event."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         wildcard = standing_value(
             over={
                 "match": {
@@ -726,7 +733,7 @@ def test_b2_7_wildcards_match_any_event(b2_config: Path) -> None:
 
 def test_b2_15_bool_retryable_never_matches(b2_config: Path) -> None:
     """A JSON-bool retryable bound is malformed for matching: never serves."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         bool_rule = standing_value(
             over={
                 "match": {
@@ -748,7 +755,7 @@ def test_b2_15_bool_retryable_never_matches(b2_config: Path) -> None:
 
 def test_b2_16_newest_wins_on_equal_specificity(b2_config: Path) -> None:
     """Equal-specificity winners resolve deterministically to the newest artifact."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         first = standing_value(over={"then": "first advisory"})
         second = standing_value(over={"then": "second advisory"})
         for text, value in (("standing directive pin alpha", first), ("standing directive pin beta", second)):
@@ -767,7 +774,7 @@ def test_b2_17_disabled_reason_code(b2_config: Path) -> None:
     """Disabled serve carries the minimal reason code (selection surface)."""
     import dataclasses
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(b2_config.parent) as client:
         remember_standing(client, standing_rule_dict(value=standing_value()))
         append_raw_event(client, "sess-dd", status="quota", retryable=0)
         svc = client.app.state.memory

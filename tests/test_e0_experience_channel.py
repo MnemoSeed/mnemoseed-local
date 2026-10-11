@@ -15,8 +15,8 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import auth_support
 import pytest
-from fastapi.testclient import TestClient
 
 from mnemoseed_local.config import ConfigError, load_config
 from mnemoseed_local.configwrite.service import (
@@ -24,7 +24,6 @@ from mnemoseed_local.configwrite.service import (
     ConfigWriteError,
     ConfigWriteService,
 )
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.storage.drivers._migrations import (
     MIGRATIONS,
     apply_migrations,
@@ -212,7 +211,7 @@ def test_fresh_install_lands_at_v15(tmp_path) -> None:
 def test_read_route_marks_purged_chunk_evidence_retired(e0_config: Path) -> None:
     """A ledger row pointing at a chunk that no longer exists surfaces with
     evidence_retired=true; the append-only row itself is never rewritten."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(e0_config.parent) as client:
         meta = client.app.state.stores.meta
         meta.append_error_event(
             ErrorEvent(
@@ -235,13 +234,20 @@ def test_read_route_marks_purged_chunk_evidence_retired(e0_config: Path) -> None
         assert page.items[0].composite_group_id == "grp-retired"
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             meta._conn.execute("UPDATE error_events SET evidence_id = 'rewritten'")
+        # reverse assertion: the read route refuses a caller without the credential
+        refused = client.post(
+            "/memory/error_events",
+            json={"profile_id": PROFILE},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_read_route_marks_live_chunk_evidence_not_retired(e0_config: Path) -> None:
     """A pointer resolving to a live chunk reads evidence_retired=false."""
     from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(e0_config.parent) as client:
         stores = client.app.state.stores
         stamp = ChunkStamp(
             chunk_id="live-chunk",
@@ -271,7 +277,7 @@ def test_composite_read_resolves_live_and_gone_in_one_page(e0_config: Path) -> N
     chunk_ids IN-clause is actively narrowing (not just a no-op)."""
     from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(e0_config.parent) as client:
         stores = client.app.state.stores
         embed = stores.embed.embed("dummy").dense
         stores.vector.upsert_chunk(
@@ -330,7 +336,7 @@ def test_read_route_retires_only_after_the_chunk_is_deleted(e0_config: Path) -> 
     (forget_this deletes chunk rows), never by rewriting the ledger."""
     from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Provenance
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(e0_config.parent) as client:
         stores = client.app.state.stores
         stamp = ChunkStamp(
             chunk_id="doomed",

@@ -792,6 +792,64 @@ def test_up_skips_model_preflight_for_non_ollama_route(cli_home: Path, monkeypat
 # ------------------------------------------- B2.12: doctor observability checks
 
 
+def test_credential_rotate_writes_a_fresh_credential_and_names_the_path(
+    cli_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Rotation is a file operation, not an HTTP route: the new value lands in
+    the config home and every client resolves it on its next request."""
+    from mnemoseed_local.credential import CREDENTIAL_FILE_NAME, read_credential_at
+
+    cli_home.mkdir(parents=True, exist_ok=True)
+    assert main(["credential", "rotate"]) == 0
+    rotated = read_credential_at(cli_home)
+    out = capsys.readouterr().out
+    assert str(cli_home / "secrets" / CREDENTIAL_FILE_NAME) in out
+    assert main(["credential", "rotate"]) == 0
+    assert read_credential_at(cli_home) != rotated
+
+
+def test_a_refused_credential_is_reported_as_an_auth_failure(cli_home: Path, monkeypatch, capsys) -> None:
+    """A 401 must never read as "daemon not running": the hint names the two
+    causes that actually happen."""
+    from mnemoseed_local.rest_client import DaemonRestError
+
+    def _refused(args: object) -> object:
+        raise DaemonRestError(401, "daemon credential required")
+
+    monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", _refused)
+    assert main(["off"]) == 1
+    err = capsys.readouterr().err
+    assert "MNEMOSEED_LOCAL_HOME" in err
+    assert "credential rotate" in err
+    assert "not running" not in err
+
+
+def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_bytes(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A stale plugin does not error — it keeps calling the daemon the old way,
+    which the credential boundary refuses. The doctor must name it, or capture
+    stops silently after an upgrade."""
+    from mnemoseed_local.hosts import install as hook_install
+
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    root = tmp_path / ".config" / "opencode"
+    target = hook_install.target_path(root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    hook_install.install_plugin(root)
+    target.write_bytes(b"// drifted plugin bytes\n")
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] stale plugin:" in out
+    assert "hook install opencode" in out
+    assert str(target) in out
+
+
 def _write_opencode_registration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str = "") -> Path:
     """Point the doctor's opencode-config seam at a hermetic file."""
     path = tmp_path / "opencode.json"

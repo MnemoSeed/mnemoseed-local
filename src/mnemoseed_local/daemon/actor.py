@@ -2,8 +2,10 @@
 
 The CLI surface forwards ``X-MnemoSeed-Actor: cli``, the host-hook transformer
 forwards ``hook``; anything else (console / default) answers ``console``. The
-wire value never influences authorization — the daemon is localhost-only by
-default and there are no tokens.
+wire value never influences authorization — the credential boundary decides who
+may call the daemon at all (see ``credential.py`` / ``daemon/auth.py``), and
+holding the credential makes every caller equivalent, so this header stays the
+self-declared attribution it has always been.
 """
 
 from __future__ import annotations

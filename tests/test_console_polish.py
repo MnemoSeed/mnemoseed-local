@@ -12,10 +12,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
-
-from mnemoseed_local.daemon.app import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = REPO_ROOT / "src" / "mnemoseed_local" / "console" / "static"
@@ -171,8 +170,7 @@ def _config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _config_path(tmp_path, monkeypatch)
-    app = create_app()
-    with TestClient(app) as tc:
+    with auth_support.boot(tmp_path) as tc:
         yield tc
 
 

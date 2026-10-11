@@ -87,6 +87,38 @@ def test_design_07_contains_no_supervisor_chain_teaching() -> None:
         assert gone not in ZH_DESIGN_07, f"design/07 still teaches the removed supervisor chain: {gone!r}"
 
 
+def test_readme_documents_the_daemon_credential_boundary() -> None:
+    assert "## Daemon credential" in README
+    assert "mnemoseed-local credential rotate" in README
+    assert "uninstall --purge" in README
+    assert "does **not** defend against" in README
+    # naming discipline: the credential is never called a token
+    lowered = README.lower()
+    for phrase in ("bearer token", "auth token", "access token", "refresh token"):
+        assert phrase not in lowered, f"README still calls the daemon credential a token: {phrase!r}"
+
+
+def test_design_04_documents_the_credential_boundary_and_its_threat_model() -> None:
+    design_04 = (REPO_ROOT / "docs" / "zh" / "design" / "04-trust-boundary-and-config.md").read_text(
+        encoding="utf-8"
+    )
+    for anchor in (
+        "3.1.1 daemon 凭据边界",
+        "3.1.2 威胁模型诚实边界",
+        "daemon.credential.key",
+        "credential rotate",
+        "auth_support.py",
+        "通配符 bind + 无 TLS = 凭据局域网裸奔",
+    ):
+        assert anchor in design_04, f"design/04 must document {anchor!r}"
+
+
+def test_design_05_replaces_the_no_token_claim() -> None:
+    design_05 = (REPO_ROOT / "docs" / "zh" / "design" / "05-host-integration.md").read_text(encoding="utf-8")
+    assert "本地 daemon 凭据" in design_05
+    assert "没有账号体系、也没有 OAuth 流程" in design_05
+
+
 def test_package_docstring_does_not_claim_no_console() -> None:
     from mnemoseed_local import __doc__ as pkg_doc
 

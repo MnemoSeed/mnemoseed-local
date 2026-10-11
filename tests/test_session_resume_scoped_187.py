@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.daemon.memory import _extract_resume_anchors
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers import (
@@ -109,7 +109,7 @@ def test_anchors_empty_for_ambiguous_prompt() -> None:
 
 
 def test_scoped_query_returns_only_matching_root(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-local", 1.0, "continue mnemoseed-local development")
         _end(client, "root-local")
         _ingest(client, "root-orch", 2.0, "continue mnemoseed-orchestrator work")
@@ -128,10 +128,17 @@ def test_scoped_query_returns_only_matching_root(config_path: Path) -> None:
         assert ids == ["root-local"]
         blob = "\n".join(c["text"] for s in payload["sessions"] for c in s["chunks"])
         assert "mnemoseed-orchestrator" not in blob
+        # reverse assertion: the same read without the credential is refused
+        refused = client.post(
+            "/session/recent",
+            json={"profile_id": PROFILE, "resume_query": "continue mnemoseed-local development"},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
 
 
 def test_scoped_query_excludes_child_session(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-local", 1.0, "continue mnemoseed-local development")
         _end(client, "root-local")
         _ingest(
@@ -155,7 +162,7 @@ def test_scoped_query_excludes_child_session(config_path: Path) -> None:
 
 
 def test_ambiguous_prompt_is_unresolved_with_no_tails(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-local", 1.0, "continue mnemoseed-local development")
         _end(client, "root-local")
 
@@ -170,7 +177,7 @@ def test_ambiguous_prompt_is_unresolved_with_no_tails(config_path: Path) -> None
 
 
 def test_assistant_only_mention_does_not_match(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-generic", 1.0, "doing generic refactoring work")
         client.post(
             "/ingest",
@@ -196,7 +203,7 @@ def test_assistant_only_mention_does_not_match(config_path: Path) -> None:
 
 
 def test_legacy_path_reports_unscoped_selection(config_path: Path) -> None:
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-local", 1.0, "continue mnemoseed-local development")
         _end(client, "root-local")
 
@@ -211,7 +218,7 @@ def test_single_identity_field_without_query_stays_unscoped(config_path: Path) -
     fields. Existing direct diagnostics send only ONE (either exclude_session_id or
     self_session_id); a bare single field must keep the legacy unscoped diagnostic
     behavior."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-x", 1.0, "diagnostic tail")
         _end(client, "root-x")
 
@@ -232,7 +239,7 @@ def test_dual_identity_fields_without_query_fails_closed(config_path: Path) -> N
     automatic path — it must NEVER silently fall back to profile-global replay.
     Fail closed: explicit unresolved metadata, zero sessions, no cross-project
     verbatim."""
-    with TestClient(create_app()) as client:
+    with auth_support.boot(config_path.parent) as client:
         _ingest(client, "root-other", 1.0, "other project tail that must NOT replay")
         _end(client, "root-other")
 

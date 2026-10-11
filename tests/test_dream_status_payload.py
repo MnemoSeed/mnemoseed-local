@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
+import auth_support
 import pytest
 from fastapi.routing import APIRoute, APIRouter
-from fastapi.testclient import TestClient
 
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.dream import consumer, nominate
@@ -55,8 +55,8 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cfg
 
 
-def _client(config_path: Path) -> TestClient:
-    return TestClient(create_app())
+def _client(config_path: Path) -> Any:
+    return auth_support.boot(config_path.parent)
 
 
 def _reconcile_node(node_id: str, *, profile_id: str, peer: str) -> GraphNode:
@@ -112,6 +112,13 @@ def test_dream_status_reports_pool_watermark_and_history(config_path: Path) -> N
         assert payload["pool"]["balance"] == pytest.approx(2.05)
         assert payload["pool"]["threshold"] > 0.0
         assert payload["watermark"] == {"start": 3, "end": 3}
+        # reverse assertion: the status read refuses a caller with no credential
+        refused = client.post(
+            "/memory/dream_status",
+            json={"profile_id": PROFILE},
+            headers={"Authorization": "Bearer not-the-credential"},
+        )
+        assert refused.status_code == 401
         assert payload["history"]["committed_runs"] >= 1
         assert payload["history"]["last_commit_at"] is not None
         assert payload["history"]["extract_failures"] == {

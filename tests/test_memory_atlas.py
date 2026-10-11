@@ -6,10 +6,10 @@ import time
 import uuid
 from pathlib import Path
 
+import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.schema.graph import GraphNode, NodeType, Provenance
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues
 
@@ -38,8 +38,7 @@ def _config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _config_path(tmp_path, monkeypatch)
-    app = create_app()
-    with TestClient(app) as tc:
+    with auth_support.boot(tmp_path) as tc:
         yield tc
 
 
@@ -221,8 +220,7 @@ def test_atlas_chunk_item_carries_source_asserted_by_and_reconcile_flag(client: 
 
 def test_get_dense_missing_ids_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _config_path(tmp_path, monkeypatch)
-    app = create_app()
-    with TestClient(app) as tc:
+    with auth_support.boot(tmp_path) as tc:
         stores = tc.app.state.stores  # type: ignore[attr-defined]
         c = _make_chunk("default", "hello", [1, 0, 0, 0, 0, 0, 0, 0])
         stores.vector.upsert_chunk(c, [1, 0, 0, 0, 0, 0, 0, 0], None)

@@ -10,6 +10,8 @@ Two paths guarded here:
 
 from __future__ import annotations
 
+import auth_support
+
 from mnemoseed_local.secrets.refs import redact_key_ref_for_display
 
 
@@ -42,9 +44,6 @@ def test_role_configured_audit_does_not_echo_a_literal_key(tmp_path, monkeypatch
     (tolerated by the loader today); the audit row must redact it."""
     import json
 
-    from fastapi.testclient import TestClient
-
-    from mnemoseed_local.daemon.app import create_app
     from mnemoseed_local.storage.drivers import lancedb_embedded, sqlite_graph, sqlite_meta
     from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
     from mnemoseed_local.storage.registry import (
@@ -83,9 +82,14 @@ def test_role_configured_audit_does_not_echo_a_literal_key(tmp_path, monkeypatch
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
 
-    with TestClient(create_app()) as client:
+    with auth_support.boot(tmp_path) as client:
         resp = client.get("/api/v1/audit")
         assert resp.status_code == 200
         text = json.dumps(resp.json(), ensure_ascii=False)
         assert canary not in text
         assert "<redacted>" in text
+        # reverse assertion: without the credential the same read is refused
+        assert (
+            client.get("/api/v1/audit", headers={"Authorization": "Bearer not-the-credential"}).status_code
+            == 401
+        )

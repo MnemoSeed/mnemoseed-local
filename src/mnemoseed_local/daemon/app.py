@@ -10,8 +10,11 @@ surface is deliberately small:
 - config get/set/rollback over ConfigWriteService (/api/v1/config),
 - /healthz liveness + /api/v1/audit read.
 
-NO identity/accounts/tokens: the daemon binds loopback by default and a
-non-loopback baseurl is rejected at boot; every memory route takes an explicit
+The HTTP surface is credential-gated: one default-deny ASGI middleware
+(``daemon/auth.py``) refuses every caller that cannot present the daemon
+credential, the liveness probes and the enumerated console documents being the
+only open paths. NO identity/accounts: the daemon binds loopback by default and
+a non-loopback baseurl is rejected at boot; every memory route takes an explicit
 profile_id (never guessed, D5 isolation).
 """
 
@@ -27,7 +30,6 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
 
@@ -47,7 +49,13 @@ from mnemoseed_local.capture.stamper import WriteContext
 from mnemoseed_local.config import Config, load_config
 from mnemoseed_local.configwrite.routes import router as configwrite_router
 from mnemoseed_local.configwrite.service import ConfigWriteService
+from mnemoseed_local.credential import LocalFileTokenVerifier, TokenVerifier, issue_credential
 from mnemoseed_local.daemon.actor import resolve_actor
+from mnemoseed_local.daemon.auth import (
+    CONSOLE_STATIC_DIR,
+    auth_middleware,
+    console_documents,
+)
 from mnemoseed_local.daemon.ingest import router as ingest_router
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
@@ -1050,9 +1058,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not _is_loopback_host(host):
         raise RuntimeError(
             f"daemon refuses non-loopback baseurl {config.baseurl!r}: the local MVP "
-            "is localhost-only (no identity/accounts/tokens)"
+            "is localhost-only (no identity/accounts)"
         )
     _attach_daemon_log_handler()
+    issue_credential()
+    app.state.console_documents = console_documents()
     logger.info(
         "daemon boot: pid=%d version=%s preset=%s port=%s",
         os.getpid(),
@@ -1229,7 +1239,14 @@ def _request_logging_middleware(app: Any, get_state: Callable[[], Any]) -> Any:
     return _entry
 
 
-def create_app() -> FastAPI:
+def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
+    """Build the daemon app.
+
+    ``token_verifier`` is the authorization seam: omitted, the local issuer's
+    verifier (the credential file in the config home) guards the surface;
+    passed explicitly, a different issuer's verifier guards it. The clients
+    have no knowledge of which one is in play.
+    """
     app = FastAPI(title="MnemoSeed Local", version=__version__, lifespan=lifespan)
     # Capture intake lives per-app state; F1 (StrippingPipeline) drains the
     # same pipeline instance the /ingest router hands turns to, on the
@@ -1237,11 +1254,19 @@ def create_app() -> FastAPI:
     app.state.capture = StrippingPipeline()
     app.state.segmenter = TurnSegmenter(app.state.capture)
     app.state.observability = Observability()
+    app.state.token_verifier = token_verifier if token_verifier is not None else LocalFileTokenVerifier()
+    # The console document set is enumerated at every boot (and here, so an app
+    # whose lifespan never ran still answers only the enumerated documents).
+    app.state.console_documents = console_documents()
     app.include_router(ingest_router)
     app.include_router(memory_router)
     app.include_router(configwrite_router)
     # B2.12 request-level observability ([logging] requests, default OFF).
     app.add_middleware(_request_logging_middleware, get_state=lambda: app.state)
+    # The credential gate wraps the logging middleware: a refused request never
+    # reaches the logger, so a 401 leaves no trace and a served one is still
+    # logged as method + path + status only.
+    app.add_middleware(auth_middleware, verifier=app.state.token_verifier, get_state=lambda: app.state)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -1280,8 +1305,9 @@ def create_app() -> FastAPI:
     @app.post("/mcp/handshake")
     async def mcp_handshake(request: Request) -> dict[str, Any]:
         """MCP-gateway startup beacon (B2.12): the stdio server announces
-        itself when a client connects it. Loopback-trusted like every other
-        surface (no tokens in the local MVP); purely observational."""
+        itself when a client connects it. Behind the credential gate like every
+        other surface except the liveness probes: a caller without the daemon
+        credential cannot move the since-boot counters."""
         observability: Observability | None = getattr(request.app.state, "observability", None)
         if observability is not None:
             observability.note_mcp_handshake()
@@ -1401,7 +1427,7 @@ def create_app() -> FastAPI:
     # after every route or it would shadow /healthz, /memory/*, /api/v1/*.
     app.mount(
         "/",
-        StaticFiles(directory=Path(__file__).parent.parent / "console" / "static", html=True),
+        StaticFiles(directory=CONSOLE_STATIC_DIR, html=True),
         name="console",
     )
 

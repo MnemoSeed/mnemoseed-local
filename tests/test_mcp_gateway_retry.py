@@ -203,6 +203,21 @@ def test_refused_retry_preserves_exact_request_bodies_per_tool() -> None:
     )
 
 
+def test_a_refused_credential_never_retries_and_names_its_real_causes() -> None:
+    """A 401 is a rest error, not unavailability: the single fast retry stays
+    reserved for a loopback refusal, and the hint names the home mismatch and
+    the rotation instead of blaming a daemon that is not there."""
+    client = ScriptedClient([("raise", DaemonRestError(401, "daemon credential required"))])
+    _, responses = run_gateway([_call("recall", {"query": "x"})], client)
+    result = responses[0]["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "MNEMOSEED_LOCAL_HOME" in text
+    assert "credential rotate" in text
+    assert "not running" not in text
+    assert len(client.calls) == 1
+
+
 def test_ping_and_tools_list_never_touch_the_client() -> None:
     client = ScriptedClient([])
     _, responses = run_gateway([_request(9, "ping"), _request(2, "tools/list")], client)

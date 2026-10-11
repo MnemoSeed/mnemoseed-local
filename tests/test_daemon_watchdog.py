@@ -27,13 +27,14 @@ import socket
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
+import auth_support
 import pytest
 from _ports import listening_loopback_socket
-from fastapi.testclient import TestClient
 
 from mnemoseed_local.capture.pool import PoolEvent, PoolEventKind
-from mnemoseed_local.daemon.app import DreamWorker, create_app
+from mnemoseed_local.daemon.app import DreamWorker
 from mnemoseed_local.daemon.watchdog import _PROBE_TIMEOUT_S, Watchdog, default_probe
 from mnemoseed_local.dream import DreamTrigger, SnapshotResult
 from mnemoseed_local.storage.ports import TurnRange
@@ -83,8 +84,11 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _detach_daemon_log_handler()
 
 
-def _boot() -> TestClient:
-    return TestClient(create_app())
+def _boot() -> Any:
+    """The authenticated boot in the ambient config home (already isolated)."""
+    from mnemoseed_local.config import CONFIG_DIR
+
+    return auth_support.boot(CONFIG_DIR)
 
 
 # ---------------------------------------------------------------- never armed
@@ -98,6 +102,9 @@ def test_create_app_and_testclient_never_arm_watchdog(config_path: Path) -> None
         assert client.get("/healthz").json()["status"] == "ok"
         names = [t.name for t in threading.enumerate()]
         assert WATCHDOG_THREAD_NAME not in names
+        # reverse assertion: the liveness probe stays open, the rest refuses
+        refused = client.get("/api/v1/audit", headers={"Authorization": "Bearer not-the-credential"})
+        assert refused.status_code == 401
 
 
 # ---------------------------------------------------------------- PRE_BIND
@@ -623,8 +630,7 @@ def test_teardown_abandons_wedged_drain_in_bounded_time(config_path: Path) -> No
     the session (F2-rootfix semantics: teardown never hangs)."""
     session = "sess-wedge"
     block = threading.Event()
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post(
             "/ingest",
             json={
@@ -642,7 +648,7 @@ def test_teardown_abandons_wedged_drain_in_bounded_time(config_path: Path) -> No
             del session_id
             block.wait(5.0)  # outlives the 2s drain stop budget
 
-        app.state.capture.drain = wedged_drain
+        client.app.state.capture.drain = wedged_drain
         started = time.monotonic()
     elapsed = time.monotonic() - started
     assert elapsed < 4.0, f"teardown was not bounded: {elapsed:.3f}s"
@@ -664,8 +670,7 @@ def test_teardown_reports_failed_drain_with_session_and_exception(config_path: P
     the session and the exception, count it as failed (never as drained), and
     still complete teardown."""
     session = "sess-fail"
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(config_path.parent) as client:
         response = client.post(
             "/ingest",
             json={
@@ -683,7 +688,7 @@ def test_teardown_reports_failed_drain_with_session_and_exception(config_path: P
             del session_id
             raise RuntimeError("teardown drain exploded")
 
-        app.state.capture.drain = failing_drain
+        client.app.state.capture.drain = failing_drain
     log_text = (config_path.parent / "daemon.log").read_text(encoding="utf-8")
     assert "teardown: drain lane complete (0 drained, 1 failed, 0 abandoned)" in log_text
     assert f"drain failed for session {session}" in log_text
@@ -714,8 +719,7 @@ def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
     shutdown, is attached exactly once across repeated in-process boots, and
     is released again by each shutdown."""
     log_file = log_home / "daemon.log"
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(log_home) as client:
         assert client.get("/healthz").json()["status"] == "ok"
         # readable while the daemon is alive: the FileHandler flushes per emit
         assert log_file.exists()
@@ -729,7 +733,7 @@ def test_daemon_log_durable_filehandler_pins(log_home: Path) -> None:
     assert "teardown: complete" in final_text
 
     # a second in-process boot must not double-attach the handler
-    with TestClient(app) as client:
+    with auth_support.boot(log_home) as client:
         assert client.get("/healthz").json()["status"] == "ok"
         target = logging.getLogger("mnemoseed_local")
         attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
@@ -821,8 +825,7 @@ def test_daemon_log_boot_rotation_still_records_the_boot_line(log_home: Path) ->
     log_file = log_home / DAEMON_LOG_NAME
     oversized = b"q" * (_DAEMON_LOG_MAX_BYTES + 1)
     log_file.write_bytes(oversized)
-    app = create_app()
-    with TestClient(app) as client:
+    with auth_support.boot(log_home) as client:
         assert client.get("/healthz").json()["status"] == "ok"
         live_text = log_file.read_text(encoding="utf-8")
         assert "daemon boot:" in live_text, "the boot line must land in the fresh log"
@@ -903,12 +906,11 @@ def test_daemon_log_handler_follows_patched_config_dir(
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", tmp_path / "config.toml")
     monkeypatch.setattr("mnemoseed_local.dream.snapshot.CONFIG_DIR", tmp_path)
-    app = create_app()
     try:
-        with TestClient(app) as client:
+        with auth_support.boot(tmp_path) as client:
             assert client.get("/healthz").json()["status"] == "ok"
         # a boot after a released shutdown re-attaches against the same root
-        with TestClient(app) as client:
+        with auth_support.boot(tmp_path) as client:
             assert client.get("/healthz").json()["status"] == "ok"
             target = logging.getLogger("mnemoseed_local")
             attached = [h for h in target.handlers if getattr(h, "name", None) == DAEMON_LOG_NAME]
