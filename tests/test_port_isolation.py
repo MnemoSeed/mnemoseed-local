@@ -52,7 +52,7 @@ JAVASCRIPT_NETWORK_PRIMITIVES = (
 )
 FETCH_OVERRIDE = "globalThis.fetch"
 
-#: Every entry point that can name a destination port, including the asyncio
+#: Every entry point that can target a destination port, including the asyncio
 #: forms an in-process guard never saw.
 NETWORK_PRIMITIVES = (
     "bind",

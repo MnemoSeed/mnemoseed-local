@@ -11,7 +11,7 @@ import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-#: The ports the installed daemon owns. A test names one only where it asserts
+#: The ports the installed daemon owns. A test references one only where it asserts
 #: what the default configuration or the documentation says.
 RESERVED_PORTS = (4096, 7788)
 
