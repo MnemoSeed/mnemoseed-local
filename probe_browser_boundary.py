@@ -138,7 +138,7 @@ def _attacker_page_server() -> Any:
             port = int(probe.getsockname()[1])
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # noqa: N802 - http.server's own name
+            def do_GET(self) -> None:  # noqa: N802
                 body = b"<html><body>attacker page</body></html>"
                 self.send_response(200)
                 self.send_header("content-type", "text/html")

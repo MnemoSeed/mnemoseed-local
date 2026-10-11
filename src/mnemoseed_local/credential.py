@@ -38,11 +38,11 @@ from mnemoseed_local.secrets.store import (
     sanitize_name,
 )
 
-#: Secret-store name of the daemon credential (one file per name).
+#: Secret-store identifier of the daemon credential (one file per identifier).
 CREDENTIAL_SECRET_NAME = "daemon/credential"
 
-#: File name the credential persists as under ``<config home>/secrets``. The
-#: OpenCode plugin reads the same name, so it is derived from the store's own
+#: File stem the credential persists as under ``<config home>/secrets``. The
+#: OpenCode plugin reads the same stem, so it is derived from the store's own
 #: naming rule instead of being written twice.
 CREDENTIAL_FILE_NAME = f"{sanitize_name(CREDENTIAL_SECRET_NAME)}{SECRET_FILE_SUFFIX}"
 

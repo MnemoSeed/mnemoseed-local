@@ -855,7 +855,7 @@ def test_process_level_stdin_roundtrips_utf8_and_stays_silent(tmp_path: Path) ->
         }
         env = {k: v for k, v in os.environ.items() if k not in ENV_VARS}
         env["MNEMOSEED_LOCAL_BASEURL"] = server.url
-        # An explicit temporary home: the child must never resolve the installed
+        # An explicit ephemeral home: the child must never resolve the installed
         # one, or a subprocess-level test reads real memory state.
         env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path)
         env["PYTHONIOENCODING"] = "gbk"

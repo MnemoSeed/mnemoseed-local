@@ -98,7 +98,7 @@ def test_no_source_introduces_an_authentication_bypass() -> None:
     offenders: dict[str, list[str]] = {}
     for path in _sources():
         if path.name == Path(__file__).name:
-            continue  # this file names the banned tokens in order to ban them
+            continue  # this file lists the banned tokens in order to ban them
         source = path.read_text(encoding="utf-8")
         found = [token for token in BYPASS_TOKENS if token in source]
         if found:

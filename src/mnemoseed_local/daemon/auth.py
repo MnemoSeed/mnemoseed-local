@@ -55,7 +55,7 @@ CREDENTIAL_COOKIE_NAME = "mnemoseed_daemon_credential"
 #: send), Path=/ (the console's own relative fetches).
 CREDENTIAL_COOKIE_ATTRIBUTES = "HttpOnly; SameSite=Strict; Path=/"
 
-#: Host names that count as loopback for the cookie grant.
+#: Host identifiers that count as loopback for the cookie grant.
 LOOPBACK_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 #: The console's shipped static files (the mount reads the same directory).
