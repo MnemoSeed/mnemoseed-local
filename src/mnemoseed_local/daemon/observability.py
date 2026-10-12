@@ -1,11 +1,12 @@
 """Process-local observability counters (B2.12).
 
 Since-boot activity signals the doctor surface reads over HTTP: capture-hook
-ingest traffic vs MCP-gateway handshakes (a registered-but-never-connected MCP
-server is invisible otherwise), plus first-sighting hygiene for non-default
-profile_ids (a typo'd id presents as an empty namespace). Everything here is
-in-memory per boot and purely observational — no ingest/recall behavior
-changes.
+ingest traffic vs authenticated requests per audit actor (the MCP gateway is
+the only production surface that calls as the ``mcp`` actor, so its
+authenticated calls since boot are the connected signal), plus first-sighting
+hygiene for non-default profile_ids (a typo'd id presents as an empty
+namespace). Everything here is in-memory per boot and purely observational —
+no ingest/recall behavior changes.
 """
 
 from __future__ import annotations
@@ -26,8 +27,7 @@ class Observability:
         self._lock = threading.Lock()
         self._started_at = time.time()
         self._capture_ingests = 0
-        self._mcp_handshake_count = 0
-        self._last_mcp_handshake_at: float | None = None
+        self._authenticated_actors: dict[str, int] = {}
         self._seen_profiles: set[str] = set()
         # T2 auto-recall: aggregate-only since-boot counters for the mid-session
         # injection serve (count of serves + cumulative injected chars). Pure
@@ -39,12 +39,15 @@ class Observability:
         with self._lock:
             self._capture_ingests += 1
 
-    def note_mcp_handshake(self) -> None:
+    def note_authenticated_request(self, actor: str) -> None:
+        """Count one request the credential gate admitted, per audit actor.
+
+        The counter sits behind the gate, so only a caller that presented the
+        daemon credential can move it, and the attribution stays the
+        self-declared header it has always been.
+        """
         with self._lock:
-            self._mcp_handshake_count += 1
-            total = self._mcp_handshake_count
-            self._last_mcp_handshake_at = time.time()
-        logger.info("MCP gateway handshake recorded (%d since boot)", total)
+            self._authenticated_actors[actor] = self._authenticated_actors.get(actor, 0) + 1
 
     def note_profile_sighting(self, profile_id: str) -> None:
         if profile_id == DEFAULT_PROFILE_ID:
@@ -70,8 +73,7 @@ class Observability:
             return {
                 "boot_started_at": self._started_at,
                 "capture_ingest_count": self._capture_ingests,
-                "mcp_handshake_count": self._mcp_handshake_count,
-                "last_mcp_handshake_at": self._last_mcp_handshake_at,
+                "authenticated_actor_counts": dict(self._authenticated_actors),
                 "recall_injection_count": self._recall_injection_count,
                 "recall_injection_chars_total": self._recall_injection_chars_total,
                 "recall_pending_served_count": self._recall_injection_count,

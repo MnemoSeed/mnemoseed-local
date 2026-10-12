@@ -185,8 +185,8 @@ daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
 ```
 
 Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `supersede(superseded_node_id, successor_node_id)`,
-`dream_once()`, `recent_sessions(n_sessions?, n_per_session?)`, `session_windows(n_sessions?)`. The
-handshake works even when the daemon is down; only tool calls report the
+`dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?)`,
+`session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
 connectivity error.
 
 ## Development
@@ -210,17 +210,14 @@ Your sponsorship covers domain/infra for cloud TEE validation and funds the dail
 | **Sponsor** | $100 | README logo + quarterly roadmap sync (no feature promises) |
 | **Enterprise** | $500 | Direct support channel + private deployment consult (pre-warms Cloud) |
 
-One-time tips also welcome via Polar (below) or Buy Me a Coffee.
+One-time tips also welcome via Polar (below).
 
 ### Channels
 
 [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-%23EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/MnemoSeed)
 [![Polar](https://img.shields.io/badge/Donate-Polar-%230066FF?logo=polar&logoColor=white)](https://buy.polar.sh/polar_cl_KoNqAsMI8IQGy5RRE8MLbX7I5TBGUMh9Kn8CC35YfP7)
-[![Buy Me a Coffee](https://img.shields.io/badge/Tip-Buy%20Me%20a%20Coffee-%23FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/mnemoseed)
 
 > **Transparency promise**: monthly dream-cost figures, evaluation data, and sponsor counts/amounts are published in the Backer brief and quarterly sync. No feature gating, no license upsell, no roadmap over-promising.
-
-[![Thanks.dev](https://img.shields.io/badge/Support-Thanks.dev-%23FF6B35)](https://thanks.dev/github/MnemoSeed/mnemoseed-local)
 
 ## Evaluation (maintainers)
 
@@ -255,7 +252,7 @@ there, and it rides the wire as a bearer header.
 - The liveness probes (`/healthz`, `/health`) stay open so the installer, the
   watchdog, and the CLI can still tell "daemon is up" from "daemon is down".
   Everything else — `/api/v1/*`, `/ingest`, `/session/*`, `/memory/*`,
-  `/mcp/handshake`, `/daemon/shutdown` — is closed to a caller without the
+  `/daemon/shutdown` — is closed to a caller without the
   credential. The console authenticates with a same-origin `HttpOnly` cookie
   granted only on loopback; the value never enters the page.
 - A refused credential is reported as an authentication failure and names the

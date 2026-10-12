@@ -94,7 +94,6 @@ def test_the_open_set_is_exactly_the_probes_plus_the_enumerated_documents() -> N
         "/memory/supersede",
         "/memory/dream_once",
         "/memory/dream_status",
-        "/mcp/handshake",
         "/daemon/shutdown",
         "/console.js",
         "/favicon.ico",
@@ -128,7 +127,6 @@ def test_the_credential_opens_the_protected_surface(home: Path) -> None:
         assert client.get("/api/v1/audit").status_code == 200
         assert client.get("/api/v1/config").status_code == 200
         assert client.get("/api/v1/observability").status_code == 200
-        assert client.post("/mcp/handshake", json={}).status_code == 200
         # Closed to a caller without the credential; with one the request reaches
         # the route, and a TestClient boot's honest "no hook" answer is not an
         # authentication failure.
@@ -264,10 +262,10 @@ def test_the_request_log_records_method_path_and_status_only(
     (tmp_path / "config.toml").write_text(_config_text(tmp_path, requests_log=True), encoding="utf-8")
     marker = {"X-MnemoSeed-Marker": "must-not-reach-the-log"}
     with auth_support.boot(tmp_path) as client, caplog.at_level(logging.INFO):
-        assert client.post("/mcp/handshake", json={}, headers=marker).status_code == 200
+        assert client.get("/api/v1/observability", headers=marker).status_code == 200
 
     lines = [record.getMessage() for record in caplog.records if "->" in record.getMessage()]
-    assert lines == ["POST /mcp/handshake -> 200"]
+    assert lines == ["GET /api/v1/observability -> 200"]
 
 
 def test_a_refusal_produces_no_log_line_at_all(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

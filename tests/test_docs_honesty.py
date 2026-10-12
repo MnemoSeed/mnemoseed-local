@@ -126,6 +126,26 @@ def test_package_docstring_does_not_claim_no_console() -> None:
     assert "no console" not in pkg_doc
 
 
+def test_readme_tools_line_matches_the_gateway_tool_schemas() -> None:
+    """The documented verbs line is the tool surface's contract: every tool the
+    gateway serves appears with its required parameters unmarked and its
+    optional ones marked, exactly as its inputSchema declares."""
+    from mnemoseed_local.mcp_gateway.server import TOOLS
+
+    documented = {
+        name: [part.strip() for part in params.split(",") if part.strip()]
+        for name, params in re.findall(r"`(\w+)\(([^)]*)\)`", README)
+    }
+    assert documented, "README must spell out the gateway tools"
+
+    for tool in TOOLS:
+        schema = tool["inputSchema"]
+        required = schema.get("required", [])
+        optional = [name for name in schema["properties"] if name not in required]
+        expected = [*required, *(f"{name}?" for name in optional)]
+        assert documented.get(tool["name"]) == expected, tool["name"]
+
+
 def test_zh_readme_spells_dream_once_correctly() -> None:
     assert "dream --once" in ZH_README
     assert "dream once" not in ZH_README

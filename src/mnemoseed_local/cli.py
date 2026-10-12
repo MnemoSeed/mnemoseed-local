@@ -418,20 +418,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if stale_plugin is not None:
         warnings.append(stale_plugin)
 
-    # B2.12 (#117): a registered MCP server that never connected while the
-    # capture hooks clearly work is the silent missing-tools state — surface
-    # it. The since-boot qualifier keeps a daemon restart from crying wolf
-    # over a healthy setup whose gateway simply has not re-announced yet.
+    # The connected signal is authenticated gateway traffic since boot: the
+    # credential gate admits every request the counter sees, and the gateway is
+    # the only production surface that calls as the mcp actor. A gateway that
+    # called nothing while the capture hooks clearly work is the silent
+    # missing-tools state, so surface it. The since-boot qualifier keeps a
+    # daemon restart from crying wolf over a healthy setup whose gateway has
+    # not called a tool yet.
     if _opencode_mcp_registered(OPENCODE_CONFIG_PATH):
         activity = _daemon_activity(config)
         if activity is not None:
-            if activity.get("capture_ingest_count", 0) > 0 and activity.get("mcp_handshake_count", 0) == 0:
+            gateway_calls = activity.get("authenticated_actor_counts", {}).get("mcp", 0)
+            if activity.get("capture_ingest_count", 0) > 0 and not gateway_calls:
                 warnings.append(
                     (
                         "mcp injection",
-                        "MCP server registered but never connected since the daemon "
-                        "booted - tools likely not injected into sessions; restart "
-                        "opencode or re-register the 'mnemoseed' MCP server",
+                        "MCP server registered but the gateway has made no authenticated "
+                        "call since the daemon booted - tools likely not injected into "
+                        "sessions; restart opencode or re-register the 'mnemoseed' MCP server",
                     )
                 )
 

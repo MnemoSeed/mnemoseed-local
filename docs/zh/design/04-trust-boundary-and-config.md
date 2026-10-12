@@ -191,7 +191,7 @@ flowchart TB
 
 1. **默认拒绝**：未命中开放集合的请求一律 401（常量 detail + `WWW-Authenticate: Bearer`），不回显任何请求材料。
 2. **精确等值匹配、零路径规范化**：禁前缀匹配，禁 `rstrip` / `normpath` / 大小写折叠——`/healthz/../api/v1/audit` 因此**不在**开放集合内，与其它未知路径一样被拒。
-3. **开放集合 = enumerated set**：`/healthz`、`/health`（liveness 探针，四个真实消费者依赖它）+ console 三文件（`/`、`/index.html`、`/app.js`、`/style.css`，lifespan 启动时从 `console/static/` 枚举）。新增文件未枚举 = console 白屏：fail-closed 且当场可见。关闭：`/mcp/handshake`（任意进程可写的自增计数）、`/daemon/shutdown`（DoS 面）、全部 `/api/v1/*`、`/ingest` `/session/*` `/memory/*`、configwrite 路由。
+3. **开放集合 = enumerated set**：`/healthz`、`/health`（liveness 探针，四个真实消费者依赖它）+ console 三文件（`/`、`/index.html`、`/app.js`、`/style.css`，lifespan 启动时从 `console/static/` 枚举）。新增文件未枚举 = console 白屏：fail-closed 且当场可见。关闭：`/daemon/shutdown`（DoS 面）、全部 `/api/v1/*`、`/ingest` `/session/*` `/memory/*`、configwrite 路由。可观测计数（B2.12 按 actor 的已认证请求计数）只由门内中间件在放行请求上写入——无任何开放路径上的可写计数器；已连接信号 = 自本次启动以来 `mcp` actor 的已认证调用数。
 
 实现锚点：`credential.py`（`TokenVerifier` Protocol + `LocalFileTokenVerifier` + `read_credential` / `issue_credential` / `rotate_credential`；`CONFIG_DIR` **函数内 call-time 解析**——`create_app()` 是模块级的，解析时机放错 = import 即写真实 home）；`daemon/auth.py`（纯 ASGI 中间件——禁 `BaseHTTPMiddleware`，它的 task-group 调度会重排 respond-then-run 接缝，`/daemon/shutdown` 依赖该接缝；认证中间件包住日志中间件，故 401 不产生日志行）；`rest_client.py` `DaemonClient.token`（frozen dataclass 末位字段）+ `client_for`（客户端唯一入口，凭据只在这一处附加）。
 
