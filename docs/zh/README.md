@@ -44,7 +44,7 @@ Phase B 已经 main 落地：
 - **保留机制重设计**：统一保留动力学 + 线索钓回 + 淡出留痕。
 - **溯源信任面**：recall/Atlas 暴露 pinned-vs-captured 判别信号，
   注入面标注 pinned 行。
-- **可观测 beacon（B2.12）**：MCP 握手 beacon、doctor 的"已注册但从未连接"
+- **可观测计数（B2.12）**：按 actor 的已认证请求计数、doctor 的"已注册但从未连接"
   警告、`/api/v1/observability` 快照端点。
 - **错误事件账本（B2.13 E0/E1）**：append-only `error_events` 表与查询原语，
   仅管道，尚无检测器。

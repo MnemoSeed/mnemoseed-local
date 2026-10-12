@@ -862,7 +862,8 @@ def _mock_daemon_activity(
     monkeypatch: pytest.MonkeyPatch,
     *,
     ingests: int = 0,
-    handshakes: int = 0,
+    gateway_calls: int = 0,
+    other_calls: int = 0,
     unreachable: bool = False,
 ) -> None:
     from mnemoseed_local.rest_client import DaemonUnavailableError
@@ -871,13 +872,16 @@ def _mock_daemon_activity(
         def __init__(self, base_url: str, **kwargs: object) -> None:
             self.base_url = base_url
 
-        def get(self, path: str) -> dict[str, int]:
+        def get(self, path: str) -> dict[str, object]:
             del path
             if unreachable:
                 raise DaemonUnavailableError("connection refused")
+            counts = {"hook": ingests, "cli": other_calls}
+            if gateway_calls:
+                counts["mcp"] = gateway_calls
             return {
                 "capture_ingest_count": ingests,
-                "mcp_handshake_count": handshakes,
+                "authenticated_actor_counts": counts,
             }
 
     monkeypatch.setattr("mnemoseed_local.cli.DaemonClient", _ObservabilityClient)
@@ -908,17 +912,34 @@ def _mock_profile_probe_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch)
 def test_doctor_warns_when_mcp_registered_but_never_connected(
     cli_home: Path, tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """#117: capture hooks ingest but the MCP gateway never connected — the
+    """Capture hooks ingest but the MCP gateway never reached the daemon — the
     exact silent-failure state that hid missing tools from sessions."""
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     _write_opencode_registration(monkeypatch, tmp_path)
-    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0, "warnings must not fail the doctor"
     out = capsys.readouterr().out
     assert "[warn] mcp injection:" in out
-    assert "MCP server registered but never connected since the daemon booted" in out
+    assert (
+        "MCP server registered but the gateway has made no authenticated call since the daemon booted" in out
+    )
     assert "tools likely not injected into sessions" in out
+
+
+def test_doctor_warns_when_only_other_actors_reached_the_daemon(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Authenticated CLI traffic is not gateway traffic: the connected signal
+    keys on the mcp actor, so a hooked-and-CLI'd daemon still names the
+    missing-tools state."""
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0, other_calls=5)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] mcp injection:" in out
 
 
 @pytest.mark.parametrize("body", ['{"mcp": {}}', "{ not json", '{"other": 1}'])
@@ -928,7 +949,7 @@ def test_doctor_stays_quiet_without_a_live_registration(
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     _write_opencode_registration(monkeypatch, tmp_path, body)
-    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
 
@@ -939,7 +960,7 @@ def test_doctor_absent_opencode_config_skips_silently(
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", tmp_path / "absent" / "opencode.json")
-    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
 
@@ -950,7 +971,7 @@ def test_doctor_stays_quiet_when_gateway_connected(
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     _write_opencode_registration(monkeypatch, tmp_path)
-    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=2)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=2)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
 
@@ -961,7 +982,7 @@ def test_doctor_stays_quiet_without_capture_activity(
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     _write_opencode_registration(monkeypatch, tmp_path)
-    _mock_daemon_activity(monkeypatch, ingests=0, handshakes=0)
+    _mock_daemon_activity(monkeypatch, ingests=0, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
 
@@ -972,7 +993,7 @@ def test_doctor_stays_quiet_when_daemon_unreachable(
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     _write_opencode_registration(monkeypatch, tmp_path)
-    _mock_daemon_activity(monkeypatch, ingests=3, handshakes=0, unreachable=True)
+    _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0, unreachable=True)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
 

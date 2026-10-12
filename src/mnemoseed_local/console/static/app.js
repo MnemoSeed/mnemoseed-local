@@ -199,14 +199,17 @@ async function loadOverview(){
   if(obs && !obs.error){
     const boot = obs.boot_started_at ? fmtISO(obs.boot_started_at) : "—";
     const ingest = obs.capture_ingest_count ?? 0;
-    const mcp = obs.mcp_handshake_count ?? 0;
+    const actors = obs.authenticated_actor_counts || {};
+    const gateway = actors.mcp ?? 0;
+    const others = Object.keys(actors).filter(a=>a!=="mcp").reduce((s,a)=>s+actors[a], 0);
     obsBody.innerHTML = `
       <div class="kv-grid">
         <dl class="kv"><dt>Capture ingests</dt><dd>${fmtNum(ingest)}</dd></dl>
-        <dl class="kv"><dt>MCP handshakes</dt><dd>${fmtNum(mcp)}</dd></dl>
+        <dl class="kv"><dt>MCP gateway calls</dt><dd>${fmtNum(gateway)}</dd></dl>
+        <dl class="kv"><dt>Other authenticated calls</dt><dd>${fmtNum(others)}</dd></dl>
         <dl class="kv"><dt>Boot</dt><dd title="${esc(boot)}">${esc(fmtRel(obs.boot_started_at))} · <span class="muted">${esc(boot)}</span></dd></dl>
       </div>`;
-    obsFoot.textContent = obs.last_mcp_handshake_at ? `Last MCP handshake ${fmtRel(obs.last_mcp_handshake_at)}` : "No MCP handshake yet in this boot.";
+    obsFoot.textContent = gateway ? `Authenticated gateway calls counted since boot.` : `No authenticated gateway call yet in this boot.`;
   } else {
     obsBody.innerHTML = `<p class="muted">Couldn’t load memories — ${esc(obs?.error||"unknown")}. <button class="btn btn-sm">Retry</button></p>`;
   }

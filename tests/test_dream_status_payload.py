@@ -479,7 +479,6 @@ def test_external_surface_inventory_equals_frozen_baseline(
     assert http_paths == {
         "/healthz",
         "/health",
-        "/mcp/handshake",
         "/api/v1/observability",
         "/api/v1/audit",
         "/api/v1/profiles",

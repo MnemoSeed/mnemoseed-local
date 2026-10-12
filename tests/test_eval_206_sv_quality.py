@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,14 @@ FROZEN_STAGED_HASH = "FDDEA62462EEC219EFDC291E8F6C924484361194D1E95A7C81CAA3FC4B
 
 WINDOWS_ONLY = pytest.mark.skipif(
     sys.platform != "win32", reason="extended-length path spellings exist on Windows"
+)
+
+#: The one cold UNC proof. An uncached network path resolves over the wire,
+#: so that end-to-end proof runs only when explicitly asked for.
+UNC_COLD = pytest.mark.skipif(
+    not os.environ.get("MNEMOSEED_UNC_COLD"),
+    reason="set MNEMOSEED_UNC_COLD=1 for the cold UNC resolution run "
+    "(an uncached network path resolves over the network)",
 )
 
 
@@ -499,27 +508,62 @@ def test_extended_length_live_home_rejects_plain_run_root_inside_it(
 
 
 @WINDOWS_ONLY
-def test_unc_spelling_of_either_side_stays_inside_the_live_home(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
+def test_extended_length_unc_spellings_compare_inside_the_live_home() -> None:
+    """The live-home comparison is a pure string transform: the extended-length
+    prefix is stripped on both sides, so one directory keeps one comparable
+    spelling whatever either side is spelled with. Asserting the transform
+    directly proves the guard's property with no network round-trip."""
+    from mnemoseed_local.eval.sv_quality_runner import _is_within, _strip_extended_length
 
-    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", r"\\?\UNC\some-server\some-share\live-home")
-    with pytest.raises(ValueError, match="live home"):
-        canonical_run_root(Path(r"\\?\UNC\some-server\some-share\live-home\run"))
-    with pytest.raises(ValueError, match="live home"):
-        canonical_run_root(Path(r"\\some-server\some-share\live-home\run"))
+    live_home = r"\\some-server\some-share\live-home"
+    run_root = r"\\some-server\some-share\live-home\run"
+    for spelling in (
+        live_home,
+        r"\\?\UNC\some-server\some-share\live-home",
+        r"\\?\unc\some-server\some-share\live-home",
+        "//?/unc/some-server/some-share/live-home",
+    ):
+        assert _strip_extended_length(spelling) == live_home, spelling
+    # The raw extended-length spelling does not compare inside the plain home,
+    # which is exactly why both sides go through the transform first.
+    extended_run_root = r"\\?\UNC\some-server\some-share\live-home\run"
+    assert not _is_within(extended_run_root, live_home)
+    for spelling in (run_root, extended_run_root, "//?/unc/some-server/some-share/live-home/run"):
+        assert _is_within(_strip_extended_length(spelling), _strip_extended_length(live_home))
 
 
 @WINDOWS_ONLY
-def test_extended_length_spelling_of_the_unc_run_root_is_rejected_against_a_plain_unc_home(
+def test_extended_length_prefix_is_dropped_from_a_local_drive_spelling() -> None:
+    """The drive form of the prefix, in any case or slash style, keeps one
+    directory at one spelling after stripping."""
+    from mnemoseed_local.eval.sv_quality_runner import _strip_extended_length
+
+    for spelling in (
+        r"\\?\C:\live-home\run",
+        r"\\?\c:\live-home\run",
+        "//?/c:/live-home/run",
+    ):
+        assert _strip_extended_length(spelling).casefold() == r"c:\live-home\run".casefold()
+    assert _strip_extended_length(r"c:\live-home\run") == r"c:\live-home\run"
+
+
+@WINDOWS_ONLY
+@UNC_COLD
+def test_cold_unc_live_home_rejects_either_run_root_spelling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The end-to-end UNC proof, opt-in only: with the network path really
+    resolved, the guard rejects the plain and the extended-length run-root
+    spelling against a UNC live home."""
     from mnemoseed_local.eval.sv_quality_runner import canonical_run_root
 
     monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", r"\\some-server\some-share\live-home")
     with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(r"\\some-server\some-share\live-home\run"))
+    with pytest.raises(ValueError, match="live home"):
         canonical_run_root(Path(r"\\?\UNC\some-server\some-share\live-home\run"))
+    with pytest.raises(ValueError, match="live home"):
+        canonical_run_root(Path(r"\\some-server\some-share\live-home"))
 
 
 def test_case_varied_run_root_is_rejected_against_an_absent_live_home(

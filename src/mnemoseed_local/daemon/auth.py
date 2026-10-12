@@ -26,7 +26,10 @@ The middleware is a plain ASGI wrapper (never ``BaseHTTPMiddleware``, whose
 extra task-group hops would reorder the respond-then-run seam
 ``/daemon/shutdown`` depends on) and it wraps the request-logging middleware,
 so a refused request produces no log line and nothing but method, path, and
-status is ever written. It logs nothing itself.
+status is ever written. It logs nothing itself; the one thing it does beyond
+refusing is handing each admitted request to the observability counters under
+its self-declared audit actor, which is what makes the since-boot connected
+signal observable without a counter any unauthenticated caller could move.
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ from urllib.parse import urlsplit
 from starlette.datastructures import MutableHeaders
 
 from mnemoseed_local.credential import TokenVerifier, read_credential_or_none
+from mnemoseed_local.daemon.actor import actor_from_header
+from mnemoseed_local.rest_client import ACTOR_HEADER
 
 #: Paths that answer without a credential: the liveness probes the watchdog,
 #: the boot announce, the installer, the CLI, and the console dot all dial.
@@ -90,15 +95,30 @@ def auth_middleware(app: Any, verifier: TokenVerifier, get_state: Callable[[], A
             return
         documents: frozenset[str] = getattr(get_state(), "console_documents", frozenset())
         path = scope.get("path", "")
-        if path not in OPEN_PATHS and path not in documents and not _authorized(scope, verifier):
-            await _refuse(send)
-            return
+        if path not in OPEN_PATHS and path not in documents:
+            if not _authorized(scope, verifier):
+                await _refuse(send)
+                return
+            _count_admitted_request(get_state(), scope)
         if path in documents:
             await app(scope, receive, _granting_send(send, scope))
             return
         await app(scope, receive, send)
 
     return _entry
+
+
+def _count_admitted_request(state: Any, scope: Any) -> None:
+    """Hand one admitted request to the observability counters, by its actor.
+
+    Only the gate's admitted traffic reaches here: a refused request left at
+    :func:`_refuse`, and the open paths never pass through this branch. The
+    actor is the self-declared header, exactly as the routes read it.
+    """
+    observability = getattr(state, "observability", None)
+    if observability is None:
+        return
+    observability.note_authenticated_request(actor_from_header(_header_value(scope, ACTOR_HEADER.lower())))
 
 
 # ---------------------------------------------------------------- refusal

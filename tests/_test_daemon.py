@@ -157,9 +157,12 @@ def _tear_down(daemon: DaemonUnderTest) -> None:
 
     A child that never answered is registered for the session sweep instead of
     being waited on: nothing orderly can be asked of a listener that never
-    opened, and an unaccounted-for process is the defect this avoids.
+    opened, and an unaccounted-for process is the defect this avoids. A child
+    that already exited is accounted for as it left: a clean exit needs nothing
+    more, and a non-zero one is a defect the teardown names instead of passing.
     """
-    if daemon.proc.poll() is None:
+    exited = daemon.proc.poll()
+    if exited is None:
         if daemon.health is None:
             session_sweeper.register(daemon.proc.pid)
         else:
@@ -167,6 +170,12 @@ def _tear_down(daemon: DaemonUnderTest) -> None:
             assert answer == _SHUTDOWN_ANSWER, answer
             daemon.shutdown_answer = answer
             _assert_exited(daemon)
+        return
+    daemon.exit_code = exited
+    assert exited == 0, (
+        f"the daemon child (pid {daemon.proc.pid}) exited non-zero (code {exited}) "
+        "before its orderly teardown"
+    )
 
 
 def _shutdown_client(daemon: DaemonUnderTest) -> DaemonClient:
@@ -196,4 +205,6 @@ def _assert_exited(daemon: DaemonUnderTest) -> None:
             f"the daemon child (pid {daemon.proc.pid}) refused to exit within "
             f"{_EXIT_TIMEOUT_S:g}s; registered with the session sweeper"
         ) from None
-    assert daemon.exit_code == 0, daemon.exit_code
+    assert daemon.exit_code == 0, (
+        f"the daemon child (pid {daemon.proc.pid}) exited non-zero (code {daemon.exit_code})"
+    )

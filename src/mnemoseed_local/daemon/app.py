@@ -1302,17 +1302,6 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
             },
         }
 
-    @app.post("/mcp/handshake")
-    async def mcp_handshake(request: Request) -> dict[str, Any]:
-        """MCP-gateway startup beacon (B2.12): the stdio server announces
-        itself when a client connects it. Behind the credential gate like every
-        other surface except the liveness probes: a caller without the daemon
-        credential cannot move the since-boot counters."""
-        observability: Observability | None = getattr(request.app.state, "observability", None)
-        if observability is not None:
-            observability.note_mcp_handshake()
-        return {"ok": True}
-
     @app.get("/api/v1/observability")
     async def observability_read() -> dict[str, Any]:
         """Since-boot activity counters for the doctor surface (B2.12)."""
@@ -1321,7 +1310,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
             return {
                 "boot_started_at": 0.0,
                 "capture_ingest_count": 0,
-                "mcp_handshake_count": 0,
+                "authenticated_actor_counts": {},
                 "recall_injection_count": 0,
                 "recall_injection_chars_total": 0,
                 "recall_pending_served_count": 0,

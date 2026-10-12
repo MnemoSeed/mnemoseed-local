@@ -1,6 +1,7 @@
-"""B2.12 observability: MCP-gateway handshake beacon surface, since-boot
-activity counters (capture-hook ingest vs MCP handshakes), the request-level
-logging toggle ([logging] requests), and first-sighting profile hygiene.
+"""B2.12 observability: authenticated-request activity counts (per audit actor),
+the since-boot activity counters (capture-hook ingest vs authenticated gateway
+traffic), the request-level logging toggle ([logging] requests), and
+first-sighting profile hygiene.
 """
 
 from __future__ import annotations
@@ -101,25 +102,49 @@ def _ingest_body(session: str = SESSION, profile: str = PROFILE) -> dict:
     }
 
 
-# ---------------------------------------------------------------- handshake beacon surface
+# ---------------------------------------------------------------- authenticated activity counts
 
 
-def test_mcp_handshake_endpoint_records_since_boot(config_path: Path) -> None:
+def test_authenticated_requests_are_counted_per_actor(config_path: Path) -> None:
+    """Every request the credential gate admits is counted against its audit
+    actor, so gateway traffic is visible without any counter an unauthenticated
+    caller could move. The reading request counts as the actor that reads."""
     with _boot(config_path) as client:
-        assert client.get("/api/v1/observability").json()["mcp_handshake_count"] == 0
-        first = client.post("/mcp/handshake", json={"profile_id": PROFILE})
-        assert first.status_code == 200
-        assert first.json() == {"ok": True}
-        client.post("/mcp/handshake", json={})
+        assert client.get("/api/v1/audit").status_code == 200
+        client.post("/ingest", json=_ingest_body(), headers={"X-MnemoSeed-Actor": "hook"})
+        assert client.get("/api/v1/config", headers={"X-MnemoSeed-Actor": "cli"}).status_code == 200
         body = client.get("/api/v1/observability").json()
-        assert body["mcp_handshake_count"] == 2
+
+    assert body["authenticated_actor_counts"] == {"console": 2, "hook": 1, "cli": 1}
 
 
-def test_handshake_counters_reset_per_boot(config_path: Path) -> None:
+def test_authenticated_counts_reset_per_boot(config_path: Path) -> None:
     with _boot(config_path) as client:
-        client.post("/mcp/handshake", json={})
+        assert client.get("/api/v1/audit").status_code == 200
+        assert client.get("/api/v1/observability").json()["authenticated_actor_counts"] == {"console": 2}
     with _boot(config_path) as client:
-        assert client.get("/api/v1/observability").json()["mcp_handshake_count"] == 0
+        assert client.get("/api/v1/observability").json()["authenticated_actor_counts"] == {"console": 1}
+
+
+def test_a_refused_request_moves_no_counter(config_path: Path) -> None:
+    """A request the gate refuses never reaches the counters: the writable
+    surface stays behind the credential, whatever path it names."""
+    with _boot(config_path) as client:
+        wrong = auth_support.credential_headers("a-credential-that-was-never-issued")
+        assert client.get("/api/v1/audit", headers=wrong).status_code == 401
+        assert client.post("/ingest", json=_ingest_body(), headers=wrong).status_code == 401
+        body = client.get("/api/v1/observability").json()
+
+    assert body["authenticated_actor_counts"] == {"console": 1}
+
+
+def test_the_retired_beacon_path_is_no_writable_counter(config_path: Path) -> None:
+    """The startup beacon is gone: its path serves no counter to a credentialed
+    caller and stays refused for everyone else."""
+    with _boot(config_path) as client:
+        assert client.post("/mcp/handshake", json={}).status_code == 405
+    with auth_support.unauthenticated(config_path.parent) as stranger:
+        assert stranger.post("/mcp/handshake", json={}).status_code == 401
 
 
 # ---------------------------------------------------------------- capture-hook activity counter
