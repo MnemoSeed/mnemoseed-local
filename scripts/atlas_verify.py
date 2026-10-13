@@ -12,8 +12,14 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import sync_playwright
 
+from mnemoseed_local.credential import DaemonCredentialError, credential_path, read_credential_at
+from mnemoseed_local.rest_client import credential_headers
+
 RESERVED_PORTS = (7788, 4096)
 REMEMBER_TEXT = "Atlas verification memory for isolated browser proof"
+#: Bounded wait for the isolated daemon's credential: its lifespan issues the
+#: file before serving, so this only covers the write landing.
+CREDENTIAL_WAIT_SECONDS = 30.0
 
 
 def free_port() -> int:
@@ -78,6 +84,25 @@ def venv_python(repo_root: Path) -> str:
     import sys
 
     return sys.executable
+
+
+def issued_credential(home: Path) -> str:
+    """The credential the isolated daemon issued, read from that daemon's home.
+
+    The daemon lifespan writes the credential file before it serves, so the
+    bounded wait only covers the write landing; a daemon that never issues one
+    is a boot failure and is reported as such.
+    """
+    deadline = time.monotonic() + CREDENTIAL_WAIT_SECONDS
+    while True:
+        try:
+            return read_credential_at(home)
+        except DaemonCredentialError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"the isolated daemon issued no credential at {credential_path(home)}"
+                ) from None
+            time.sleep(0.25)
 
 
 def stop_owned_daemon(process: subprocess.Popen[bytes], base_url: str) -> None:
@@ -200,6 +225,8 @@ def main() -> int:
                     time.sleep(0.25)
             else:
                 raise RuntimeError("isolated daemon did not become ready")
+            credential = issued_credential(home)
+            headers = credential_headers(credential)
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch()
                 try:
@@ -214,12 +241,14 @@ def main() -> int:
             remember = httpx.post(
                 base_url + "/memory/remember",
                 json={"profile_id": "default", "text": REMEMBER_TEXT},
+                headers=headers,
                 timeout=30.0,
             )
             remember.raise_for_status()
             listed = httpx.post(
                 base_url + "/memory/atlas",
                 json={"profile_id": "default", "kind": "both"},
+                headers=headers,
                 timeout=30.0,
             )
             listed.raise_for_status()
@@ -231,6 +260,7 @@ def main() -> int:
             isolated = httpx.post(
                 base_url + "/memory/atlas",
                 json={"profile_id": "other"},
+                headers=headers,
                 timeout=30.0,
             )
             isolated.raise_for_status()
