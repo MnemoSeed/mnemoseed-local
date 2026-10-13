@@ -82,7 +82,9 @@ def daemon_for_test(tmp_path: Path) -> Iterator[DaemonUnderTest]:
     """Boot a daemon child on an ephemeral port and tear it down through the product."""
     port = unused_loopback_port()
     home = tmp_path / "home"
-    home.mkdir()
+    # exist_ok: a restart test reuses one home across sequential boots, so the
+    # credential the first boot issued stays the one the second one accepts.
+    home.mkdir(exist_ok=True)
     (home / "config.toml").write_text(_embedded_config_text(tmp_path, port), encoding="utf-8")
     # The interpreter directly, not through a virtualenv launcher: a launcher
     # stands a trampoline in front of the real process, and the pid that waits
