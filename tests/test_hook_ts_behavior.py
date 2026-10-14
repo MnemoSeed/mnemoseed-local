@@ -636,20 +636,71 @@ def test_debug_lane_stays_silent_without_the_env(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------- B2.6 host-plugin bundling
 
+#: The first-party remote MCP entry the config hook injects: the daemon's
+#: loopback HTTP surface, the three-header identity contract, no OAuth
+#: auto-detection, and the daemon client's own timeout.
+_REMOTE_ENTRY = {
+    "type": "remote",
+    "url": "http://localhost:7788/mcp",
+    "headers": {"x-mnemoseed-profile": "default", "x-mnemoseed-actor": "mcp"},
+    "oauth": False,
+    "enabled": True,
+    "timeout": 30000,
+}
+_REMOTE_ENTRY_WITH_CREDENTIAL = {
+    **_REMOTE_ENTRY,
+    "headers": {
+        "x-mnemoseed-profile": "default",
+        "x-mnemoseed-actor": "mcp",
+        "authorization": "Bearer driver-issued-credential",
+    },
+}
 
-def test_config_hook_injects_the_mcp_registration_create_if_absent(tmp_path: Path) -> None:
-    """B2.6 bundling: the config hook registers cfg.mcp["mnemoseed"] with the
-    A3 MCP-gateway command, creating the mcp map when absent; a user's
-    existing manual registration is never overwritten; a null cfg is a no-op."""
+
+def test_config_hook_injects_the_remote_mcp_registration_create_if_absent(tmp_path: Path) -> None:
+    """B2.6 bundling plus the HTTP MCP transport: the config hook registers
+    cfg.mcp["mnemoseed"] as the remote entry, creating the mcp map when
+    absent; a user's existing manual registration is never overwritten; a null
+    cfg is a no-op."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "config-inject")
-    expected = {"type": "local", "command": ["mnemoseed-local", "mcp"], "enabled": True}
-    assert transcript["empty"]["mcp"]["mnemoseed"] == expected
-    assert transcript["bare"]["mcp"]["mnemoseed"] == expected
-    assert transcript["manual"]["mcp"]["mnemoseed"] == {"type": "remote", "url": "http://mcp.example"}, (
-        "a user's manual registration must win untouched"
-    )
+    assert transcript["empty"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
+    assert transcript["bare"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
+    assert transcript["manual"]["mcp"]["mnemoseed"] == {
+        "type": "remote",
+        "url": "http://mcp.example",
+        "headers": {"X-Custom": "1"},
+    }, "a user's manual registration must win untouched"
     assert transcript["noThrow"] is True
+
+
+def test_config_hook_migrates_the_factory_stdio_entry_to_remote(tmp_path: Path) -> None:
+    """The one rewrite: the factory stdio entry this bundle's older versions
+    injected becomes the remote HTTP entry, preserving the user's enabled
+    flag; a foreign stdio entry and a manual remote entry are never touched."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "config-inject-migrate")
+    assert transcript["factory"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
+    assert transcript["disabled"]["mcp"]["mnemoseed"] == {**_REMOTE_ENTRY, "enabled": False}, (
+        "a user-disabled entry must stay disabled after the rewrite"
+    )
+    assert transcript["foreign"]["mcp"]["mnemoseed"] == {
+        "type": "local",
+        "command": ["other-tool", "mcp"],
+        "enabled": True,
+    }, "a foreign stdio entry is manual, never migrated"
+    assert transcript["manual"]["mcp"]["mnemoseed"] == {"type": "remote", "url": "http://mcp.example"}
+
+
+def test_config_hook_reads_the_daemon_credential_into_the_remote_entry(tmp_path: Path) -> None:
+    """The remote entry carries the daemon credential the same file the daemon
+    writes holds; a home that has none still gets the entry (the daemon then
+    refuses it honestly)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "config-inject-credential")
+    assert transcript["seeded"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY_WITH_CREDENTIAL
+    assert transcript["bare"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
+    assert "authorization" not in transcript["bare"]["mcp"]["mnemoseed"]["headers"]
 
 
 def test_options_tuple_switch_short_circuits_the_whole_bundle(tmp_path: Path) -> None:
@@ -679,8 +730,7 @@ def test_config_hook_is_fail_open_on_frozen_objects(tmp_path: Path) -> None:
     # entry — both must not overwrite other keys
     assert transcript["frozenCfgHasMnemoseed"] is None
     assert transcript["frozenMcpHasMnemoseed"] is None
-    expected = {"type": "local", "command": ["mnemoseed-local", "mcp"], "enabled": True}
-    assert transcript["afterMnemoseed"] == expected
+    assert transcript["afterMnemoseed"] == _REMOTE_ENTRY
 
 
 # ---------------------------------------------------------------- debug-log rotation

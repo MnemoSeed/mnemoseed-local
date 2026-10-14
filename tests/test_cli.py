@@ -187,12 +187,16 @@ def _mock_doctor_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     The hermetic config home is already patched by the cli_home fixture (both
     the cli and the config module namespaces), so doctor loads the file the
     test wrote there. The hardware probes are patched too, so no real
-    nvidia-smi / RAM lookup leaks the host's hardware into the report."""
+    nvidia-smi / RAM lookup leaks the host's hardware into the report. The
+    stale-plugin lane is patched as well: it reads the host's installed plugin
+    bytes, which no offline fixture controls (its own hermetic test below
+    pins it against a drifted copy under a temporary home)."""
     monkeypatch.setattr("mnemoseed_local.storage.factory.build_stores", lambda config: _FakeDoctorStores())
     monkeypatch.setattr("mnemoseed_local.llm.RoleRouter", _FakeDoctorRouter)
     monkeypatch.setattr("mnemoseed_local.hardware.probe_max_vram_gb", lambda: 0.0)
     monkeypatch.setattr("mnemoseed_local.hardware.probe_ram_gb", lambda: None)
     monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", cli_home / "no-opencode.json")
+    monkeypatch.setattr("mnemoseed_local.cli._stale_installed_plugin_warning", lambda: None)
 
     class _UnreachableDaemonClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -830,10 +834,15 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     """A stale plugin does not error — it keeps calling the daemon the old way,
     which the credential boundary refuses. The doctor must name it, or capture
     stops silently after an upgrade."""
+    from mnemoseed_local import cli
     from mnemoseed_local.hosts import install as hook_install
 
+    real_stale_plugin_warning = cli._stale_installed_plugin_warning
     _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
+    # this lane's own subject: the shared fixture silences it, this test puts
+    # the real one back against an isolated home holding a drifted copy
+    monkeypatch.setattr("mnemoseed_local.cli._stale_installed_plugin_warning", real_stale_plugin_warning)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
         monkeypatch.delenv(var, raising=False)
@@ -963,6 +972,73 @@ def test_doctor_absent_opencode_config_skips_silently(
     _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
+
+
+_FACTORY_STDIO_ENTRY = """{"mcp": {"mnemoseed": {
+  "type": "local",
+  "command": ["mnemoseed-local", "mcp"],
+  "enabled": true
+}}}"""
+_REMOTE_MCP_ENTRY = """{"mcp": {"servers": {"mnemoseed": {
+  "type": "remote",
+  "url": "http://localhost:7788/mcp",
+  "oauth": false
+}}}}"""
+
+
+def test_doctor_warns_about_a_legacy_stdio_mcp_entry(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The daemon serves the MCP tools over loopback HTTP on POST /mcp, so the
+    factory stdio entry spawns a long-lived gateway process per host and
+    connects the slow way; the doctor names it."""
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path, _FACTORY_STDIO_ENTRY)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn] legacy stdio mcp entry:" in out
+    assert "POST /mcp" in out
+    assert "restart the host" in out
+
+
+def test_doctor_warns_about_a_legacy_stdio_entry_under_the_servers_map(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The entry can live under either mcp map; the hint reads both."""
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"servers": {"mnemoseed": {"type": "local", "command": ["mnemoseed-local", "mcp"]}}}}',
+    )
+    assert main(["doctor"]) == 0
+    assert "[warn] legacy stdio mcp entry:" in capsys.readouterr().out
+
+
+def test_doctor_stays_quiet_about_a_remote_mcp_entry(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(monkeypatch, tmp_path, _REMOTE_MCP_ENTRY)
+    assert main(["doctor"]) == 0
+    assert "legacy stdio mcp entry" not in capsys.readouterr().out
+
+
+def test_doctor_stays_quiet_about_a_foreign_stdio_mcp_entry(
+    cli_home: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_doctor_config(cli_home)
+    _mock_doctor_backend(cli_home, monkeypatch)
+    _write_opencode_registration(
+        monkeypatch,
+        tmp_path,
+        '{"mcp": {"mnemoseed": {"type": "local", "command": ["other-tool", "mcp"]}}}',
+    )
+    assert main(["doctor"]) == 0
+    assert "legacy stdio mcp entry" not in capsys.readouterr().out
 
 
 def test_doctor_stays_quiet_when_gateway_connected(

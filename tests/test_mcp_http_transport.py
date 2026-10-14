@@ -111,9 +111,7 @@ def test_uncredentialed_post_is_refused_with_the_constant_detail(home: Path) -> 
 def test_missing_or_blank_profile_header_is_a_constant_400(home: Path) -> None:
     with auth_support.boot(home) as client:
         absent = client.post(MCP_PATH, json=_rpc(1, "initialize"))
-        blank = client.post(
-            MCP_PATH, json=_rpc(2, "initialize"), headers={PROFILE_HEADER: "   "}
-        )
+        blank = client.post(MCP_PATH, json=_rpc(2, "initialize"), headers={PROFILE_HEADER: "   "})
         declared_actor = client.post(
             MCP_PATH,
             json=_rpc(3, "initialize"),
@@ -167,9 +165,7 @@ def test_the_trailing_slash_path_is_not_the_route(home: Path) -> None:
         assert client.post(MCP_PATH + "/", json=_rpc(1, "initialize")).status_code == 401
     with auth_support.boot(home) as client:
         read = client.get(MCP_PATH + "/")
-        posted = client.post(
-            MCP_PATH + "/", json=_rpc(1, "initialize"), headers={PROFILE_HEADER: "default"}
-        )
+        posted = client.post(MCP_PATH + "/", json=_rpc(1, "initialize"), headers={PROFILE_HEADER: "default"})
 
     # Admitted, then matched by no route: the console mount answers, and it
     # refuses the POST verb the MCP surface would need.
@@ -179,9 +175,7 @@ def test_the_trailing_slash_path_is_not_the_route(home: Path) -> None:
 
 def test_malformed_and_non_object_bodies_are_a_constant_400(home: Path) -> None:
     with auth_support.boot(home) as client:
-        unparseable = client.post(
-            MCP_PATH, content=b"{not json", headers={PROFILE_HEADER: "default"}
-        )
+        unparseable = client.post(MCP_PATH, content=b"{not json", headers={PROFILE_HEADER: "default"})
         non_object = client.post(MCP_PATH, json=[1, 2, 3], headers={PROFILE_HEADER: "default"})
 
     for response in (unparseable, non_object):
@@ -203,9 +197,7 @@ def test_a_notification_gets_no_jsonrpc_answer(home: Path) -> None:
 
 def test_an_unknown_method_keeps_the_jsonrpc_error_envelope(home: Path) -> None:
     with auth_support.boot(home) as client:
-        response = client.post(
-            MCP_PATH, json=_rpc(7, "resources/list"), headers={PROFILE_HEADER: "default"}
-        )
+        response = client.post(MCP_PATH, json=_rpc(7, "resources/list"), headers={PROFILE_HEADER: "default"})
 
     assert response.status_code == 200
     payload = response.json()
@@ -242,7 +234,8 @@ def test_tool_call_round_trip_on_a_real_daemon(tmp_path: Path) -> None:
         assert json.loads(stored["content"][0]["text"])["outcome"] == "new_chunk"
 
         recalled = _post_mcp(
-            daemon, _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": "http transport probe fact"}})
+            daemon,
+            _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": "http transport probe fact"}}),
         )
         assert recalled.status_code == 200
         entries = recalled.json()["result"]
@@ -294,7 +287,9 @@ def test_two_concurrent_clients_stay_profile_isolated(tmp_path: Path) -> None:
 
         reads = {
             profile: _post_mcp(
-                daemon, _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": "namespace fact"}}), profile=profile
+                daemon,
+                _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": "namespace fact"}}),
+                profile=profile,
             )
             for profile in bodies
         }
@@ -325,16 +320,12 @@ def test_tool_call_completes_far_below_the_self_call_timeout(tmp_path: Path) -> 
 def test_restart_keeps_the_stateless_surface(tmp_path: Path) -> None:
     fact = "survives a daemon restart"
     with daemon_for_test(tmp_path) as first:
-        answered = _post_mcp(
-            first, _rpc(1, "tools/call", {"name": "remember", "arguments": {"text": fact}})
-        )
+        answered = _post_mcp(first, _rpc(1, "tools/call", {"name": "remember", "arguments": {"text": fact}}))
         assert answered.json()["result"]["isError"] is False
 
     with daemon_for_test(tmp_path) as second:
         assert second.port != first.port
-        recalled = _post_mcp(
-            second, _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": fact}})
-        )
+        recalled = _post_mcp(second, _rpc(2, "tools/call", {"name": "recall", "arguments": {"query": fact}}))
         shake = _post_mcp(second, _rpc(3, "initialize"), profile="default")
 
     assert recalled.json()["result"]["isError"] is False

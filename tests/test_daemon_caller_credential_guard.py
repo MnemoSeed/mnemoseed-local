@@ -76,6 +76,7 @@ KNOWN_CALLERS: dict[str, str] = {
     "scripts/atlas_verify.py": CREDENTIALED,
     "scripts/check_changed_comments.py": OPEN_SET,
     "scripts/gate.ps1": OPEN_SET,
+    "scripts/probe_mcp_http.py": CREDENTIALED,
     "scripts/sanitize_atlas_evidence.py": OPEN_SET,
     "scripts/windows-install-helpers.ps1": OPEN_SET,
     "scripts/windows-logon-task.ps1": OPEN_SET,

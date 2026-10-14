@@ -418,6 +418,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if stale_plugin is not None:
         warnings.append(stale_plugin)
 
+    stale_stdio_mcp = _stale_stdio_mcp_warning(OPENCODE_CONFIG_PATH)
+    if stale_stdio_mcp is not None:
+        warnings.append(stale_stdio_mcp)
+
     # The connected signal is authenticated gateway traffic since boot: the
     # credential gate admits every request the counter sees, and the gateway is
     # the only production surface that calls as the mcp actor. A gateway that
@@ -509,6 +513,49 @@ def _stale_installed_plugin_warning() -> tuple[str, str] | None:
         f"the installed plugin at {info.path} differs from the shipped one; "
         "run 'mnemoseed-local hook install opencode' to reinstall it "
         "(a stale plugin's daemon calls are refused and its capture stops silently)",
+    )
+
+
+def _mnemoseed_mcp_entry(path: Path) -> object | None:
+    """The host config's ``mnemoseed`` MCP entry, under either map shape.
+
+    A missing, unreadable or malformed file says nothing, so it answers None
+    rather than an error.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    mcp = data.get("mcp") if isinstance(data, dict) else None
+    if not isinstance(mcp, dict):
+        return None
+    entry = mcp.get("mnemoseed")
+    if entry is None:
+        servers = mcp.get("servers")
+        entry = servers.get("mnemoseed") if isinstance(servers, dict) else None
+    return entry
+
+
+def _stale_stdio_mcp_warning(path: Path) -> tuple[str, str] | None:
+    """An ``mnemoseed`` entry still on the factory stdio shape.
+
+    The daemon serves the MCP tools over loopback HTTP on POST /mcp, so a
+    stdio entry spawns a long-lived gateway process per host and reaches the
+    same tools the slow way. The config hook rewrites the factory entry on the
+    next host start; the doctor names it so a host that never reloads its
+    plugins still hears about it.
+    """
+    entry = _mnemoseed_mcp_entry(path)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("command") != ["mnemoseed-local", "mcp"]:
+        return None
+    return (
+        "legacy stdio mcp entry",
+        "the 'mnemoseed' MCP entry is the factory stdio shape (command "
+        "['mnemoseed-local','mcp']); the daemon serves the same tools over "
+        "loopback HTTP on POST /mcp - restart the host (or move the entry to "
+        "the remote shape) to stop spawning a long-lived gateway process",
     )
 
 

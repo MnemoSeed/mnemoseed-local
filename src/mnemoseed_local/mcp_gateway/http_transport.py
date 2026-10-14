@@ -108,7 +108,7 @@ def _jsonrpc_message(body: bytes) -> dict[str, Any] | None:
     return message if isinstance(message, dict) else None
 
 
-async def _answered(client: GatewayClient, message: dict[str, Any], app: Any) -> dict[str, Any] | None:
+async def _answered(client: Any, message: dict[str, Any], app: Any) -> dict[str, Any] | None:
     """The message's answer, with the daemon-touching methods off the loop.
 
     Only ``tools/call`` reaches the daemon, so only it pays the thread hop;
