@@ -227,7 +227,9 @@ Honest boundaries of the HTTP surface:
 - Non-POST methods on `/mcp` are 405; `/mcp/` is not the route (the console
   mount answers it); the surface is not in the console's open document set.
 - One tool call is two authenticated requests (the client leg plus the
-  daemon's own self-call leg), so the since-boot `mcp` counter moves by two.
+  daemon's own self-call leg); the since-boot `mcp` counter moves by two
+  when the client leg also declares `X-MnemoSeed-Actor: mcp`, as the
+  first-party entry does.
 - The remote entry reads the credential once at config-hook time; a rotated
   credential leaves the entry stale until the hook runs again (restart the
   host after `mnemoseed-local credential rotate`).

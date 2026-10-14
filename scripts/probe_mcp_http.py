@@ -100,19 +100,17 @@ def _opencode_config(oc_home: Path, credential: str, profile_id: str, url: str) 
         if key in host_config:
             config[key] = host_config[key]
     config["mcp"] = {
-        "servers": {
-            "mnemoseed": {
-                "type": "remote",
-                "url": url,
-                "headers": {
-                    "Authorization": f"Bearer {credential}",
-                    "X-MnemoSeed-Profile": profile_id,
-                    ACTOR_HEADER: "mcp",
-                },
-                "oauth": False,
-                "enabled": True,
-                "timeout": 30000,
-            }
+        "mnemoseed": {
+            "type": "remote",
+            "url": url,
+            "headers": {
+                "Authorization": f"Bearer {credential}",
+                "X-MnemoSeed-Profile": profile_id,
+                ACTOR_HEADER: "mcp",
+            },
+            "oauth": False,
+            "enabled": True,
+            "timeout": 30000,
         }
     }
     path = config_dir / "opencode.json"
@@ -196,63 +194,68 @@ def main() -> int:
     from mnemoseed_local.rest_client import DaemonClient
 
     workdir = Path(tempfile.mkdtemp(prefix="mnemoseed-mcp-probe-"))
-    oc_home = workdir / "oc-home"
-    if not _stage_provider_credential(oc_home):
-        print("probe unavailable: no provider credential under the host's opencode data dir")
-        return 2
-    home = workdir / "home"
-    home.mkdir()
-    port = _unused_loopback_port()
-    base_url = f"http://{_LOOPBACK}:{port}"
-    (home / "config.toml").write_text(_embedded_config_text(workdir, port), encoding="utf-8")
-    environment = {
-        **os.environ,
-        "MNEMOSEED_LOCAL_HOME": str(home),
-        "PYTHONPATH": os.pathsep.join(
-            filter(None, [_SRC, sysconfig.get_paths()["purelib"], os.environ.get("PYTHONPATH", "")])
-        ),
-    }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "mnemoseed_local.cli", "up", "--host", _LOOPBACK, "--port", str(port)],
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        cwd=str(_REPO_ROOT),
-    )
-    credential = ""
-    transcript: dict[str, Any] = {"base_url": base_url, "isolated_home": str(home)}
     try:
-        _await_ready(base_url)
-        credential = read_credential_at(home)
-        config_path = _opencode_config(oc_home, credential, "default", f"{base_url}/mcp")
-        run = _run_opencode(oc_home, workdir)
-        # An explicit token, not client_for: client_for resolves the process's
-        # own config home, and this probe reads the isolated daemon's home.
-        client = DaemonClient(base_url=base_url, profile_id="default", actor="cli", token=credential)
-        activity = client.get("/api/v1/observability")
-        recalled = client.post("/memory/recall", {"profile_id": "default", "query": _PROBE_FACT})
-        transcript.update(
-            {
-                "opencode_config": str(config_path),
-                "opencode_exit_code": run.returncode,
-                "opencode_output_tail": (run.stdout or "").strip().splitlines()[-6:],
-                "authenticated_actor_counts": activity["authenticated_actor_counts"],
-                "recalled_fact": any(
-                    _PROBE_FACT in json.dumps(entry, ensure_ascii=False)
-                    for entry in recalled["memory"]["entries"]
-                ),
-            }
+        oc_home = workdir / "oc-home"
+        if not _stage_provider_credential(oc_home):
+            print("probe unavailable: no provider credential under the host's opencode data dir")
+            return 2
+        home = workdir / "home"
+        home.mkdir()
+        port = _unused_loopback_port()
+        base_url = f"http://{_LOOPBACK}:{port}"
+        (home / "config.toml").write_text(_embedded_config_text(workdir, port), encoding="utf-8")
+        environment = {
+            **os.environ,
+            "MNEMOSEED_LOCAL_HOME": str(home),
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, [_SRC, sysconfig.get_paths()["purelib"], os.environ.get("PYTHONPATH", "")])
+            ),
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mnemoseed_local.cli", "up", "--host", _LOOPBACK, "--port", str(port)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(_REPO_ROOT),
         )
-        transcript["status"] = "PASS" if (run.returncode == 0 and transcript["recalled_fact"]) else "FAIL"
-    finally:
-        transcript["shutdown"] = _shutdown(base_url, credential)
+        credential = ""
+        transcript: dict[str, Any] = {"base_url": base_url, "isolated_home": str(home)}
         try:
-            proc.wait(timeout=30.0)
-        except subprocess.TimeoutExpired:
-            transcript["daemon_exit_code"] = None
-    print(json.dumps(transcript, indent=2, ensure_ascii=False))
-    return 0 if transcript.get("status") == "PASS" else 1
+            _await_ready(base_url)
+            credential = read_credential_at(home)
+            config_path = _opencode_config(oc_home, credential, "default", f"{base_url}/mcp")
+            run = _run_opencode(oc_home, workdir)
+            # An explicit token, not client_for: client_for resolves the process's
+            # own config home, and this probe reads the isolated daemon's home.
+            client = DaemonClient(base_url=base_url, profile_id="default", actor="cli", token=credential)
+            activity = client.get("/api/v1/observability")
+            recalled = client.post("/memory/recall", {"profile_id": "default", "query": _PROBE_FACT})
+            transcript.update(
+                {
+                    "opencode_config": str(config_path),
+                    "opencode_exit_code": run.returncode,
+                    "opencode_output_tail": (run.stdout or "").strip().splitlines()[-6:],
+                    "authenticated_actor_counts": activity["authenticated_actor_counts"],
+                    "recalled_fact": any(
+                        _PROBE_FACT in json.dumps(entry, ensure_ascii=False)
+                        for entry in recalled["memory"]["entries"]
+                    ),
+                }
+            )
+            transcript["status"] = "PASS" if (run.returncode == 0 and transcript["recalled_fact"]) else "FAIL"
+        finally:
+            transcript["shutdown"] = _shutdown(base_url, credential)
+            try:
+                proc.wait(timeout=30.0)
+            except subprocess.TimeoutExpired:
+                transcript["daemon_exit_code"] = None
+        print(json.dumps(transcript, indent=2, ensure_ascii=False))
+        return 0 if transcript.get("status") == "PASS" else 1
+    finally:
+        # The workdir holds the staged provider credential and the isolated
+        # daemon's credential, so it leaves no trace once the transcript is out.
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
