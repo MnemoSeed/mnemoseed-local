@@ -87,6 +87,7 @@ from mnemoseed_local.llm.types import (
     LLMError,
     LLMUnavailable,
 )
+from mnemoseed_local.mcp_gateway.http_transport import router as mcp_router
 from mnemoseed_local.retrieve.cues import CueConfig, _is_tool_name, extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.schema.turn import ProfileArchiveRequest, ProfileCreateRequest, Turn, TurnRole
@@ -1261,6 +1262,10 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
     app.include_router(ingest_router)
     app.include_router(memory_router)
     app.include_router(configwrite_router)
+    # The loopback HTTP MCP transport: registered with the other routers, ahead
+    # of the console mount below (Starlette matches in registration order, and
+    # the mount would otherwise swallow /mcp).
+    app.include_router(mcp_router)
     # B2.12 request-level observability ([logging] requests, default OFF).
     app.add_middleware(_request_logging_middleware, get_state=lambda: app.state)
     # The credential gate wraps the logging middleware: a refused request never

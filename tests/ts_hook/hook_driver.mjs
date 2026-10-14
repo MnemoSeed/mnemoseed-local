@@ -1659,7 +1659,9 @@ async function main() {
       await hooks.config(empty)
       const bare = { mcp: {} }
       await hooks.config(bare)
-      const manual = { mcp: { mnemoseed: { type: "remote", url: "http://mcp.example" } } }
+      const manual = {
+        mcp: { mnemoseed: { type: "remote", url: "http://mcp.example", headers: { "X-Custom": "1" } } },
+      }
       await hooks.config(manual)
       let noThrow = true
       try {
@@ -1668,6 +1670,44 @@ async function main() {
         noThrow = false
       }
       console.log(JSON.stringify({ empty, bare, manual, noThrow }))
+      break
+    }
+
+    case "config-inject-migrate": {
+      // The one rewrite: the factory stdio entry this bundle's older versions
+      // injected (command == ["mnemoseed-local","mcp"]) becomes the remote HTTP
+      // entry, preserving the user's enabled flag. A foreign stdio entry and a
+      // manual remote entry are never touched.
+      const factory = {
+        mcp: { mnemoseed: { type: "local", command: ["mnemoseed-local", "mcp"], enabled: true } },
+      }
+      await hooks.config(factory)
+      const disabled = {
+        mcp: { mnemoseed: { type: "local", command: ["mnemoseed-local", "mcp"], enabled: false } },
+      }
+      await hooks.config(disabled)
+      const foreign = {
+        mcp: { mnemoseed: { type: "local", command: ["other-tool", "mcp"], enabled: true } },
+      }
+      await hooks.config(foreign)
+      const manual = { mcp: { mnemoseed: { type: "remote", url: "http://mcp.example" } } }
+      await hooks.config(manual)
+      console.log(JSON.stringify({ factory, disabled, foreign, manual }))
+      break
+    }
+
+    case "config-inject-credential": {
+      // The remote entry reads the daemon credential file at config-hook time:
+      // present -> the authorization header rides the entry; absent -> the
+      // entry still injects (the daemon refuses it honestly).
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "driver-issued-credential\n", "utf8")
+      const seeded = {}
+      await hooks.config(seeded)
+      await unlink(CREDENTIAL_PATH)
+      const bare = {}
+      await hooks.config(bare)
+      console.log(JSON.stringify({ seeded, bare }))
       break
     }
 

@@ -181,6 +181,7 @@ flowchart TB
 | 写面 loopback 纵深 | `configwrite/routes.py:40-59`：`_is_loopback`（含 `127.*` 前缀与 IPv4-mapped IPv6）+ `_reject_remote_writes` → 403 | 读面随 daemon 绑定天然受限；写面再设一道 403 纵深 |
 | 隐式信任 = 正确性前提 | `daemon/actor.py:15-19`：`X-MnemoSeed-Actor` 仅归因，`_VALID_ACTORS = cli/console/mcp`，wire 值不参与授权 | 无账号体系是**有意的**（MVP §1 裁掉账号体系）；凭据不区分客户端身份——持 credential 即等价，actor 仍是自声明归因、不参与授权（§3.1.1） |
 | 多 profile 运行时 | 全部内存/摄取路由显式携带 `profile_id`（schema/turn、daemon/memory、ingest）；存储各层按 profile_id 键控 | 数据面是 N 个隐式隔离命名空间（惯例单个 `default`，无需表行）；生命周期与 agent→profile 绑定管理面见 §3.6 |
+| MCP HTTP 面（`/mcp`） | `daemon/app.py` `create_app`：`include_router(mcp_router)` 早于 console mount；`/mcp` 不进 `OPEN_PATHS`、不进 console documents——默认拒绝**依建构继承**，非新增机制 | 传输语义（三头身份契约 / 无状态 / 离环 tools/call）见 design/05 §3.2.1；`X-MnemoSeed-Profile` 是 namespace 选择，**不是授权**——与 actor 头同属自声明层 |
 | 记忆明文不出本机 | 无任何出站内存路径；`openai_compatible` 驱动仅作代码内保留（MVP §4.8"BYOK 推迟"） | 纯本地；BYOK 属 Phase B 后显式 opt-in（§4.1「未实施/在途」） |
 
 #### 3.1.1 daemon 凭据边界（本地 bearer）

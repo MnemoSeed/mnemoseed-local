@@ -341,6 +341,65 @@ function daemonHeaders(): Record<string, string> {
   return { "content-type": "application/json", ...credentialHeaders() }
 }
 
+// ---- B2.6 bundling / HTTP MCP transport: the config hook registers the
+// daemon's MCP server into the loading host's config. The daemon serves the
+// same gateway over loopback HTTP on POST /mcp, so the first-party entry is
+// REMOTE: it connects to the running daemon instead of spawning a long-lived
+// stdio gateway process. The entry carries oauth:false (a first-party 401 must
+// not open a browser OAuth/DCR loop) and an explicit timeout aligned with the
+// daemon client's REQUEST_TIMEOUT_SECONDS. The credential is the same file the
+// daemon writes, read at config-hook time; a home that has none leaves the
+// entry without an authorization header, and the daemon refuses it honestly.
+const MCP_ENTRY_NAME = "mnemoseed"
+const MCP_REMOTE_TIMEOUT_MS = 30000
+const MCP_ACTOR = "mcp"
+// The factory stdio entry this bundle's older versions injected: the only
+// shape the hook rewrites (preserving the user's enabled flag).
+const FACTORY_STDIO_COMMAND = ["mnemoseed-local", "mcp"]
+
+function isFactoryStdioEntry(entry: unknown): boolean {
+  if (entry === null || typeof entry !== "object") return false
+  const command = (entry as JsonRecord).command
+  return (
+    Array.isArray(command) &&
+    command.length === FACTORY_STDIO_COMMAND.length &&
+    FACTORY_STDIO_COMMAND.every((part, index) => command[index] === part)
+  )
+}
+
+function mcpEntryHeaders(): Record<string, string> {
+  return {
+    "x-mnemoseed-profile": PROFILE_ID,
+    "x-mnemoseed-actor": MCP_ACTOR,
+    ...credentialHeaders(),
+  }
+}
+
+function remoteMcpEntry(): Record<string, unknown> {
+  return {
+    "type": "remote",
+    "url": BASE_URL + "/mcp",
+    "headers": mcpEntryHeaders(),
+    "oauth": false,
+    "enabled": true,
+    "timeout": MCP_REMOTE_TIMEOUT_MS,
+  }
+}
+
+function installMcpEntry(mcp: Record<string, unknown>): void {
+  // Create-if-absent: a manual or foreign registration wins untouched. The
+  // one rewrite is the factory stdio entry, which becomes the remote entry
+  // with the user's enabled flag carried over.
+  const existing = mcp[MCP_ENTRY_NAME]
+  if (existing === undefined || existing === null) {
+    mcp[MCP_ENTRY_NAME] = remoteMcpEntry()
+    return
+  }
+  if (!isFactoryStdioEntry(existing)) return
+  const enabled = (existing as JsonRecord).enabled
+  mcp[MCP_ENTRY_NAME] = { ...remoteMcpEntry(), "enabled": enabled !== false }
+}
+
 async function rotateDebugLogIfOversized(): Promise<void> {
   try {
     const info = await stat(DEBUG_LOG_PATH)
@@ -2329,18 +2388,15 @@ export default async function MnemoSeedLocalPlugin(
   return {
     // B2.6 bundling: register the daemon's MCP server into the loading host's
     // config. Create-if-absent at BOTH levels — cfg.mcp ??= {} (the map) and
-    // mcp["mnemoseed"] ??= {..} (the entry) — so a user's existing manual
-    // "mnemoseed" registration (README §MCP gateway) wins untouched. The
-    // entry shape matches the A3 README sample plus an explicit enabled flag.
+    // the entry — so a user's existing manual "mnemoseed" registration (README
+    // §MCP gateway) wins untouched; the factory stdio entry this bundle's
+    // older versions injected is rewritten to the remote HTTP entry with its
+    // enabled flag preserved.
     "config": async (cfg: any): Promise<void> => {
       try {
         if (cfg === null || typeof cfg !== "object") return
         const mcp = (cfg.mcp ??= {}) as Record<string, unknown>
-        mcp["mnemoseed"] ??= {
-          "type": "local",
-          "command": ["mnemoseed-local", "mcp"],
-          "enabled": true,
-        }
+        installMcpEntry(mcp)
       } catch (error) {
         console.debug("mnemoseed-local: config hook failed:", error)
       }

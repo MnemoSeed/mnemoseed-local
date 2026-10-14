@@ -246,17 +246,18 @@ def test_plugin_registers_the_required_hooks() -> None:
 
 
 def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_config_hook() -> None:
-    """B2.6 host-plugin bundling: the config hook registers the daemon's MCP
-    server into the loading host's config (per-host isolation — cfg belongs
-    to the host whose plugin dir loaded this file). Create-if-absent at BOTH
-    levels — cfg.mcp ??= {} (the map) and mcp["mnemoseed"] ??= {..} (the
-    entry) — so a user's existing manual "mnemoseed" registration (README
-    §MCP gateway) is never overwritten; the entry shape matches the A3 README
-    sample plus an explicit enabled flag."""
+    """B2.6 host-plugin bundling plus the HTTP MCP transport: the config hook
+    registers the daemon's MCP server into the loading host's config (per-host
+    isolation — cfg belongs to the host whose plugin dir loaded this file).
+    Create-if-absent at BOTH levels — cfg.mcp ??= {} (the map) and the entry —
+    so a user's existing manual "mnemoseed" registration (README §MCP gateway)
+    is never overwritten; the one rewrite is the factory stdio entry, which
+    migrates to the remote HTTP shape. The injected entry is remote, without
+    OAuth auto-detection, and carries an explicit timeout."""
     source = _plugin_source()
     assert "cfg.mcp ??=" in source, "the mcp map must be created when absent"
-    assert 'mcp["mnemoseed"] ??=' in source, "an existing manual registration must win untouched"
-    for token in ('"mnemoseed"', '"mnemoseed-local"', '"mcp"', '"type": "local"', '"enabled": true'):
+    assert "installMcpEntry(mcp)" in source, "the entry install must run create-if-absent"
+    for token in ('"mnemoseed"', '"mnemoseed-local"', '"mcp"', '"type": "remote"', '"oauth": false'):
         assert token in source, token
 
 

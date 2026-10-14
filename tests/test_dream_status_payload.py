@@ -501,6 +501,7 @@ def test_external_surface_inventory_equals_frozen_baseline(
         "/memory/forget_this",
         "/memory/reinforce",
         "/memory/timeline",
+        "/mcp",
         *expected_paths,
     }
 

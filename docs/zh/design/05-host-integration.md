@@ -14,7 +14,7 @@
 | 通道 | 形态 | 谁在用 |
 |---|---|---|
 | ① 宿主 hook | 随包分发的 OpenCode 插件（`plugin.ts`），fire-and-forget 把事件翻译成 daemon REST 调用 | OpenCode（今日唯一宿主适配） |
-| ② MCP 网关 | 零依赖 stdio JSON-RPC 2.0 进程，模型经 `tools/call` 主动读写 | 任何 MCP 宿主；capture 自动通道仍归 hook 主线 |
+| ② MCP 网关 | 零依赖 stdio JSON-RPC 2.0 进程，外加 daemon 上的 loopback HTTP 面（`POST /mcp`，无状态、同一套工具与归因）；模型经 `tools/call` 主动读写 | 任何 MCP 宿主；capture 自动通道仍归 hook 主线 |
 | ③ CLI | `mnemoseed-local` 动词面，状态变更走 daemon REST | 用户 / 脚本 / 任何宿主 |
 
 **内容所有权（本篇 own 传输/生命周期机制）**：
@@ -84,6 +84,8 @@ flowchart LR
 ```
 
 **走查要点**：网关是串行 stdio 循环（server.py:285-320），一次 `tools/call` 最多占用一个循环周期；daemon 故障经 `GatewayClient` 转为结构化 `isError` 返回，**永不整死循环**。握手（`initialize` → `notifications/initialized` → `tools/list`）在 daemon 缺席时照常完成——「模型能连上、调不动」由 isError 如实暴露，而不是连接即失败。
+
+同一套 `handle_message` / `call_tool` / `TOOLS` 同时挂在 daemon 的 loopback HTTP 面上（`POST /mcp`，见 §3.2.1）：HTTP 客户端不再拉起长活 stdio 子进程，工具集、`isError` 文案与 audit actor 与 stdio 逐字节一致。
 
 ### 1.3 安装编排壳
 
@@ -202,6 +204,28 @@ flowchart TB
 **disabled 诚实文案（B2.5）**：`serve()` 启动时读一次 `daemon_state.is_disabled()`（`CONFIG_DIR/daemon.off` 哨兵，缺席 = 默认开），注入 `GatewayClient` 的 down-hint；disabled 时 refused-after-retry 文案 = `cannot reach {base_url}: memory service is disabled by the user (run 'mnemoseed-local on' to re-enable)`。标准 down hint / timeout hint / 422 文案字节不动（pin 碰撞审计保字节）。
 
 **UTF-8 线钉死**（server.py:262-282）：`_force_utf8_lane` 对双道 stdio 现场 `reconfigure`——输入道只钉编码 UTF-8；输出道钉 UTF-8 + `newline=""`（关掉 Windows text-mode 的 `\n→\r\n` 翻译，保住严格换行分帧）。cp936 乱码 + CRLF 翻译是双坑（2026-08-18 go-live smoke 实锤），`7023746` 修复；回归测试 `test_serve_forces_utf8_and_untranslated_newlines_on_stdio_lanes` 复现 live 同指纹的解码错位（byte 0xa1 = em-dash 的 GBK 头字节，roadmap 行内记录 @1035），钉死「em-dash 在 UTF-8 线上存活 + 线上无 `\r\n`」。
+
+### 3.2.1 HTTP 传输面（`mcp_gateway/http_transport.py`，loopback `/mcp`）
+
+**路由**：唯一精确路径 `POST /mcp`（`app.include_router(mcp_router)` 与其余 router 并列，**必须早于 console `StaticFiles` 挂载**——Starlette 按注册序匹配）。信封层直调既有 `handle_message` / `call_tool` / `TOOLS`，**零改动**：`initialize` 答既有 `PROTOCOL_VERSION`，工具集与 `isError` 文案字节不变。非 POST 方法（`GET`/`DELETE` 等）→ 405 + `Allow: POST`；`/mcp/` 不是本路由（带凭据落到 console mount：GET 404 / POST 405；不带凭据 401）。body 非单个 JSON 对象 → 常量 400（`MALFORMED_MESSAGE_DETAIL`）；notification（无 id / `notifications/*`）→ 202 空体。**无状态**：不发 `Mcp-Session-Id`、无服务端会话表，重启无可失状态。
+
+**per-request 身份契约**（三头，只有 `/mcp` 解释后两个）：
+
+| 头 | 语义 | 层 |
+|---|---|---|
+| `Authorization: Bearer <credential>` | 授权（边界唯一入口） | 既有 gate，不动 |
+| `X-MnemoSeed-Profile` | 每请求 namespace 选择；缺失/空白 → 常量 400（`MISSING_PROFILE_DETAIL`），不静默默认 | 本面新增 |
+| `X-MnemoSeed-Actor` | 自声明归因；**自调用腿一律钉 `ACTOR="mcp"`**，客户端声明值不改变内部归因 | 既有语义 |
+
+**profile 不是授权**：与 REST 面同款边界如实文档化——持 credential 即等价，profile 只选 namespace，绝不给「某 profile 需要某凭据」的错觉。
+
+**并发与生命周期**：每请求构造 `GatewayClient.wrap(DaemonClient(base_url=app.state.config.baseurl, profile_id=<header>, actor=ACTOR, token=read_credential_or_none()))`——profile 与凭据都按请求解析，并发客户端天然隔离。`tools/call` 经 `anyio.to_thread.run_sync` **离环**执行（每 app 一个 `anyio.CapacityLimiter(4)`；anyio 默认 limiter 为 40，4 ≪ 40 无饥饿）：同步 inline 会让自调用腿请求落在一个已被占住的事件循环上而自死锁，测试以「远小于 30s 完成」为 oracle 钉死。`initialize`/`ping`/`tools/list` 不触达 daemon，留在环上。loopback refused 仍由 `GatewayClient` 既有单次快重试兜；`/daemon/shutdown` 的 respond-then-exit 接缝零触碰；不新增中间件（`len(factories)==2` 的 pin 不破）、不新增常驻线程。
+
+**观测诚实记账**：每次 tool call = 2 笔已认证 `mcp` 请求（客户端腿 + 自调用腿），语义写进 README；doctor guard 为 `> 0` 不受影响。
+
+**第一方 remote 条目**：插件 config hook 注入 create-if-absent 条目，必带 `"oauth": false`（否则 OpenCode 遇 401 会起浏览器 OAuth/DCR 循环）与显式 `timeout`（30000，对齐 `REQUEST_TIMEOUT_SECONDS`），凭据在 config-hook 时读 `<home>/secrets/daemon.credential.key` 字面值；现存本厂 stdio 条目（`command == ["mnemoseed-local","mcp"]`）**形状迁移**为 remote 并保留用户 `enabled`，manual/foreign 条目不碰。
+
+**云 seam 不动**：`TokenVerifier` Protocol + `create_app(token_verifier=...)` 原样保留；HTTP 面不引入任何「识别签发方」分支。
 
 ### 3.3 CLI 动词全表（`cli.py`，取证 build_parser）
 
@@ -323,3 +347,4 @@ flowchart TB
 | POST | `/api/v1/config/set` | 单键配置写入（版本化 + 热生效） |
 | GET | `/api/v1/config/versions` | 配置版本历史 |
 | POST | `/api/v1/config/rollback` | 配置回滚（append-only） |
+| POST | `/mcp` | MCP HTTP 传输面（JSON-RPC 2.0；三头身份契约；无状态；离环 tools/call；§3.2.1） |

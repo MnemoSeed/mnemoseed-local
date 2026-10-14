@@ -184,10 +184,57 @@ daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
 {"mcp": {"mnemoseed": {"type": "local", "command": ["mnemoseed-local", "mcp"]}}}
 ```
 
+The running daemon also serves the same gateway over loopback HTTP on
+**`POST /mcp`** (`application/json` only, stateless — no session id, no
+server-side session table). The OpenCode plugin's config hook registers the
+remote entry for you (`oauth: false` plus an explicit 30s timeout; an existing
+factory stdio entry is shape-migrated, a manual entry wins untouched):
+
+```json
+{"mcp": {"mnemoseed": {
+  "type": "remote",
+  "url": "http://localhost:7788/mcp",
+  "headers": {
+    "Authorization": "Bearer <the daemon credential>",
+    "X-MnemoSeed-Profile": "default",
+    "X-MnemoSeed-Actor": "mcp"
+  },
+  "oauth": false,
+  "enabled": true,
+  "timeout": 30000
+}}}
+```
+
+Any third-party local client speaks the same contract with plain HTTP: read
+the credential from `~/.mnemoseed-local/secrets/daemon.credential.key`,
+present it as the bearer header, carry `X-MnemoSeed-Profile`, and POST the
+JSON-RPC body to `/mcp`.
+
 Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `supersede(superseded_node_id, successor_node_id)`,
 `dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?)`,
 `session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
 connectivity error.
+
+Honest boundaries of the HTTP surface:
+
+- `X-MnemoSeed-Profile` is per-request namespace selection, not
+  authorization: the credential is the only boundary, exactly like the REST
+  surface. A missing or blank profile header is a constant 400 (no silent
+  `default`).
+- `X-MnemoSeed-Actor` is self-declared attribution only. The daemon pins
+  every self-call from this surface to the `mcp` audit actor, so a
+  client-declared value never changes attribution.
+- Non-POST methods on `/mcp` are 405; `/mcp/` is not the route (the console
+  mount answers it); the surface is not in the console's open document set.
+- One tool call is two authenticated requests (the client leg plus the
+  daemon's own self-call leg); the since-boot `mcp` counter moves by two
+  when the client leg also declares `X-MnemoSeed-Actor: mcp`, as the
+  first-party entry does.
+- The remote entry reads the credential once at config-hook time; a rotated
+  credential leaves the entry stale until the hook runs again (restart the
+  host after `mnemoseed-local credential rotate`).
+- `"oauth": false` keeps a first-party entry from opening a browser
+  OAuth/DCR loop when the daemon answers 401.
 
 ## Development
 
@@ -252,7 +299,7 @@ there, and it rides the wire as a bearer header.
 - The liveness probes (`/healthz`, `/health`) stay open so the installer, the
   watchdog, and the CLI can still tell "daemon is up" from "daemon is down".
   Everything else — `/api/v1/*`, `/ingest`, `/session/*`, `/memory/*`,
-  `/daemon/shutdown` — is closed to a caller without the
+  `/daemon/shutdown`, `/mcp` — is closed to a caller without the
   credential. The console authenticates with a same-origin `HttpOnly` cookie
   granted only on loopback; the value never enters the page.
 - A refused credential is reported as an authentication failure and names the
