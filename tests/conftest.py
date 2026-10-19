@@ -1,10 +1,15 @@
-"""Session-wide isolation: the reserved-port report and the sweeper drain.
+"""Session-wide isolation: the reserved-port report, the sweeper drain, and the
+reload guard.
 
 Nothing here intercepts a socket. The reserved ports are watched by a static
 scan of the test sources (``test_port_isolation``); the session precondition
 measures them once and reports what it found, so a developer who is running the
 daemon is told about it rather than blocked; and a test daemon that refused its
 orderly teardown is accounted for by the session sweeper at the end.
+
+The reload guard is armed before any test module is imported, so a test that
+reloads a module defining an exception fails where the reload is written instead
+of failing unrelated files later in the session.
 """
 
 from __future__ import annotations
@@ -13,8 +18,11 @@ import logging
 from collections.abc import Iterator
 
 import pytest
+import reload_guard
 import session_sweeper
 from _ports import reserved_port_occupancy
+
+reload_guard.activate()
 
 logger = logging.getLogger("mnemoseed_local.tests.isolation")
 

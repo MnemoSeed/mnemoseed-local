@@ -34,6 +34,25 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+  # The cheap static gates read every commit a pull request adds, so a commit cannot
+  # hide behind a green tip or a merge. The type check and the suite stay in the
+  # `test` job above, where their cost is paid once.
+  commit-range-gates:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --frozen
+      - name: Cheap gates on every commit
+        run: uv run python scripts/check_commit_range.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+
   atlas-browser:
     runs-on: ubuntu-latest
     timeout-minutes: 15
