@@ -26,6 +26,15 @@ listing captured earlier in the session.
 - Commit discipline (user directive 2026-08-19): land work via
   **issue → branch → PR → merge** (PR body: `Closes #<issue>`), never a
   direct commit to `main`.
+- **Every pushed commit is green; a merge is not a repair surface**. When a
+  commit is found gate-red, fix that commit itself (amend) or land a follow-up
+  commit that says what it repairs — never fold the fix into a later commit or
+  a merge. A merge commit carries only the reconciliation of its two parents.
+  `scripts/check_commit_range.py` reads the cheap gates (changed comments,
+  `ruff check`, `ruff format --check`) on every commit of a range; the type
+  check and the suite read the tip, where their cost is paid once. That script
+  is the mechanical half and covers the cheap gates only — it is not a licence
+  to push a commit whose tests or types fail.
 - **Delegated execution (user directive 2026-08-19, designed in from the
   start)**: the main session only orchestrates (decompose, brief, accept,
   run gates). ALL execution goes to the named subagents (registered as
