@@ -1320,3 +1320,278 @@ def test_install_registers_user_prompt_submit_as_the_injection_surface(
     assert len(handlers) == 1
     assert handlers[0]["command"] == cc_install.TRANSFORM_COMMAND
     assert handlers[0].get("async") is not True
+
+
+# ---------------------------------------------------------------- conversation visibility
+
+
+def test_visibility_signal_vocabulary_is_fixed_and_non_directive() -> None:
+    """The signal word list is fixed, English, and carries no imperative — the
+    signals state what mnemoseed did, never instruct the model."""
+    assert events.T2_SIGNAL == "[mnemoseed] recalled related memories"
+    assert events.CAPTURE_SIGNAL == "[mnemoseed] captured this session"
+    assert events.capture_count_line(3) == "[mnemoseed] captured 3 turns since the last report"
+    assert events.recall_count_line(2, 1200) == "[mnemoseed] 2 memories, 1200 chars"
+
+
+def test_t2_block_with_signal_places_one_signal_line_after_the_fence() -> None:
+    """compact T2: exactly one signal line, right after the fence-open line,
+    before the disclaimer; the block stays inside item_budget + wrapper."""
+    items = [{"kind": "chunk", "id": "c1", "text": "中段关键线索"}]
+    block = events.build_t2_context(items, 1200, signal=events.T2_SIGNAL)
+    assert block is not None
+    lines = block.split("\n")
+    assert lines[0] == events.RECALL_FENCE_OPEN
+    assert lines[1] == events.T2_SIGNAL
+    assert lines[2].startswith("The block below is an automatic memory replay")
+    assert lines[-1] == events.RECALL_FENCE_CLOSE
+    assert block.count("[mnemoseed]") == 1
+    wrapper = (
+        len(events.RECALL_FENCE_OPEN) + 1 + len(events.RECALL_DISCLAIMER) + 1 + len(events.RECALL_FENCE_CLOSE)
+    )
+    assert len(block) <= 1200 + wrapper
+
+
+def test_t2_block_signal_sheds_first_under_budget_pressure() -> None:
+    """design/11 §4.3 drop order extends to the signal line: under pressure the
+    signal sheds BEFORE any item, and the shed result is byte-identical to the
+    no-signal build (the signal is purely additive when it fits)."""
+    text = "z" * 149  # bare line cost 150 == budget 150; with the signal it overruns
+    items = [{"kind": "chunk", "id": "c1", "text": text}]
+    with_signal = events.build_t2_context(items, 150, signal=events.T2_SIGNAL)
+    without_signal = events.build_t2_context(items, 150)
+    assert without_signal is not None
+    assert with_signal == without_signal, "the shed signal must restore the bare block"
+    assert events.T2_SIGNAL not in with_signal
+
+
+def test_t2_block_verbose_carries_the_count_line_after_the_signal() -> None:
+    signal = events.T2_SIGNAL + "\n" + events.recall_count_line(1, 6)
+    items = [{"kind": "chunk", "id": "c1", "text": "中段关键线索"}]
+    block = events.build_t2_context(items, 1200, signal=signal)
+    assert block is not None
+    lines = block.split("\n")
+    assert lines[1] == events.T2_SIGNAL
+    assert lines[2] == "[mnemoseed] 1 memories, 6 chars"
+    assert block.count("[mnemoseed]") == 2
+
+
+def test_inject_recall_context_serves_the_signal_only_under_a_rendering_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wire `visibility` field is the only source: present compact -> signal;
+    present off -> no signal; ABSENT (old daemon) -> no signal (absent => off)."""
+    cases = [
+        ({"mode": "compact", "capture": False}, True),
+        ({"mode": "verbose", "capture": False}, True),
+        ({"mode": "off", "capture": False}, False),
+        (None, False),
+        ("garbage", False),
+    ]
+    for visibility, expected in cases:
+        payload: dict = _pull_payload()
+        if visibility is not None:
+            payload["visibility"] = visibility
+        _capture_pull(monkeypatch, payload)
+        block = events.inject_recall_context(
+            "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+        )
+        assert block is not None
+        assert (events.T2_SIGNAL in block) is expected, visibility
+
+
+def test_inject_recall_context_verbose_adds_the_exact_count_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    items = [
+        {"kind": "chunk", "id": "c1", "text": "中段关键线索"},
+        {"kind": "chunk", "id": "c2", "text": "第二条"},
+    ]
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(items=items, budget_chars=2400, visibility={"mode": "verbose", "capture": False}),
+    )
+    block = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert block is not None
+    # chars = the served item text bytes (sanitized), memories = served items
+    chars = sum(len(item["text"]) for item in items)
+    assert f"[mnemoseed] {len(items)} memories, {chars} chars" in block
+
+
+def test_inject_recall_context_capture_only_signal_serves_a_bare_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enabled=false + a pending capture signal: the answer is the bare signal
+    line (no fence, no block) — the claude_code stdout red line's revision."""
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(enabled=False, items=[], visibility={"mode": "compact", "capture": True}),
+    )
+    payload = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert payload == events.CAPTURE_SIGNAL
+
+
+def test_inject_recall_context_capture_only_off_or_absent_stays_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """off (or an absent field) with a pending capture signal: zero output —
+    the byte-level no-op holds."""
+    for visibility in ({"mode": "off", "capture": True}, None):
+        payload: dict = _pull_payload(enabled=False, items=[])
+        if visibility is not None:
+            payload["visibility"] = visibility
+        _capture_pull(monkeypatch, payload)
+        assert (
+            events.inject_recall_context(
+                "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+            )
+            is None
+        ), visibility
+
+
+def test_inject_recall_context_capture_count_line_in_verbose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(enabled=False, items=[], visibility={"mode": "verbose", "capture": 3}),
+    )
+    payload = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert payload == "[mnemoseed] captured 3 turns since the last report"
+
+
+def test_inject_recall_context_capture_signal_and_block_coexist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both events in one pull: the capture line rides ahead of the block; the
+    block itself keeps exactly one signal line."""
+    items = [{"kind": "chunk", "id": "c1", "text": "中段关键线索"}]
+    _capture_pull(
+        monkeypatch,
+        _pull_payload(items=items, budget_chars=2400, visibility={"mode": "compact", "capture": True}),
+    )
+    payload = events.inject_recall_context(
+        "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
+    )
+    assert payload is not None
+    capture_line, _, block = payload.partition("\n")
+    assert capture_line == events.CAPTURE_SIGNAL
+    assert block.startswith(events.RECALL_FENCE_OPEN)
+    assert block.count("[mnemoseed]") == 1
+
+
+def test_transformer_emits_the_capture_only_payload_when_recall_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The stdout red-line revision: enabled=false + a pending capture signal is
+    a payload on stdout (mode != off), not silence."""
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        calls.append((path, body or {}))
+        if path == "/session/recall-pending":
+            return _pull_payload(enabled=False, items=[], visibility={"mode": "compact", "capture": True})
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    assert (
+        _run_transformer(
+            monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        )
+        == 0
+    )
+    assert [path for path, _ in calls] == ["/ingest", "/session/recall-pending"]
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["additionalContext"] == events.CAPTURE_SIGNAL
+
+
+def test_transformer_stays_silent_when_off_despite_a_pending_capture(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """mode=off: byte-level no-op — a pending capture signal produces zero stdout."""
+
+    def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        if path == "/session/recall-pending":
+            return _pull_payload(enabled=False, items=[], visibility={"mode": "off", "capture": True})
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", fake_post)
+    assert (
+        _run_transformer(
+            monkeypatch, {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_process_level_visibility_payload_roundtrips_utf8(tmp_path: Path) -> None:
+    """Subprocess-level UTF-8 oracle for the signal chain: the capture server
+    answers recall-pending with a visibility payload; the transformer prints the
+    exact JSON with the Chinese item text and the ASCII signal intact under a
+    hostile PYTHONIOENCODING."""
+    served = _pull_payload(visibility={"mode": "compact", "capture": True})
+
+    class VisibilityServer:
+        def __init__(self) -> None:
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+                    length = int(self.headers.get("Content-Length", 0))
+                    self.rfile.read(length)
+                    body = served if self.path == "/session/recall-pending" else {}
+                    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                def log_message(self, *args: object) -> None:
+                    pass
+
+            self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+        @property
+        def url(self) -> str:
+            host, port = self.server.server_address[:2]
+            return f"http://{host}:{port}"
+
+        def close(self) -> None:
+            self.server.shutdown()
+            self.server.server_close()
+
+    server = VisibilityServer()
+    try:
+        payload = {
+            "session_id": "cc-sess-01",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "第一条提示",
+        }
+        env = {k: v for k, v in os.environ.items() if k not in ENV_VARS}
+        env["MNEMOSEED_LOCAL_BASEURL"] = server.url
+        env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path)
+        env["PYTHONIOENCODING"] = "gbk"
+        result = subprocess.run(
+            [sys.executable, "-m", "mnemoseed_local.cli", "_hook-event", "--host", "claude_code"],
+            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            timeout=120,
+            env=env,
+            shell=False,
+        )
+        assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+        out = json.loads(result.stdout.decode("utf-8"))
+        block = out["hookSpecificOutput"]["additionalContext"]
+        capture_line, _, fence_block = block.partition("\n")
+        assert capture_line == events.CAPTURE_SIGNAL
+        assert "中段关键线索" in fence_block
+        assert "第一条提示" not in block
+    finally:
+        server.close()

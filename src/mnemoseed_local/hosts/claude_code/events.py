@@ -30,10 +30,12 @@ re-checks each full item fail-closed (an oversized item drops the WHOLE
 selection), and there is NO slicing floor in this path — the daemon is the sole
 budget authority across the whole positive-int range.
 
-RED LINE: stdout stays EMPTY on every path EXCEPT a served T2 pull, which emits
-one JSON object (CC feeds UserPromptSubmit stdout back into model context, so
-injection rides it deliberately; failures stay swallowed into the opt-in stderr
-debug lane, never stdout).
+RED LINE: stdout stays EMPTY on every path EXCEPT (a) a served T2 pull, which
+emits one JSON object (CC feeds UserPromptSubmit stdout back into model context,
+so injection rides it deliberately; failures stay swallowed into the opt-in
+stderr debug lane, never stdout), and (b) a visibility signal payload when
+the daemon's wire mode is not off — which may be a bare capture signal line
+without any served selection.
 """
 
 from __future__ import annotations
@@ -100,6 +102,58 @@ PIN_SUFFIX = " ⟵ pinned"
 #: Claude Code hook event that carries the injection (the additionalContext
 #: JSON property, both in our payload and in the decision-control schema).
 INJECTION_HOOK_EVENT = "UserPromptSubmit"
+
+#: conversation visibility: the fixed, neutral, non-directive signal
+#: vocabulary (byte-identical to the opencode plugin; the source-level oracle
+#: in tests pins both sides together). Rendering is gated on the daemon's wire
+#: ``visibility`` field; a field that is absent or anything but compact/verbose
+#: means off (old daemon x new hook stays byte-identical).
+T2_SIGNAL = "[mnemoseed] recalled related memories"
+CAPTURE_SIGNAL = "[mnemoseed] captured this session"
+
+#: The daemon wire keys of the visibility field.
+VISIBILITY_KEY = "visibility"
+VISIBILITY_MODES = ("compact", "verbose")
+
+
+def visibility_mode(served: dict[str, Any] | None) -> str | None:
+    """The rendering mode of a pull payload, None when off or unusable."""
+    if not isinstance(served, dict):
+        return None
+    visibility = served.get(VISIBILITY_KEY)
+    if not isinstance(visibility, dict):
+        return None
+    mode = visibility.get("mode")
+    return mode if mode in VISIBILITY_MODES else None
+
+
+def capture_signal_of(served: dict[str, Any] | None) -> str | None:
+    """The pending capture signal text of a pull payload, None when silent.
+
+    compact renders the once-per-session line; verbose renders the capture
+    count line; anything else (including off and a zero count) is silent.
+    """
+    if visibility_mode(served) is None or served is None:
+        return None
+    visibility = served[VISIBILITY_KEY]
+    if not isinstance(visibility, dict):
+        return None
+    capture = visibility.get("capture")
+    if capture is True:
+        return CAPTURE_SIGNAL
+    if isinstance(capture, int) and not isinstance(capture, bool) and capture > 0:
+        return capture_count_line(capture)
+    return None
+
+
+def recall_count_line(memories: int, chars: int) -> str:
+    """The verbose T2 count line (appended after the compact signal line)."""
+    return f"[mnemoseed] {memories} memories, {chars} chars"
+
+
+def capture_count_line(count: int) -> str:
+    """The verbose capture count line (replaces the compact capture line)."""
+    return f"[mnemoseed] captured {count} turns since the last report"
 
 
 def endpoint_budget(kind: str) -> float | Timeout:
@@ -313,7 +367,9 @@ def sanitize_recall_text(text: str) -> str:
     )
 
 
-def build_t2_context(items: list[dict[str, Any]] | Any, item_budget: int) -> str | None:
+def build_t2_context(
+    items: list[dict[str, Any]] | Any, item_budget: int, signal: str | None = None
+) -> str | None:
     """Assemble the fenced mid-session recall block from a served selection.
 
     Mirrors opencode's ``buildT2Injection`` byte-for-byte in semantics: the same
@@ -324,11 +380,31 @@ def build_t2_context(items: list[dict[str, Any]] | Any, item_budget: int) -> str
     slicing floor in this path: the daemon's ``_MIN_SLICE_CHARS`` governs only
     its own boundary-item tail cut; full items under any positive budget are
     served and must append (QA IMPORTANT-3).
+
+    ``signal`` is the prebuilt visibility text (compact line, or the
+    compact line plus the verbose count line separated by one newline). It
+    renders right after the fence-open line and its cost is the FIRST budget
+    shed under pressure — the shed result is byte-identical to the no-signal
+    build, so the signal is purely additive when it fits.
     """
     if not isinstance(items, list):
         return None
+    base = _build_t2_lines(items, item_budget, signal=None)
+    if base is None:
+        return None
+    if signal:
+        with_signal = _build_t2_lines(items, item_budget, signal=signal)
+        if with_signal is not None:
+            return with_signal
+    return base
+
+
+def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal: str | None) -> str | None:
     wrapper = len(RECALL_FENCE_OPEN) + 1 + len(RECALL_DISCLAIMER) + 1 + len(RECALL_FENCE_CLOSE)
-    lines: list[str] = [RECALL_FENCE_OPEN, RECALL_DISCLAIMER]
+    lines: list[str] = [RECALL_FENCE_OPEN]
+    if signal:
+        lines.append(signal)
+    lines.append(RECALL_DISCLAIMER)
     remaining = item_budget
     committed = False
     # design/11 §4.3: the per-line affix is the FIRST budget shed under pressure.
@@ -416,15 +492,52 @@ def inject_recall_context(session_id: str, client: DaemonClient) -> str | None:
     Runs only after the ingest ACK (the daemon parked the focal slot before the
     2xx — ``ack-implies-ready``); the daemon's own ``enabled``/``items``/``slot_consumed``
     semantics are the arm-clearing authority, so a non-empty serve returns the
-    block while an empty/disabled/failed pull returns ``None`` and the prompt
-    proceeds untouched.
+    block while an empty/disabled/failed pull falls through to the capture
+    signal (a bare line when the wire mode renders and the latch is pending) and
+    ``None`` when nothing is to say.
     """
     served = pull_pending_recall(session_id, client)
-    if served is None or served.get("enabled") is not True:
+    if served is None:
         return None
-    budget = served.get(RECALL_BUDGET_KEY)
-    item_budget = budget if isinstance(budget, (int, float)) and budget > 0 else RECALL_PULL_MAX_CHARS
-    return build_t2_context(served.get("items"), int(item_budget))
+    parts: list[str] = []
+    if served.get("enabled") is True:
+        budget = served.get(RECALL_BUDGET_KEY)
+        item_budget = (
+            int(budget) if isinstance(budget, (int, float)) and budget > 0 else RECALL_PULL_MAX_CHARS
+        )
+        items = served.get("items")
+        if isinstance(items, list) and items:
+            signal = _t2_signal_of(served, items)
+            block = build_t2_context(items, item_budget, signal=signal)
+            if block is not None:
+                parts.append(block)
+    capture = capture_signal_of(served)
+    if capture is not None:
+        parts.insert(0, capture)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _t2_signal_of(served: dict[str, Any], items: list[dict[str, Any]]) -> str | None:
+    """The prebuilt T2 signal text under the payload's visibility mode.
+
+    compact: the bare signal line; verbose: the signal line plus the count line
+    (memories = served items, chars = their sanitized text bytes — exact, since
+    the T2 build is all-or-nothing).
+    """
+    mode = visibility_mode(served)
+    if mode is None:
+        return None
+    if mode != "verbose":
+        return T2_SIGNAL
+    texts = [
+        sanitize_recall_text(str(item.get("text")))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
+    ]
+    chars = sum(len(text) for text in texts)
+    return T2_SIGNAL + "\n" + recall_count_line(len(texts), chars)
 
 
 def additional_context_payload(block: str) -> dict[str, Any]:

@@ -116,6 +116,15 @@
 > - **后悔/反事实思维**（regret / counterfactual thinking）——归因与失真语义已由在册条目覆盖（R7 来源监控、R34/R35 重建性与误导信息框架），不再重复入册。
 > - **Von Restorff 隔离效应**——**暂缓入册**。缓办备忘：①「隔离效应」一词已被竞品营销用作签名概念，直接引用将造成对外叙事混淆；②「越突出越记得住」若落为写入侧显著性加权即触碰捕获中立红线。重议条件：仅限读取面（呈现侧显著性标注）设计出现时，并先过中立执法扫描再入册。
 
+## 信任与自动化（#273 会话内可见性）
+
+| # | Citation | Used for | 对应本篇 | Status |
+|---|---|---|---|---|
+| R54 | Lee, J. D., & See, K. A. (2004). Trust in automation: Designing for appropriate reliance. *Human Factors*, 46(1), 50–80. DOI: 10.1518/hfes.46.1.50.30392 | 自动化信任校准：系统行为的可观察性支撑适度依赖 → 自动记忆动作在发生时以紧凑、真实（绝不伪造）的信号外显 | PRD-273 | ✅ Crossref 核验命中（标题检索：title/year/venue/volume/issue/page 全对） |
+| R55 | Parasuraman, R., & Riley, V. (1997). Humans and automation: Use, misuse, disuse, abuse. *Human Factors*, 39(2), 230–253. DOI: 10.1518/001872097778543886 | 不可观察的自动化招致 misuse/disuse → 可见性默认 compact（外显）+ off 可退的依据 | PRD-273 | ✅ Crossref 核验命中（DOI 直接解析，author/year/venue/volume/issue/page 全对） |
+
+> 本节未入册说明：默认 compact 与 verbose 计数频率为工程判断，不锚任何文献；多巴胺/奖励回路、游戏化反馈、"透明必然建立信任"口号式主张均未达实证门槛，不入册。
+
 ## 工程与行业文献（I 类）
 
 | # | Citation | Used for | 对应本篇 | Status |

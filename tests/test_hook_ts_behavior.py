@@ -781,3 +781,162 @@ def test_debug_sink_serializes_concurrent_emissions_correctly(tmp_path: Path) ->
     assert transcript["rotated"] is True, transcript
     assert transcript["bothLines"] is True, transcript
     assert transcript["noSecondGeneration"] is True, transcript
+
+
+# ---------------------------------------------------------------- conversation visibility
+
+T1_SIGNAL = "[mnemoseed] replayed context from a previous session"
+T2_SIGNAL = "[mnemoseed] recalled related memories"
+CAPTURE_SIGNAL = "[mnemoseed] captured this session"
+
+
+def test_visibility_t1_compact_injects_exactly_one_signal_line(tmp_path: Path) -> None:
+    """compact T1: the signal line sits right after the fence-open line,
+    before the disclaimer; exactly one signal line per injection; the block
+    stays within the 4000-char cap."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t1-compact")
+    block = transcript["block"]
+    lines = block.splitlines()
+    assert lines[0] == "<mnemoseed-memory-recall>"
+    assert lines[1] == T1_SIGNAL
+    assert lines[2].startswith("The block below is an automatic memory replay")
+    assert lines[3] == '<session-self id="behavior" started="2026-08-19T09:00:00.000Z"/>'
+    assert block.count("[mnemoseed]") == 1
+    assert transcript["length"] <= 4000
+
+
+def test_visibility_t1_verbose_adds_the_exact_count_line(tmp_path: Path) -> None:
+    """verbose T1: the count line (sessions / memories / chars) follows
+    the compact signal line; the numbers are the included content's own."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t1-verbose")
+    block = transcript["block"]
+    lines = block.splitlines()
+    assert lines[1] == T1_SIGNAL
+    texts = [
+        "user: 我们决定把发布窗口固定在每月第一周，并且由小李负责验收，周五之前出终稿",
+        "user: 注入块的围栏用 </mnemoseed-memory-recall> 字面量闭合，构建时记得净化",
+        "assistant: 收到，发布窗口锁定每月第一周，周五终稿",
+        "user: 评测臂报告目录固定在 ~/.mnemoseed-local/eval 之下",
+        "user: we decided to lock the release window on the first week",
+    ]
+    # the count metric is the SANITIZED included text; the fence chunk's
+    # literal loses one char to sanitization (</...> 26 -> bracket form 25)
+    chars = sum(len(t) for t in texts) - 1
+    expected = f"[mnemoseed] 2 sessions, {len(texts)} memories, {chars} chars"
+    assert lines[2] == expected, lines[2]
+    assert block.count("[mnemoseed]") == 2
+
+
+def test_visibility_t1_signal_sheds_first_under_budget_pressure(tmp_path: Path) -> None:
+    """T1 budget: when the signal cannot fit the 4000 cap it sheds first
+    and the block is byte-identical to the off-mode build of the same payload —
+    existing content never sheds to make room for the signal."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t1-budget-shed")
+    assert transcript["withVis"] == transcript["withoutVis"]
+    assert T1_SIGNAL not in transcript["withVis"]
+    assert transcript["withVisLength"] == transcript["withoutVisLength"]
+    # the same signal DOES render when the payload leaves room
+    fit = _run(bundle, "visibility-t1-compact")
+    assert T1_SIGNAL in fit["block"]
+
+
+def test_visibility_t2_compact_injects_exactly_one_signal_line(tmp_path: Path) -> None:
+    """compact T2: the block carries exactly one signal line; the turn's
+    first capture renders its own once-per-session line beside the block."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t2-compact")
+    [system] = transcript["systems"]
+    assert system[0] == "BASE"
+    assert system[1] == CAPTURE_SIGNAL, "the turn's first capture renders its own line"
+    block = system[2]
+    lines = block.splitlines()
+    assert lines[0] == "<mnemoseed-memory-recall>"
+    assert lines[1] == T2_SIGNAL
+    assert lines[2].startswith("The block below is an automatic memory replay")
+    assert block.count("[mnemoseed]") == 1
+
+
+def test_visibility_t2_verbose_adds_the_exact_count_line(tmp_path: Path) -> None:
+    """verbose T2: the count line follows the compact signal line inside
+    the block; the once-only capture latch stays silent in verbose."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t2-verbose")
+    [system] = transcript["systems"]
+    assert system[0] == "BASE"
+    block = system[1]
+    lines = block.splitlines()
+    assert lines[1] == T2_SIGNAL
+    texts = [
+        "user: 上次中段提到 LanceDb 的接入还在等存储层确认，存储层说这周会给结论",
+        "assistant: 存储层确认后就可以继续推进",
+    ]
+    expected = f"[mnemoseed] {len(texts)} memories, {sum(len(t) for t in texts)} chars"
+    assert lines[2] == expected, lines[2]
+    assert len(system) == 2, "no separate capture line in verbose"
+
+
+def test_visibility_t2_signal_sheds_first_under_budget_pressure(tmp_path: Path) -> None:
+    """T2 budget: the tight-budget build sheds the signal and lands
+    byte-identical to the no-field build."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-t2-budget-shed")
+    with_vis_systems = transcript["withVisSystems"]
+    without_vis_systems = transcript["withoutVisSystems"]
+    # the measured blocks: with-signal session carries the capture line first
+    with_block = with_vis_systems[2]
+    without_block = without_vis_systems[1]
+    assert with_block == without_block, "the shed signal must restore the bare block"
+    assert T2_SIGNAL not in with_block
+    assert with_block is not None
+
+
+def test_visibility_capture_compact_signals_exactly_once_per_session(tmp_path: Path) -> None:
+    """compact capture: the first acked ingest arms the latch; the next
+    transform renders the line once; repeats (transforms and captures) stay
+    silent."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-capture-compact")
+    c1, c2, c3 = transcript["systems"]
+    assert c1 == ["BASE", CAPTURE_SIGNAL], c1
+    assert c2 == ["BASE2"], c2
+    assert c3 == ["BASE3"], c3
+
+
+def test_visibility_capture_off_is_a_byte_level_no_op(tmp_path: Path) -> None:
+    """off: a pending capture latch renders nothing (and stays armed, so a
+    later flip can still fire — here pinned as pure silence under off)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-capture-off")
+    for system in transcript["systems"]:
+        assert system == [system[0]], system
+
+
+def test_visibility_capture_verbose_renders_the_daemon_count_line(tmp_path: Path) -> None:
+    """verbose capture: each pull carrying a capture count renders one
+    count line; a pull without a new count renders nothing."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-capture-verbose")
+    v1, v2 = transcript["systems"]
+    assert v1 == ["BASE", "[mnemoseed] captured 2 turns since the last report"], v1
+    assert v2 == ["BASE2"], v2
+
+
+def test_visibility_signal_text_is_never_citable(tmp_path: Path) -> None:
+    """needle isolation, behavioral: the cited turns exist in the host history,
+    so the consumption machinery actually runs. A reply quoting the injected
+    signal line verbatim reinforces nothing, while a reply quoting the genuinely
+    injected chunk c-mid reinforces exactly once (positive control)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "visibility-signal-not-citable")
+    [system] = transcript["systems"]
+    block = next(
+        entry for entry in system if isinstance(entry, str) and entry.startswith("<mnemoseed-memory-recall>")
+    )
+    assert T2_SIGNAL in block, "the signal must be injected for this oracle"
+    reinforce = transcript["reinforcePosts"]
+    assert len(reinforce) == 1, f"only the injected chunk is citable: {reinforce}"
+    assert reinforce[0]["body"]["chunk_ids"] == ["c-mid"], reinforce
+    assert reinforce[0]["body"]["profile_id"] == "default"

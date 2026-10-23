@@ -48,6 +48,10 @@ Phase B has landed through main:
 - **Session continuity** (T1/T2/T3): start-of-session replay injection, mid-turn
   focal auto-recall, and consumption-evidence reinforcement (cited memories are
   reinforced; injection alone is not).
+- **Conversation visibility**: each action states itself with one fixed,
+  non-directive line in the conversation (capture, replay, recall). Default
+  `compact`; `[visibility] mode` selects `off` (silent) or `verbose` (adds
+  count lines), hot-applied without a restart.
 - **Two Tier-1 hosts**: the OpenCode plugin plus a first-class Claude Code hook
   adapter (B2.10), both capturing every turn.
 - **origin_agent attribution** (B2.9): memories record which in-host agent
@@ -169,7 +173,9 @@ into `~/.claude/settings.json` for `UserPromptSubmit`, `Stop`, `PostToolUse`,
 `uninstall` removes only the marked ones (`disable`/`enable` flip a flag on our
 entries). The hooks pipe Claude Code's stdin payloads through the hidden
 `mnemoseed-local _hook-event --host claude_code` transformer into the daemon
-(fire-and-forget with a ~2s timeout; zero stdout, so prompts stay clean).
+(fire-and-forget with a ~2s timeout; stdout stays empty except a served
+auto-recall block and the visibility signal line when `[visibility] mode` is
+not `off`).
 Settings files must stay plain JSON (Claude Code documents plain JSON) —
 commented (JSONC) files are refused untouched with manual-edit guidance.
 Lifecycle: `mnemoseed-local hook {install|uninstall|status|disable|enable}

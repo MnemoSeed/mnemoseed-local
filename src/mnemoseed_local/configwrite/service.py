@@ -48,6 +48,7 @@ from mnemoseed_local.config import (
     DREAM_HARDWARE_TIERS,
     LAMBDA_TARGETS,
     LLM_ROLES,
+    VISIBILITY_MODES,
     CaptureConfig,
     Config,
     DecayConfig,
@@ -55,6 +56,7 @@ from mnemoseed_local.config import (
     ExperienceChannelConfig,
     ProfilesConfig,
     RoleLLMConfig,
+    VisibilityConfig,
     validate_agent_bindings,
 )
 from mnemoseed_local.secrets.refs import SECRETS_REF_RE, is_secrets_ref
@@ -438,6 +440,22 @@ def _capture_apply(config: Config, field: str, value: Any) -> None:
         raw_capture[field] = value
 
 
+def _visibility_apply(config: Config, field: str, value: Any) -> None:
+    """Replace the frozen VisibilityConfig and mirror the change into config.raw.
+
+    The daemon's MemoryService reads the live config on every wire response, so
+    a mode flip hot-applies to the NEXT session/recent or recall-pending event
+    without a restart.
+    """
+    mode = {} if value is None else {"mode": str(value)}
+    config.visibility = VisibilityConfig(**mode)
+    raw_visibility = config.raw.setdefault("visibility", {})
+    if value is None:
+        raw_visibility.pop(field, None)
+    else:
+        raw_visibility[field] = value
+
+
 def _profiles_apply(config: Config, field: str, value: Any) -> None:
     """Replace the frozen ProfilesConfig and mirror the change into config.raw.
 
@@ -689,6 +707,16 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         validate=_validate_positive_int,
         read=lambda config: config.capture.auto_recall_budget_chars,
         apply=lambda config, value: _capture_apply(config, "auto_recall_budget_chars", value),
+        live_apply=True,
+    ),
+    # Conversation visibility: the signal mode. Live-applied — the
+    # daemon's MemoryService publishes it on the next wire event.
+    "visibility.mode": ConfigKey(
+        key_path="visibility.mode",
+        value_type="off | compact | verbose",
+        validate=lambda value: _validate_choice(value, VISIBILITY_MODES),
+        read=lambda config: config.visibility.mode,
+        apply=lambda config, value: _visibility_apply(config, "mode", value),
         live_apply=True,
     ),
     # Multi-profile runtime (#109): the agent->profile persona binding map.
@@ -976,6 +1004,9 @@ class ConfigWriteService:
                 },
                 "profiles": {
                     "agent_bindings": dict(self._config.profiles.agent_bindings),
+                },
+                "visibility": {
+                    "mode": self._config.visibility.mode,
                 },
             },
             "restart_required": {},

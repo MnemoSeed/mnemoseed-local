@@ -91,6 +91,64 @@ const RULES_DISCLAIMER =
 // cannot rot it silently.
 const REINFORCE_BATCH_SIZE = 64
 
+// ---- conversation visibility -------------------------------------
+// One neutral, non-directive signal line in the conversation per mnemoseed
+// action. The vocabulary is fixed (byte-identical to
+// hosts/claude_code/events.py — the source-level oracle pins both sides) and
+// never instructs the model. The ONLY source of the mode is the daemon's wire
+// `visibility` field; a field that is absent or unusable means off (old
+// daemon x new hook stays byte-identical).
+const T1_SIGNAL = "[mnemoseed] replayed context from a previous session"
+const T2_SIGNAL = "[mnemoseed] recalled related memories"
+const CAPTURE_SIGNAL = "[mnemoseed] captured this session"
+
+function visibilityModeOf(payload: any): string | null {
+  // "off" is a known explicit mode (it must update the observed-mode state);
+  // an absent or unusable field reads as off too.
+  const mode = payload?.visibility?.mode
+  if (mode === "compact" || mode === "verbose" || mode === "off") return mode
+  return null
+}
+
+function t1CountLine(sessions: number, memories: number, chars: number): string {
+  return `[mnemoseed] ${sessions} sessions, ${memories} memories, ${chars} chars`
+}
+
+function t2CountLine(memories: number, chars: number): string {
+  return `[mnemoseed] ${memories} memories, ${chars} chars`
+}
+
+function captureCountLine(count: number): string {
+  return `[mnemoseed] captured ${count} turns since the last report`
+}
+
+function t1SignalText(
+  mode: string | null,
+  sessions: number,
+  memories: number,
+  chars: number,
+): string | null {
+  if (mode !== "compact" && mode !== "verbose") return null
+  if (mode === "verbose") return T1_SIGNAL + "\n" + t1CountLine(sessions, memories, chars)
+  return T1_SIGNAL
+}
+
+function t2SignalText(mode: string | null, memories: number, chars: number): string | null {
+  if (mode !== "compact" && mode !== "verbose") return null
+  if (mode === "verbose") return T2_SIGNAL + "\n" + t2CountLine(memories, chars)
+  return T2_SIGNAL
+}
+
+// Insert the signal text as the first line inside the fence (before the
+// disclaimer); the caller sheds it wholesale when the result overruns the
+// budget — the signal is the FIRST budget shed, existing content never sheds
+// to make room for it.
+function withSignalAfterFence(block: string, signal: string): string {
+  if (!block.startsWith(RECALL_FENCE_OPEN)) return block
+  const rest = block.slice(RECALL_FENCE_OPEN.length + 1)
+  return RECALL_FENCE_OPEN + "\n" + signal + "\n" + rest
+}
+
 // B2.1 T2 mid-session auto-recall (PRD-B2.1): a bounded pending-recall pull
 // per ACKED user ingest. The daemon is the ONLY budget authority
 // (capture.auto_recall_budget_chars, default 2400, reported on the wire as
@@ -551,6 +609,27 @@ const pendingPull = new Map<string, { armed: boolean; acked: boolean }>()
 // (D2 — the daemon merges them into its selection).
 const t1InjectedChunkIds = new Map<string, string[]>()
 
+// the per-session first-capture latch (INDEPENDENT of reconciledSessions,
+// whose semantics are "already reconciled" with three enqueue triggers — the
+// two must never couple). Armed on the first acked ingest; rendered once at
+// the next transform under the observed compact mode; a fired latch never
+// re-arms within the session and a pending one survives off.
+const firstCaptureSeen = new Map<string, "pending" | "fired">()
+// sessionID -> the most recently observed wire mode (compact | verbose | off).
+// The capture latch renders only under a known compact mode, so a flip to off
+// holds the line and a flip back releases it.
+const lastVisibilityMode = new Map<string, string>()
+
+function armCaptureSignal(sessionID: string): void {
+  if (!firstCaptureSeen.has(sessionID)) firstCaptureSeen.set(sessionID, "pending")
+}
+
+function takeCaptureSignal(sessionID: string): boolean {
+  if (firstCaptureSeen.get(sessionID) !== "pending") return false
+  firstCaptureSeen.set(sessionID, "fired")
+  return true
+}
+
 function normalizeRecallText(text: string): string {
   // One role-prefix strip (the verbatim channel labels turns), then collapse
   // whitespace to single spaces and lowercase — needle building and the
@@ -707,7 +786,24 @@ function registerNeedles(
 function buildRecallInjection(
   groups: any[],
   selfWindow: any,
+  mode: string | null = null,
 ): { block: string; registry: Map<string, Set<string>>; includedIds: string[] } | null {
+  // the visibility signal rides inside the block when the mode renders
+  // AND the result stays within MAX_INJECT_CHARS; otherwise it sheds whole and
+  // the base block is returned byte-identical to the off-mode build.
+  const base = buildRecallInjectionBase(groups, selfWindow)
+  if (base === null) return null
+  const signal = t1SignalText(mode, base.groupCount, base.includedIds.length, base.chars)
+  if (signal === null) return base
+  const candidate = withSignalAfterFence(base.block, signal)
+  if (candidate.length > MAX_INJECT_CHARS) return base
+  return { ...base, block: candidate }
+}
+
+function buildRecallInjectionBase(
+  groups: any[],
+  selfWindow: any,
+): { block: string; registry: Map<string, Set<string>>; includedIds: string[]; groupCount: number; chars: number } | null {
   // Accrue newest-first (groups in payload order, chunks within a group
   // reversed) against a char budget whose final assembled block must stay
   // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line, the
@@ -736,6 +832,8 @@ function buildRecallInjection(
   lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
   if (selfLine) lines.push(selfLine)
   let committedGroup = false
+  let groupCount = 0
+  let chars = 0
   for (const group of groups) {
     const chunks = Array.isArray(group?.chunks) ? [...group.chunks].reverse() : []
     if (chunks.length === 0) continue
@@ -755,6 +853,7 @@ function buildRecallInjection(
         if (chunkId) includedIds.push(chunkId)
         groupChunks.push(text)
         remaining -= lineCost
+        chars += text.length
         gotChunk = true
         continue
       }
@@ -765,6 +864,7 @@ function buildRecallInjection(
       if (chunkId) includedIds.push(chunkId)
       groupChunks.push("…" + slicedText)
       remaining = 0
+      chars += slicedText.length + 1
       gotChunk = true
       break
     }
@@ -773,12 +873,13 @@ function buildRecallInjection(
     for (let i = groupChunks.length - 1; i >= 0; i--) lines.push(groupChunks[i])
     lines.push("</session-tail>")
     committedGroup = true
+    groupCount += 1
   }
   if (!committedGroup) return null
   lines.push(RECALL_FENCE_CLOSE)
   const block = lines.join("\n")
   if (block.length > MAX_INJECT_CHARS) return null
-  return { block, registry, includedIds }
+  return { block, registry, includedIds, groupCount, chars }
 }
 
 function mergeRegistry(
@@ -801,7 +902,26 @@ function mergeRegistry(
 function buildT2Injection(
   items: any[],
   itemBudget: number,
+  mode: string | null = null,
 ): { block: string; registry: Map<string, Set<string>> } | null {
+  // the visibility signal rides inside the block when the mode renders
+  // AND the result stays within itemBudget + wrapper; otherwise it sheds whole
+  // and the base block is returned byte-identical to the off-mode build.
+  const base = buildT2InjectionBase(items, itemBudget)
+  if (base === null) return null
+  const signal = t2SignalText(mode, base.memories, base.chars)
+  if (signal === null) return base
+  const candidate = withSignalAfterFence(base.block, signal)
+  const wrapper =
+    RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length
+  if (candidate.length > itemBudget + wrapper) return base
+  return { ...base, block: candidate }
+}
+
+function buildT2InjectionBase(
+  items: any[],
+  itemBudget: number,
+): { block: string; registry: Map<string, Set<string>>; memories: number; chars: number } | null {
   // B2.1 T2 (D7): same fence + disclaimer envelope and same needle channel as
   // T1 — no group headers (the daemon already shaped the payload). The DAEMON
   // is the only budget authority (capture.auto_recall_budget_chars, reported
@@ -821,6 +941,8 @@ function buildT2Injection(
   let remaining = itemBudget
   lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
   let committed = false
+  let memories = 0
+  let chars = 0
   // design/11 §4.3: the per-line affix is the FIRST budget shed under pressure.
   // `keptAffix` sums the affix cost already committed in `lines`, and
   // `affixIndices` records the ABSOLUTE `lines` positions of the lines that
@@ -858,6 +980,8 @@ function buildT2Injection(
         registerNeedles(registry, text, chunkId)
         lines.push(text)
         remaining -= text.length + 1
+        memories += 1
+        chars += text.length
         committed = true
         continue
       }
@@ -867,6 +991,8 @@ function buildT2Injection(
     lines.push(pinned ? text + PIN_SUFFIX : text)
     remaining -= lineCost
     keptAffix += affixLen
+    memories += 1
+    chars += text.length
     if (pinned) affixIndices.push(lines.length - 1)
     committed = true
   }
@@ -874,7 +1000,7 @@ function buildT2Injection(
   lines.push(RECALL_FENCE_CLOSE)
   const block = lines.join("\n")
   if (block.length > itemBudget + wrapper) return null
-  return { block, registry }
+  return { block, registry, memories, chars }
 }
 
 function pollCandidates(served: any): number {
@@ -972,6 +1098,11 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
   if (!sessionID) return
   if (!Array.isArray(hookOutput?.system)) return
   try {
+    // the once-per-session capture signal renders at the next transform,
+    // only under the most recently observed compact mode (off holds the latch).
+    if (lastVisibilityMode.get(sessionID) === "compact" && takeCaptureSignal(sessionID)) {
+      hookOutput.system.push(CAPTURE_SIGNAL)
+    }
     // T1 (session-start replay) and T2 (mid-session recall) are INDEPENDENT
     // branches: the T1 attempt gate must NEVER early-return past the T2 pull
     // (D8 — the pre-T2 `injectedSessions.has` return silently strangled the
@@ -979,6 +1110,8 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
     if (!injectedSessions.has(sessionID)) {
       injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
       const data = await fetchSessionTails(sessionID)
+      const dataMode = visibilityModeOf(data)
+      if (dataMode !== null) lastVisibilityMode.set(sessionID, dataMode)
       // Scoped-resume (issue #187): T1 injection proceeds only when the
       // daemon returns selection "matched". Unresolved/unscoped selections
       // yield no injection. A response without a selection key is an old
@@ -991,7 +1124,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         data !== null && (typeof sel !== "string" ? !sentQuery : sel === "matched")
       let built = null
       if (injectionAllowed) {
-        built = buildRecallInjection(data.sessions, data.self_window)
+        built = buildRecallInjection(data.sessions, data.self_window, dataMode)
       } else {
         debugLog("session-start injection skipped (selection=%s)", {
           sessionID,
@@ -1039,6 +1172,22 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         if (DEBUG) debugLog("recall-pending poll", { sessionID, reason: "pull failed" })
         return
       }
+      const servedMode = visibilityModeOf(served)
+      if (servedMode !== null) lastVisibilityMode.set(sessionID, servedMode)
+      // the first-observed-mode render — the mode may arrive in THIS
+      // transform's pull, so the latch is re-checked here after observing it.
+      if (servedMode === "compact" && takeCaptureSignal(sessionID)) {
+        hookOutput.system.push(CAPTURE_SIGNAL)
+      }
+      // verbose capture: the daemon's capture count rides the pull; each
+      // count>0 pull renders one count line ahead of any block.
+      if (
+        servedMode === "verbose" &&
+        typeof served.visibility?.capture === "number" &&
+        served.visibility.capture > 0
+      ) {
+        hookOutput.system.push(captureCountLine(served.visibility.capture))
+      }
       let injectedChars = 0
       if (served.enabled === true && served.items.length > 0) {
         // QA BLOCKER-1: the daemon's budget_chars IS the item budget — the
@@ -1052,7 +1201,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
           typeof served.budget_chars === "number" && served.budget_chars > 0
             ? served.budget_chars
             : RECALL_PULL_MAX_CHARS
-        const built = buildT2Injection(served.items, itemBudget)
+        const built = buildT2Injection(served.items, itemBudget, servedMode)
         if (built === null) {
           debugLog("recall pull dropped: selection exceeds the item budget", {
             sessionID,
@@ -1888,6 +2037,7 @@ function postUserIngest(
     body,
     () => {
       noteWatermark(sessionID, ts)
+      armCaptureSignal(sessionID)
       const armed = pendingPull.get(sessionID)
       if (armed !== undefined) armed.acked = true
     },
@@ -1922,6 +2072,7 @@ function postAssistantIngest(
     astBody,
     () => {
       noteWatermark(sessionID, stamp)
+      armCaptureSignal(sessionID)
       if (messageID) unparkAssistant(sessionID, messageID)
     },
     () => {
@@ -1961,7 +2112,10 @@ function postToolIngest(
   post(
     "/ingest",
     toolBody,
-    () => noteWatermark(sessionID, ts),
+    () => {
+      noteWatermark(sessionID, ts)
+      armCaptureSignal(sessionID)
+    },
     scheduleRecovery(sessionID),
   )
 }
@@ -2326,6 +2480,8 @@ export default async function MnemoSeedLocalPlugin(
           citedChunks.delete(sessionID)
           pendingPull.delete(sessionID)
           t1InjectedChunkIds.delete(sessionID)
+          firstCaptureSeen.delete(sessionID)
+          lastVisibilityMode.delete(sessionID)
           sessionParentIds.delete(sessionID)
           sessionFirstMessages.delete(sessionID)
           enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))

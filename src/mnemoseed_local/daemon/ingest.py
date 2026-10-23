@@ -189,6 +189,15 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except SessionSettledError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    # every accepted capture ingest feeds the per-session visibility
+    # latch (first-capture signal; verbose count). Best-effort: the signal
+    # bookkeeping must never fail the capture itself.
+    memory = getattr(request.app.state, "memory", None)
+    if memory is not None:
+        try:
+            memory.note_capture(effective_profile, event.session_id)
+        except Exception:  # pragma: no cover - accounting must not fail ingest
+            logger.warning("capture visibility bookkeeping failed", exc_info=True)
     # B2.1 T2 (PRD-B2.1): user prompts run the embedding-free focal scan and
     # park the pending-recall selection BEFORE the 202 answers (ack-implies-
     # ready). The scan is store I/O, so it runs in a worker thread; the
