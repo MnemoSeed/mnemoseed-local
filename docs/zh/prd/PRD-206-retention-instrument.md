@@ -299,3 +299,205 @@
   seed 时间戳可留在既有 fixture seed 证据中，不借用该列。
 - **落地措辞澄清**：架构裁定中出现的「landed S1」是源码检视措辞，不表示 S1 已落地；
   S1 尚未提交、未开 PR、未合并。
+
+## 15. S7 终段机制与合并状态记录（append-only，时点快照）
+
+> 本节只做 S7 终段的机制与范围记录，不改变 §1–§14 的任何一条。理论锚仍是 §12 的
+> 「不借用」：不新增任何神经科学/心理学借用，无新参数、新默认值、新诊断码、新门、新 CLI 面。
+> 本节为文档快照；**S7 自身的最终完整门禁、独立实现 QA 与合并均仍为 PENDING**，
+> 完成真相以 #264 落地 PR 与最终归档记录为准，本节不声明 S7 自身的 PR 号、commit、
+> merge 或门禁结果，也不引用任何尚未发生的自指哈希。
+
+### 15.1 实际 S1–S6 合并引用（来自提供的实际证据）
+
+上文头部状态行与 §13 中「S1 尚未落地」等叙述是各自时点的快照，按 append 纪律原样保留；
+其后 S1–S6 已按 issue → branch → PR → merge 逐片落地（证据 `s7-pre-doc-actual-evidence.json`：
+六片 `MERGED`、各自五项 CI 全绿）：
+
+| 片 | issue | PR | merge commit |
+|---|---|---|---|
+| S1 | #255 | #258 | `52a1fc1fdaab8d16c0b91423a28c837d7ef7fd6f` |
+| S2 | #256 | #262 | `e77bb86c97738f2caa873544906d4fa33fac7b40` |
+| S3 | #257 | #263 | `20e734bcb0dca22bcbae4b21191b8fa83e9103cc` |
+| S4 | #259 | #269 | `65d872ee7f8c5dbbb47bdaef6d4ce5420c09b347` |
+| S5 | #260 | #266 | `604be63942bfcd41559de47d1d2a65111e888c17` |
+| S6 | #261 | #265 | `406aac4fc0aec57eea6e4c1f2e72439185d774f1` |
+
+S7 的实现面（`cli.py` 与 `tests/instrument/test_cli_daily_run.py`、
+`test_cli_restart_and_gap.py`、`test_cli_control_repair.py`）在隔离当前代码与冻结测试上
+记录了六项实际预文档检查（comments/focused/ruff/format/mypy/probe，exitCode 全 0）；
+该预文档阶段**不是**最终门禁、不是独立 QA、不是提交/合并验收。S7 终段的全量门禁
+（注释门 + pytest + ruff check + ruff format --check + mypy src）、具名独立对抗式 QA
+（0 BLOCKER 且 0 IMPORTANT）、`Closes` 式落地 PR、合并后 worktree/分支清理，均为
+待办的后续动作。
+
+### 15.2 已接受的机制裁定：仅写方 DELETE 规范化（D2）与严格只读适配器（D1）
+
+- **裁定集**：`s7-revised-ro-binding.md`（D1：collect/summary 的严格只读适配器可行，
+  首裁中的「逻辑 no-op bootstrap」回退**已撤回**；collect 与 summary 对产品存储均为
+  物理严格只读）、`s7-final-wal-ruling.md`（D2 作为规范机制偏差**显式记录**而非隐式默许）、
+  `s7-final-summary-ruling.md`（裁定与既有条款**兼容**：ledger 权威 summary 可采纳，
+  竞争被消除而非豁免）。
+- **D1（§13 机制偏差，已记录）**：`cli.py` 内私有适配器把产品驱动绑定到显式绝对路径
+  与 S4 冻结的 `readonly_connection`（`mode=ro` URI + `PRAGMA query_only=ON`），客户端
+  逐连接补 `row_factory=sqlite3.Row` 与 `busy_timeout`；不调用父类构造器、不迁移、
+  不 `mkdir`、不建文件，产品写路径结构上不可达（继承写路径与迁移、写版 journal pragma
+  均不可执行）。读取一律经**继承的真实产品方法**；写企图返 `sqlite3.OperationalError`。
+  这是「导入不改产品」的偏离点（绑定不经构造器），**按记录呈现、不静默重释**；
+  该适配器为单线程语义（CLI 本身单线程）。
+- **D2（§11/§13 规范机制偏差，已记录；字节级而非值级）**：在**已获写授权**的
+  `init`/`control-repair` 路径内执行一次直接写 pragma `PRAGMA journal_mode=DELETE`。
+  所写的是**文件头 journal-mode 字节**，可能把既有 WAL checkpoint 进主文件字节；
+  但**任何行的值、schema 对象、`sqlite_master`/`table_info` 哈希、
+  `schema_version`/`seed_manifest_hash` 等逻辑证据全保留不变**。只读 SQL 证据面
+  （S4 `sql_readonly.py`）保持零写；记录路径（P1 §5「记录永不触发产品改写」）不在
+  pragma 之内。
+- **规范化次序与失败语义**：`_normalize_to_rollback_journal` 先做一次状态探测 open，
+  再用转换 open 执行 pragma，验证返回 mode 恰为 `delete`、随后校验头 18/19 字节
+  恰 `\x01\x01` 且连接关闭后无 `-wal`/`-shm` 兄弟文件；任一步失败即类型化
+  （`store_not_normalized` / `store_normalization_unverified` / `binding_incomplete`），
+  存储（含 WAL 存储）**保持原样、不删除任何产物、不回滚已提交的效果**、绝不静默空读。
+  `init` 内规范化先于任何 ledger 写：顺序为 取锁 → 锁内新鲜检查 → 真实播种 →
+  **显式关闭全部 seeded 驱动**（显式关闭是"database is locked"的硬前提）→ 规范化
+  （daily home 4 库；meta.db 虽不被 collect 读取，亦为 home 一致而同样规范化）→
+  下面 15.4 的五字段最终化 → `create_ledger` → register → **manifest 最后写**；
+  规范化失败 ⇒ 无 ledger 行、无 manifest、零删除，后续 `init` 由既有新鲜拒绝拒不补写，
+  `collect` 如实 `ledger_missing` fail-closed。`control-repair` 内：真实 repair 通过与
+  逐行 ACK 证据之后**关闭 control 驱动**，仅规范化 control 对；失败即 exit 1，
+  已提交的 repair 效果永不回滚、永不重放，存储保持 WAL 且下一次只读打开如实失败。
+- **精确 pre-open 拒绝（先于任何 SQLite open）**：RO 池每次连接前对存储做纯文件字节
+  检查 `store_file_missing`（缺文件即类型失败，**绝不**触发父类构造器的静默建空库）、
+  `store_not_sqlite`（魔法串）、`store_journal_not_rollback`（头 18/19 必须恰 `\x01\x01`
+  — 回退 journal，非 1/1 即 `binding_incomplete` 且 header_pair 以 hex 显示）、
+  `store_sidecar_present`（存在任何 `-wal`/`-shm` 兄弟即拒绝）、头不可读/截短亦类型化。
+  从不 `immutable=1`、从不在 open 之后回退改判、collect/summary **永不**规范化、
+  **永不**打开产品驱动、**永不重进 WAL**。
+- **as-is 边界（诚实声明）**：`summary` 按冻结契约不取 WriterLock，故并发
+  `control-repair` 理论上可在 summary 运行期间对 control 对重进 WAL——按原样记录，
+  daily 对从不被 repair 触碰；不新增补救参数。
+
+### 15.3 已接受的写方重试裁定（control-repair）
+
+已接受裁定（id `retention-p2-s7-control-retry-plan-20261023`，`ALLOW EXPLICIT
+WRITER RETRY`）：**单独再次请求**的 `control-repair` 使用真实可写驱动，即使先前一次
+规范化失败遗留 WAL，也允许重新规范化；该重试必须观测 **0 pending、零 receipt 效应
+重放、`delivered_at` 戳逐字稳定**；RO 适配器开侧的严格 pre-open guard **保持不变**；
+不引入自动补完、不新增任何命令或参数。
+
+### 15.4 当前 CLI 实态：init / collect / summary 机制
+
+- **init（§14.2/§14.3 的实现了结）**：`FreshInit` 单写者 OS 锁全程，锁内新鲜检查
+  每 context 恰一次；来源清单为调用方声明文件（字典形字符串→字符串），`source_hash`
+  仍只来自声明清单（冻结 7 路径集 + 64 位小写十六进制形状检查），仪器不声称已核验
+  磁盘产品文件。真实播种后**关闭 seeded 驱动 → DELETE 规范化 → 恰五个预注册字段
+  最终化**（`control_id`、`source_commit`、`source_hash`、`config_json`、`config_hash`；
+  `cohort` 身份输入与已持久化值不动；home B 仅 control 记录）→ `create_ledger` →
+  register（primary 与链接 control 两行）→ **manifest 最后写** → 输出冻结报告字段。
+- **collect（一次真实观测 run）**：WriterLock 全程；锁不可得 ⇒ ledger 零新增行 +
+  ledger 外**独占创建**一次性调用回执（不覆盖、零学分）+ exit 1。run 顺序固定：
+  `run_started`（携带 schema/instrument/source 绑定与重启链接 `restart_of_run_id`/
+  `prior_run_unclosed`）→ 对每个**未恢复的中断 attempt** **恰一次** recovery attempt
+  （`observation_kind='recovery'`、`recovers_attempt_id`、`calendar_eligible=0`、
+  真实时钟区间的受限再读；**无任何 repair 效果重放、无日历晋升**）→ 一次主 collect
+  attempt。观测是真实时钟括区间（**PRE `capture_pre` 即 `collected_at_raw` 唯一权威
+  时点**）；失效则 `failed_read`/`clock_invalid`（主诊断 = 检查首码），失败终端行如实
+  携带原始 raw 时点；`utc_date` 在追加时一次性派生存储，之后不可变；
+  `calendar_eligible=1` 仅当 `observed_ok` 且属 `daily_cohort`。历史 floor 复用 S5
+  `_advanced_floor`：仅 `observation_kind='collect'` 且非 seed 时钟的行（含失败终端行
+  与 collect 种 `instrument_gap` 行的原始时点）推进 floor；`attempt_started` 不参与、
+  recovery/replay_check 行**不推进**；S7 追加行写入前无任何隐藏时钟读与默认回退。
+  `run_closed` 仅当 S1 唯一可闭性谓词通过，否则 `binding_incomplete`（`run_not_closable`）
+  原样退出——存在 gap 的 run **不闭合、不产出 run_closed、不补记、不重放**。
+  collect 报告（stdout 冻结 canonical JSON）含 `run_id`/`attempt_id`/`event_id`/
+  `ledger_seq`/`outcome`/`utc_date`/完整分桶投影文档/`diag_codes`/`trust_codes`。
+- **collect 读取面（严格 RO）**：四空库两对逐个 pre-open guard 后，经 S4
+  `readonly_connection` 打开 cohort 对并配 RO 适配器：未决 receipts 逐行成
+  `ProjectionInput`（`nomination_id`/`disposition`/`reason_code`/`applied_at_raw`
+  **持久化原文逐字**，不重序列化）→ S4 逐字段 receipt 交叉核对（任一不符 ⇒
+  `receipt_crosscheck_mismatch` 阻塞，绝不静默跳过）→ profiles/nodes/version 链经
+  继承真实方法分页读取；`node_versions` 零新增 + 逐行哈希 + `sqlite_master`/
+  `table_info`/完整当前节点内容哈希前后夹逼（`assert_node_integrity` 阻塞任何漂移；
+  第二只读出口 `versions(node_id)` 交叉核对）；读取到的快照同样进入节点完整性括区。
+  SQL 文本 sha256 进 provenance（query hash 表 + 每模板按占位符数渲染后哈希）。
+- **summary（ledger 权威、as-of 最新完整观测）**：**只开 ledger**（ro URI +
+  `query_only=ON`；存在性 ⇒ 否则 `ledger_missing`；`user_version==SCHEMA_VERSION`、
+  `integrity_check=='ok'`、`GUARD_TRIGGERS` 触发器齐全，否则 `ledger_corrupt`）与
+  manifest 连续性（`check_cohort_continuity`，缺/错配 fail-closed）；请求
+  `cohort_id` 与行身份不符即拒。**最新 `run_closed` 的 run 即最新完整观测**（S1
+  唯一可闭性谓词 ⇒ 其全部 attempt 均 `observed_ok`、无 gap；闭 run 无终端行、非
+  `observed_ok`、缺 `clock_source` 均为 `binding_incomplete` 显式失败——失败/gapped
+  run 永不具投影权威，其证据经 `instrument_gap` 行与既有数量如实可见）。对该观测
+  terminal 载荷中**逐字记录**的原始 `ProjectionInput` 列表 + 该观测捕捉的 PRE（作为
+  `now_raw`，不重读 OS 时钟、不读产品库、无隐藏时钟）重算 S6 `project`；
+  `--cutoff-seconds` 每次显式（A6.2 字面谓词，非粘滞，可对同一冻结输入重复重投影）。
+  **null 与零严格分离**：从未有完整观测 ⇒ `projection` 组为 **null**、观测日期
+  为 null（**不得**以全零冒充「空投影成功」），numerator/shadowed/revoked/gap 数量
+  照报并显式标注 as-of；有观测但该观测无幸存 admitted 行 ⇒ 各组计 0——两者可分辨。
+  terminal 载荷缺 `projection_inputs` 或其条目形状不符（键集不恰为四键、含非字符串值）
+  ⇒ `projection_inputs_missing` / `projection_inputs_malformed` 显式失败 exit 1，
+  **错误负载绝不渲染为成功汇总**。summary 还报告首个/末个 admitted UTC 日期、
+  `date_difference_days`、`elapsed_seconds`（首末真实捕捉差，描述性）、
+  `calendar_gap_days`（admitted 跨度内无 admitted 持有者的 UTC 日期数，描述性——
+  **不是**任何再推导阈值或门，keep 显示位）。
+
+### 15.5 receipt 只读证据面：精确 22 列名 schema/类型映射（源绑定）
+
+需求列集为源绑定 22 个列名：public 21 字段（`ReconciliationReceipt`
+dataclass 21 字段）**加**内部 `input_hash`（**仅存在性验证，永不进入 public 比较**）。
+列声明类型逐列绑定于迁移 DDL / `_RECEIPT_COLUMNS` 源检视：
+
+| 列名 | SQLite 声明类型 | public Python 类型 |
+|---|---|---|
+| `nomination_id` | TEXT | str |
+| `profile_id` | TEXT | str |
+| `disposition` | TEXT | str（枚举级 str） |
+| `reason_code` | TEXT | str（枚举级 str） |
+| `canonical_kind` | TEXT | str |
+| `composite_group_id` | TEXT | str |
+| `evidence_event_ids` | TEXT | tuple[int, ...] |
+| `verdict` | TEXT | str |
+| `quality` | TEXT | str |
+| `left_node_id` | TEXT | str |
+| `left_version` | INTEGER | int |
+| `left_expected_peer_id` | TEXT | str |
+| `right_node_id` | TEXT | str |
+| `right_version` | INTEGER | int |
+| `right_expected_peer_id` | TEXT | str |
+| `winner_node_id` | TEXT | str \| None |
+| `loser_node_id` | TEXT | str \| None |
+| `loser_prior_version` | INTEGER | int \| None |
+| `loser_new_version` | INTEGER | int \| None |
+| `downweight_factor` | REAL | float \| None |
+| `applied_at` | TEXT | float（由同一持久化文本解码比较） |
+| `input_hash`（内部） | TEXT | —（仅存在性） |
+
+- `evidence_event_ids` 的中立 JSON 词表在 SQLite 渲染为 **TEXT**（`PRAGMA table_info`
+  实现观察的类型串，而非迁移字面 `JSON`）；比较以 `json.loads(row_text) ==
+  list(receipt.evidence_event_ids)` 完成。
+- **集合/类型式（与物理列序无关）**：DDL 实际列序（含 `input_hash` 中位插入）与
+  public 比较序不同；`verify_receipt_schema` 以 `PRAGMA table_info` 的列名集合与每列
+  类型串对照上述映射——缺列 / 多列 / 类型不符 ⇒ `binding_incomplete`（detail 列出
+  `missing_columns`/`unexpected_columns`/`mistyped_columns`）。public 21 字段的比较
+  顺序由冻结 SELECT 列表给出。
+- **类型化 SQLite receipt-read 边界**：两侧均来自**同一持久化行**（SQL 文本读出的
+  原始值 vs 同行产品 API 解码），可空字段 **None 语义精确**：两侧皆 `None` ⇒ 相等，
+  一侧 `None` ⇒ 不等，否则各自类型逐字/精确比较（不做 `str(None)`、不折 `''` 或 0；
+  数值比较拒绝 `bool`）；`applied_at` 以同一持久化文本两侧 `epoch_from_iso` 后精确
+  浮点相等。产品读取路径的任何 `sqlite3.Error` 与不可解码 receipt 内容
+  （`ValueError`/`TypeError`/`OverflowError`）转 `binding_incomplete`
+  （`product_receipt_query_error` / `product_receipt_decode_error`）；行缺失 /
+  receipt 缺失进 `mismatch_fields`（`row_missing` / `receipt_missing`）。错误既不
+  逸出为未捕获异常，也绝不产出 `observed_ok` 终态或成功交叉核对。
+
+### 15.6 范围与状态声明（不作扩圈）
+
+- **P2 全程保持隔离合成工程**：无真实采集、无 30 真实日历日、无有效观测日计数或
+  日历学分声明、无 provider 质量实验、无 owner 侧 ratify、无 activation、不触产品
+  面与安装 runtime；不启动 7788、不启动 daemon/consumer。
+- 本节未新增源码、测试、CLI 参数、manifest 键或 schema 变更；§10 的 13 条验收断言、
+  §9 的切片表与测试文件清单、§12 的 not-borrowed 清单按 P1 冻结语义不变。
+  S7 后续状态变化只经 #264 落地 PR 与最终归档记录，不在本文档回填。
+
+### 15.7 只读连接关闭的补充验证
+
+只读池在配置连接前把句柄登记至继承的 `_open` 集合，使 `close_all()` 确定关闭实际连接；新增关闭后 SQL 操作被拒绝的回归用例。此项修复不改变采集、日历计数、理论锚或任何参数。本轮门禁、独立复审及落地状态以当前 PR 与归档为准，既有失败与否决记录保留。
