@@ -148,6 +148,14 @@ DEFAULT_RECALL_RESCUE_CUE_MIN: float = 0.2
 DREAM_HARDWARE_TIERS: frozenset[str] = frozenset({"standard", "lite", "advanced"})
 DREAM_ENSEMBLE_MODES: frozenset[str] = frozenset({"off", "verify", "vote"})
 
+#: Conversation visibility: one neutral, non-directive signal line in
+#: the conversation when mnemoseed acts. ``compact`` (the shipped default)
+#: renders one line per action; ``verbose`` appends count lines; ``off`` is a
+#: byte-level no-op. The enum set is shared by the loader and the configwrite
+#: registry (one source, both consumers).
+DEFAULT_VISIBILITY_MODE: str = "compact"
+VISIBILITY_MODES: frozenset[str] = frozenset({"off", "compact", "verbose"})
+
 
 @dataclass(frozen=True)
 class ExperienceChannelConfig:
@@ -338,6 +346,19 @@ class RecallConfig:
 
 
 @dataclass(frozen=True)
+class VisibilityConfig:
+    """Conversation visibility: the in-conversation signal mode.
+
+    ``mode`` selects off (zero signals, byte-level no-op), compact (one
+    neutral signal line per action, the shipped default) or verbose (compact
+    plus count lines). The hooks render the signals; the daemon publishes the
+    mode on the session/recent and recall-pending wire fields.
+    """
+
+    mode: str = DEFAULT_VISIBILITY_MODE
+
+
+@dataclass(frozen=True)
 class ProfilesConfig:
     """Multi-profile runtime bindings ([profiles], #109).
 
@@ -490,6 +511,7 @@ class Config:
     decay: DecayConfig = field(default_factory=DecayConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
+    visibility: VisibilityConfig = field(default_factory=VisibilityConfig)
     profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     llm: dict[str, RoleLLMConfig] = field(default_factory=lambda: dict(DEFAULT_LLM_ROUTES))
@@ -880,6 +902,18 @@ def load_config(path: Path | None = None) -> Config:
             raise ConfigError("recall.rescue_cue_min", "must be a number in (0, 1]")
         recall = RecallConfig(rescue_floor=float(floor_raw), rescue_cue_min=float(cue_raw))
 
+    # [visibility] table: the in-conversation signal mode. The enum set
+    # is shared with the configwrite registry so load-time and write-time
+    # validation cannot drift.
+    visibility = VisibilityConfig()
+    visibility_raw = raw.get("visibility")
+    if visibility_raw is not None:
+        visibility_table = _require_table(visibility_raw, "visibility")
+        mode_raw = visibility_table.get("mode", DEFAULT_VISIBILITY_MODE)
+        if not isinstance(mode_raw, str) or mode_raw not in VISIBILITY_MODES:
+            raise ConfigError("visibility.mode", f"must be one of {', '.join(sorted(VISIBILITY_MODES))}")
+        visibility = VisibilityConfig(mode=mode_raw)
+
     # [profiles] table (#109): agent->profile persona bindings, replace
     # semantics. The shape validator is shared with the configwrite registry,
     # so load-time and write-time validation cannot drift.
@@ -911,6 +945,7 @@ def load_config(path: Path | None = None) -> Config:
         decay=decay,
         capture=capture,
         recall=recall,
+        visibility=visibility,
         profiles=profiles,
         logging=logging_config,
         llm=llm_routes,
@@ -1049,6 +1084,16 @@ path = "~/.mnemoseed-local/isolated.db"
 # `mnemoseed-local profile create research`.
 # [profiles]
 # agent_bindings = {"planner" = "research"}
+
+# Conversation visibility: one neutral, non-directive signal line in
+# the conversation when mnemoseed acts (capture, session-start replay,
+# mid-session auto-recall). The word list is fixed and carries no instruction.
+#   mode     — off | compact | verbose
+#              off     zero signals (byte-identical to pre-visibility behavior)
+#              compact one line per action (default)
+#              verbose compact line plus a count line (memories/chars)
+# [visibility]
+# mode = "compact"
 
 # Request-level observability (B2.12): when ON, every HTTP request logs one
 # INFO line (method + path + status) to daemon.log; request bodies are never

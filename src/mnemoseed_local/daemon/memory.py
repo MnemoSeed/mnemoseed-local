@@ -550,6 +550,15 @@ class MemoryService:
         # re-arm (the ledger stays append-only — the arm reads around old
         # rows instead of deleting them). Bounded like the hook debounce.
         self._provider_event_settled: dict[tuple[str, str], float] = {}
+        # Conversation visibility: per-session capture bookkeeping for
+        # the stateless claude_code host. ``_capture_first`` is the once-per-
+        # session compact latch; ``_capture_counts`` accumulates captures
+        # since the last served count (verbose). Recorded on every capture
+        # regardless of mode; consumption happens at pull time under the
+        # current mode (off consumes nothing, so a later flip still fires).
+        self._capture_first: dict[tuple[str, str], bool] = {}
+        self._capture_counts: dict[tuple[str, str], int] = {}
+        self._capture_lock = threading.Lock()
 
     @property
     def retriever(self) -> HybridRetriever:
@@ -1034,6 +1043,7 @@ class MemoryService:
                 "guidance": _RECENT_SESSIONS_GUIDANCE,
                 "selection": "unresolved",
                 "selection_reason": "automatic-path identity fields without resume_query",
+                "visibility": self._visibility_mode_payload(),
             }
         limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
@@ -1079,6 +1089,7 @@ class MemoryService:
             "guidance": _RECENT_SESSIONS_GUIDANCE,
             "selection": "unscoped",
             "selection_reason": "no resume_query",
+            "visibility": self._visibility_mode_payload(),
         }
         rules_budget = self._build_rules_budget(
             profile_id=profile_id, session_id=self_session_id, per_session=per_session
@@ -1110,6 +1121,7 @@ class MemoryService:
                 "guidance": _RECENT_SESSIONS_GUIDANCE,
                 "selection": "unresolved",
                 "selection_reason": "no anchors",
+                "visibility": self._visibility_mode_payload(),
             }
         # Scan a bounded page for anchor hits in USER segments only
         limit = 2000
@@ -1168,6 +1180,7 @@ class MemoryService:
                 "guidance": _RECENT_SESSIONS_GUIDANCE,
                 "selection": "unresolved",
                 "selection_reason": "no session matched",
+                "visibility": self._visibility_mode_payload(),
             }
         # Fetch tails for matched IDs; the grouping walk keeps recency
         # order and applies the session cap to survivors.
@@ -1207,6 +1220,7 @@ class MemoryService:
             "guidance": _RECENT_SESSIONS_GUIDANCE,
             "selection": "matched",
             "anchors": anchors,
+            "visibility": self._visibility_mode_payload(),
         }
 
     def _build_rules_budget(
@@ -1705,6 +1719,61 @@ class MemoryService:
             "conflict_reason": None,
         }
 
+    # ------------------------------------------------------------ visibility
+
+    def note_capture(self, profile_id: str, session_id: str) -> None:
+        """Record one capture ingest for the session (the visibility latch).
+
+        Called from the ingest route after the segmenter accepted the event.
+        Recording is mode-independent: the latch waits through off and fires on
+        the first pull under a rendering mode. The latch value stays in the map
+        after firing (True -> False): once-per-session, never re-armed by a
+        later capture in the same session.
+        """
+        with self._capture_lock:
+            key = (profile_id, session_id)
+            self._capture_counts[key] = self._capture_counts.get(key, 0) + 1
+            if key not in self._capture_first:
+                self._capture_first[key] = True
+
+    def _capture_signal(self, profile_id: str, session_id: str) -> bool | int:
+        """Consume and report the pending capture signal under the live mode.
+
+        off -> False (nothing consumed, the latch stays armed); compact ->
+        the once-per-session latch (true exactly once, the only consumption of
+        the latch); verbose -> the capture count since the last served count
+        (false when nothing new) — the count never touches the latch, so a
+        later compact flip still fires the first-capture line. Keys are
+        resolved by session_id like the pending slot, so a bound agent's
+        effective-profile parking never orphans the signal.
+        """
+        mode = self._config.visibility.mode
+        with self._capture_lock:
+            exact = (profile_id, session_id)
+            if mode == "off":
+                return False
+            key = exact
+            if key not in self._capture_first and key not in self._capture_counts:
+                for k in self._capture_first:
+                    if k[1] == session_id:
+                        key = k
+                        break
+            if mode == "verbose":
+                count = self._capture_counts.pop(key, 0)
+                return count if count > 0 else False
+            if self._capture_first.get(key) is True:
+                self._capture_first[key] = False
+                return True
+            return False
+
+    def _visibility_payload(self, profile_id: str, session_id: str) -> dict[str, Any]:
+        """The recall-pending visibility field: mode + consumed capture signal."""
+        return {"mode": self._config.visibility.mode, "capture": self._capture_signal(profile_id, session_id)}
+
+    def _visibility_mode_payload(self) -> dict[str, Any]:
+        """The session/recent visibility field (mode only)."""
+        return {"mode": self._config.visibility.mode}
+
     def recall_pending(self, profile_id: str, session_id: str, seen_chunk_ids: list[str]) -> dict[str, Any]:
         """Serve the pending slot (D6): the caller's seen ids (its T1-injected
         flat list, <=16) join the daemon's SERVED-ids set as the pull-time
@@ -1752,6 +1821,9 @@ class MemoryService:
                 "matched_rule_source": None,
                 "matched_chunk_id": None,
                 "conflict_reason": None,
+                # the capture signal rides even a disabled pull — the
+                # stateless hook renders it alone when nothing else is served.
+                "visibility": self._visibility_payload(profile_id, session_id),
             }
         with self._pending_lock:
             # session-scoped sweep: pending is parked under effective profile
@@ -1859,6 +1931,8 @@ class MemoryService:
             "matched_rule_source": matched_rule_source,
             "matched_chunk_id": matched_chunk_id,
             "conflict_reason": conflict_reason,
+            # the visibility field is additive (absent => off for the hook).
+            "visibility": self._visibility_payload(profile_id, session_id),
         }
 
     def end_session(self, profile_id: str, session_id: str) -> None:
@@ -1883,6 +1957,14 @@ class MemoryService:
             self._pending_consumed.pop(key, None)
             self._budget_consumed.pop(key, None)
             self._scan_seq.pop(key, None)
+            # the capture latch and count die with the session
+            with self._capture_lock:
+                self._capture_first.pop(key, None)
+                self._capture_counts.pop(key, None)
+                for k in [k for k in self._capture_first if k[1] == session_id and k != key]:
+                    self._capture_first.pop(k, None)
+                for k in [k for k in self._capture_counts if k[1] == session_id and k != key]:
+                    self._capture_counts.pop(k, None)
             # B1: a settled session drops its consumed provider-event marks —
             # the arm never survives /session/end.
             for done in [k for k in self._provider_event_consumed if k[:2] == key or k[1] == session_id]:

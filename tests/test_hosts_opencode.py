@@ -679,3 +679,54 @@ def test_plugin_bounds_stale_watermark_artifacts_by_age_with_a_guard() -> None:
     assert "const WATERMARK_STALE_SWEEP_INTERVAL_MS" in source, "the interval guard must be named"
     assert "sweepStaleWatermarkArtifacts(" in source, "the sweep entry must exist"
     assert "watermarkStaleSweepLastAt" in source, "the guard clock must exist"
+
+
+# ---------------------------------------------------------------- conversation visibility
+
+
+def test_plugin_pins_the_visibility_signal_vocabulary_and_mode_gate() -> None:
+    """the fixed neutral signal lines live as named constants, the wire
+    mode gate accepts only compact/verbose/off (anything else reads off), and
+    the mode's only source is the daemon's wire `visibility` field."""
+    source = _plugin_source()
+    assert 'const T1_SIGNAL = "[mnemoseed] replayed context from a previous session"' in source
+    assert 'const T2_SIGNAL = "[mnemoseed] recalled related memories"' in source
+    assert 'const CAPTURE_SIGNAL = "[mnemoseed] captured this session"' in source
+    gate = re.search(r"function visibilityModeOf[^}]+}", source, re.S)
+    assert gate is not None, "the shared mode gate must exist"
+    body = gate.group(0)
+    for mode in ('"compact"', '"verbose"', '"off"'):
+        assert mode in body, mode
+    assert "visibility?.mode" in body, "the mode reads only the wire field"
+
+
+def test_plugin_pins_the_independent_first_capture_latch() -> None:
+    """the first-capture latch is its OWN map (never reconciledSessions),
+    armed on every ingest ack, rendered once under the observed compact mode,
+    and cleaned up with the session."""
+    source = _plugin_source()
+    assert "const firstCaptureSeen" in source
+    assert "armCaptureSignal(" in source
+    assert "takeCaptureSignal(" in source
+    # armed at all three ingest ack callbacks
+    assert len(re.findall(r"armCaptureSignal\(sessionID\)", source)) == 3
+    # rendered only under the observed compact mode
+    render = re.search(r"takeCaptureSignal\(sessionID\)", source)
+    assert render is not None
+    # cleaned up with the session lifecycle
+    deleted = re.search(r'case "session\.deleted":.*?break', source, re.S)
+    assert deleted is not None and "firstCaptureSeen.delete(" in deleted.group(0)
+    assert "lastVisibilityMode.delete(" in deleted.group(0)
+
+
+def test_plugin_visibility_signal_is_budget_shed_not_content_shed() -> None:
+    """the signal rides inside the block via withSignalAfterFence and the
+    shed path restores the base block byte-identically (never shrinks existing
+    content to make room for the signal)."""
+    source = _plugin_source()
+    assert "function withSignalAfterFence(" in source
+    t1_wrap = re.search(r"function buildRecallInjection\(.*?\n\}", source, re.S)
+    assert t1_wrap is not None and "withSignalAfterFence(" in t1_wrap.group(0)
+    assert "MAX_INJECT_CHARS" in t1_wrap.group(0)
+    t2_wrap = re.search(r"function buildT2Injection\(.*?\n\}", source, re.S)
+    assert t2_wrap is not None and "withSignalAfterFence(" in t2_wrap.group(0)

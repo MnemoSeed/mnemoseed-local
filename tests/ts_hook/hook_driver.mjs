@@ -159,6 +159,8 @@ let sliceTurnsVisible = false
 // recall-pull-t1-independence: the fake host history gains assistant replies
 // that cite the T2-injected chunk c-mid (the second is a re-citation).
 let t2CiteTurnsVisible = false
+// signal-not-citable: reply quoting the signal line sends no reinforce.
+let signalCiteTurnVisible = false
 
 function historyEntries() {
   const entries = [
@@ -313,6 +315,17 @@ function historyEntries() {
           text: "再确认一次：上次中段提到 LanceDb 的接入还在等存储层确认。",
         },
       ],
+    })
+  }
+  if (signalCiteTurnVisible) {
+    entries.push({
+      info: {
+        id: "m_sig_cite_1",
+        role: "assistant",
+        sessionID: SES,
+        time: { completed: 10_000 },
+      },
+      parts: [{ type: "text", text: "[mnemoseed] recalled related memories" }],
     })
   }
   return entries
@@ -2799,6 +2812,245 @@ async function main() {
       await seam.runStaleSweep(true)
       const forcedRemoved = !(await exists(guardedTmp))
       console.log(JSON.stringify({ oldRemoved, youngKept, unrelatedKept, guardHeld, forcedRemoved }))
+      break
+    }
+
+    case "visibility-t1-compact": {
+      // compact T1: exactly one signal line, right after the fence-open
+      // line, before the disclaimer; the block stays within the 4000 cap.
+      recentPayload = { ...RECENT_PAYLOAD, visibility: { mode: "compact" } }
+      const o = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      console.log(JSON.stringify({ block: o.system[1], length: o.system[1].length }))
+      break
+    }
+
+    case "visibility-t1-verbose": {
+      // verbose T1: the compact signal line plus the count line
+      // (sessions / memories / chars of the included content).
+      recentPayload = { ...RECENT_PAYLOAD, visibility: { mode: "verbose" } }
+      const o = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      console.log(JSON.stringify({ block: o.system[1], length: o.system[1].length }))
+      break
+    }
+
+    case "visibility-t1-budget-shed": {
+      // T1 budget discipline: when the signal does not fit the 4000 cap
+      // it sheds FIRST and the resulting block is byte-identical to the
+      // off-mode build of the same payload (existing content never sheds to
+      // make room for the signal).
+      const filled = {
+        profile_id: "default",
+        self_window: null,
+        sessions: [
+          {
+            session_id: "sess-vis-big",
+            latest_at: 50.0,
+            chunks: [
+              { chunk_id: "c-vis-a", text: "assistant: " + "乙".repeat(3900), ingested_at: 50.0, turn_start: 0, turn_end: 0 },
+              { chunk_id: "c-vis-b", text: "user: " + "丙".repeat(9000), ingested_at: 40.0, turn_start: 0, turn_end: 0 },
+            ],
+          },
+        ],
+      }
+      recentPayload = { ...filled, visibility: { mode: "compact" } }
+      const withVis = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: "sess-vis-on" }, withVis)
+      recentPayload = filled
+      const withoutVis = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: "sess-vis-off" }, withoutVis)
+      console.log(
+        JSON.stringify({
+          withVis: withVis.system[1],
+          withoutVis: withoutVis.system[1],
+          withVisLength: withVis.system[1]?.length ?? 0,
+          withoutVisLength: withoutVis.system[1]?.length ?? 0,
+        }),
+      )
+      break
+    }
+
+    case "visibility-t2-compact": {
+      // compact T2: exactly one signal line inside the block.
+      recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "compact", capture: false } }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_vis_t2" },
+        { parts: [{ type: "text", text: "触发一轮" }] },
+      )
+      await delay(50)
+      const o = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      console.log(JSON.stringify({ systems: [o.system] }))
+      break
+    }
+
+    case "visibility-t2-verbose": {
+      // verbose T2: the compact signal line plus the count line
+      // (memories / chars of the served items).
+      recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "verbose", capture: false } }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_vis_t2v" },
+        { parts: [{ type: "text", text: "触发一轮" }] },
+      )
+      await delay(50)
+      const o = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      console.log(JSON.stringify({ systems: [o.system] }))
+      break
+    }
+
+    case "visibility-t2-budget-shed": {
+      // T2 budget discipline: a tight budget sheds the signal first; the
+      // shed result is byte-identical to the no-field build.
+      const tight = {
+        enabled: true,
+        items: [{ kind: "chunk", id: "c-vis-tight", text: "z".repeat(149) }],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 150,
+      }
+      recallPayload = { ...tight, visibility: { mode: "compact", capture: false } }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_vis_shed" },
+        { parts: [{ type: "text", text: "紧预算轮" }] },
+      )
+      await delay(50)
+      const withVis = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, withVis)
+      recallPayload = tight
+      await hooks["chat.message"](
+        { sessionID: "sess-vis-t2b", messageID: "m_vis_shed2" },
+        { parts: [{ type: "text", text: "紧预算轮" }] },
+      )
+      await delay(50)
+      const withoutVis = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: "sess-vis-t2b" }, withoutVis)
+      console.log(
+        JSON.stringify({
+          withVisSystems: withVis.system,
+          withoutVisSystems: withoutVis.system,
+        }),
+      )
+      break
+    }
+
+    case "visibility-capture-compact": {
+      // compact capture: the first acked ingest arms the per-session
+      // latch; the next transform renders the line exactly once, later
+      // transforms and later captures never re-arm it.
+      recallPayload = {
+        enabled: false,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+        visibility: { mode: "compact", capture: false },
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_cap1" },
+        { parts: [{ type: "text", text: "第一轮" }] },
+      )
+      await delay(50)
+      const c1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, c1)
+      const c2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, c2)
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_cap2" },
+        { parts: [{ type: "text", text: "第二轮" }] },
+      )
+      await delay(50)
+      const c3 = { system: ["BASE3"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, c3)
+      console.log(JSON.stringify({ systems: [c1.system, c2.system, c3.system] }))
+      break
+    }
+
+    case "visibility-capture-off": {
+      // off: a pending capture latch renders nothing and stays armed.
+      recallPayload = {
+        enabled: false,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+        visibility: { mode: "off", capture: true },
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_capo1" },
+        { parts: [{ type: "text", text: "关灯轮" }] },
+      )
+      await delay(50)
+      const o1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
+      const o2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o2)
+      console.log(JSON.stringify({ systems: [o1.system, o2.system] }))
+      break
+    }
+
+    case "visibility-capture-verbose": {
+      // verbose capture: the daemon's capture count rides the pull; each
+      // count>0 pull renders one count line (the once-only latch stays armed
+      // for a later compact flip and renders nothing in verbose).
+      recallPayload = {
+        enabled: false,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+        visibility: { mode: "verbose", capture: 2 },
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_capv1" },
+        { parts: [{ type: "text", text: "计数轮一" }] },
+      )
+      await delay(50)
+      const v1 = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, v1)
+      recallPayload = {
+        enabled: false,
+        items: [],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+        visibility: { mode: "verbose", capture: false },
+      }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_capv2" },
+        { parts: [{ type: "text", text: "计数轮二" }] },
+      )
+      await delay(50)
+      const v2 = { system: ["BASE2"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, v2)
+      console.log(JSON.stringify({ systems: [v1.system, v2.system] }))
+      break
+    }
+
+    case "visibility-signal-not-citable": {
+      // Signal-line quote: zero reinforce. c-mid quote: exactly one (positive control).
+      recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "compact", capture: false } }
+      await hooks["chat.message"](
+        { sessionID: SES, messageID: "m_vis_cite" },
+        { parts: [{ type: "text", text: "引用轮" }] },
+      )
+      await delay(50)
+      const o = { system: ["BASE"] }
+      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      citationTurnsVisible = true
+      t2CiteTurnsVisible = true
+      signalCiteTurnVisible = true
+      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_1", 8_000) })
+      await delay(100)
+      await hooks.event({ event: messageUpdatedAssistant("m_sig_cite_1", 10_000) })
+      await delay(100)
+      console.log(
+        JSON.stringify({
+          systems: [o.system],
+          reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+        }),
+      )
       break
     }
 

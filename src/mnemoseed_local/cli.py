@@ -1347,11 +1347,13 @@ def _read_stdin_text() -> str:
 def cmd_hook_event(args: argparse.Namespace) -> int:
     """Hidden transformer: host hook stdin JSON -> normalized daemon POST.
 
-    Zero stdout on EVERY path EXCEPT a served B2.1 T2 mid-session recall pull:
-    an acked UserPromptSubmit emits one JSON ``{hookSpecificOutput.additionalContext}``
-    object so Claude Code injects the pending recall alongside the submitted
-    prompt. Fire-and-forget with a ~2s timeout; failures swallowed into the
-    opt-in stderr debug lane.
+    Zero stdout on EVERY path EXCEPT (a) a served B2.1 T2 mid-session recall
+    pull — an acked UserPromptSubmit emits one JSON
+    ``{hookSpecificOutput.additionalContext}`` object so Claude Code injects the
+    pending recall alongside the submitted prompt — and (b) a visibility
+    signal payload when the daemon's wire mode is not off (a bare capture signal
+    line may ride the same shape without a served selection). Fire-and-forget
+    with a ~2s timeout; failures swallowed into the opt-in stderr debug lane.
     """
     from mnemoseed_local.hosts import install as shared
     from mnemoseed_local.hosts.claude_code import events
