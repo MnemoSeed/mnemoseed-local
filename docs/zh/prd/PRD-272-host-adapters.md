@@ -339,3 +339,44 @@ R54/R55（#273 批已入册）。不入册清单：无（无候选）。
 - **重钉**：`tests/fixtures/codex_hook/` 四 fixture 与 `tests/test_s0_host_contracts.py`
   允许清单按上述清单重钉（键集 == 允许清单的白名单式断言，多余键即红）；幽灵字段
   零残留。§9.3 水位 wire 形状不涉及 stdin 字段，无需订正。
+
+### 9.6 S2a 定案：实捕降级（无头 CLI 缺位）、T1 通道形状、Stop 形状（2026-10-24）
+
+- **实捕结果：降级 docs-only（第二次）**。探针过程：`zcode` 不在 PATH（Git Bash/where 均无）；本机
+  ZCode 仅以 Electron 桌面应用形态存在（`%LOCALAPPDATA%/Programs/ZCode`，`app.asar.unpacked` 内无
+  CLI 入口二进制）；npm 全局 bin 仅有 codex/opencode shim。无头/`-p` 模式无载体，触发一次会话
+  只能启动用户桌面应用并落用户级 `~/.zcode`（合同红线）⇒ 按简报预置门立即降级。**§9.2 的
+  CC 兼容方言假设保持工作契约**，`tests/fixtures/zcode_hook/` 四 fixture 零改动（无实捕差异可
+  钉）；§9.1 的 `hookSpecificOutput.{hookEventName, additionalContext}` 输出布局假设同样保持
+  （SessionStart T1 注入通道未实证这一点如实保持，S4/E2E 或 owner 辅助可再核）。
+- **T1 通道形状定案（docs-only 定案，S2a 已实现）**：SessionStart firing ⇒ 无状态 hook 进程内
+  **恰一次** `POST /session/recent`（attempt-once 的门 = 进程本身，跨 firing 不共享状态）；请求体
+  = `{profile_id, sessions: 2, per_session: 8, exclude_session_id}`，**不带 `self_session_id` 与
+  `resume_query`**——会话起始无 prompt 可作 scoped-resume 锚，且 daemon 对"双身份字段 + 无
+  resume_query"按 automatic-path fail-closed 处理（`daemon/memory.py` session_recent 守卫），
+  legacy unscoped 重放才是无状态 SessionStart hook 的诚实形状。注入块沿 opencode
+  `buildRecallInjection` 形状（围栏 + disclaimer + `<session-tail id/ended/started>` 组 + 边界块
+  尾切片），预算 4000 chars，信号行按 wire `visibility` mode（off/缺席 ⇒ 无信号行）。
+- **T1/T2 状态边界（如实记录）**：T2 pull 的 `seen_chunk_ids` 恒为空——SessionStart 进程退出后
+  T1 已注入的 chunk id 无处存活，focal 命中可能重放一条 T1 已服务过的 chunk。无状态 hook 的
+  设计下界，与 §3.3 对 Codex 的判断一致；若 E2E 显现重复注入副作用，再议 per-session 侧车。
+- **Stop 形状定案**：`last_assistant_message`（方言假设字段）为主文本；`transcript_path` 尾部按
+  Claude-Code 转录 JSONL 方言防御性解析（取 model_id 与文本兜底）——zcode rollout 文件
+  （`model-io-session_*.jsonl`）内部形状未经实捕核实，解析失败降级 `(None, "")`，事件不丢弃。
+  `stop_hook_active` 不改变捕获行为（续答轮的 assistant 文本仍属会话内容）。
+- **B2.7 规则预算载体未随 zcode T1**：§3.2/§5.3 对 zcode T1 的冻结验收仅钉"围栏 + compact 信号
+  行、预算内"；opencode 载体与 claude_code S1b 补全项不自动扩展到 zcode（记为收口前 owner 可选
+  项，非本批验收缺口）。
+- **安装器机制定案**：`hooks.enabled` pre-state 记录在配置同目录 sidecar
+  `mnemoseed-local.json`（`{"hooks_enabled": true|false|null}`，null=键缺席）——不向宿主 config
+  写外来键；卸载仅按记录回滚（记录缺失 = 诚实未知，开关不动）。marker 契约 = `type: "process"`
+  且 `args` 精确等于保留 argv（`_hook-event --host zcode` 直连形，或 `-m mnemoseed_local.cli …`
+  模块形）——command 本身随环境（PATH 上的工具 shim 优先，否则运行期解释器绝对路径），故以
+  argv 而非路径为保留签名。`--dry-run` 为模块级能力（`install(dry_run=True)`/`uninstall(
+  dry_run=True)`）；`host` 子命令组分派约定零参调用，CLI 旗标需改 cli.py（S1 面已冻结），如需
+  CLI 露出留收口批裁定。
+- **暂存债务（QA 对抗审入册）**：claude_code 侧与 common 新核存在同逻辑副本，收口前归位
+  `hosts/common/`——`claude_code/events.py:194-227,252-262,300-370` ↔ `common/recall.py:98-147,
+  323-371`（T1/T2 读取-渲染 lane）；`claude_code/install.py:105-121` ↔ `common/config.py:35-66`
+  （strict-JSON 配置手术）。归位切片 = S1b（claude_code 重接 common lane，字节 oracle 护航）；
+  归位前两侧零漂移由测试钉死。
