@@ -242,6 +242,17 @@ Honest boundaries of the HTTP surface:
 - `"oauth": false` keeps a first-party entry from opening a browser
   OAuth/DCR loop when the daemon answers 401.
 
+## Agent skill
+
+The repo ships an agent skill at `skills/mnemoseed/SKILL.md` that teaches a
+coding agent when and how to call the MCP tools above: proactive-recall
+etiquette, the scoped `recent_sessions` resume, and pinned-vs-captured
+discrimination. Install it manually by copying the `skills/mnemoseed/`
+directory into your host's skills directory (for example `~/.claude/skills/`
+for Claude Code or `.opencode/skills/` for OpenCode) and restarting the host.
+This `skills/` tree is the shipped product artifact; `.opencode/skills/` is
+this repository's own in-repo automation and does not ship.
+
 ## Development
 
 Test-driven, with an adversarial verifier on every task: failing tests first.
