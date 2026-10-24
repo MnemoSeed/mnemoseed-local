@@ -1,0 +1,1 @@
+{"hook_event_name":"Stop","session_id":"zc-sess-01","cwd":"G:/dev/demo","transcript_path":"G:/dev/demo/.zcode/cli/rollout/model-io-session_zc-sess-01.jsonl","stop_hook_active":false,"last_assistant_message":"失败原因是测试里的时钟断言没有冻结；我给你改成注入时钟。"}

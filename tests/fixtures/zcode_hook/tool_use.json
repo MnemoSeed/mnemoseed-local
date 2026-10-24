@@ -1,0 +1,1 @@
+{"hook_event_name":"PostToolUse","session_id":"zc-sess-01","cwd":"G:/dev/demo","tool_name":"Bash","tool_input":{"command":"uv run pytest -q"},"tool_response":{"stdout":"938 passed, 5 skipped"},"tool_use_id":"toolu_01ABC123"}
