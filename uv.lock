@@ -685,6 +685,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "zstandard" },
 ]
 
 [package.metadata]
@@ -709,6 +710,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
     { name = "ruff", specifier = ">=0.5" },
+    { name = "zstandard", specifier = ">=0.22" },
 ]
 
 [[package]]

@@ -558,6 +558,10 @@ class MemoryService:
         # current mode (off consumes nothing, so a later flip still fires).
         self._capture_first: dict[tuple[str, str], bool] = {}
         self._capture_counts: dict[tuple[str, str], int] = {}
+        # Transcript-differential capture progress (PRD-272 §9.3): the
+        # per-(profile, session) high watermark of rollout line ordinals.
+        # Ingest-boundary dedup only — scoring/ranking/provenance never read it.
+        self._transcript_ordinals: dict[tuple[str, str], int] = {}
         self._capture_lock = threading.Lock()
 
     @property
@@ -1770,6 +1774,28 @@ class MemoryService:
         """The recall-pending visibility field: mode + consumed capture signal."""
         return {"mode": self._config.visibility.mode, "capture": self._capture_signal(profile_id, session_id)}
 
+    def transcript_ordinal_dedupes(self, profile_id: str, session_id: str, ordinal: int) -> bool:
+        """True when the ordinal is at or below the session's high watermark:
+        an ingest-boundary replay that must not segment again (PRD-272 §9.3)."""
+        with self._capture_lock:
+            stored = self._transcript_ordinals.get((profile_id, session_id))
+            return stored is not None and ordinal <= stored
+
+    def transcript_watermark(self, profile_id: str, session_id: str) -> int | None:
+        """The session's stored high watermark, None before the first ordinal."""
+        with self._capture_lock:
+            return self._transcript_ordinals.get((profile_id, session_id))
+
+    def note_transcript_ordinal(self, profile_id: str, session_id: str, ordinal: int) -> int:
+        """Raise the session's high watermark to the max; returns the watermark
+        after the update. The ingest route gates this on segmenter acceptance."""
+        with self._capture_lock:
+            key = (profile_id, session_id)
+            stored = self._transcript_ordinals.get(key)
+            updated = ordinal if stored is None else max(stored, ordinal)
+            self._transcript_ordinals[key] = updated
+            return updated
+
     def _visibility_mode_payload(self) -> dict[str, Any]:
         """The session/recent visibility field (mode only)."""
         return {"mode": self._config.visibility.mode}
@@ -1961,10 +1987,13 @@ class MemoryService:
             with self._capture_lock:
                 self._capture_first.pop(key, None)
                 self._capture_counts.pop(key, None)
+                self._transcript_ordinals.pop(key, None)
                 for k in [k for k in self._capture_first if k[1] == session_id and k != key]:
                     self._capture_first.pop(k, None)
                 for k in [k for k in self._capture_counts if k[1] == session_id and k != key]:
                     self._capture_counts.pop(k, None)
+                for k in [k for k in self._transcript_ordinals if k[1] == session_id and k != key]:
+                    self._transcript_ordinals.pop(k, None)
             # B1: a settled session drops its consumed provider-event marks —
             # the arm never survives /session/end.
             for done in [k for k in self._provider_event_consumed if k[:2] == key or k[1] == session_id]:

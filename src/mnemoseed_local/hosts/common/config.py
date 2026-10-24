@@ -48,6 +48,21 @@ def write_atomic(target: Path, data: Mapping[str, object], dry_run: bool = False
         return False
     if dry_run:
         return True
+    return _replace_via_temp(target, payload)
+
+
+def write_text_atomic(target: Path, text: str, dry_run: bool = False) -> bool:
+    """Atomically rewrite ``target`` with ``text`` as UTF-8 bytes; the same
+    no-op / dry-run / crash-safety contract as :func:`write_atomic`."""
+    payload = text.encode("utf-8")
+    if target.is_file() and target.read_bytes() == payload:
+        return False
+    if dry_run:
+        return True
+    return _replace_via_temp(target, payload)
+
+
+def _replace_via_temp(target: Path, payload: bytes) -> bool:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=target.parent, prefix=f"{target.name}.", suffix=".tmp")
     temp = Path(temp_name)

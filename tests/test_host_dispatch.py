@@ -65,40 +65,48 @@ def test_host_group_unknown_host_is_an_argparse_error(capsys: pytest.CaptureFixt
 # ---------------------------------------------------------------- fail-open transformer dispatch
 
 
-def test_hook_event_missing_module_fails_open(capsys: pytest.CaptureFixture[str]) -> None:
-    """A host without a transformer module (codex_cli ships none yet) must log
-    honestly on stderr, keep stdout empty, and exit 0."""
-    assert cmd_hook_event(argparse.Namespace(host="codex_cli")) == 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "codex_cli" in captured.err
-
-
-def test_hook_event_missing_module_fails_open_through_main(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["_hook-event", "--host", "codex_cli"]) == 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "codex_cli" in captured.err
-
-
-def test_hook_event_fake_module_name_fails_open(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _bind_missing_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(
         HOOK_HOSTS,
-        "fake",
+        "ghost",
         HostBinding(
             events="mnemoseed_local.hosts.__missing_host__.events",
             events_entry="transform_event",
             install="mnemoseed_local.hosts.__missing_host__.install",
         ),
     )
-    assert main(["_hook-event", "--host", "fake"]) == 0
+
+
+def test_hook_event_missing_module_fails_open(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A host without a transformer module must log honestly on stderr, keep
+    stdout empty, and exit 0."""
+    _bind_missing_host(monkeypatch)
+    assert cmd_hook_event(argparse.Namespace(host="ghost")) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "fake" in captured.err
+    assert "ghost" in captured.err
+
+
+def test_hook_event_missing_module_fails_open_through_main(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bind_missing_host(monkeypatch)
+    assert main(["_hook-event", "--host", "ghost"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ghost" in captured.err
+
+
+def test_hook_event_fake_module_name_fails_open(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bind_missing_host(monkeypatch)
+    assert main(["_hook-event", "--host", "ghost"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ghost" in captured.err
 
 
 # ---------------------------------------------------------------- host lifecycle skeleton
@@ -113,11 +121,14 @@ def test_host_group_help_lists_the_verbs(capsys: pytest.CaptureFixture[str]) -> 
         assert verb in out
 
 
-def test_host_lifecycle_missing_module_fails_loud(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["host", "install", "--host", "codex_cli"]) == 1
-    assert "not implemented yet for host codex_cli" in capsys.readouterr().err
-    assert main(["host", "status", "--host", "codex_cli"]) == 1
-    assert "not implemented yet for host codex_cli" in capsys.readouterr().err
+def test_host_lifecycle_missing_module_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bind_missing_host(monkeypatch)
+    assert main(["host", "install", "--host", "ghost"]) == 1
+    assert "not implemented yet for host ghost" in capsys.readouterr().err
+    assert main(["host", "status", "--host", "ghost"]) == 1
+    assert "not implemented yet for host ghost" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------- host module surface

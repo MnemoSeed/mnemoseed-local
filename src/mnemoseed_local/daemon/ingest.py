@@ -183,6 +183,24 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
             "profile_id": event.profile_id,
             "event": event.event.value,
         }
+    # Transcript-differential hosts replay their batch on every firing; the
+    # per-session high watermark dedupes at the ingest boundary (PRD-272
+    # §9.3): an ordinal at or below it skips segmentation entirely and the
+    # 202 answers with the stored watermark so the stateless hook keeps
+    # flowing.
+    memory = getattr(request.app.state, "memory", None)
+    if (
+        event.transcript_ordinal is not None
+        and memory is not None
+        and memory.transcript_ordinal_dedupes(effective_profile, event.session_id, event.transcript_ordinal)
+    ):
+        return {
+            "status": "accepted",
+            "session_id": event.session_id,
+            "profile_id": event.profile_id,
+            "event": event.event.value,
+            "ack_ordinal": memory.transcript_watermark(effective_profile, event.session_id),
+        }
     try:
         segmenter.ingest(event)
     except ProfileMismatchError as exc:
@@ -198,6 +216,19 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
             memory.note_capture(effective_profile, event.session_id)
         except Exception:  # pragma: no cover - accounting must not fail ingest
             logger.warning("capture visibility bookkeeping failed", exc_info=True)
+    # the transcript watermark only advances on a segmenter-accepted event;
+    # the 202 echoes it so the stateless hook can lift its send floor.
+    ack_ordinal: int | None = None
+    if event.transcript_ordinal is not None:
+        if memory is not None:
+            try:
+                ack_ordinal = memory.note_transcript_ordinal(
+                    effective_profile, event.session_id, event.transcript_ordinal
+                )
+            except Exception:  # pragma: no cover - accounting must not fail ingest
+                logger.warning("transcript watermark bookkeeping failed", exc_info=True)
+        if ack_ordinal is None:
+            ack_ordinal = event.transcript_ordinal
     # B2.1 T2 (PRD-B2.1): user prompts run the embedding-free focal scan and
     # park the pending-recall selection BEFORE the 202 answers (ack-implies-
     # ready). The scan is store I/O, so it runs in a worker thread; the
@@ -221,12 +252,15 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
                 )
             except Exception:  # pragma: no cover - the scan must never fail ingest
                 logger.warning("focal scan failed; ingest proceeds", exc_info=True)
-    return {
+    body: dict[str, Any] = {
         "status": "accepted",
         "session_id": event.session_id,
         "profile_id": event.profile_id,
         "event": event.event.value,
     }
+    if ack_ordinal is not None:
+        body["ack_ordinal"] = ack_ordinal
+    return body
 
 
 @router.post("/session/end")
