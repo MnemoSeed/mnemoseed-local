@@ -41,8 +41,7 @@ without any served selection.
 from __future__ import annotations
 
 import json
-import os
-import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -50,8 +49,39 @@ from typing import Any
 from httpx import Timeout
 from pydantic import BaseModel
 
+from mnemoseed_local.hosts.common import payload
+from mnemoseed_local.hosts.common.daemon import (
+    POST_TIMEOUT_SECONDS,
+    RECALL_BUDGET_KEY,
+    RECALL_PULL_MAX_CHARS,
+    debug,
+    hook_client,
+    profile_id,
+    pull_pending_recall,
+)
+from mnemoseed_local.hosts.common.daemon import (
+    RECALL_PULL_TIMEOUT_SECONDS as RECALL_PULL_TIMEOUT_SECONDS,
+)
+from mnemoseed_local.hosts.common.fence import (
+    RECALL_DISCLAIMER as RECALL_DISCLAIMER,
+)
+from mnemoseed_local.hosts.common.fence import (
+    RECALL_FENCE_CLOSE as RECALL_FENCE_CLOSE,
+)
+from mnemoseed_local.hosts.common.fence import (
+    RECALL_FENCE_OPEN as RECALL_FENCE_OPEN,
+)
+from mnemoseed_local.hosts.common.fence import (
+    RECALL_FENCE_SANITIZED as RECALL_FENCE_SANITIZED,
+)
+from mnemoseed_local.hosts.common.t2 import build_t2_context, sanitize_recall_text
+from mnemoseed_local.hosts.common.visibility import (
+    VISIBILITY_KEY,
+    capture_count_line,
+    recall_count_line,
+    visibility_mode,
+)
 from mnemoseed_local.rest_client import DaemonClient
-from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE
 from mnemoseed_local.schema.turn import (
     FlushRequest,
     HostId,
@@ -63,41 +93,10 @@ from mnemoseed_local.schema.turn import (
 #: kind -> daemon REST endpoint (kind names are the transformer's action tags).
 ENDPOINTS = {"ingest": "/ingest", "flush": "/flush", "session_end": "/session/end"}
 
-#: Fire-and-forget POST budget (mirrors the opencode plugin's 2s discipline).
-POST_TIMEOUT_SECONDS = 2.0
-
 #: Per-phase cap for SessionEnd posts: CC enforces a shared ~1.5s teardown
 #: clock on SessionEnd hooks while /session/end drains server-side, so the
-#: call must give up fast (residual worst-case noted in the PRD boundary).
+#: call must give up fast.
 SESSION_END_TIMEOUT_SECONDS = 0.5
-
-#: B2.1 T2 dedicated mid-session pull budget (PRD-B2.1 / design 05): 300ms, a
-#: distinct constant — reusing the flat 2s host budget would be too heavy for
-#: a per-turn pull (re-review issue 9 adopted).
-RECALL_PULL_TIMEOUT_SECONDS = 0.3
-
-#: Fallback item budget when the daemon omits ``budget_chars`` (older daemon, or
-#: a malformed payload). The daemon is the ONLY budget authority in the normal
-#: path; this mirrors the opencode plugin's ``RECALL_PULL_MAX_CHARS``.
-RECALL_PULL_MAX_CHARS = 1200
-
-#: B2.1 T1/T2 injection envelope, byte-identical to the opencode plugin so the
-#: two hosts ship the same memory-replay fence + disclaimer to the model.
-RECALL_FENCE_OPEN = "<mnemoseed-memory-recall>"
-RECALL_FENCE_CLOSE = "</mnemoseed-memory-recall>"
-RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
-RECALL_DISCLAIMER = (
-    "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
-)
-
-#: The daemon reports its effective item budget on the wire under this key.
-RECALL_BUDGET_KEY = "budget_chars"
-
-#: R2 provenance affix (design/11 §8 copy deck, byte-identical to the opencode
-#: plugin): a per-line pin marker on an explicitly-pinned recall item; captured
-#: items are NOT annotated (absence is the captured signal). 9 chars including
-#: the leading separator; decoration only, NEVER part of the verbatim text.
-PIN_SUFFIX = " ⟵ pinned"
 
 #: Claude Code hook event that carries the injection (the additionalContext
 #: JSON property, both in our payload and in the decision-control schema).
@@ -110,58 +109,6 @@ INJECTION_HOOK_EVENT = "UserPromptSubmit"
 #: means off (old daemon x new hook stays byte-identical).
 T2_SIGNAL = "[mnemoseed] recalled related memories"
 CAPTURE_SIGNAL = "[mnemoseed] captured this session"
-
-#: The daemon wire keys of the visibility field.
-VISIBILITY_KEY = "visibility"
-VISIBILITY_MODES = ("compact", "verbose")
-
-
-def visibility_mode(served: dict[str, Any] | None) -> str | None:
-    """The rendering mode of a pull payload, None when off or unusable."""
-    if not isinstance(served, dict):
-        return None
-    visibility = served.get(VISIBILITY_KEY)
-    if not isinstance(visibility, dict):
-        return None
-    mode = visibility.get("mode")
-    return mode if mode in VISIBILITY_MODES else None
-
-
-def capture_signal_of(served: dict[str, Any] | None) -> str | None:
-    """The pending capture signal text of a pull payload, None when silent.
-
-    compact renders the once-per-session line; verbose renders the capture
-    count line; anything else (including off and a zero count) is silent.
-    """
-    if visibility_mode(served) is None or served is None:
-        return None
-    visibility = served[VISIBILITY_KEY]
-    if not isinstance(visibility, dict):
-        return None
-    capture = visibility.get("capture")
-    if capture is True:
-        return CAPTURE_SIGNAL
-    if isinstance(capture, int) and not isinstance(capture, bool) and capture > 0:
-        return capture_count_line(capture)
-    return None
-
-
-def recall_count_line(memories: int, chars: int) -> str:
-    """The verbose T2 count line (appended after the compact signal line)."""
-    return f"[mnemoseed] {memories} memories, {chars} chars"
-
-
-def capture_count_line(count: int) -> str:
-    """The verbose capture count line (replaces the compact capture line)."""
-    return f"[mnemoseed] captured {count} turns since the last report"
-
-
-def endpoint_budget(kind: str) -> float | Timeout:
-    """POST budget per action kind (see SESSION_END_TIMEOUT_SECONDS)."""
-    if kind == "session_end":
-        return Timeout(SESSION_END_TIMEOUT_SECONDS)
-    return POST_TIMEOUT_SECONDS
-
 
 MAX_TOOL_OUTPUT_CHARS = 8000
 
@@ -180,21 +127,6 @@ def _normalizer(name: str) -> Callable[[Normalizer], Normalizer]:
         return fn
 
     return register
-
-
-def debug_enabled() -> bool:
-    return bool(os.environ.get("MNEMOSEED_LOCAL_DEBUG"))
-
-
-def debug(message: str) -> None:
-    """Opt-in failure lane: stderr only (never stdout), silent unless enabled."""
-    if debug_enabled():
-        print(f"mnemoseed-local: {message}", file=sys.stderr)
-
-
-def profile_id() -> str:
-    """Profile binding convention: env override or the default profile."""
-    return os.environ.get("MNEMOSEED_LOCAL_PROFILE_ID") or "default"
 
 
 def normalize_event(payload: dict[str, Any], *, now: float) -> Action | None:
@@ -358,132 +290,51 @@ def injection_session_id(body: BaseModel) -> str | None:
     return None
 
 
-def sanitize_recall_text(text: str) -> str:
-    """Fence integrity (TA-5): served text may literally carry the fence markers
-    (self-dogfood hits this); replace BOTH literals with the ‹› form in one pass
-    so the assembled block carries exactly one open/close fence pair."""
-    return text.replace(RECALL_FENCE_OPEN, RECALL_FENCE_SANITIZED).replace(
-        RECALL_FENCE_CLOSE, RECALL_FENCE_SANITIZED
-    )
+def endpoint_budget(kind: str) -> float | Timeout:
+    """POST budget per action kind (see SESSION_END_TIMEOUT_SECONDS)."""
+    if kind == "session_end":
+        return Timeout(SESSION_END_TIMEOUT_SECONDS)
+    return POST_TIMEOUT_SECONDS
 
 
-def build_t2_context(
-    items: list[dict[str, Any]] | Any, item_budget: int, signal: str | None = None
-) -> str | None:
-    """Assemble the fenced mid-session recall block from a served selection.
+def capture_signal_of(served: dict[str, Any] | None) -> str | None:
+    """The pending capture signal text of a pull payload, None when silent.
 
-    Mirrors opencode's ``buildT2Injection`` byte-for-byte in semantics: the same
-    fence + disclaimer envelope, no group headers (the daemon already shaped the
-    payload), and the daemon's ``budget_chars`` IS the item budget. The envelope
-    re-checks each FULL item fail-closed — an oversized line or assembled block
-    is dropped WHOLE (defense in depth, unreachable by design). There is NO
-    slicing floor in this path: the daemon's ``_MIN_SLICE_CHARS`` governs only
-    its own boundary-item tail cut; full items under any positive budget are
-    served and must append (QA IMPORTANT-3).
-
-    ``signal`` is the prebuilt visibility text (compact line, or the
-    compact line plus the verbose count line separated by one newline). It
-    renders right after the fence-open line and its cost is the FIRST budget
-    shed under pressure — the shed result is byte-identical to the no-signal
-    build, so the signal is purely additive when it fits.
+    compact renders the once-per-session line; verbose renders the capture
+    count line; anything else (including off and a zero count) is silent.
     """
-    if not isinstance(items, list):
+    if visibility_mode(served) is None or served is None:
         return None
-    base = _build_t2_lines(items, item_budget, signal=None)
-    if base is None:
+    visibility = served[VISIBILITY_KEY]
+    if not isinstance(visibility, dict):
         return None
-    if signal:
-        with_signal = _build_t2_lines(items, item_budget, signal=signal)
-        if with_signal is not None:
-            return with_signal
-    return base
+    capture = visibility.get("capture")
+    if capture is True:
+        return CAPTURE_SIGNAL
+    if isinstance(capture, int) and not isinstance(capture, bool) and capture > 0:
+        return capture_count_line(capture)
+    return None
 
 
-def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal: str | None) -> str | None:
-    wrapper = len(RECALL_FENCE_OPEN) + 1 + len(RECALL_DISCLAIMER) + 1 + len(RECALL_FENCE_CLOSE)
-    lines: list[str] = [RECALL_FENCE_OPEN]
-    if signal:
-        lines.append(signal)
-    lines.append(RECALL_DISCLAIMER)
-    remaining = item_budget
-    committed = False
-    # design/11 §4.3: the per-line affix is the FIRST budget shed under pressure.
-    # `kept_affix` sums the affix cost already committed in `lines`, and
-    # `affix_indices` records the ABSOLUTE `lines` positions of the lines that
-    # carry it — so a later overrun can refund their cost and rebuild exactly
-    # those lines bare instead of dropping a daemon-legal selection (IMPORTANT-1).
-    # Indices (not flags) are tracked so a rebuild can never be mis-indexed
-    # against `lines[2 + i]` when the affix is shed a second time in one call.
-    kept_affix = 0
-    affix_indices: list[int] = []
-    for item in items:
-        raw = item.get("text") if isinstance(item, dict) else None
-        text = sanitize_recall_text(raw if isinstance(raw, str) else "")
-        if not text:
-            continue
-        # R2 provenance: the affix rides ONLY an explicitly-pinned item; a
-        # captured (other source) or source-less item is NOT annotated —
-        # absence is the captured signal, the most token-lean rendering
-        # (design/11 §4.2).
-        pinned = isinstance(item, dict) and item.get("source") == EXPLICIT_PIN_SOURCE
-        affix_len = len(PIN_SUFFIX) if pinned else 0
-        line_cost = len(text) + 1 + affix_len
-        if line_cost > remaining:
-            # design/11 §4.3 drop order: a kept affix must never change item
-            # keep/drop semantics — so on an overrun shed EVERY kept affix (refund
-            # their cost and rebuild the committed lines bare) BEFORE dropping.
-            # Only a line whose BARE cost still exceeds the sheddable-recovered
-            # budget stays fail-closed (whole selection dropped, unchanged).
-            if len(text) + 1 <= remaining + kept_affix:
-                if kept_affix:
-                    remaining += kept_affix
-                    kept_affix = 0
-                    for index in affix_indices:
-                        lines[index] = lines[index][: -len(PIN_SUFFIX)]
-                    affix_indices = []
-                lines.append(text)
-                remaining -= len(text) + 1
-                committed = True
-                continue
-            return None
-        lines.append(text + PIN_SUFFIX if pinned else text)
-        remaining -= line_cost
-        kept_affix += affix_len
-        if pinned:
-            affix_indices.append(len(lines) - 1)
-        committed = True
-    if not committed:
-        return None
-    lines.append(RECALL_FENCE_CLOSE)
-    block = "\n".join(lines)
-    if len(block) > item_budget + wrapper:
-        return None
-    return block
+def _t2_signal_of(served: dict[str, Any], items: list[dict[str, Any]]) -> str | None:
+    """The prebuilt T2 signal text under the payload's visibility mode.
 
-
-def pull_pending_recall(session_id: str, client: DaemonClient) -> dict[str, Any] | None:
-    """Bounded ``POST /session/recall-pending`` pull (300ms, fail-open).
-
-    Mirrors opencode's ``pullPendingRecall``: a dedicated await with its own
-    timeout, never the fire-and-forget ``post()`` budget. ``seen_chunk_ids`` is
-    empty — the claude_code host performs no T1 session-start replay, so there
-    is nothing before the T2 pull to de-duplicate against.
+    compact: the bare signal line; verbose: the signal line plus the count line
+    (memories = served items, chars = their sanitized text bytes — exact, since
+    the T2 build is all-or-nothing).
     """
-    pull_client = DaemonClient(
-        base_url=client.base_url,
-        profile_id=client.profile_id,
-        actor=client.actor,
-        timeout=Timeout(RECALL_PULL_TIMEOUT_SECONDS),
-        token=client.token,
-    )
-    try:
-        return pull_client.post(
-            "/session/recall-pending",
-            {"profile_id": client.profile_id, "session_id": session_id, "seen_chunk_ids": []},
-        )
-    except Exception as exc:  # noqa: BLE001 - fail-open pull lane
-        debug(f"recall-pending pull failed: {exc}")
+    mode = visibility_mode(served)
+    if mode is None:
         return None
+    if mode != "verbose":
+        return T2_SIGNAL
+    texts = [
+        sanitize_recall_text(str(item.get("text")))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
+    ]
+    chars = sum(len(text) for text in texts)
+    return T2_SIGNAL + "\n" + recall_count_line(len(texts), chars)
 
 
 def inject_recall_context(session_id: str, client: DaemonClient) -> str | None:
@@ -519,32 +370,46 @@ def inject_recall_context(session_id: str, client: DaemonClient) -> str | None:
     return "\n".join(parts)
 
 
-def _t2_signal_of(served: dict[str, Any], items: list[dict[str, Any]]) -> str | None:
-    """The prebuilt T2 signal text under the payload's visibility mode.
-
-    compact: the bare signal line; verbose: the signal line plus the count line
-    (memories = served items, chars = their sanitized text bytes — exact, since
-    the T2 build is all-or-nothing).
-    """
-    mode = visibility_mode(served)
-    if mode is None:
-        return None
-    if mode != "verbose":
-        return T2_SIGNAL
-    texts = [
-        sanitize_recall_text(str(item.get("text")))
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text")
-    ]
-    chars = sum(len(text) for text in texts)
-    return T2_SIGNAL + "\n" + recall_count_line(len(texts), chars)
-
-
 def additional_context_payload(block: str) -> dict[str, Any]:
     """The UserPromptSubmit JSON-stdout shape Claude Code reads for injection."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": INJECTION_HOOK_EVENT,
-            "additionalContext": block,
-        }
-    }
+    return payload.additional_context_payload(block, INJECTION_HOOK_EVENT)
+
+
+def transform_event(raw: str) -> int:
+    """One hook stdin JSON object -> daemon POSTs (the registered dispatch entry).
+
+    Zero stdout on EVERY path EXCEPT a served T2 pull or a visibility signal
+    payload (see the module red line). Fire-and-forget: failures land in the
+    opt-in stderr debug lane; a dropped or malformed event is exit 0.
+    """
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        debug("dropped malformed stdin payload")
+        return 0
+    if not isinstance(event, dict):
+        debug("dropped non-object stdin payload")
+        return 0
+    try:
+        action = normalize_event(event, now=time.time())
+    except Exception as exc:  # noqa: BLE001 - tolerant-by-contract lane
+        debug(f"normalization failed: {exc}")
+        return 0
+    if action is None:
+        debug(f"dropped unmapped or identity-less event {event.get('hook_event_name')!r}")
+        return 0
+    kind, body = action
+    client = hook_client(timeout=endpoint_budget(kind))
+    try:
+        client.post(ENDPOINTS[kind], body.model_dump(mode="json"))
+        # only an ACKED user ingest parks the focal slot, so the pull runs
+        # strictly after the 2xx (ack-implies-ready); a served selection is
+        # emitted as additionalContext — the ONE stdout this lane may write
+        session_id = injection_session_id(body)
+        if session_id is not None:
+            block = inject_recall_context(session_id, client)
+            if block is not None:
+                print(json.dumps(additional_context_payload(block)))
+    except Exception as exc:  # noqa: BLE001 - fire-and-forget contract
+        debug(f"{kind} post failed: {exc}")
+    return 0

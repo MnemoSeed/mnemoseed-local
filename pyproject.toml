@@ -40,6 +40,10 @@ dev = [
     "playwright==1.55.0",
 ]
 
+[project.optional-dependencies]
+# codex host: zstandard for its compressed payloads (lazy import)
+codex = ["zstandard"]
+
 [project.scripts]
 mnemoseed-local = "mnemoseed_local.cli:main"
 
