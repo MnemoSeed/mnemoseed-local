@@ -35,15 +35,19 @@ from pathlib import Path
 
 import httpx
 
+from mnemoseed_local.hosts.common.daemon import (
+    DEFAULT_BASE_URL as DEFAULT_BASE_URL,
+)
+from mnemoseed_local.hosts.common.daemon import (
+    resolve_base_url as resolve_base_url,
+)
+
 #: Plugin filename as written under the host's auto-discovery directory.
 PLUGIN_FILENAME = "mnemoseed-local.ts"
 
 #: Disabled rename suffix (B2.6 switch): the host's plugin glob matches only
 #: ``*.ts``/``*.js``, so ``mnemoseed-local.ts.disabled`` stops loading.
 DISABLED_SUFFIX = ".disabled"
-
-#: Daemon base URL the shipped plugin posts to when no env override is set.
-DEFAULT_BASE_URL = "http://localhost:7788"
 
 #: Probe budget for the status check (mirrors the plugin's request timeout).
 PROBE_TIMEOUT_SECONDS = 2.0
@@ -73,11 +77,6 @@ def resolve_config_root() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "opencode"
-
-
-def resolve_base_url() -> str:
-    """Daemon base URL the hook posts to (env override, else the default)."""
-    return (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or DEFAULT_BASE_URL).rstrip("/")
 
 
 def plugin_bytes() -> bytes:

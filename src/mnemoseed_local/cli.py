@@ -3,19 +3,21 @@
 Verbs: init / up / on / off / status / doctor / recall / remember / dream
 (--once, status) / forget / profile (create | list | archive | unarchive) /
 config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
-hook (install | uninstall | status) / mcp (MCP stdio gateway). Local loopback
-by default; every state-changing verb talks to the daemon REST (FR-7.12); no
-identity/accounts in the local MVP.
+hook (install | uninstall | status) / host (install | uninstall | status) /
+mcp (MCP stdio gateway). Local loopback by default; every state-changing verb
+talks to the daemon REST (FR-7.12); no identity/accounts in the local MVP.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import sys
 import time
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1230,6 +1232,43 @@ def cmd_profile(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------ host hook (A3 T2)
 
 
+@dataclass(frozen=True)
+class HostBinding:
+    """Per-host CLI dispatch record.
+
+    ``events`` is the stdin-transformer module and ``events_entry`` the
+    raw-stdin-text -> exit-code function it must expose; ``install`` is the
+    adapter module whose zero-arg install/uninstall/status functions are the
+    lifecycle entries. Choices for both surfaces derive from this table's
+    keys, so a host registers once.
+    """
+
+    events: str
+    events_entry: str
+    install: str
+
+
+#: The host adapters the CLI dispatches to. zcode / codex_cli ship no modules
+#: yet: their transformer entries fail open, their lifecycle entries fail loud.
+HOOK_HOSTS: dict[str, HostBinding] = {
+    "claude_code": HostBinding(
+        events="mnemoseed_local.hosts.claude_code.events",
+        events_entry="transform_event",
+        install="mnemoseed_local.hosts.claude_code.install",
+    ),
+    "zcode": HostBinding(
+        events="mnemoseed_local.hosts.zcode.events",
+        events_entry="transform_event",
+        install="mnemoseed_local.hosts.zcode.install",
+    ),
+    "codex_cli": HostBinding(
+        events="mnemoseed_local.hosts.codex_cli.events",
+        events_entry="transform_event",
+        install="mnemoseed_local.hosts.codex_cli.install",
+    ),
+}
+
+
 def cmd_hook(args: argparse.Namespace) -> int:
     """Host hook management (design/01 §4.5).
 
@@ -1345,56 +1384,50 @@ def _read_stdin_text() -> str:
 
 
 def cmd_hook_event(args: argparse.Namespace) -> int:
-    """Hidden transformer: host hook stdin JSON -> normalized daemon POST.
+    """Hidden transformer dispatcher: host hook stdin JSON -> daemon POST.
 
-    Zero stdout on EVERY path EXCEPT (a) a served B2.1 T2 mid-session recall
-    pull — an acked UserPromptSubmit emits one JSON
-    ``{hookSpecificOutput.additionalContext}`` object so Claude Code injects the
-    pending recall alongside the submitted prompt — and (b) a visibility
-    signal payload when the daemon's wire mode is not off (a bare capture signal
-    line may ride the same shape without a served selection). Fire-and-forget
-    with a ~2s timeout; failures swallowed into the opt-in stderr debug lane.
+    The per-host transformer owns the stdout discipline (see its module).
+    Dispatch-time import or entry-lookup failures fail open — an honest
+    stderr note and exit 0; a hook must never block its host.
     """
-    from mnemoseed_local.hosts import install as shared
-    from mnemoseed_local.hosts.claude_code import events
+    binding = HOOK_HOSTS[args.host]
+    try:
+        module = importlib.import_module(binding.events)
+        entry: Callable[[str], int] = getattr(module, binding.events_entry)
+    except (ModuleNotFoundError, AttributeError) as exc:
+        print(
+            f"mnemoseed-local: {args.host} transformer unavailable ({exc}); event dropped",
+            file=sys.stderr,
+        )
+        return 0
+    return entry(_read_stdin_text())
 
-    try:
-        payload = json.loads(_read_stdin_text())
-    except ValueError:
-        events.debug("dropped malformed stdin payload")
-        return 0
-    if not isinstance(payload, dict):
-        events.debug("dropped non-object stdin payload")
-        return 0
-    try:
-        action = events.normalize_event(payload, now=time.time())
-    except Exception as exc:  # noqa: BLE001 - tolerant-by-contract lane
-        events.debug(f"normalization failed: {exc}")
-        return 0
-    if action is None:
-        events.debug(f"dropped unmapped or identity-less event {payload.get('hook_event_name')!r}")
-        return 0
-    kind, body = action
-    from mnemoseed_local.rest_client import client_for
 
-    client = client_for(
-        shared.resolve_base_url(),
-        profile_id=events.profile_id(),
-        actor="hook",
-        timeout=events.endpoint_budget(kind),
-    )
+def cmd_host(args: argparse.Namespace) -> int:
+    """Host adapter lifecycle: install | uninstall | status.
+
+    Routes to the adapter module named in HOOK_HOSTS and its convention-named
+    zero-arg lifecycle functions. A missing adapter is a user-facing error
+    (fail loud), unlike the hook transformer's fail-open dispatch.
+    """
+    binding = HOOK_HOSTS[args.host]
     try:
-        client.post(events.ENDPOINTS[kind], body.model_dump(mode="json"))
-        # B2.1 T2: only an ACKED user ingest parks the focal slot, so the pull
-        # runs strictly after the 2xx (ack-implies-ready); a served selection is
-        # emitted as additionalContext — the ONE stdout this lane may write.
-        session_id = events.injection_session_id(body)
-        if session_id is not None:
-            block = events.inject_recall_context(session_id, client)
-            if block is not None:
-                print(json.dumps(events.additional_context_payload(block)))
-    except Exception as exc:  # noqa: BLE001 - fire-and-forget contract
-        events.debug(f"{kind} post failed: {exc}")
+        module = importlib.import_module(binding.install)
+    except ModuleNotFoundError:
+        print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
+        return 1
+    entry = getattr(module, args.host_command, None)
+    if entry is None:
+        print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
+        return 1
+    result = entry()
+    if args.host_command == "status":
+        print(f"host: {result.state}")
+        print(f"path: {result.path}")
+        print(f"daemon: {'reachable' if result.daemon_reachable else 'unreachable'} ({result.base_url})")
+    else:
+        path, applied = result
+        print(f"{args.host_command}: {path} ({'applied' if applied else 'no change'})")
     return 0
 
 
@@ -1558,7 +1591,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_hook_event = sub.add_parser("_hook-event", help=argparse.SUPPRESS)
-    p_hook_event.add_argument("--host", required=True, choices=("claude_code",))
+    p_hook_event.add_argument("--host", required=True, choices=tuple(HOOK_HOSTS))
+
+    p_host = sub.add_parser("host", help="manage a host adapter (install | uninstall | status)")
+    host_common = argparse.ArgumentParser(add_help=False)
+    host_common.add_argument(
+        "--host",
+        required=True,
+        choices=tuple(HOOK_HOSTS),
+        help="the host adapter to operate on",
+    )
+    host_verbs = p_host.add_subparsers(dest="host_command", required=True)
+    host_verbs.add_parser("install", parents=[host_common], help="install the host adapter's hook")
+    host_verbs.add_parser("uninstall", parents=[host_common], help="remove the host adapter's hook")
+    host_verbs.add_parser("status", parents=[host_common], help="report the host adapter's install state")
 
     p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")
     p_mcp.add_argument("--baseurl", default=None, help="daemon base URL override")
@@ -1598,6 +1644,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_uninstall(args)
     if args.command == "hook":
         return cmd_hook(args)
+    if args.command == "host":
+        return cmd_host(args)
     if args.command == "_hook-event":
         return cmd_hook_event(args)
     if args.command == "mcp":
