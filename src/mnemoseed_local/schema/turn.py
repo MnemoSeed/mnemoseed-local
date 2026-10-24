@@ -99,6 +99,11 @@ class IngestEvent(BaseModel):
     # Session lineage: the parent session id that spawned this one (subagent/
     # orchestrator nesting). None=root caller, string=child caller.
     session_parent_id: str | None = None
+    # Capture progress for transcript-differential hosts (additive, wire-
+    # compatible both directions): the rollout line ordinal this event was
+    # normalized from. The daemon skips ordinals at or below the session's
+    # high watermark and echoes ack_ordinal on the 202.
+    transcript_ordinal: int | None = Field(default=None, ge=0)
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

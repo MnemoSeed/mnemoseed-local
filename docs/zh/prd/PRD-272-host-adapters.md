@@ -380,3 +380,60 @@ R54/R55（#273 批已入册）。不入册清单：无（无候选）。
   323-371`（T1/T2 读取-渲染 lane）；`claude_code/install.py:105-121` ↔ `common/config.py:35-66`
   （strict-JSON 配置手术）。归位切片 = S1b（claude_code 重接 common lane，字节 oracle 护航）；
   归位前两侧零漂移由测试钉死。
+
+### 9.7 S2b 定案：Codex 适配器实现形状（2026-10-24）
+
+- **包面订正**：适配器落在 `hosts/codex_cli/`（`events.py` / `transcript.py` /
+  `install.py`），以 cli.py S1a 冻结的 `HOOK_HOSTS` 分派串
+  （`mnemoseed_local.hosts.codex_cli.*`）为准——§4 表内 "`hosts/codex/`" 按切片简称
+  读，cli.py 零触碰。测试 `tests/test_hosts_codex.py`（50 例）。
+- **差分读形状**：transcript 事实源（`.jsonl.zst` 经 `common/zstd` lazy 解压、
+  `.jsonl` 直读兜底；行 `ordinal` 取记录自带值，缺席时回退物理行号）。Stop/
+  SessionEnd 批 = 末条 user message ordinal 之后的 message turn——append-only 转录
+  下即纯 assistant 批（user turn 只由其 UserPromptSubmit firing 携带）；首 POST 的
+  202 `ack_ordinal` 即本进程后续发送下界（≤ack 跳发，中途崩溃后下次 firing 经局部
+  下界重推导 + ack 跳发天然 replay）。UserPromptSubmit 锚 = 转录中与 prompt 精确
+  （strip 相等）匹配的最新 user turn；无匹配 ⇒ 事件不带 ordinal（仍摄取、不参与水
+  位——诚实方向，水位偏低只多做去重、永不丢数据）。stdin 的 `last_assistant_message`
+  不作兜底文本：转录即事实源，无 ordinal 的旁路文本是后续差分无法去重的静默双捕。
+- **zstd 缺席**：诚实报错（无条件 stderr 一行，含 `[codex]` 安装指引），差分降级为
+  空批；SessionEnd 的 settle 仍发。stdout 纪律与 claude_code/zcode 同构。
+- **daemon 侧（§9.3 wire 落地）**：`IngestEvent.transcript_ordinal: int | None =
+  Field(default=None, ge=0)`（additive，ge=0 钉住行号语义）；memory 服务 per-
+  (effective profile, session) 高水位（in-memory、max 更新、复用 `_capture_lock`）；
+  dedup 门在 provider_error 分派之后、segmenter 之前——≤ 水位的事件跳过入段、跳过
+  capture latch 与 T2 scan，202 带 `ack_ordinal`（既有宿主 202 逐字节不变，测试断言
+  键集）；水位只在 segmenter 接受后推进；`/session/end` 按 exact key + session 级
+  sweep 清理，settled 会话的重放走 SessionSettledError 409（无复活路径）；
+  provider_error 提名永不参与水位（该 lane 无 ordinal，其 202 保持原形）。
+- **安装器**：`hooks.json` = Claude-Code 兼容顶层事件映射（探针实证插件形，四事件
+  单 `type: command` handler）；marker = argv 尾契约（shim 形
+  `_hook-event --host codex_cli` / 完整模块形 `-m mnemoseed_local.cli …`；命令含
+  `-m` 但非完整模块尾 ⇒ 非 ours）。`config.toml` marker-block 文本手术：严格
+  tomllib 拒改坏文件 → 精确 canonical 块替换/移除 → 重写后再解析验证 → 原子写
+  （`common/config.write_text_atomic` 新增，`write_atomic` 收敛为同核——common 最小
+  小补）；`[mcp_servers.mnemoseed]` 下携带本工具不管理的键 ⇒ 拒改并指引手工修复；
+  `command` 一律 which().resolve() 绝对路径。
+- **信任三态**：`[hooks.state.*].trusted_hash` 值集 vs sha256(hooks.json 字节)；
+  无记录 ⇒ `installed, not yet trusted`；有记录无匹配 ⇒ `stale trust (hooks
+  changed; re-trust via /hooks)`；匹配 ⇒ `installed`。边界如实记录：Codex 自身的
+  hash 算法与 per-hook key 命名未获证据钉死（探针只录得键形状，值脱敏），本侧比较
+  为保守近似——失配一律建议重信任（安全方向）；真实信任后若仍报 stale 属保守误报，
+  只影响 status 文案，不阻塞捕获。
+- **dispatch 测试重指**：`test_host_dispatch.py` 的"未实现宿主"覆盖改用 ghost
+  binding（codex_cli 落地后 HOOK_HOSTS 内已无未实现宿主可指）。
+
+### 9.8 S2b 对抗审记档（2026-10-24，QA 终判 CLOSABLE）
+
+- **ack 低报方向的双防线**：`test_watermark_loss_replays_without_duplicates` 对 ack 谎报
+  不敏感（恢复 firing 首 POST 走 dedup 门读真实水位，不经被谎报的 note 路径）；该方向由
+  `test_legacy_202_body_stays_byte_identical` 的 ack==7 精确断言补位。两个 ack 源
+  （note 推进回传 / 门读取）各有精确 oracle，防线整体成立。
+- **zstd 真实解压路径入测**：zstandard 进 dev 依赖组（0.25.0），新增
+  `test_zst_transcript_roundtrips_real_zstandard`（importorskip 护栏）补齐 QA IMPORTANT-1
+  的"生产主捕获形态零实测"缺口；`[codex]` extras 语义不变。
+- **NIT 记档（不随批修）**：① `install.py` `_trusted_hashes` 对 `tomllib.TOMLDecodeError`
+  （`ConfigParseError` 非 ValueError 子类）未捕——实测死路径（前序短路）；② TOML span
+  替换在"漂移重装"时可吞我们表头后的用户注释（首装与正常路径实证不动）；③ hooks/config
+  双文件写非事务（先验证后写、hooks 先 config 后，半态窗极窄）；④ 混合 ordinal/缺失行
+  回退物理行号在真实 rollout（ordinal==行号）自洽，人为背离时 floor 永久跳过（防御路径）。
