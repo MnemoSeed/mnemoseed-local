@@ -30,6 +30,7 @@ class HostId(StrEnum):
     GEMINI_CLI = "gemini_cli"
     OPENCODE = "opencode"
     WINDSURF = "windsurf"
+    ZCODE = "zcode"
     GENERIC = "generic"  # any script / mnemoseed CLI direct path
 
 
