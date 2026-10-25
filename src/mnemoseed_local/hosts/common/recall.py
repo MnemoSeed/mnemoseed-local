@@ -30,7 +30,11 @@ from mnemoseed_local.hosts.common.fence import (
     RECALL_DISCLAIMER,
     RECALL_FENCE_CLOSE,
     RECALL_FENCE_OPEN,
+    RULES_DISCLAIMER,
+    RULES_FENCE_CLOSE,
+    RULES_FENCE_OPEN,
     sanitize_recall_text,
+    sanitize_rules_text,
 )
 from mnemoseed_local.hosts.common.t2 import build_t2_context
 from mnemoseed_local.hosts.common.visibility import (
@@ -318,6 +322,32 @@ def session_start_block(data: dict[str, Any] | None) -> str | None:
         return block
     candidate = _with_signal_after_fence(block, signal)
     return candidate if len(candidate) <= T1_MAX_INJECT_CHARS else block
+
+
+def rules_budget_block(rules_budget: Any) -> str | None:
+    """The fenced standing-rules budget block of a /session/recent payload.
+
+    The daemon is the sole budget authority: the object rides verbatim as
+    compact JSON behind the disclaimer, never interpreted. Absent, null, or
+    any non-object renders nothing (absent semantics on the wire)."""
+    if not isinstance(rules_budget, dict):
+        return None
+    content = sanitize_rules_text(json.dumps(rules_budget, ensure_ascii=False, separators=(",", ":")))
+    return "\n".join([RULES_FENCE_OPEN, RULES_DISCLAIMER, content, RULES_FENCE_CLOSE])
+
+
+def session_start_injection(data: dict[str, Any] | None) -> str | None:
+    """The full SessionStart payload: the fenced T1 replay block plus the
+    standing-rules budget block, the rules block riding the same read
+    independently of the recall block's presence."""
+    if data is None:
+        return None
+    parts = [
+        part
+        for part in (session_start_block(data), rules_budget_block(data.get("rules_budget")))
+        if part is not None
+    ]
+    return "\n".join(parts) or None
 
 
 def tool_output_text(response: Any) -> str:
