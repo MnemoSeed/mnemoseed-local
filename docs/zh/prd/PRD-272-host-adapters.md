@@ -498,3 +498,76 @@ R54/R55（#273 批已入册）。不入册清单：无（无候选）。
   `_build_rules_budget` 既有语义携 `rules_budget`，`session_id=None` 时 session-scoped
   规则不泄漏）；`cli.py`/`hosts/zcode|codex_cli|opencode`/opencode 插件零触碰；
   T1/T2 seen_chunk_ids 状态边界沿 §9.6（无状态 hook 下界）不变。
+
+## 10. 收口记录（S4，append-only，2026-10-25）
+
+### 10.1 批次总账（切片 → PR → 合入提交，从 `git log --oneline` 提取）
+
+| 切片 | PR | 合入提交（squash 进 main） | 内容 |
+|---|---|---|---|
+| S0 | #278 | `6fdc9c4` | 契约钉死：`tests/fixtures/zcode_hook/` + `tests/fixtures/codex_hook/` golden stdin、`zcode` 枚举 additive、§9.1–9.3/9.5 定案 |
+| S1a | #279 | `0a6b96f` | 共享核抽取到 `hosts/common/`（claude_code 重接零回归）+ `_hook-event` 多宿主分派 + `host` 子命令骨架 + `[codex]` extras |
+| S2a+S3a | #280 | `a2c09d0` | ZCode 适配器（T1/T2/可见性/Stop 形状）+ 安装器（pre-state sidecar、marker 手术） |
+| S2b+S3b | #283 | `8ab8dc5` | Codex 适配器（transcript 水位差分、ack 幂等、settle、lazy zstandard）+ 安装器（信任三态） |
+| S1b | #284 | `36bcaf4` | claude_code 补全（T1 via SessionStart、规则预算载体、SubagentStop 摄取、§9.6 债务归位） |
+| S4 | 收口 PR | （本切片：E2E + README 诚实化 + 本节；收口 PR 号合入时回填） | `Closes #272` |
+
+### 10.2 每切片 QA 终判汇总（PR 附件记录）
+
+- **S0（#278）**：首判 NOT CLOSABLE（对抗 QA 实抓 Codex 契约幽灵字段，教训入 §9.5）→
+  按独立抓取的官方文档重钉后放行；枚举纯度、fixture 白名单牙齿（mutation 验证）、
+  16 处 file:line 证据经 QA 核实。
+- **S1a（#279）**：CLOSABLE；1 IMPORTANT（分派入口 getattr 在 fail-open try 之外）与
+  1 NIT（status 前缀）随批修；一次 events.py 意外回滚事件如实披露并经编译码比对核实
+  逐字节重建。
+- **S2a+S3a（#280）**：CLOSABLE；5/5 mutation 击杀（卸载回滚、off 信号泄漏、ingest
+  失败仍拉取、非 canonical MCP 键、他人条目删除）；1 IMPORTANT（暂存债务未入册）以
+  §9.6 记录收口；T1 fail-closed 守卫证明不可达。
+- **S2b+S3b（#283）**：CLOSABLE（记档 §9.8）；5/5 mutation 击杀（去重门移除、ack 高报、
+  过滤器丢事件、拒改守卫移除、裸 zstd 栈）；IMPORTANT-1（真实 .zst 零实测）随批修
+  （zstandard 入 dev 组 + roundtrip 测试）；IMPORTANT-2 与四个 NIT 记档 §9.8。
+- **S1b（#284）**：CLOSABLE，无 BLOCKER/IMPORTANT；5/5 mutation 击杀（normalizer 移除、
+  agent lift 移除、JSON 分隔符、规则块移除、旧循环还原）；两处结构性测试触碰经 QA
+  裁定正当（更强替代覆盖）。
+- **S4（本切片）**：测试-only 切片；红绿证据 = 孪生 mutation run（provenance 断言翻转为
+  错误期望值 ⇒ zcode 全链红，未触碰的 codex 链保持绿），零源码触碰。
+
+### 10.3 门禁数字
+
+基线（#278 之前）3938 通过 → #278: 3957 → #280: 4030 → #283: 4082 → #284: 4107 →
+S4 收口全量（4123 collected）：**4109 passed, 6 skipped + 9 例预存
+`test_windows_autostart.py` 本机环境失败**（GBK codepage 子进程解码根因，CI 绿，
+归 #252 族跟踪；本批零新增失败，4109 = #284 的 4107 + 本切片 2 例 E2E）。
+四门禁（pytest / ruff check / ruff format --check / mypy src）全绿；S4 零 commit，
+changed-comments 由套件内 `test_comment_guard.py` 覆盖并通过。
+
+### 10.4 诚实边界清单
+
+1. **ZCode stdin 方言与 T1 输出布局未实捕**：CC 兼容方言与
+   `hookSpecificOutput.{hookEventName, additionalContext}` 布局为 docs-only 工作契约
+   （两次实捕降级，§9.2/§9.6）；E2E 以 golden fixture 驱动真实 transformer + 真
+   daemon，等宿主接线为实证、方言本身仍待一次 workspace 级实捕核对。
+2. **Codex 信任 hash 为保守近似**：Codex 自身 hash 算法与 per-hook 键名未获证据钉死，
+   本侧 sha256(hooks.json 字节) 比较失配一律建议重信任（§9.7，安全方向）。
+3. **Codex Desktop app-server 模式未验证**（§2 非目标）。
+4. **T2 `seen_chunk_ids` 恒空**：无状态 hook 下界，T1 已注入的 chunk 可能被 focal
+   重放（§9.6；E2E 未显现重复注入副作用，按预案记录不再扩面）。
+5. **zcode T1 规则预算载体未随批**（§9.6 记为收口前 owner 可选项）。
+6. **E2E 中段持久化走 `/flush`**：zcode 无 SessionEnd（惰性边界如实，§6.5），T1/T2
+   的服务以 daemon 自身 PreCompact 救援面把会话变持久为前提；E2E 同时断言 codex 链
+   的纯 settle 路径作为对照。
+
+### 10.5 owner 面向部署升级步骤（列命令，不执行；顺序钉死沿 §5.9）
+
+1. `mnemoseed-local off`（停旧 runtime 的 daemon，当前 v0.0.1）
+2. `uv tool install --force .`（升级 runtime 到本批产物；如需 Codex 适配器则
+   `uv tool install --force '.[codex]'`）
+3. `mnemoseed-local up`（新 daemon 带全部 wire 面，旧 hook 升级后行为单调向好）
+4. opencode 插件逐字节刷新：以仓内
+   `src/mnemoseed_local/hosts/opencode/plugin.ts` 覆盖
+   `~/.config/opencode/plugin/mnemoseed-local.ts`，并核验两文件逐字节相等
+5. `mnemoseed-local host install --host claude_code`（owner 确认后）
+6. （可选，按需）`mnemoseed-local host install --host zcode`；
+   `mnemoseed-local host install --host codex_cli` 后在 Codex 内 `/hooks` 信任一次
+7. `mnemoseed-local doctor` 复核：无"已注册未连接"类告警；捕获流经 doctor /
+   observability 复核
