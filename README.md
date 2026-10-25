@@ -52,8 +52,8 @@ Phase B has landed through main:
   non-directive line in the conversation (capture, replay, recall). Default
   `compact`; `[visibility] mode` selects `off` (silent) or `verbose` (adds
   count lines), hot-applied without a restart.
-- **Two Tier-1 hosts**: the OpenCode plugin plus a first-class Claude Code hook
-  adapter (B2.10), both capturing every turn.
+- **Four Tier-1 hosts**: the OpenCode plugin plus first-class hook adapters for
+  Claude Code (B2.10), ZCode and Codex CLI, all capturing every turn.
 - **origin_agent attribution** (B2.9): memories record which in-host agent
   produced them (`ingest -> turn -> stamp -> recall/recent`), as inert
   provenance that never affects scoring or ranking.
@@ -86,8 +86,9 @@ focal_floor=0.5 / budget_chars=2400 (accepted 2026-08-23).
 - **Experience learning is under construction and off.** The error-event ledger
   and scoping work (B2.13 E0/E1) is scaffolding; no detector decides anything,
   and none of it is on by default.
-- **Hosts are OpenCode and Claude Code only.** Those are the two integrations
-  that ship.
+- **Hosts are OpenCode, Claude Code, ZCode and Codex CLI.** Those are the
+  integrations that ship. The Codex Desktop app-server mode is unverified, and
+  Codex hooks need a one-time in-app trust review before they fire.
 - **Windows starts at user logon, without crash supervision.** The installer registers one current-user Task Scheduler entry. It does not restart the daemon after a later crash.
 - **Platform coverage is uneven.** Windows is the primary tested platform,
   Linux runs in CI, and macOS requires manual ollama setup.
@@ -152,6 +153,17 @@ The installer's final setup step is `mnemoseed-local hook install opencode`, so
 the OpenCode hook is installed automatically (restart OpenCode to load it).
 Hook lifecycle:
 `mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
+The ZCode and Codex CLI adapters install through the `host` command group:
+`mnemoseed-local host install --host zcode` registers four ZCode hook events
+plus the loopback MCP entry in `~/.zcode/cli/config.json`, and
+`mnemoseed-local host install --host codex_cli` writes the user-level Codex
+`hooks.json` plus the stdio gateway entry in `config.toml` (Codex then asks
+you to review and trust the hooks once via `/hooks`; `host status` reports
+that trust state honestly). Lifecycle:
+`mnemoseed-local host {install|uninstall|status} --host zcode|codex_cli`.
+The Codex adapter needs the optional `[codex]` extra
+(`uv tool install --force '.[codex]'`) for zstandard-compressed rollout
+transcripts.
 Profile namespaces are managed on the running daemon:
 `mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
 deletes data and does not unbind agents).
@@ -168,8 +180,9 @@ deletes data and does not unbind agents).
 ### Claude Code
 
 `mnemoseed-local hook install claude_code` merges marked MnemoSeed hook entries
-into `~/.claude/settings.json` for `UserPromptSubmit`, `Stop`, `PostToolUse`,
-`PreCompact` and `SessionEnd` — your own hook entries are never touched, and
+into `~/.claude/settings.json` for `SessionStart`, `UserPromptSubmit`, `Stop`,
+`PostToolUse`, `SubagentStop`, `PreCompact` and `SessionEnd` — your own hook
+entries are never touched, and
 `uninstall` removes only the marked ones (`disable`/`enable` flip a flag on our
 entries). The hooks pipe Claude Code's stdin payloads through the hidden
 `mnemoseed-local _hook-event --host claude_code` transformer into the daemon
