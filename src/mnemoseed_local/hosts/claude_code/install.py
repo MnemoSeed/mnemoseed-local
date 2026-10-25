@@ -3,11 +3,12 @@
 Unlike file-copy hosts (opencode auto-discovers a plugin directory), Claude
 Code owns a single user settings file. Install therefore MERGES idempotent,
 marker-matched handler entries into ``hooks.{UserPromptSubmit,Stop,
-PostToolUse,PreCompact,SessionEnd}``; foreign entries are never touched.
-Marker contract (``is_ours``): the command is exactly ``TRANSFORM_COMMAND``
-or starts with the reserved prefix ``MARKER + " "`` — a foreign command that
-merely mentions mnemoseed-local is never ours; the loose substring probe
-(``_looks_like_ours``) only feeds keep-warnings.
+PostToolUse,PreCompact,SessionEnd,SessionStart,SubagentStop}``; foreign
+entries are never touched. Marker contract (``is_ours``): the command is
+exactly ``TRANSFORM_COMMAND`` or starts with the reserved prefix
+``MARKER + " "`` — a foreign command that merely mentions mnemoseed-local is
+never ours; the loose substring probe (``_looks_like_ours``) only feeds
+keep-warnings.
 
 disable/enable flip a ``disabled`` flag on our entries only (CC has no glob
 discovery to rename out of). Official CC docs specify plain JSON for settings
@@ -25,25 +26,33 @@ filesystem work — no daemon REST writes.
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 from mnemoseed_local.hosts import install as shared
+from mnemoseed_local.hosts.common import config
 from mnemoseed_local.hosts.install import HookStatus
 
 #: Reserved command prefix identifying our handler entries.
 MARKER = "mnemoseed-local"
 
-#: The five hook events we register in v1. UserPromptSubmit doubles as the
-#: B2.1 T2 mid-session recall-injection surface: the transformer that runs for
-#: it idempotently ingests AND, on a served pending recall, emits
+#: The hook events registered in the user settings. UserPromptSubmit doubles
+#: as the T2 mid-session recall-injection surface: the transformer that runs
+#: for it idempotently ingests AND, on a served pending recall, emits
 #: `additionalContext` to stdout — so the handler MUST stay synchronous (an
 #: async UserPromptSubmit would push additionalContext to the next turn and
-#: break the same-turn injection contract).
-HOOK_EVENTS = ("UserPromptSubmit", "Stop", "PostToolUse", "PreCompact", "SessionEnd")
+#: break the same-turn injection contract). SessionStart rides the T1
+#: session-start replay; SubagentStop rides the Stop capture channel.
+HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "Stop",
+    "PostToolUse",
+    "PreCompact",
+    "SessionEnd",
+    "SessionStart",
+    "SubagentStop",
+)
 
 #: Command each registered handler runs (CC pipes the event JSON via stdin).
 TRANSFORM_COMMAND = "mnemoseed-local _hook-event --host claude_code"
@@ -100,32 +109,6 @@ def _load(target: Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise SettingsParseError(f"{target} does not contain a JSON object")
     return data
-
-
-def _serialize(data: dict[str, object]) -> bytes:
-    return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-
-
-def _write_new(target: Path, data: dict[str, object]) -> bool:
-    payload = _serialize(data)
-    if target.is_file() and target.read_bytes() == payload:
-        return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(dir=target.parent, prefix=f"{target.name}.", suffix=".tmp")
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, target)
-    except OSError:
-        try:
-            temp.unlink()
-        except OSError:
-            pass
-        raise
-    return True
 
 
 def _hooks_map(data: dict[str, object]) -> dict[str, object] | None:
@@ -187,7 +170,7 @@ def install(path: Path | None = None) -> tuple[Path, bool]:
             # a malformed foreign value must be refused, never overwritten
             raise SettingsParseError(f"{target}: hooks.{event} exists but is not a list — fix it manually")
         hooks[event] = [{"hooks": [_handler()]}]
-    return target, _write_new(target, data)
+    return target, config.write_atomic(target, data)
 
 
 def uninstall(path: Path | None = None) -> tuple[Path, bool]:
@@ -219,7 +202,7 @@ def uninstall(path: Path | None = None) -> tuple[Path, bool]:
                 if hooks is not None:
                     del hooks[event]
     if existed:
-        _write_new(target, data)
+        config.write_atomic(target, data)
     if stale:
         print(
             "note: kept foreign hook command(s) that merely mention mnemoseed-local: " + "; ".join(stale),
@@ -253,7 +236,7 @@ def _toggle_disabled(path: Path | None, disabled: bool) -> tuple[Path, bool]:
             del handler["disabled"]
             changed = True
     if changed:
-        _write_new(target, data)
+        config.write_atomic(target, data)
     return target, changed
 
 

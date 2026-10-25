@@ -437,3 +437,64 @@ R54/R55（#273 批已入册）。不入册清单：无（无候选）。
   替换在"漂移重装"时可吞我们表头后的用户注释（首装与正常路径实证不动）；③ hooks/config
   双文件写非事务（先验证后写、hooks 先 config 后，半态窗极窄）；④ 混合 ordinal/缺失行
   回退物理行号在真实 rollout（ordinal==行号）自洽，人为背离时 floor 永久跳过（防御路径）。
+
+### 9.9 S1b 定案：claude_code 补全——T1 via SessionStart、规则预算载体、SubagentStop 摄取、§9.6 债务归位（2026-10-24）
+
+- **T1 载荷形状（定案 + 落地）**：SessionStart firing ⇒ 无状态 hook 进程内恰一次
+  `POST /session/recent`（attempt-once 的门 = 进程本身，§9.6 同款），请求体 =
+  `{profile_id, sessions: 2, per_session: 8, exclude_session_id}`，不带
+  `self_session_id`/`resume_query`（golden fixture
+  `tests/fixtures/claude_code_hook/session_start.json` 钉死该读体）。输出 =
+  `hookSpecificOutput.{hookEventName: "SessionStart", additionalContext}` 单 JSON 对象，
+  载荷 = 围栏 T1 块 + `"\n"` + 规则预算块（顺序沿 opencode：recall 先、rules 后）；
+  信号行在围栏内（compact 单行 / verbose 加计数行），off/缺席 ⇒ 零信号行、块本身仍注入
+  （zcode 先例的操作性读法，§5.3 验收按此执行）。空 recall/畸形响应/拉取失败 ⇒ 零 stdout。
+- **规则预算载体（B2.7）**：构造收进 `hosts/common/`（claude_code/zcode/codex_cli 三家
+  Python 宿主共享；opencode 是 TS 不共享）——`fence.py` 增规则预算围栏族
+  （`RULES_FENCE_OPEN/CLOSE/SANITIZED`/`RULES_DISCLAIMER`，字节对齐 plugin.ts）+
+  `sanitize_rules_text`；`recall.py` 增 `rules_budget_block`（opencode
+  `buildRulesBudgetInjection` 形状：缺席/null/非 object ⇒ 无块；dict ⇒ compact JSON
+  （`ensure_ascii=False` + `separators=(",", ":")`，JSON.stringify 对齐）经 sanitize
+  入围栏）与 `session_start_injection` 组合器。`rules_budget` 独立于 recall 块的存在与
+  visibility mode（空 recall + 有预算 ⇒ 仅规则块；off ⇒ 块仍注入）。
+  **zcode/codex 现有行为零变化**：两家 T1 不消费 rules budget（§9.6 定案原样），套件
+  回归绿。
+- **SubagentStop 摄取（§9.4 裁定执行，零 daemon 改动）**：`@_normalizer("SubagentStop")`
+  与 `"Stop"` 注册同一函数（既有 `_stop` 通道），`_agent_of` 填 `agent` ⇒ origin_agent
+  链（segment→app→stamper 先在）；共享路径对 Stop 同样 lift `agent`（CC Stop stdin 无
+  agent 字段 ⇒ None，wire dump 逐字节不变）。`session_parent_id` 恒 None（CC 子代理
+  stdin 的 session_id 即父会话，correct-by-construction）；fixture
+  `tests/fixtures/claude_code_hook/subagent_stop.json`（归一化 wire 体 + raw 全 stdin
+  锚，公共字段 + agent_id/agent_type）钉死：归一化结果与 golden wire 体全等（经
+  `IngestEvent.model_validate` 双向）、与 Stop 同 wire 形状（除 raw）、真实 daemon 面
+  202。**SubagentStart 不摄取**（不新增 IngestEventType；归一化恒 None 有测试）。
+- **§9.6 债务归位（执行记录）**：① `claude_code/events.py` 删本地副本
+  `_transcript_tail`/`_tool_output_text`/`capture_signal_of`/`_t2_signal_of`/
+  `inject_recall_context` 与信号常量、工具帽常量定义，改 import `common/recall.py`
+  （`transcript_tail`/`tool_output_text`/`t2_signal_of` 经 `inject_recall_context`
+  内聚、`T1_SIGNAL`/`T2_SIGNAL`/`CAPTURE_SIGNAL`/`MAX_TOOL_OUTPUT_CHARS`/
+  `TOOL_TRUNCATION_MARKER` re-export），共享核 re-export 面
+  （`test_host_dispatch.py` 钉死清单）全绿；`Action` 别名 `tuple[str, BaseModel]` →
+  `tuple[str, Any]`（zcode 同款；t1 动作第二元素是 session id 字符串）。
+  ② `claude_code/install.py` 删 `_serialize`/`_write_new`，三处写路径改
+  `common/config.write_atomic`（语义同构：byte-identical no-op / temp+fsync+os.replace；
+  `SettingsParseError` 拒改面不动）。字节 oracle：既有 claude_code 套件 92 例归位前后
+  全绿，结构性例外仅下条两处。
+- **结构性触碰（字节 oracle 的两个例外，如实记录）**：①
+  `tests/test_hosts_claude_code.py::test_subagent_lifecycle_events_are_not_ingested_in_v1`
+  循环收窄为 `("SubagentStart",)`——其 SubagentStop 断言钉的正是本批关闭的 v1 边界
+  （§3.5 "本批关闭" / §9.4 "随批"），与"既有断言零修改"无法两全；SubagentStop 新契约由
+  S1b 新套件（`tests/test_hosts_claude_code_s1b.py`，23 个测试函数 / 25 个收集用例）
+  钉死。
+  ② `tests/test_visibility.py` 跨宿主信号词汇 oracle 的源 grep 从
+  `claude_code/events.py` 改指 `common/recall.py`（字面量随债务归位迁至共享核）；
+  运行时字节等价仍由该测试的 `events_module.recall_count_line/capture_count_line`
+  断言与 zcode 套件的 `cc_events` 逐字节比对钉死。
+- **安装器 5→7 事件**：`HOOK_EVENTS` 增 `SessionStart`/`SubagentStop`（marker 生命周期
+  不变：注册/幂等/卸载恰移除；disable/enable 机制经既有用例的事件循环加宽覆盖两新事件，
+  S1b 未新增该面断言）；诚实升级
+  面：既有 5 事件装机的 `status` 变 `partial`（新事件缺我们的条目）。
+- **边界（如实记录）**：daemon 侧零改动（`/session/recent` unscoped 响应本就按
+  `_build_rules_budget` 既有语义携 `rules_budget`，`session_id=None` 时 session-scoped
+  规则不泄漏）；`cli.py`/`hosts/zcode|codex_cli|opencode`/opencode 插件零触碰；
+  T1/T2 seen_chunk_ids 状态边界沿 §9.6（无状态 hook 下界）不变。

@@ -481,7 +481,7 @@ def test_stop_never_settles_the_session() -> None:
 
 
 def test_subagent_lifecycle_events_are_not_ingested_in_v1() -> None:
-    for name in ("SubagentStart", "SubagentStop"):
+    for name in ("SubagentStart",):
         payload = {"session_id": "cc-sess-01", "hook_event_name": name, "agent_type": "Explore"}
         assert events.normalize_event(payload, now=8.0) is None, name
 

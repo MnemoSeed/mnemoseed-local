@@ -309,6 +309,9 @@ def test_visibility_field_is_additive_over_the_existing_recall_keys(config_path:
 PLUGIN_TS = (
     Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "hosts" / "opencode" / "plugin.ts"
 )
+SHARED_RECALL_PY = (
+    Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "hosts" / "common" / "recall.py"
+)
 EVENTS_PY = (
     Path(__file__).resolve().parents[1] / "src" / "mnemoseed_local" / "hosts" / "claude_code" / "events.py"
 )
@@ -348,7 +351,7 @@ def test_signal_vocabulary_is_fixed_and_shared_across_hosts() -> None:
     assert ts_lines[3] == "[mnemoseed] {} sessions, {} memories, {} chars"
     assert ts_lines[4] == "[mnemoseed] {} memories, {} chars"
     assert ts_lines[5] == "[mnemoseed] captured {} turns since the last report"
-    source = EVENTS_PY.read_text(encoding="utf-8")
+    source = SHARED_RECALL_PY.read_text(encoding="utf-8")
     for name, expected in (("T2_SIGNAL", T2_SIGNAL), ("CAPTURE_SIGNAL", CAPTURE_SIGNAL)):
         match = re.search(rf'{name} = "([^"]+)"', source)
         assert match is not None and match.group(1) == expected, name
