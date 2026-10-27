@@ -31,9 +31,27 @@ pytestmark = [
 ]
 
 
+_TEXT_CAPTURE = {"encoding": "utf-8", "errors": "replace"}
+
+
+def _run_captured(
+    command: list[str], env: dict[str, str] | None = None, *, timeout: float = 15
+) -> subprocess.CompletedProcess[str]:
+    # Child console encoding is locale/OEM dependent; only ASCII is asserted,
+    # so the reader must survive arbitrary bytes.
+    return subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+        **_TEXT_CAPTURE,
+    )
+
+
 def run_fixture(command: list[str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
     local_app_data = str(tmp_path / "LocalAppData")
-    return subprocess.run(
+    return _run_captured(
         command,
         env={
             **os.environ,
@@ -41,10 +59,6 @@ def run_fixture(command: list[str], tmp_path: Path) -> subprocess.CompletedProce
             "USERNAME": TEST_USER,
             "LOCALAPPDATA": local_app_data,
         },
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
     )
 
 
@@ -75,7 +89,7 @@ def task_fixture_command(
 
 
 def run_bootstrap(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return _run_captured(
         [
             PWSH,
             "-NoLogo",
@@ -91,10 +105,6 @@ def run_bootstrap(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[
             str(tmp_path / "result.txt"),
         ],
         env={**os.environ, "MNEMOSEED_LOCAL_HOME": str(tmp_path / "home")},
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
     )
 
 
@@ -105,6 +115,22 @@ def run_task(tmp_path: Path, scenario: str, *, uninstall: bool = False) -> subpr
 def result_text(tmp_path: Path) -> str:
     result = tmp_path / "result.txt"
     return result.read_text(encoding="utf-8") if result.exists() else ""
+
+
+def test_fixture_reader_survives_non_utf8_output() -> None:
+    completed = _run_captured(
+        [
+            sys.executable,
+            "-c",
+            r"import sys; sys.stdout.buffer.write(b'bad:\xa1\xa1'); sys.stderr.buffer.write(b'err:\xff')",
+        ],
+    )
+
+    assert completed.returncode == 0
+    assert isinstance(completed.stdout, str)
+    assert "bad:" in completed.stdout
+    assert isinstance(completed.stderr, str)
+    assert "err:" in completed.stderr
 
 
 def test_off_before_start_does_not_probe_or_launch(tmp_path: Path) -> None:
@@ -220,13 +246,19 @@ def test_repeat_trigger_is_serialized_by_named_mutex(tmp_path: Path) -> None:
         "-Result",
         str(result),
     ]
-    first = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **_TEXT_CAPTURE,
+    )
     try:
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline and not result.exists():
             time.sleep(0.05)
         assert result.exists(), "first trigger did not reach the launcher"
-        second = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15, check=False)
+        second = _run_captured(command, env=env)
         first_stdout, first_stderr = first.communicate(timeout=15)
     finally:
         if first.poll() is None:
@@ -410,7 +442,7 @@ def test_installer_operation_does_not_register_after_rejected_migration(
 def test_installer_removes_only_exact_legacy_ollama_task(tmp_path: Path) -> None:
     completed = run_legacy_migration(tmp_path, "owned")
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert '"Unregistered":true' in (tmp_path / "migration-result.json").read_text()
+    assert '"Unregistered":true' in (tmp_path / "migration-result.json").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("scenario", ["foreign", "drifted"])
@@ -435,7 +467,7 @@ def test_installer_helper_resolution_behavior(
 ) -> None:
     import json
 
-    completed = subprocess.run(
+    completed = _run_captured(
         [
             PWSH,
             "-NoLogo",
@@ -450,10 +482,6 @@ def test_installer_helper_resolution_behavior(
             "-Root",
             str(tmp_path),
         ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
@@ -476,7 +504,7 @@ def test_installer_bootstrap_executes_extracted_functions_with_empty_script_root
 ) -> None:
     import json
 
-    completed = subprocess.run(
+    completed = _run_captured(
         [
             PWSH,
             "-NoLogo",
@@ -499,10 +527,6 @@ def test_installer_bootstrap_executes_extracted_functions_with_empty_script_root
             "-Root",
             str(tmp_path),
         ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
@@ -519,7 +543,7 @@ def test_installer_bootstrap_executes_extracted_functions_with_empty_script_root
 def test_installer_bootstrap_precedence_and_failure_cleanup(tmp_path: Path, scenario: str) -> None:
     import json
 
-    completed = subprocess.run(
+    completed = _run_captured(
         [
             PWSH,
             "-NoLogo",
@@ -542,10 +566,6 @@ def test_installer_bootstrap_precedence_and_failure_cleanup(tmp_path: Path, scen
             "-Root",
             str(tmp_path),
         ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(completed.stdout)
@@ -559,12 +579,9 @@ def test_installer_bootstrap_precedence_and_failure_cleanup(tmp_path: Path, scen
 
 
 def test_install_dry_run_documents_exact_legacy_migration(tmp_path: Path) -> None:
-    completed = subprocess.run(
+    completed = _run_captured(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ROOT / "install.ps1"), "-DryRun"],
-        capture_output=True,
-        text=True,
         timeout=20,
-        check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "remove only the exact root OllamaHeadlessServe task" in completed.stdout
