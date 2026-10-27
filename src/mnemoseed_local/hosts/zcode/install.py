@@ -8,16 +8,21 @@ no matcher = match every firing) and explicitly flips ``hooks.enabled: true``
 while recording the pre-state in a sidecar file next to the config — uninstall
 rolls the switch back ONLY from that record (a lost record is honest unknown
 and leaves the switch untouched). Install also writes the canonical
-``mcp.servers["mnemoseed-local"]`` HTTP entry; foreign hooks groups, foreign
-MCP servers, and any other user keys are never touched.
+``mcp.servers["mnemoseed-local"]`` entry — a ``type: stdio`` registration of
+the CLI ``mcp`` gateway, whose command resolves like the handlers' and which
+attaches the daemon credential itself per request, so no secret lives in the
+host config; foreign hooks groups, foreign MCP servers, and any other user
+keys are never touched.
 
 Marker contract (``is_ours``): a ``type: process`` handler whose ``args`` is
 exactly one of the two reserved argv forms running the hidden
 ``_hook-event --host zcode`` verb — the command itself is environment-
 dependent (the tool shim on PATH, else the running interpreter via ``-m``),
-so the argv, not the path, is the reserved signature. A foreign command that
-merely mentions mnemoseed-local is never ours; the loose substring probe
-(``_looks_like_ours``) only feeds keep-warnings.
+so the argv, not the path, is the reserved signature. The MCP entry is ours
+by the same structural rule (``is_ours_mcp_entry``: ``type: stdio`` plus the
+reserved gateway argv). A foreign command that merely mentions mnemoseed-local
+is never ours; the loose substring probe (``_looks_like_ours``) only feeds
+keep-warnings.
 
 A non-strict or structurally malformed config (JSONC comments, a non-object
 ``hooks``/``events``/``mcp`` block, a non-boolean ``enabled``) REFUSES with a
@@ -64,9 +69,10 @@ EVENTS_KEY = "events"
 MCP_KEY = "mcp"
 MCP_SERVERS_KEY = "servers"
 
-#: Our MCP server entry (canonical: exactly the documented keys).
+#: Canonical MCP server key and the reserved stdio gateway argv forms.
 MCP_SERVER_NAME = "mnemoseed-local"
-MCP_SERVER_ENTRY = {"type": "http", "url": "http://localhost:7788/mcp"}
+MCP_GATEWAY_ARGS = ("mcp",)
+MCP_MODULE_GATEWAY_ARGS = ("-m", "mnemoseed_local.cli") + MCP_GATEWAY_ARGS
 
 #: Sidecar next to the config recording the ``hooks.enabled`` pre-state.
 PRESTATE_FILENAME = "mnemoseed-local.json"
@@ -88,6 +94,15 @@ def transform_command() -> tuple[str, tuple[str, ...]]:
     return sys.executable, MODULE_TRANSFORM_ARGS
 
 
+def mcp_server_entry() -> dict[str, object]:
+    """The canonical MCP entry: the stdio gateway verb, whose executable
+    resolves exactly like the handlers' — the gateway attaches the daemon
+    credential per request, so the host config carries no secret."""
+    command, handler_args = transform_command()
+    args = MCP_GATEWAY_ARGS if handler_args == TRANSFORM_ARGS else MCP_MODULE_GATEWAY_ARGS
+    return {"type": "stdio", "command": command, "args": list(args)}
+
+
 def _handler() -> dict[str, object]:
     command, args = transform_command()
     return {
@@ -104,6 +119,15 @@ def is_ours(handler: object) -> bool:
         return False
     args = handler.get("args")
     return isinstance(args, list) and tuple(args) in (TRANSFORM_ARGS, MODULE_TRANSFORM_ARGS)
+
+
+def is_ours_mcp_entry(entry: object) -> bool:
+    """Marker contract for the MCP entry: ``type: stdio`` plus exactly one of
+    the two reserved gateway argv forms — the command is never compared."""
+    if not isinstance(entry, dict) or entry.get("type") != "stdio":
+        return False
+    args = entry.get("args")
+    return isinstance(args, list) and tuple(args) in (MCP_GATEWAY_ARGS, MCP_MODULE_GATEWAY_ARGS)
 
 
 def _looks_like_ours(handler: object) -> bool:
@@ -166,7 +190,7 @@ def _mcp_servers(data: dict[str, object]) -> dict[str, object] | None:
 
 def _ours_mcp_present(data: dict[str, object]) -> bool:
     servers = _mcp_servers(data)
-    return isinstance(servers, dict) and servers.get(MCP_SERVER_NAME) == MCP_SERVER_ENTRY
+    return isinstance(servers, dict) and is_ours_mcp_entry(servers.get(MCP_SERVER_NAME))
 
 
 def _prestate_path(target: Path) -> Path:
@@ -204,8 +228,9 @@ def _require_object(target: Path, container: dict[str, object], key: str) -> dic
 
 def install(path: Path | None = None, dry_run: bool = False) -> tuple[Path, bool]:
     """Merge one marked handler group per event, flip ``hooks.enabled: true``
-    (recording the pre-state), and write the canonical MCP entry; returns
-    ``(path, changed)``. A dry run previews the change without writing."""
+    (recording the pre-state — the first record wins on reinstall), and write
+    the canonical MCP entry; returns ``(path, changed)``. A dry run previews
+    the change without writing."""
     target = path or config_path()
     data = load_object(target)
     hooks = _require_object(target, data, HOOKS_KEY)
@@ -229,17 +254,19 @@ def install(path: Path | None = None, dry_run: bool = False) -> tuple[Path, bool
     hooks[ENABLED_KEY] = True
     mcp = _require_object(target, data, MCP_KEY)
     servers = _require_object(target, mcp, MCP_SERVERS_KEY)
-    servers[MCP_SERVER_NAME] = dict(MCP_SERVER_ENTRY)
+    servers[MCP_SERVER_NAME] = mcp_server_entry()
     changed = write_atomic(target, data, dry_run=dry_run)
     if changed and not dry_run:
-        write_atomic(_prestate_path(target), {PRESTATE_KEY: enabled_pre})
+        found, _ = _read_prestate(target)
+        if not found:
+            write_atomic(_prestate_path(target), {PRESTATE_KEY: enabled_pre})
     return target, changed
 
 
 def uninstall(path: Path | None = None, dry_run: bool = False) -> tuple[Path, bool]:
-    """Remove only marker-matched entries, the canonical MCP entry, and — per
-    the recorded pre-state — the ``hooks.enabled`` flip; foreign hooks and MCP
-    entries stay value-identical. Returns ``(path, existed)``."""
+    """Remove only marker-matched entries, our structure-matched MCP entry,
+    and — per the recorded pre-state — the ``hooks.enabled`` flip; foreign
+    hooks and MCP entries stay value-identical. Returns ``(path, existed)``."""
     target = path or config_path()
     if not target.is_file():
         return target, False
@@ -281,7 +308,7 @@ def uninstall(path: Path | None = None, dry_run: bool = False) -> tuple[Path, bo
         if not hooks:
             del data[HOOKS_KEY]
     servers = _mcp_servers(data)
-    if isinstance(servers, dict) and MCP_SERVER_NAME in servers:
+    if isinstance(servers, dict) and is_ours_mcp_entry(servers.get(MCP_SERVER_NAME)):
         del servers[MCP_SERVER_NAME]
         mcp = data.get(MCP_KEY)
         if isinstance(mcp, dict):

@@ -737,8 +737,9 @@ def test_install_writes_the_canonical_hooks_and_mcp_config(
         assert handler["args"] == list(args)
         assert handler["timeoutMs"] == zc_install.HANDLER_TIMEOUT_MS
     assert config["mcp"]["servers"]["mnemoseed-local"] == {
-        "type": "http",
-        "url": "http://localhost:7788/mcp",
+        "type": "stdio",
+        "command": command,
+        "args": ["mcp"],
     }
     assert Path(handler["command"]).is_absolute()
 
@@ -751,6 +752,42 @@ def test_install_records_the_enabled_pre_state_sidecar(
     zc_install.install()
     sidecar = json.loads((zc_home / "cli" / "mnemoseed-local.json").read_text(encoding="utf-8"))
     assert sidecar[zc_install.PRESTATE_KEY] is False
+
+
+def test_repair_install_keeps_the_first_recorded_prestate(
+    zc_home: Path, stable_command: tuple[str, tuple[str, ...]]
+) -> None:
+    """First record wins: a repair install (e.g. over the legacy HTTP entry)
+    must not clobber the pre-state with the already-flipped switch."""
+    path = zc_home / "cli" / "config.json"
+    sidecar = path.parent / zc_install.PRESTATE_FILENAME
+    legacy = {
+        "hooks": {
+            "enabled": True,
+            "events": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "process",
+                                "command": "C:/old/mnemoseed-local.exe",
+                                "args": list(zc_install.TRANSFORM_ARGS),
+                            }
+                        ]
+                    }
+                ]
+            },
+        },
+        "mcp": {"servers": {"mnemoseed-local": {"type": "http", "url": "http://localhost:7788/mcp"}}},
+    }
+    _seed_config(path, legacy)
+    sidecar.write_text(json.dumps({zc_install.PRESTATE_KEY: False}), encoding="utf-8")
+    zc_install.install()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))[zc_install.PRESTATE_KEY] is False
+    _, existed = zc_install.uninstall()
+    assert existed is True
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert config["hooks"]["enabled"] is False
 
 
 def test_install_is_idempotent_byte_identical(
@@ -858,6 +895,24 @@ def test_uninstall_without_install_reports_absent(zc_home: Path) -> None:
     assert existed is False
 
 
+def test_uninstall_leaves_a_foreign_shaped_mcp_entry_under_our_name(
+    zc_home: Path, stable_command: tuple[str, tuple[str, ...]]
+) -> None:
+    """Structure recognition, not the server key alone: an entry we did not
+    write, even under our own key, is user data and stays."""
+    path = zc_home / "cli" / "config.json"
+    _seed_config(path)
+    zc_install.install()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    foreign_shape = {"type": "stdio", "command": "C:/tools/unrelated.exe", "args": ["serve"]}
+    config["mcp"]["servers"]["mnemoseed-local"] = foreign_shape
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    _, existed = zc_install.uninstall()
+    assert existed is True
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert config["mcp"]["servers"]["mnemoseed-local"] == foreign_shape
+
+
 def test_dry_run_previews_without_writing(zc_home: Path, stable_command: tuple[str, tuple[str, ...]]) -> None:
     path = zc_home / "cli" / "config.json"
     original = _seed_config(path)
@@ -944,6 +999,16 @@ def test_status_tracks_the_install_states(
     del config["hooks"]["events"]["Stop"]
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     assert zc_install.status().state == "partial"
+    zc_install.install()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    del config["mcp"]["servers"]["mnemoseed-local"]
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    assert zc_install.status().state == "partial"
+    zc_install.install()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["mcp"]["servers"]["mnemoseed-local"] = {"type": "http", "url": "http://localhost:7788/mcp"}
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    assert zc_install.status().state == "partial"
 
 
 def test_status_reports_the_config_path_and_daemon_probe(
@@ -968,12 +1033,43 @@ def test_transform_command_resolves_an_absolute_tool_reference() -> None:
     assert args[-3:] == ("_hook-event", "--host", "zcode")
 
 
+@pytest.mark.parametrize(
+    ("resolved", "expected_args"),
+    [
+        ((str(Path(__file__).resolve()), zc_install.TRANSFORM_ARGS), ["mcp"]),
+        ((sys.executable, zc_install.MODULE_TRANSFORM_ARGS), ["-m", "mnemoseed_local.cli", "mcp"]),
+    ],
+)
+def test_mcp_server_entry_resolves_like_the_handler(
+    resolved: tuple[str, tuple[str, ...]],
+    expected_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(zc_install, "transform_command", lambda: resolved)
+    assert zc_install.mcp_server_entry() == {
+        "type": "stdio",
+        "command": resolved[0],
+        "args": expected_args,
+    }
+
+
+def test_mcp_server_entry_resolves_an_absolute_command() -> None:
+    entry = zc_install.mcp_server_entry()
+    assert Path(str(entry["command"])).is_absolute()
+    assert tuple(entry["args"]) in (zc_install.MCP_GATEWAY_ARGS, zc_install.MCP_MODULE_GATEWAY_ARGS)
+
+
 def test_utf8_foreign_content_survives_the_roundtrip(
     zc_home: Path, stable_command: tuple[str, tuple[str, ...]]
 ) -> None:
     path = zc_home / "cli" / "config.json"
     foreign = {
-        "mcp": {"servers": {"本地服务器": {"type": "stdio", "command": "C:/工具/服务器.exe"}}},
+        "mcp": {
+            "servers": {
+                "本地服务器": {"type": "stdio", "command": "C:/工具/服务器.exe"},
+                "其他网关": {"type": "stdio", "command": "C:/工具/其他.exe", "args": ["mcp"]},
+            }
+        },
         "hooks": {
             "enabled": False,
             "events": {"Stop": [{"hooks": [{"type": "command", "command": "我的钩子 --标记"}]}]},
@@ -985,6 +1081,49 @@ def test_utf8_foreign_content_survives_the_roundtrip(
     config = json.loads(path.read_text(encoding="utf-8"))
     assert config["mcp"]["servers"] == foreign["mcp"]["servers"]
     assert config["hooks"]["events"] == foreign["hooks"]["events"]
+
+
+def test_installed_mcp_entry_spawns_a_working_gateway(
+    zc_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance: the entry install() writes is a spawnable stdio gateway
+    that answers initialize and tools/list without a daemon."""
+    resolved = (sys.executable, zc_install.MODULE_TRANSFORM_ARGS)
+    monkeypatch.setattr(zc_install, "transform_command", lambda: resolved)
+    zc_install.install()
+    path = zc_home / "cli" / "config.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcp"]["servers"]["mnemoseed-local"]
+    requests = (
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",'
+        '"capabilities":{},"clientInfo":{"name":"install-acceptance","version":"1"}}}\n'
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ENV_VARS}
+    env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path)
+    proc = subprocess.Popen(
+        [entry["command"], *entry["args"]],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    try:
+        out, err = proc.communicate(requests, timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail("the gateway did not answer the handshake within 10s")
+    responses: dict[object, dict] = {}
+    for line in out.splitlines():
+        if line.strip():
+            message = json.loads(line)
+            responses[message["id"]] = message
+    assert responses[1]["result"]["serverInfo"]["name"] == "mnemoseed-local", err
+    tools = responses[2]["result"]["tools"]
+    assert isinstance(tools, list) and tools, err
 
 
 def test_host_cli_lifecycle_wiring(

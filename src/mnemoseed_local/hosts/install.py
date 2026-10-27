@@ -49,8 +49,8 @@ PLUGIN_FILENAME = "mnemoseed-local.ts"
 #: ``*.ts``/``*.js``, so ``mnemoseed-local.ts.disabled`` stops loading.
 DISABLED_SUFFIX = ".disabled"
 
-#: Probe budget for the status check (mirrors the plugin's request timeout).
-PROBE_TIMEOUT_SECONDS = 2.0
+#: Probe budget for the status check — roomy enough for a daemon busy under local model load.
+PROBE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)

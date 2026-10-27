@@ -75,9 +75,11 @@
   兼容 JSON 方言——S0 以 zcode-guide 文档钉死字段清单；假设不成立则 S0 产出真实方言
   fixture 再实现。
 - **安装面**：`~/.zcode/cli/config.json` 顶层 `hooks`（默认禁用，安装器**显式翻转
-  `hooks.enabled: true` 并记录 pre-state**——卸载时仅在 pre-state 为 false 时回翻）+
-  `mcp.servers` 写入 `{"type":"http","url":"http://localhost:7788/mcp"}`（canonical、
-  绝对路径、schema 严格）。marker 精确匹配 + 原子重写 + UTF-8 免疫 locale（claude_code
+  `hooks.enabled: true` 并记录 pre-state**（首记录优先，重装不覆盖）——卸载时仅在
+  pre-state 为 false 时回翻）+ `mcp.servers` 写入 stdio 网关条目
+  `{"type":"stdio","command":<mnemoseed-local shim 或解释器,绝对路径>,"args":["mcp"]}`
+  （canonical、schema 严格；daemon 凭据由网关进程自行读取并附加，不入宿主配置，凭据
+  轮换无需改宿主配置）。marker 结构精确匹配 + 原子重写 + UTF-8 免疫 locale（claude_code
   安装器先例）。
 - **捕获通道**：hooks 直供（事件载荷），不依赖 db.sqlite（WAL 轮询留待有漏捕证据）。
 
