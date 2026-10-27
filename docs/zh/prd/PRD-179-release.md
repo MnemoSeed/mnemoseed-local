@@ -102,3 +102,10 @@ PR #288 首push后 CI：6/7 绿，仅 `release-install-verify (ubuntu-latest)` �
 - 本会话新鲜 Linux 证据：WSL2 artifact harness 七步全 PASS、failures 0（`.release179-linux-zcode-verify-20261028.json`）。
 - 已知无关本地门禁失败：`tests/test_windows_autostart.py` 9 例在中文 locale Windows 上因 schtasks GBK 输出按 UTF-8 解码而失败，主仓 d5658c7 无修复时同样复现——预存环境敏感，与本修复无关，另行开 queue issue；干净 runner CI 为准。
 - 修复按纪律 amend 回原发布提交（该提交自身被修绿），不折入后续合并。
+
+## 11. 发布执行记录（2026-10-28）
+
+- 修复后 PR #288 CI **7/7 全绿**（含此前失败的 `release-install-verify (ubuntu-latest)`，26s 过），合并提交 `c30054f`，`Closes #179` 生效。
+- `v0.2.0` tag 已推送；release workflow：build **成功**，publish **失败**——PyPI trusted publishing 交换返回 `invalid-publisher`（找不到匹配 claims 的 publisher，非凭据或网络问题）。
+- 待用户动作（不可代办）：在 pypi.org 为 `mnemoseed-local` 配置 trusted publisher——owner `MnemoSeed` / repository `mnemoseed-local` / workflow `release.yml` / environment `pypi`（首次上传需 pending publisher 预注册）。配置后直接重跑 run 40549633160 的 publish job 即可，无需重新打 tag。
+- 默认索引 pin 安装验证被发布阻断，发布成功后单独记录；本机 PASS 不替代。
