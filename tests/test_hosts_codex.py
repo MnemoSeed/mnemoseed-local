@@ -10,10 +10,11 @@ process send floor), and the zero-stdout red line on every other path. The
 watermark three-state tests boot the REAL daemon and assert the ingest-
 boundary oracle — segmenter acceptances and settled turn counts, never HTTP
 counts (§9.3: same-state replay still travels, the daemon skips it). Lifecycle
-tests pin the marked-entry surgery on the sandbox ``CODEX_HOME`` (Claude-Code-
-compatible ``hooks.json`` command entries, the ``config.toml`` marker block
-for the stdio MCP gateway) and the three honest trust states from
-``[hooks.state]``.
+tests pin the marked-entry surgery on the sandbox ``CODEX_HOME`` (the
+documented ``hooks.json`` root ``hooks`` container: event -> matcher groups ->
+command handlers; the ``config.toml`` marker block for the stdio MCP gateway),
+the legacy flat-shape migration, and the trust-unverified status of a complete
+install.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -853,9 +855,26 @@ def test_missing_zstandard_still_settles_session_end(
 # ---------------------------------------------------------------- installer lifecycle (§5.5)
 
 
-FOREIGN_HOOKS = {
-    "Stop": [{"hooks": [{"type": "command", "command": "my-own-hook --flag"}]}],
-}
+IS_WINDOWS = os.name == "nt"
+
+FOREIGN_HANDLER = {"type": "command", "command": "my-own-hook --flag"}
+
+
+def _handler_for(command: str) -> dict[str, str]:
+    return {"type": "command", "command": command}
+
+
+def _group(handlers: list[dict[str, str]], matcher: str | None = None) -> dict[str, object]:
+    group: dict[str, object] = {"hooks": handlers}
+    if matcher is not None:
+        group["matcher"] = matcher
+    return group
+
+
+_FOREIGN_STOP = _group([dict(FOREIGN_HANDLER)], matcher="Bash")
+_FOREIGN_STOP["notes"] = {"origin": "user"}
+_FOREIGN_PROMPT = _group([{"type": "command", "command": "other-helper.exe lint", "timeout": 30}])
+FOREIGN_HOOKS = {"hooks": {"Stop": [_FOREIGN_STOP], "UserPromptSubmit": [_FOREIGN_PROMPT]}}
 
 FOREIGN_TOML = (
     "# user tuning\n"
@@ -869,6 +888,16 @@ FOREIGN_TOML = (
     'trust_level = "trusted"\n'
 )
 
+#: Our gateway table as a previous install left it (same keys, stale command).
+STALE_MCP_BLOCK = '[mcp_servers.mnemoseed]\ncommand = "C:/tools/stale.exe"\nargs = ["mcp"]\n'
+
+_LEGACY_EXE = str(Path(__file__).resolve())
+
+#: The command shapes a flat (pre-container) install left behind: the shim and
+#: the ``-m`` module fallback, both with a quoted executable head.
+LEGACY_OWN_SHIM = f'"{_LEGACY_EXE}" {" ".join(cx_install.TRANSFORM_ARGS)}'
+LEGACY_OWN_MODULE = f'"{sys.executable}" -m mnemoseed_local.cli {" ".join(cx_install.TRANSFORM_ARGS)}'
+
 
 @pytest.fixture
 def stable_command(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
@@ -879,20 +908,56 @@ def stable_command(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
     return exe, command
 
 
-def test_install_writes_the_canonical_hooks_and_mcp_block(
-    cx_home: Path, stable_command: tuple[str, str]
+def _nested(hooks: dict[str, Any]) -> dict[str, Any]:
+    container = hooks.get("hooks")
+    return container if isinstance(container, dict) else {}
+
+
+def _own_commands(hooks: dict[str, Any]) -> list[str]:
+    """Every marker-matched command in the nested container and in the legacy
+    flat root shape."""
+    containers = [_nested(hooks), {key: value for key, value in hooks.items() if key != "hooks"}]
+    found: list[str] = []
+    for container in containers:
+        for event in cx_install.HOOK_EVENTS:
+            groups = container.get(event)
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                handlers = group.get("hooks") if isinstance(group, dict) else None
+                for handler in handlers if isinstance(handlers, list) else []:
+                    if cx_install.is_ours(handler):
+                        found.append(str(handler["command"]))
+    return found
+
+
+def _digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def _seed_hooks(cx_home: Path, document: object) -> Path:
+    hooks_file = cx_home / "hooks.json"
+    hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    hooks_file.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return hooks_file
+
+
+def test_install_writes_the_nested_hooks_container_and_mcp_block(
+    cx_home: Path, stable_command: tuple[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
     hooks_file, changed = cx_install.install()
     assert changed is True
     assert hooks_file == cx_home / "hooks.json"
+    assert "/hooks" in capsys.readouterr().out, "install points at the one-time trust review"
     hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
-    assert set(hooks) == set(cx_install.HOOK_EVENTS)
+    assert set(hooks) == {"hooks"}
+    container = _nested(hooks)
+    assert set(container) == set(cx_install.HOOK_EVENTS)
     exe, command = stable_command
     for event in cx_install.HOOK_EVENTS:
-        groups = hooks[event]
+        groups = container[event]
         assert len(groups) == 1, event
-        handler = groups[0]["hooks"][0]
-        assert handler == {"type": "command", "command": command}
+        assert groups[0]["hooks"] == [_handler_for(command)]
     config = (cx_home / "config.toml").read_text(encoding="utf-8")
     assert "[mcp_servers.mnemoseed]" in config
     entry = tomllib.loads(config)["mcp_servers"]["mnemoseed"]
@@ -909,24 +974,29 @@ def test_install_is_idempotent_byte_identical(cx_home: Path, stable_command: tup
     assert (cx_home / "config.toml").read_bytes() == config_first
 
 
-def test_install_never_mutates_foreign_entries(cx_home: Path, stable_command: tuple[str, str]) -> None:
-    hooks_file = cx_home / "hooks.json"
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    hooks_file.write_text(json.dumps(FOREIGN_HOOKS, indent=2) + "\n", encoding="utf-8")
+def test_install_preserves_foreign_nested_groups_and_metadata(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
     config = cx_home / "config.toml"
     config.write_text(FOREIGN_TOML, encoding="utf-8")
     cx_install.install()
     hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
-    assert hooks["Stop"][0] == FOREIGN_HOOKS["Stop"][0]
-    assert len(hooks["Stop"]) == 2, "our group joins the foreign one"
+    stop_groups = _nested(hooks)["Stop"]
+    assert FOREIGN_HOOKS["hooks"]["Stop"][0] in stop_groups, "the matcher, metadata and handler survive"
+    assert len(stop_groups) == 2, "our group joins the foreign one"
+    prompt_groups = _nested(hooks)["UserPromptSubmit"]
+    assert prompt_groups[0] == FOREIGN_HOOKS["hooks"]["UserPromptSubmit"][0]
+    assert len(prompt_groups) == 2
+    assert FOREIGN_HOOKS["hooks"]["Stop"][0]["matcher"] == "Bash"
+    assert FOREIGN_HOOKS["hooks"]["Stop"][0]["notes"] == {"origin": "user"}
+    assert len(_own_commands(hooks)) == len(cx_install.HOOK_EVENTS)
     config_text = config.read_text(encoding="utf-8")
     assert config_text.startswith(FOREIGN_TOML), "foreign toml bytes stay byte-identical ahead of our block"
 
 
 def test_uninstall_removes_exactly_our_entries(cx_home: Path, stable_command: tuple[str, str]) -> None:
-    hooks_file = cx_home / "hooks.json"
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    hooks_file.write_text(json.dumps(FOREIGN_HOOKS, indent=2) + "\n", encoding="utf-8")
+    hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
     config = cx_home / "config.toml"
     config.write_text(FOREIGN_TOML, encoding="utf-8")
     cx_install.install()
@@ -942,25 +1012,134 @@ def test_uninstall_without_install_reports_absent(cx_home: Path) -> None:
     assert existed is False
 
 
-def test_dry_run_previews_without_writing(cx_home: Path, stable_command: tuple[str, str]) -> None:
+def test_nested_install_then_uninstall_leaves_no_own_entries(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    cx_install.install()
+    _, existed = cx_install.uninstall()
+    assert existed is True
     hooks_file = cx_home / "hooks.json"
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    hooks_file.write_text(json.dumps(FOREIGN_HOOKS, indent=2) + "\n", encoding="utf-8")
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8")) if hooks_file.is_file() else {}
+    assert _own_commands(hooks) == []
+    config = cx_home / "config.toml"
+    assert "[mcp_servers.mnemoseed]" not in (config.read_text(encoding="utf-8") if config.is_file() else "")
+
+
+def test_legacy_flat_owned_entries_migrate_into_the_nested_container(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    ours_shim = _handler_for(LEGACY_OWN_SHIM)
+    ours_module = _handler_for(LEGACY_OWN_MODULE)
+    legacy = {
+        "Stop": [_group([ours_shim, dict(FOREIGN_HANDLER)], matcher="Bash")],
+        "UserPromptSubmit": [_group([ours_module])],
+        "SessionStart": [_group([dict(FOREIGN_HANDLER)])],
+    }
+    hooks_file = _seed_hooks(cx_home, legacy)
+    _, changed = cx_install.install()
+    assert changed is True
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+    container = _nested(hooks)
+    assert set(container) == set(cx_install.HOOK_EVENTS)
+    _, command = stable_command
+    assert _own_commands(hooks) == [command] * len(cx_install.HOOK_EVENTS)
+    expected_stop = [_group([dict(FOREIGN_HANDLER)], matcher="Bash")]
+    expected_start = [_group([dict(FOREIGN_HANDLER)])]
+    assert hooks["Stop"] == expected_stop, "the foreign flat value and its group metadata stay put"
+    assert "UserPromptSubmit" not in hooks, "a flat event holding only our handler is gone"
+    assert hooks["SessionStart"] == expected_start, "foreign flat entries are never migrated"
+    migrated = hooks_file.read_bytes()
+    _, changed = cx_install.install()
+    assert changed is False
+    assert hooks_file.read_bytes() == migrated
+
+    _, existed = cx_install.uninstall()
+    assert existed is True
+    remaining = json.loads(hooks_file.read_text(encoding="utf-8"))
+    assert _own_commands(remaining) == []
+    assert remaining["Stop"] == expected_stop
+    assert remaining["SessionStart"] == expected_start
+
+
+def test_install_replaces_a_stale_own_command_and_keeps_its_siblings(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    stale = "C:/old/venv/Scripts/mnemoseed-local.exe " + " ".join(cx_install.TRANSFORM_ARGS)
+    stale_group = _group([_handler_for(stale), dict(FOREIGN_HANDLER)], matcher="Bash")
+    hooks_file = _seed_hooks(cx_home, {"hooks": {"Stop": [stale_group]}})
+    _, changed = cx_install.install()
+    assert changed is True
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+    groups = _nested(hooks)["Stop"]
+    assert groups[0] == _group([dict(FOREIGN_HANDLER)], matcher="Bash")
+    _, command = stable_command
+    ours = [group for group in groups if any(cx_install.is_ours(h) for h in group.get("hooks", []))]
+    assert len(ours) == 1, "one canonical handler total"
+    assert ours[0]["hooks"] == [_handler_for(command)]
+    assert stale not in hooks_file.read_text(encoding="utf-8")
+
+
+def test_install_relocates_a_filtered_own_group_and_keeps_its_metadata(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Our handler only counts as canonical in an unfiltered group: a matcher
+    that can never fire moves the handler out, while the group's own metadata
+    survives in the emptied original."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    _, command = stable_command
+    filtered = _group([_handler_for(command)], matcher="never-match-this-session")
+    filtered["notes"] = {"origin": "user"}
+    hooks_file = _seed_hooks(cx_home, {"hooks": {"Stop": [filtered]}})
+    assert cx_install.status().state == "partial"
+
+    _, changed = cx_install.install()
+    assert changed is True
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+    stop_groups = _nested(hooks)["Stop"]
+    emptied = {"hooks": [], "matcher": "never-match-this-session", "notes": {"origin": "user"}}
+    assert emptied in stop_groups, "the emptied group keeps its matcher and metadata"
+    occupied = [group for group in stop_groups if group.get("hooks")]
+    assert occupied == [_group([_handler_for(command)])]
+    assert _own_commands(hooks) == [command] * len(cx_install.HOOK_EVENTS)
+
+    installed = hooks_file.read_bytes()
+    _, changed = cx_install.install()
+    assert changed is False
+    assert hooks_file.read_bytes() == installed
+
+
+def test_uninstall_strips_owned_entries_from_both_shapes(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    ours_shim = _handler_for(LEGACY_OWN_SHIM)
+    ours_module = _handler_for(LEGACY_OWN_MODULE)
+    seeded = {
+        "hooks": {"Stop": [_group([ours_shim, dict(FOREIGN_HANDLER)], matcher="Bash")]},
+        "Stop": [_group([ours_module])],
+        "UserPromptSubmit": [_group([ours_module])],
+    }
+    hooks_file = _seed_hooks(cx_home, seeded)
+    _, existed = cx_install.uninstall()
+    assert existed is True
+    remaining = json.loads(hooks_file.read_text(encoding="utf-8"))
+    assert remaining == {"hooks": {"Stop": [_group([dict(FOREIGN_HANDLER)], matcher="Bash")]}}
+
+
+def test_dry_run_previews_without_writing(cx_home: Path, stable_command: tuple[str, str]) -> None:
+    hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
+    seeded = hooks_file.read_text(encoding="utf-8")
     config = cx_home / "config.toml"
     config.write_text(FOREIGN_TOML, encoding="utf-8")
     _, would_change = cx_install.install(dry_run=True)
     assert would_change is True
-    assert hooks_file.read_text(encoding="utf-8") == json.dumps(FOREIGN_HOOKS, indent=2) + "\n"
+    assert hooks_file.read_text(encoding="utf-8") == seeded
     assert config.read_text(encoding="utf-8") == FOREIGN_TOML
     _, changed = cx_install.install()
     assert changed is True
 
 
 def test_dry_run_uninstall_previews_without_writing(cx_home: Path, stable_command: tuple[str, str]) -> None:
-    hooks_file = cx_home / "hooks.json"
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    seeded = json.dumps(FOREIGN_HOOKS, indent=2) + "\n"
-    hooks_file.write_text(seeded, encoding="utf-8")
+    hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
     config = cx_home / "config.toml"
     config.write_text(FOREIGN_TOML, encoding="utf-8")
     cx_install.install()
@@ -980,9 +1159,9 @@ def test_malformed_hooks_json_refuses_instead_of_corrupting(
 ) -> None:
     hooks_file = cx_home / "hooks.json"
     cases = [
-        '{\n  // user annotation\n  "Stop": []\n}\n',
+        '{\n  // user annotation\n  "hooks": {"Stop": []}\n}\n',
         "{broken",
-        json.dumps({"Stop": "garbage"}),
+        "[]",
     ]
     for original in cases:
         hooks_file.parent.mkdir(parents=True, exist_ok=True)
@@ -990,19 +1169,81 @@ def test_malformed_hooks_json_refuses_instead_of_corrupting(
         with pytest.raises(cx_install.ConfigParseError):
             cx_install.install()
         assert hooks_file.read_text(encoding="utf-8") == original
+        assert not (cx_home / "config.toml").exists(), "no config write lands either"
 
 
-def test_malformed_config_toml_refuses_instead_of_corrupting(
-    cx_home: Path, stable_command: tuple[str, str]
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"hooks": []},
+        {"hooks": "garbage"},
+        {"hooks": {"Stop": "garbage"}},
+        {"hooks": {"Stop": ["garbage"]}},
+        {"hooks": {"Stop": [{"hooks": "garbage"}]}},
+        {"Stop": {"hooks": []}},
+        {"Stop": ["garbage"]},
+        {"Stop": "garbage"},
+    ],
+)
+def test_malformed_hooks_structure_refuses_before_any_write(
+    cx_home: Path, stable_command: tuple[str, str], document: object
+) -> None:
+    hooks_file = _seed_hooks(cx_home, document)
+    config = cx_home / "config.toml"
+    config.write_text(FOREIGN_TOML + STALE_MCP_BLOCK, encoding="utf-8")
+    hooks_before, config_before = _digest(hooks_file), _digest(config)
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.install()
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.uninstall()
+    assert _digest(hooks_file) == hooks_before, document
+    assert _digest(config) == config_before, document
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"hooks": None},
+        {"hooks": {"Stop": [{"hooks": None}]}},
+    ],
+)
+def test_explicit_null_hook_containers_refuse_before_any_write(
+    cx_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    document: object,
+) -> None:
+    """An explicit null is a malformed container, not an absent one."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    hooks_file = _seed_hooks(cx_home, document)
+    config = cx_home / "config.toml"
+    config.write_text(FOREIGN_TOML + STALE_MCP_BLOCK, encoding="utf-8")
+    hooks_before, config_before = _digest(hooks_file), _digest(config)
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.install()
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.uninstall()
+    assert _digest(hooks_file) == hooks_before, document
+    assert _digest(config) == config_before, document
+    assert cx_install.status().state == "malformed", document
+
+
+@pytest.mark.parametrize("original", ["[broken\n", "model = \n", 'model = "gpt-5"\n[unclosed\n'])
+def test_malformed_config_toml_refuses_before_any_write(
+    cx_home: Path, stable_command: tuple[str, str], original: str
 ) -> None:
     config = cx_home / "config.toml"
-    cases = ["[broken\n", "model = \n", 'model = "gpt-5"\n[unclosed\n']
-    for original in cases:
-        config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(original, encoding="utf-8")
-        with pytest.raises(cx_install.ConfigParseError):
-            cx_install.install()
-        assert config.read_text(encoding="utf-8") == original
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(original, encoding="utf-8")
+    hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
+    hooks_before, config_before = _digest(hooks_file), _digest(config)
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.install()
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.uninstall()
+    assert _digest(hooks_file) == hooks_before, "the hooks write never lands"
+    assert _digest(config) == config_before
+    assert config.read_text(encoding="utf-8") == original
 
 
 def test_foreign_keys_under_our_mcp_table_refuse(cx_home: Path, stable_command: tuple[str, str]) -> None:
@@ -1023,20 +1264,73 @@ def _seed_trusted_hash(cx_home: Path, digest: str) -> None:
         handle.write(f'\n[hooks.state."cx:hooks.json:stop:0:0"]\ntrusted_hash = "{digest}"\n')
 
 
-def test_status_reports_the_three_trust_states(
+def test_status_reports_structural_states(
     cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
     assert cx_install.status().state == "not-installed"
+
+    hooks_file = _seed_hooks(cx_home, {"Stop": [_group([_handler_for(LEGACY_OWN_SHIM)])]})
+    assert cx_install.status().state in {"not-installed", "partial"}, "a flat root shape is never canonical"
+
+    hooks_file = _seed_hooks(cx_home, {"hooks": {"Stop": [_group([_handler_for(LEGACY_OWN_SHIM)])]}})
+    assert cx_install.status().state == "partial"
+
+    malformed = (
+        "{broken",
+        "[]",
+        json.dumps({"hooks": []}),
+        json.dumps({"hooks": {"Stop": "garbage"}}),
+    )
+    for document in malformed:
+        hooks_file.write_text(document, encoding="utf-8")
+        assert cx_install.status().state == "malformed", document
+
+
+def test_status_treats_a_filtered_own_group_as_incomplete(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Our handler under a matcher that can never fire is not a complete
+    install, and a reinstall relocates it into an unfiltered group."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    _, command = stable_command
     cx_install.install()
-    assert cx_install.status().state == cx_install.TRUST_PENDING
+    hooks_file = cx_home / "hooks.json"
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+    _nested(hooks)["Stop"][0]["matcher"] = "never-match-this-session"
+    hooks_file.write_text(json.dumps(hooks, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert cx_install.status().state == "partial"
+
+    _, changed = cx_install.install()
+    assert changed is True
+    repaired = json.loads(hooks_file.read_text(encoding="utf-8"))
+    moved = [group for group in _nested(repaired)["Stop"] if group.get("hooks")]
+    assert moved == [_group([_handler_for(command)])]
+    assert "unverified" in cx_install.status().state.lower()
+
+
+def test_status_reports_a_complete_install_as_trust_unverified(
+    cx_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    cx_install.install()
+    config = cx_home / "config.toml"
+    assert "[hooks.state" not in config.read_text(encoding="utf-8"), "install never writes a trust record"
+    info = cx_install.status()
+    assert "unverified" in info.state.lower()
+    assert info.state not in {"installed", "not-installed", "partial", "malformed"}
+
     digest = hashlib.sha256((cx_home / "hooks.json").read_bytes()).hexdigest()
     _seed_trusted_hash(cx_home, digest)
-    assert cx_install.status().state == "installed"
-    hooks = json.loads((cx_home / "hooks.json").read_text(encoding="utf-8"))
-    hooks["Stop"].append({"hooks": [{"type": "command", "command": "extra --flag"}]})
-    (cx_home / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
-    assert cx_install.status().state == cx_install.TRUST_STALE
+    assert "unverified" in cx_install.status().state.lower(), "a whole-file hash is not a trust signal"
+
+    assert main(["host", "status", "--host", "codex_cli"]) == 0
+    out = capsys.readouterr().out
+    assert "unverified" in out
+    assert "/hooks" in out
 
 
 def test_status_reports_the_config_path_and_daemon_probe(
@@ -1050,24 +1344,95 @@ def test_status_reports_the_config_path_and_daemon_probe(
 
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", fake_probe)
     info = cx_install.status()
+    assert info.state == "not-installed", "structure and reachability are reported apart"
     assert info.daemon_reachable is True
     assert info.path == cx_home / "hooks.json"
     assert info.root == cx_home
     assert seen["base_url"] == "http://localhost:7788"
 
 
-def test_transform_command_resolves_an_absolute_tool_reference() -> None:
-    command = cx_install.transform_command()
-    assert command.endswith(" " + " ".join(cx_install.TRANSFORM_ARGS))
-    head = command.split(" ", 1)[0]
-    assert Path(head.strip('"')).is_absolute()
+WINDOWS_HOSTILE_PATHS = [
+    r"C:\Program Files\MnemoSeed\mnemoseed-local.exe",
+    r"C:\Users\O'Brien\mnemoseed-local.exe",
+    r"C:\Users\$env:PATH\mnemoseed-local.exe",
+    r"C:\Users\back`tick\mnemoseed-local.exe",
+    r"C:\Users\Little Star\O'Brien $x `y\mnemoseed-local.exe",
+]
+
+POSIX_HOSTILE_PATHS = [
+    "/opt/mnemo seed/mnemoseed-local",
+    "/opt/O'Brien/mnemoseed-local",
+    "/opt/$HOME/`tick`/mnemoseed-local",
+    "/opt/Mnemo Seed/O'Brien $X `y`/mnemoseed-local",
+]
+
+
+def _tail(module_form: bool) -> tuple[str, ...]:
+    base = ("-m", "mnemoseed_local.cli") if module_form else ()
+    return (*base, *cx_install.TRANSFORM_ARGS)
+
+
+def _powershell_literal(text: str) -> tuple[str, str]:
+    """The value of a leading single-quoted PowerShell literal plus the rest."""
+    assert text.startswith("'"), text
+    value: list[str] = []
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if char == "'":
+            if text[index + 1 : index + 2] == "'":
+                value.append("'")
+                index += 2
+                continue
+            return "".join(value), text[index + 1 :]
+        value.append(char)
+        index += 1
+    raise AssertionError(f"unterminated PowerShell literal: {text}")
+
+
+@pytest.mark.parametrize("module_form", [False, True])
+@pytest.mark.parametrize("exe", WINDOWS_HOSTILE_PATHS)
+def test_windows_commands_call_a_single_quoted_literal(exe: str, module_form: bool) -> None:
+    tail = _tail(module_form)
+    command = cx_install.render_command(exe, tail, windows=True)
+    assert command.startswith("& "), command
+    literal, rest = _powershell_literal(command[2:])
+    assert literal == exe, "the path is a literal, never an executable expression"
+    assert rest == " " + " ".join(tail)
+    assert cx_install.is_ours({"type": "command", "command": command}) is True
+
+
+@pytest.mark.parametrize("module_form", [False, True])
+@pytest.mark.parametrize("exe", POSIX_HOSTILE_PATHS)
+def test_posix_commands_keep_the_path_as_one_shell_word(exe: str, module_form: bool) -> None:
+    tail = _tail(module_form)
+    command = cx_install.render_command(exe, tail, windows=False)
+    assert shlex.split(command) == [exe, *tail]
+    assert not command.startswith("&")
+    assert cx_install.is_ours({"type": "command", "command": command}) is True
+
+
+@pytest.mark.parametrize("shim_present", [True, False])
+def test_transform_command_renders_the_platform_quote(
+    monkeypatch: pytest.MonkeyPatch, shim_present: bool
+) -> None:
+    windows_exe = r"C:\Program Files\MnemoSeed\mnemoseed-local.exe"
+    posix_exe = "/opt/mnemo seed/mnemoseed-local"
+    exe = windows_exe if IS_WINDOWS else posix_exe
+    found = "mnemoseed-local" if shim_present else None
+    monkeypatch.setattr(cx_install, "transform_executable", lambda: exe)
+    monkeypatch.setattr(cx_install.shutil, "which", lambda name: found)
+    expected = cx_install.render_command(exe, _tail(not shim_present), windows=IS_WINDOWS)
+    assert cx_install.transform_command() == expected
+    assert cx_install.is_ours({"type": "command", "command": expected}) is True
 
 
 def test_foreign_module_form_mentioning_the_verb_is_never_ours() -> None:
-    tail = " ".join(cx_install.TRANSFORM_ARGS)
-    legit_module = f"{sys.executable} -m mnemoseed_local.cli {tail}"
-    foreign_module = f"{sys.executable} -m evil_pkg {tail}"
-    shim_form = f"{sys.executable} {tail}"
+    legit_module = cx_install.render_command(sys.executable, _tail(True), windows=IS_WINDOWS)
+    foreign_module = cx_install.render_command(
+        sys.executable, ("-m", "evil_pkg", *cx_install.TRANSFORM_ARGS), windows=IS_WINDOWS
+    )
+    shim_form = cx_install.render_command(sys.executable, _tail(False), windows=IS_WINDOWS)
     assert cx_install.is_ours({"type": "command", "command": legit_module}) is True
     assert cx_install.is_ours({"type": "command", "command": shim_form}) is True
     assert cx_install.is_ours({"type": "command", "command": foreign_module}) is False
@@ -1078,14 +1443,12 @@ def test_foreign_module_form_mentioning_the_verb_is_never_ours() -> None:
 def test_foreign_entry_mentioning_the_marker_is_kept_with_a_warning(
     cx_home: Path, stable_command: tuple[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    hooks_file = cx_home / "hooks.json"
-    foreign = {"Stop": [{"hooks": [{"type": "command", "command": "mnemoseed-local-helper.exe watch"}]}]}
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    hooks_file.write_text(json.dumps(foreign, indent=2) + "\n", encoding="utf-8")
+    foreign = {"hooks": {"Stop": [_group([_handler_for("mnemoseed-local-helper.exe watch")])]}}
+    hooks_file = _seed_hooks(cx_home, foreign)
     _, changed = cx_install.install()
     assert changed is True
     hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
-    assert len(hooks["Stop"]) == 2
+    assert len(_nested(hooks)["Stop"]) == 2
     _, existed = cx_install.uninstall()
     assert existed is True
     assert json.loads(hooks_file.read_text(encoding="utf-8")) == foreign
@@ -1093,10 +1456,8 @@ def test_foreign_entry_mentioning_the_marker_is_kept_with_a_warning(
 
 
 def test_utf8_foreign_content_survives_the_roundtrip(cx_home: Path, stable_command: tuple[str, str]) -> None:
-    hooks_file = cx_home / "hooks.json"
-    foreign = {"Stop": [{"hooks": [{"type": "command", "command": "我的钩子 --标记"}]}]}
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    hooks_file.write_text(json.dumps(foreign, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    foreign = {"hooks": {"Stop": [_group([_handler_for("我的钩子 --标记")], matcher="Bash")]}}
+    hooks_file = _seed_hooks(cx_home, foreign)
     config = cx_home / "config.toml"
     seeded = '[mcp_servers."本地服务器"]\ncommand = "C:/工具/服务器.exe"\n\n' + FOREIGN_TOML
     config.write_text(seeded, encoding="utf-8")
@@ -1132,11 +1493,13 @@ def test_host_cli_lifecycle_wiring(
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
     assert main(["host", "install", "--host", "codex_cli"]) == 0
     assert "applied" in capsys.readouterr().out
-    assert (cx_home / "hooks.json").is_file()
+    hooks = json.loads((cx_home / "hooks.json").read_text(encoding="utf-8"))
+    assert set(hooks) == {"hooks"}
 
     assert main(["host", "status", "--host", "codex_cli"]) == 0
     out = capsys.readouterr().out
-    assert "not yet trusted" in out
+    assert "unverified" in out
+    assert "/hooks" in out
 
     assert main(["host", "uninstall", "--host", "codex_cli"]) == 0
     assert "applied" in capsys.readouterr().out

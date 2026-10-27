@@ -1,49 +1,49 @@
 """Codex CLI hook lifecycle: marked-entry surgery on the sandbox CODEX_HOME.
 
 The user-level ``hooks.json`` follows the Claude-Code-compatible shape Codex
-consumes natively (per-event matcher groups holding ``type: command``
-handlers); install merges one marked handler per subscribed event, and
-``config.toml`` gains the ``[mcp_servers.mnemoseed]`` stdio gateway entry.
-Marker contract (``is_ours``): a handler whose command ends with the
-reserved ``_hook-event --host codex_cli`` argv tail — either the shim form
-or the full ``-m`` module form. The executable is environment-dependent, so
-the argv tail, not the path, is the signature; a foreign command that merely
-mentions mnemoseed-local is never ours (the loose substring probe only feeds
-keep-warnings).
+consumes natively: a top-level ``hooks`` object maps each event to matcher
+groups holding ``type: command`` handlers. Install keeps exactly one canonical
+handler per subscribed event inside that container, and ``config.toml`` gains
+the ``[mcp_servers.mnemoseed]`` stdio gateway entry.
 
-config.toml surgery is marker-block text surgery: a strict ``tomllib`` parse
-first (a broken file refuses untouched), then the exact canonical table
-block is appended or removed and the rewrite is re-verified before any
-bytes land — user comments and foreign tables stay byte-identical. A
-``[mcp_servers.mnemoseed]`` table carrying keys this tool does not manage
-refuses with manual-edit guidance instead of being overwritten. All
-rewrites are atomic (temp file + fsync + ``os.replace`` in the target dir),
-UTF-8 bytes regardless of the process locale; ``--dry-run`` is module-level
-(``install(dry_run=True)``).
+Marker contract (``is_ours``): a handler whose command ends with the reserved
+``_hook-event --host codex_cli`` argv tail — either the shim form or the
+``-m mnemoseed_local.cli`` module form. The executable is environment
+dependent, so the argv tail, not the path, is the signature; a foreign command
+that merely mentions mnemoseed-local is never ours (the loose substring probe
+only feeds keep-warnings). Handler commands render per platform: a PowerShell
+call operator with a single-quoted literal on Windows, POSIX shell quoting
+elsewhere.
 
-The hooks trust gate is Codex-side: after install the user must review and
-trust the hooks once via ``/hooks``, and Codex records the content hash
-under ``[hooks.state]`` in config.toml. Status reports the three honest
-states: no ``trusted_hash`` entries -> installed but not yet trusted;
-entries present but none matching the sha256 of the current hooks.json
-bytes -> stale trust (the file changed; re-trust via /hooks); a match ->
-trusted. A mismatch always advises the re-trust, which is the safe
-direction.
+Surgery rewrites only marker-owned handlers, harvesting both the nested
+container and the historical flat root shape. Foreign groups, their matcher and
+metadata fields, foreign handler values and the whole ``config.toml`` text stay
+untouched: our canonical group is appended, and a group left without handlers
+survives only when it carries metadata of its own.
 
-Status reuses the shared /healthz probe, base-URL resolution and HookStatus
-shape from ``mnemoseed_local.hosts.install``; all operations are local
-filesystem work — no daemon REST writes.
+Both files validate before either write lands: strict JSON/TOML parse first,
+then the container/known-event/group schema, so an unexpected shape refuses
+with ``ConfigParseError`` and both files keep their bytes. The ``config.toml``
+rewrite swaps the line span of our canonical table and re-verifies the parse
+before it is stored; every rewrite is atomic (temp file + fsync +
+``os.replace``) and UTF-8 regardless of the process locale, and
+``install(dry_run=True)`` previews without writing.
+
+Status is structural: a complete canonical install reports trust unverified,
+because Codex asks the user to review the hooks once inside ``/hooks``. This
+tool never reads or writes a trust record, and daemon reachability is reported
+apart from the structural state.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import shlex
 import shutil
 import sys
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -68,9 +68,8 @@ MODULE_TAIL = " ".join(("-m", "mnemoseed_local.cli") + TRANSFORM_ARGS)
 HOOKS_FILENAME = "hooks.json"
 CONFIG_FILENAME = "config.toml"
 
+#: The top-level object mapping events to matcher groups.
 HOOKS_KEY = "hooks"
-STATE_KEY = "state"
-TRUSTED_HASH_KEY = "trusted_hash"
 
 #: Our MCP server entry: the stdio gateway (canonical: exactly these keys).
 MCP_SERVER_NAME = "mnemoseed"
@@ -79,9 +78,9 @@ MCP_COMMAND_KEY = "command"
 MCP_ARGS_KEY = "args"
 MCP_GATEWAY_ARGS = ("mcp",)
 
-#: The honest trust states (exact status strings).
-TRUST_PENDING = "installed, not yet trusted"
-TRUST_STALE = "stale trust (hooks changed; re-trust via /hooks)"
+#: Structural status of a complete canonical install: the host still asks the
+#: user to approve the hooks once.
+TRUST_UNVERIFIED = "installed, trust unverified (review and approve the hooks in Codex via /hooks)"
 
 
 def codex_home() -> Path:
@@ -108,17 +107,23 @@ def transform_executable() -> str:
     return str(Path(shim).resolve()) if shim else sys.executable
 
 
+def render_command(head: str, tail: Sequence[str], *, windows: bool) -> str:
+    """One handler command line: ``head`` stays a single literal argument — a
+    PowerShell single-quoted string after the call operator on Windows, a
+    POSIX-quoted shell word elsewhere."""
+    if windows:
+        literal = "'" + head.replace("'", "''") + "'"
+        return " ".join(["&", literal, *tail])
+    return " ".join([shlex.quote(head), *tail])
+
+
 def transform_command() -> str:
-    """The handler command string (the executable plus the reserved argv)."""
-    module_form = ("-m", "mnemoseed_local.cli") + TRANSFORM_ARGS
-    tail = TRANSFORM_ARGS if shutil.which("mnemoseed-local") else module_form
-    return _join_command([transform_executable(), *tail])
-
-
-def _join_command(argv: list[str]) -> str:
-    head, *tail = argv
-    joined = f'"{head}"' if " " in head else head
-    return " ".join([joined, *tail])
+    """The handler command string: the executable plus the reserved argv tail
+    (the shim form when ``mnemoseed-local`` is on PATH, else the module form)."""
+    tail = (
+        TRANSFORM_ARGS if shutil.which("mnemoseed-local") else ("-m", "mnemoseed_local.cli", *TRANSFORM_ARGS)
+    )
+    return render_command(transform_executable(), tail, windows=os.name == "nt")
 
 
 def is_ours(handler: object) -> bool:
@@ -146,79 +151,149 @@ def _handler() -> dict[str, object]:
 def _group_handlers(group: object) -> list[object] | None:
     if not isinstance(group, dict):
         return None
-    handlers = group.get("hooks")
+    handlers = group.get(HOOKS_KEY)
     return handlers if isinstance(handlers, list) else None
 
 
-def _iter_ours(data: dict[str, object]) -> Iterator[tuple[str, dict[str, object], dict[str, object]]]:
-    """Yield ``(event, matcher group, handler)`` for every marker-matched entry."""
-    for event in HOOK_EVENTS:
-        groups = data.get(event)
-        if not isinstance(groups, list):
+def _iter_group_handlers(groups: object) -> Iterator[tuple[dict[str, object], dict[str, object]]]:
+    """Yield ``(matcher group, handler)`` for every object handler in a list."""
+    if not isinstance(groups, list):
+        return
+    for group in groups:
+        if not isinstance(group, dict):
             continue
-        for group in groups:
-            handlers = _group_handlers(group)
-            if handlers is None or not isinstance(group, dict):
-                continue
-            for handler in handlers:
-                if isinstance(handler, dict) and is_ours(handler):
-                    yield event, group, handler
+        for handler in _group_handlers(group) or []:
+            if isinstance(handler, dict):
+                yield group, handler
 
 
-def _merge_hooks(target: Path, data: dict[str, object], dry_run: bool) -> bool:
-    """Merge one marked handler group per event; returns whether bytes moved."""
-    for event in HOOK_EVENTS:
-        groups = data.get(event)
-        if isinstance(groups, list):
-            if not any(is_ours(h) for g in groups for h in _group_handlers(g) or []):
-                groups.append({"hooks": [_handler()]})
+def _strip_event(groups: list[object]) -> bool:
+    """Drop marker-owned handlers from one event's group list; a group left
+    without handlers survives only when it carries metadata of its own."""
+    changed = False
+    kept: list[object] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept.append(group)
             continue
-        if groups is not None:
-            raise ConfigParseError(f"{target}: {event} exists but is not a list — fix it manually")
-        data[event] = [{"hooks": [_handler()]}]
-    return write_atomic(target, data, dry_run=dry_run)
+        handlers = _group_handlers(group)
+        if handlers is None:
+            kept.append(group)
+            continue
+        remaining = [handler for handler in handlers if not is_ours(handler)]
+        if len(remaining) == len(handlers):
+            kept.append(group)
+            continue
+        changed = True
+        if not remaining and set(group) == {HOOKS_KEY}:
+            continue
+        group[HOOKS_KEY] = remaining
+        kept.append(group)
+    groups[:] = kept
+    return changed
 
 
-def _loose_ours(data: dict[str, object]) -> list[str]:
+def _strip_event_in(holder: dict[str, object], event: str) -> bool:
+    """Strip one event of one holder (nested container or flat root); an event
+    left without groups goes with them."""
+    groups = holder.get(event)
+    if not isinstance(groups, list):
+        return False
+    changed = _strip_event(groups)
+    if changed and not groups:
+        del holder[event]
+    return changed
+
+
+def _strip_own(data: dict[str, object], container: dict[str, object] | None) -> bool:
+    """Remove every marker-owned handler from both shapes; an emptied nested
+    container goes too. Returns whether the document would change."""
+    changed = False
+    for holder in [container, data] if container is not None else [data]:
+        for event in HOOK_EVENTS:
+            changed = _strip_event_in(holder, event) or changed
+    if container is not None and not container and changed:
+        data.pop(HOOKS_KEY, None)
+    return changed
+
+
+def _is_canonical(groups: object, handler: dict[str, object]) -> bool:
+    """Whether one event already carries exactly our canonical handler alone,
+    in an unfiltered group holding no keys besides its handlers."""
+    own = [(group, entry) for group, entry in _iter_group_handlers(groups) if is_ours(entry)]
+    return (
+        len(own) == 1
+        and own[0][1] == handler
+        and set(own[0][0]) == {HOOKS_KEY}
+        and _group_handlers(own[0][0]) == [handler]
+    )
+
+
+def _merge_events(data: dict[str, object], container: dict[str, object]) -> bool:
+    """Strip marker-owned handlers from both shapes, then keep one canonical
+    group per event inside the nested container."""
+    handler = _handler()
+    changed = False
+    for event in HOOK_EVENTS:
+        changed = _strip_event_in(data, event) or changed
+        if _is_canonical(container.get(event), handler):
+            continue
+        changed = _strip_event_in(container, event) or changed
+        existing = container.get(event)
+        groups: list[object] = existing if isinstance(existing, list) else []
+        container[event] = groups
+        groups.append({HOOKS_KEY: [handler]})
+        changed = True
+    return changed
+
+
+def _loose_commands(data: dict[str, object], container: dict[str, object] | None) -> list[str]:
     """Commands that merely mention the marker — never decisions, only notes."""
-    found = set()
-    for event in HOOK_EVENTS:
-        groups = data.get(event)
-        if not isinstance(groups, list):
-            continue
-        for group in groups:
-            for handler in _group_handlers(group) or []:
-                if isinstance(handler, dict) and _looks_like_ours(handler) and not is_ours(handler):
+    found: set[str] = set()
+    for holder in [container, data] if container is not None else [data]:
+        for event in HOOK_EVENTS:
+            for _, handler in _iter_group_handlers(holder.get(event)):
+                if _looks_like_ours(handler) and not is_ours(handler):
                     found.add(str(handler.get("command", "")))
     return sorted(found)
 
 
-def _strip_hooks(target: Path, dry_run: bool = False) -> bool:
-    """Remove only marker-matched entries; foreign hooks stay value-identical."""
-    if not target.is_file():
-        return False
-    data = load_object(target)
-    loose = _loose_ours(data)
-    existed = False
-    # materialize first: removals mutate the containers being iterated
-    for event, group, handler in list(_iter_ours(data)):
-        existed = True
-        handlers = _group_handlers(group) or []
-        handlers.remove(handler)
-        if not handlers:
-            groups = data.get(event)
-            if isinstance(groups, list):
-                groups.remove(group)
-                if not groups:
-                    del data[event]
-    if existed:
-        write_atomic(target, data, dry_run=dry_run)
-    if loose:
-        print(
-            "note: kept foreign hook command(s) that merely mention mnemoseed-local: " + "; ".join(loose),
-            file=sys.stderr,
-        )
-    return existed
+# ------------------------------------------------------------ schema validation
+
+
+def _validate_groups(target: Path, event: str, groups: object) -> None:
+    """One event's value must be matcher groups of object handlers."""
+    if not isinstance(groups, list):
+        raise ConfigParseError(f"{target}: {event} is not a list of matcher groups — fix it manually")
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ConfigParseError(
+                f"{target}: {event} holds a matcher group that is not an object — fix it manually"
+            )
+        handlers = group.get(HOOKS_KEY)
+        if HOOKS_KEY in group and not isinstance(handlers, list):
+            raise ConfigParseError(
+                f"{target}: {event} holds a group whose hooks is not a list — fix it manually"
+            )
+        for handler in handlers or []:
+            if not isinstance(handler, dict):
+                raise ConfigParseError(
+                    f"{target}: {event} holds a hook handler that is not an object — fix it manually"
+                )
+
+
+def _validate(target: Path, data: dict[str, object]) -> dict[str, object] | None:
+    """Refuse an unexpected container / known-event / group shape; returns the
+    nested ``hooks`` container when the file already carries one."""
+    container = data.get(HOOKS_KEY)
+    if HOOKS_KEY in data and not isinstance(container, dict):
+        raise ConfigParseError(f"{target}: {HOOKS_KEY} is not an object of hook events — fix it manually")
+    for event in HOOK_EVENTS:
+        if isinstance(container, dict) and event in container:
+            _validate_groups(target, event, container[event])
+        if event in data:
+            _validate_groups(target, event, data[event])
+    return container if isinstance(container, dict) else None
 
 
 # ------------------------------------------------------------ config.toml marker-block surgery
@@ -322,80 +397,60 @@ def _remove_table(text: str) -> tuple[str, bool]:
 
 
 def install(dry_run: bool = False) -> tuple[Path, bool]:
-    """Merge one marked handler group per event into hooks.json and the
+    """Merge one canonical handler group per event into hooks.json and the
     canonical MCP entry into config.toml; returns ``(hooks path, changed)``.
     Both targets validate before either writes; a dry run previews without
     writing."""
     target = hooks_path()
     data = load_object(target)
+    container = _validate(target, data)
     config = config_path()
     text = _load_config(config)
     _require_replaceable(config, _parsed(text))
     new_config, mcp_changed = _replace_table(text, _canonical_mcp_block())
     if mcp_changed:
         _verify_toml(config, new_config)
-    hooks_changed = _merge_hooks(target, data, dry_run)
+    if container is None:
+        container = {}
+        data[HOOKS_KEY] = container
+    hooks_changed = _merge_events(data, container)
+    if hooks_changed:
+        hooks_changed = write_atomic(target, data, dry_run=dry_run)
     if mcp_changed:
-        write_text_atomic(config, new_config, dry_run=dry_run)
+        mcp_changed = write_text_atomic(config, new_config, dry_run=dry_run)
     if hooks_changed and not dry_run:
         print("next: review and trust the hooks once inside Codex via /hooks")
     return target, hooks_changed or mcp_changed
 
 
 def uninstall(dry_run: bool = False) -> tuple[Path, bool]:
-    """Remove only marker-matched hook entries and the canonical MCP table;
-    foreign hooks, MCP entries, and any other config bytes stay value-
-    identical. Returns ``(hooks path, existed)``."""
+    """Remove only marker-owned hook entries and the canonical MCP table;
+    foreign groups, metadata, handlers and config text stay value-identical.
+    Returns ``(hooks path, existed)``."""
     target = hooks_path()
+    data = load_object(target)
+    container = _validate(target, data)
+    loose = _loose_commands(data, container)
     config = config_path()
     text = _load_config(config)
     _require_replaceable(config, _parsed(text))
     new_config, removed = _remove_table(text)
     if removed:
         _verify_toml(config, new_config)
-    existed = _strip_hooks(target, dry_run=dry_run)
+    hooks_changed = _strip_own(data, container)
+    if hooks_changed:
+        write_atomic(target, data, dry_run=dry_run)
     if removed:
         write_text_atomic(config, new_config, dry_run=dry_run)
-    return target, existed or removed
+    if loose:
+        print(
+            "note: kept foreign hook command(s) that merely mention mnemoseed-local: " + "; ".join(loose),
+            file=sys.stderr,
+        )
+    return target, hooks_changed or removed
 
 
-# ------------------------------------------------------------ status + trust
-
-
-def _content_digest(hooks_file: Path) -> str | None:
-    try:
-        return hashlib.sha256(hooks_file.read_bytes()).hexdigest()
-    except OSError:
-        return None
-
-
-def _trusted_hashes(target: Path) -> set[str]:
-    """Every ``trusted_hash`` Codex recorded under ``[hooks.state]``; an
-    unreadable or absent config means nothing was trusted yet."""
-    try:
-        parsed = _parsed(_read_config(target))
-    except (OSError, ValueError):
-        return set()
-    hooks = parsed.get(HOOKS_KEY)
-    state = hooks.get(STATE_KEY) if isinstance(hooks, dict) else None
-    if not isinstance(state, dict):
-        return set()
-    found: set[str] = set()
-    for record in state.values():
-        if isinstance(record, dict):
-            digest = record.get(TRUSTED_HASH_KEY)
-            if isinstance(digest, str) and digest:
-                found.add(digest)
-    return found
-
-
-def _trust_state(hooks_file: Path) -> str:
-    """The three honest trust states from config.toml's ``[hooks.state]``."""
-    entries = _trusted_hashes(config_path())
-    if not entries:
-        return TRUST_PENDING
-    digest = _content_digest(hooks_file)
-    return "installed" if digest is not None and digest in entries else TRUST_STALE
+# ------------------------------------------------------------ status
 
 
 def _mcp_present(parsed: dict[str, Any]) -> bool:
@@ -404,49 +459,56 @@ def _mcp_present(parsed: dict[str, Any]) -> bool:
     return entry == {MCP_COMMAND_KEY: transform_executable(), MCP_ARGS_KEY: list(MCP_GATEWAY_ARGS)}
 
 
-def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
-    """Marker-detection state + shared /healthz reachability probe.
+def _has_own(groups: object) -> bool:
+    return any(is_ours(handler) for _, handler in _iter_group_handlers(groups))
 
-    States: ``not-installed`` / ``partial`` (some event lacks our entry, or
-    the MCP entry is missing or drifted) / ``differs`` (hooks.json exists but
-    does not strict-parse) / the three trust states of a full install.
-    """
-    target = path or hooks_path()
-    state = "differs"
+
+def _flat_own(data: dict[str, object]) -> bool:
+    """Marker-owned handlers in the flat root shape."""
+    return any(_has_own(data.get(event)) for event in HOOK_EVENTS)
+
+
+def _any_own(data: dict[str, object], container: dict[str, object] | None) -> bool:
+    if _flat_own(data):
+        return True
+    return container is not None and any(_has_own(container.get(event)) for event in HOOK_EVENTS)
+
+
+def _structural_state(target: Path) -> str:
+    """The structural install state alone; daemon reachability is reported apart."""
     try:
         data = load_object(target)
+        container = _validate(target, data)
+        parsed = _parsed(_load_config(config_path()))
     except ConfigParseError:
-        data = {}
-    else:
-        present = sum(1 for event in HOOK_EVENTS if _has_ours(data, event))
-        if present == 0:
-            state = "not-installed"
-        elif present < len(HOOK_EVENTS) or not _mcp_entry_live():
-            state = "partial"
-        else:
-            state = _trust_state(target)
+        return "malformed"
+    handler = _handler()
+    complete = (
+        isinstance(container, dict)
+        and not _flat_own(data)
+        and _mcp_present(parsed)
+        and all(_is_canonical(container.get(event), handler) for event in HOOK_EVENTS)
+    )
+    if complete:
+        return TRUST_UNVERIFIED
+    return "partial" if _any_own(data, container) else "not-installed"
+
+
+def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
+    """Structural state of the sandbox Codex home plus the shared /healthz
+    reachability probe.
+
+    States: ``not-installed`` / ``partial`` (a known event lacks our canonical
+    handler, the shape is legacy flat, or the MCP entry is missing or drifted) /
+    ``malformed`` (hooks.json or config.toml does not parse or has an unexpected
+    shape) / the trust-unverified state of a complete canonical install.
+    """
+    target = path or hooks_path()
     resolved_base = base_url if base_url is not None else shared.resolve_base_url()
     return HookStatus(
         root=codex_home(),
         path=target,
-        state=state,
+        state=_structural_state(target),
         daemon_reachable=shared.daemon_reachable(resolved_base),
         base_url=resolved_base,
     )
-
-
-def _mcp_entry_live() -> bool:
-    """The canonical MCP entry as the file stands now; an unreadable config
-    reads as absent (a read-only probe never raises)."""
-    try:
-        parsed = _parsed(_read_config(config_path()))
-    except ConfigParseError:
-        return False
-    return _mcp_present(parsed)
-
-
-def _has_ours(data: dict[str, object], event: str) -> bool:
-    groups = data.get(event)
-    if not isinstance(groups, list):
-        return False
-    return any(isinstance(h, dict) and is_ours(h) for g in groups for h in _group_handlers(g) or [])

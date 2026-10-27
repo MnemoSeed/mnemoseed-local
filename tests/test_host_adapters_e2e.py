@@ -333,7 +333,8 @@ def test_zcode_host_chain_end_to_end_on_a_real_daemon(
 # ---------------------------------------------------------------- codex chain
 
 
-CX_FOREIGN_HOOKS = {"Stop": [{"hooks": [{"type": "command", "command": "my-own-hook --flag"}]}]}
+CX_FOREIGN_GROUP = {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-own-hook --flag"}]}
+CX_FOREIGN_HOOKS = {"hooks": {"Stop": [CX_FOREIGN_GROUP]}}
 CX_FOREIGN_CONFIG_TOML = (
     "# user tuning\n"
     'model = "gpt-5-codex"\n'
@@ -402,9 +403,14 @@ def test_codex_host_chain_end_to_end_on_a_real_daemon(
     assert main(["host", "install", "--host", "codex_cli"]) == 0
     capsys.readouterr()
     installed = json.loads(hooks_path.read_text(encoding="utf-8"))
-    assert set(installed) == {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
+    assert set(installed) == {"hooks"}
+    container = installed["hooks"]
+    assert set(container) == {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
+    assert container["Stop"][0] == CX_FOREIGN_HOOKS["hooks"]["Stop"][0], "the foreign group survives install"
     assert main(["host", "status", "--host", "codex_cli"]) == 0
-    assert "installed, not yet trusted" in capsys.readouterr().out
+    status_out = capsys.readouterr().out
+    assert "unverified" in status_out
+    assert "/hooks" in status_out
     assert "[mcp_servers.mnemoseed]" in config_path.read_text(encoding="utf-8")
 
     rollout_a = _write_rollout(

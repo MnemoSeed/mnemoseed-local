@@ -187,17 +187,46 @@ def test_unknown_layer_resolution_names_key():
         Config().layer_instances("unknown")
 
 
-def test_dream_auto_trigger_defaults_to_true(tmp_path, monkeypatch):
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    cfg = load_config(tmp_path / "missing.toml")
-    assert cfg.dream.auto_trigger is True
+_AUTO_FLAG_KEYS: dict[str, tuple[str, str]] = {
+    "dream": ("auto_trigger", "floor_pool_points = 10.0"),
+    "capture": ("auto_recall", "auto_recall_focal_floor = 0.5"),
+}
 
 
-def test_dream_auto_trigger_parses(tmp_path, monkeypatch):
+def _auto_flag(cfg: Config, table: str) -> bool:
+    """The auto flag a table carries (dream or capture)."""
+    return cfg.dream.auto_trigger if table == "dream" else cfg.capture.auto_recall
+
+
+@pytest.mark.parametrize("table", ["dream", "capture"])
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("missing-file", True),
+        ("missing-table", True),
+        ("empty-table", True),
+        ("missing-key", True),
+        ("explicit-true", True),
+        ("explicit-false", False),
+    ],
+)
+def test_auto_flag_load_matrix(tmp_path, monkeypatch, table, scenario, expected):
+    """An absent table or absent key resolves ON; an explicit value is preserved."""
     monkeypatch.delenv("STORAGE_MODE", raising=False)
-    p = tmp_path / "config.toml"
-    _write(p, 'preset = "embedded"\n[dream]\nauto_trigger = true\n')
-    assert load_config(p).dream.auto_trigger is True
+    key, sibling = _AUTO_FLAG_KEYS[table]
+    other_table = "capture" if table == "dream" else "dream"
+    body = {
+        "missing-file": None,
+        "missing-table": f'preset = "embedded"\n[{other_table}]\n',
+        "empty-table": f"[{table}]\n",
+        "missing-key": f"[{table}]\n{sibling}\n",
+        "explicit-true": f"[{table}]\n{key} = true\n",
+        "explicit-false": f"[{table}]\n{key} = false\n",
+    }[scenario]
+    path = tmp_path / "config.toml"
+    if body is not None:
+        _write(path, body)
+    assert _auto_flag(load_config(path), table) is expected
 
 
 def test_dream_table_must_be_a_table(tmp_path, monkeypatch):
