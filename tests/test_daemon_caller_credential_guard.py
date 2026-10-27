@@ -440,6 +440,7 @@ KNOWN_CALLERS: dict[str, str] = {
     "scripts/gate.ps1": OPEN_SET,
     "scripts/probe_mcp_http.py": CREDENTIALED,
     "scripts/sanitize_atlas_evidence.py": OPEN_SET,
+    "scripts/verify_release_install.py": OPEN_SET,
     "scripts/windows-install-helpers.ps1": OPEN_SET,
     "scripts/windows-logon-task.ps1": OPEN_SET,
     "scripts/windows-logon.ps1": OPEN_SET,

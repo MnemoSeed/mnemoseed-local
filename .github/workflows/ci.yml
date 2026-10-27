@@ -118,3 +118,29 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: .\install.ps1 -DryRun
+
+  release-install-verify:
+    # Build the wheel and sdist from the checkout, install the wheel with its
+    # codex extra into an isolated uv tool dir, and verify the installed
+    # surface on a clean runner. The structured proof uploads even on failure.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Verify the built wheel on a clean runner
+        run: uv run --no-project python scripts/verify_release_install.py --report release-proof/verify-release-install.json
+      - name: Upload install proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-install-proof-${{ matrix.os }}
+          path: release-proof/
+          if-no-files-found: warn
+          retention-days: 14

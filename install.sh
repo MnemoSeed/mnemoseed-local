@@ -13,7 +13,7 @@
 #   2. detect / install uv       (official installer; well-known install dir is
 #      prepended to the current process PATH)
 #   3. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
-#      to the exact mnemoseed-local==<version> spec; never a floating latest)
+#      to the exact mnemoseed-local[codex]==<version> spec; never a floating latest)
 #   4. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
 #   5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
 #      the script never changes config keys itself
@@ -47,7 +47,7 @@ UV_BIN_DIR="$HOME/.local/bin"
 DEFAULT_MODEL='qwen3.5:9b'
 # The exact wheel spec: a floating `latest` would silently track main. Keep in
 # lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
-CLI_PIN='mnemoseed-local==0.0.1'
+CLI_PIN='mnemoseed-local[codex]==0.2.0'
 OLLAMA_URL='https://ollama.com/install.sh'
 UV_URL='https://astral.sh/uv/install.sh'
 
@@ -238,10 +238,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' '[3] mnemoseed-local CLI'
     if have mnemoseed-local; then
         printf '%s\n' "    probe: mnemoseed-local command FOUND at $(command -v mnemoseed-local)"
-        printf '%s\n' "    plan:  would run \`uv tool upgrade $CLI_PIN\`"
+        printf '%s\n' "    plan:  would run \`uv tool upgrade --python 3.12 $CLI_PIN\`"
     else
         printf '%s\n' '    probe: mnemoseed-local command NOT FOUND'
-        printf '%s\n' "    plan:  would run \`uv tool install $CLI_PIN\`"
+        printf '%s\n' "    plan:  would run \`uv tool install --python 3.12 $CLI_PIN\`"
     fi
     printf '%s\n' '[4] init'
     printf '%s\n' "    plan:  would run \`mnemoseed-local init\` when $CONFIG_PATH does not exist; skipped when present"
@@ -309,13 +309,13 @@ prepend_path "$UV_BIN_DIR"
 printf '%s\n' '[3/8] mnemoseed-local CLI'
 if have mnemoseed-local; then
     printf '%s\n' "      found - upgrading via uv tool ($CLI_PIN)..."
-    if ! uv tool upgrade "$CLI_PIN"; then
-        die "'uv tool upgrade $CLI_PIN' failed"
+    if ! uv tool upgrade --python 3.12 "$CLI_PIN"; then
+        die "'uv tool upgrade --python 3.12 $CLI_PIN' failed"
     fi
 else
     printf '%s\n' "      not found - installing via uv tool ($CLI_PIN)..."
-    if ! uv tool install "$CLI_PIN"; then
-        die "'uv tool install $CLI_PIN' failed"
+    if ! uv tool install --python 3.12 "$CLI_PIN"; then
+        die "'uv tool install --python 3.12 $CLI_PIN' failed"
     fi
 fi
 have mnemoseed-local || die "mnemoseed-local was installed but is not on PATH; add $UV_BIN_DIR to PATH and re-run"

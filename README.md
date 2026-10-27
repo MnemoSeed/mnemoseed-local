@@ -157,13 +157,22 @@ The ZCode and Codex CLI adapters install through the `host` command group:
 `mnemoseed-local host install --host zcode` registers four ZCode hook events
 plus the loopback MCP entry in `~/.zcode/cli/config.json`, and
 `mnemoseed-local host install --host codex_cli` writes the user-level Codex
-`hooks.json` plus the stdio gateway entry in `config.toml` (Codex then asks
-you to review and trust the hooks once via `/hooks`; `host status` reports
-that trust state honestly). Lifecycle:
+`hooks.json` plus the stdio gateway entry in `config.toml`. The hooks file
+keeps one top-level `hooks` object — event name to matcher groups, each group
+holding `type: command` handlers; install adds one MnemoSeed group per
+subscribed event and rewrites only its own marked handlers, so your own
+groups, their matcher and metadata fields, and the rest of `config.toml` keep
+their bytes.
+`host status` reports the structure of that install as `not-installed`,
+`partial` or `malformed`, and a complete install as *trust unverified*:
+MnemoSeed never reads or writes a Codex trust record, and daemon reachability
+is reported separately from the structure. Approving the hooks is your own
+one-time step inside Codex — nothing fires as trusted before you run `/hooks`
+and review them there. Lifecycle:
 `mnemoseed-local host {install|uninstall|status} --host zcode|codex_cli`.
 The Codex adapter needs the optional `[codex]` extra
-(`uv tool install --force '.[codex]'`) for zstandard-compressed rollout
-transcripts.
+(`uv tool install --force '.[codex]'`), which provides `zstandard` for
+compressed rollout transcripts.
 Profile namespaces are managed on the running daemon:
 `mnemoseed-local profile {create|list|archive|unarchive}` (archiving never
 deletes data and does not unbind agents).
