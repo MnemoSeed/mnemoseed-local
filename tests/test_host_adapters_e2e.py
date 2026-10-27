@@ -39,6 +39,7 @@ from mnemoseed_local.cli import main
 from mnemoseed_local.daemon.app import create_app
 from mnemoseed_local.hosts.common.fence import RECALL_DISCLAIMER, RECALL_FENCE_CLOSE, RECALL_FENCE_OPEN
 from mnemoseed_local.hosts.common.recall import CAPTURE_SIGNAL, T1_SIGNAL, T2_SIGNAL
+from mnemoseed_local.hosts.zcode import install as zc_install
 from mnemoseed_local.rest_client import DaemonClient
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -208,10 +209,7 @@ def test_zcode_host_chain_end_to_end_on_a_real_daemon(
     installed = json.loads(config_path.read_text(encoding="utf-8"))
     assert installed["hooks"]["enabled"] is True
     assert set(installed["hooks"]["events"]) == {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
-    assert installed["mcp"]["servers"]["mnemoseed-local"] == {
-        "type": "http",
-        "url": "http://localhost:7788/mcp",
-    }
+    assert installed["mcp"]["servers"]["mnemoseed-local"] == zc_install.mcp_server_entry()
     assert (host_home / ".zcode" / "cli" / "mnemoseed-local.json").is_file()
     assert main(["host", "status", "--host", "zcode"]) == 0
     status = capsys.readouterr().out

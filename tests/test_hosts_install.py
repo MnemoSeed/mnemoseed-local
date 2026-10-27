@@ -275,7 +275,7 @@ def test_status_base_url_follows_env_override(opencode_home: Path, monkeypatch: 
 # ---------------------------------------------------------------- daemon probe
 
 
-def test_daemon_probe_hits_healthz_with_2s_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_daemon_probe_hits_healthz_with_5s_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, object] = {}
 
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
@@ -286,7 +286,7 @@ def test_daemon_probe_hits_healthz_with_2s_timeout(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(httpx, "get", fake_get)
     assert install.daemon_reachable("http://localhost:7788/") is True
     assert calls["url"] == "http://localhost:7788/healthz"
-    assert calls["timeout"] == 2.0
+    assert calls["timeout"] == 5.0
 
 
 def test_daemon_probe_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
