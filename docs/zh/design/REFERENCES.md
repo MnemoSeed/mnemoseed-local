@@ -122,6 +122,7 @@
 |---|---|---|---|---|
 | R54 | Lee, J. D., & See, K. A. (2004). Trust in automation: Designing for appropriate reliance. *Human Factors*, 46(1), 50–80. DOI: 10.1518/hfes.46.1.50.30392 | 自动化信任校准：系统行为的可观察性支撑适度依赖 → 自动记忆动作在发生时以紧凑、真实（绝不伪造）的信号外显 | PRD-273 | ✅ Crossref 核验命中（标题检索：title/year/venue/volume/issue/page 全对） |
 | R55 | Parasuraman, R., & Riley, V. (1997). Humans and automation: Use, misuse, disuse, abuse. *Human Factors*, 39(2), 230–253. DOI: 10.1518/001872097778543886 | 不可观察的自动化招致 misuse/disuse → 可见性默认 compact（外显）+ off 可退的依据 | PRD-273 | ✅ Crossref 核验命中（DOI 直接解析，author/year/venue/volume/issue/page 全对） |
+| R56 | von Restorff, H. (1933). Über die Wirkung von Bereichsbildungen im Spurenfeld. *Psychologische Forschung*, 18, 299–342; Hunt, R. R., & Worthen, J. B. (Eds.) (2006). *Distinctiveness and Memory*. Oxford University Press. | 独特性效应：与背景差异显著的项记忆更牢 → 精炼优先保留差异事件（错误→修复、决策反转），平淡内容只做摘要 | 11 | ⚠️ 高置信经典但本轮未直接核验——标注待抽查 |
 
 > 本节未入册说明：默认 compact 与 verbose 计数频率为工程判断，不锚任何文献；多巴胺/奖励回路、游戏化反馈、"透明必然建立信任"口号式主张均未达实证门槛，不入册。
 
