@@ -1,0 +1,484 @@
+{
+  "status": "observed",
+  "pairs": [
+    {
+      "pair_id": "share-01",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "5f6375a9a0894ab8858eec7710abbf2b",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-02",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "d689cc83530243f88027250d62eaeb71",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-03",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "c6eae74a566f4870b5fbad292882d594",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-04",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "insufficient",
+        "reason_class": "insufficient",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "disagreement",
+        "disposition": "deferred",
+        "reason": "seat_disagreement"
+      }
+    },
+    {
+      "pair_id": "share-05",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "12e4e9f05c3c489aa8003c9312527ad6",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-06",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "b3cea0e1079c464f83644dba72355e15",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-07",
+      "left_id": "1e4ea1caee2e44ecaebd62f4987bff21",
+      "right_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-08",
+      "left_id": "5f6375a9a0894ab8858eec7710abbf2b",
+      "right_id": "d689cc83530243f88027250d62eaeb71",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-09",
+      "left_id": "5f6375a9a0894ab8858eec7710abbf2b",
+      "right_id": "c6eae74a566f4870b5fbad292882d594",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "share-10",
+      "left_id": "5f6375a9a0894ab8858eec7710abbf2b",
+      "right_id": "6ca41b1824d94f7685a7dcb31b9d9937",
+      "category": "sharing",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-01",
+      "left_id": "c6eae74a566f4870b5fbad292882d594",
+      "right_id": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-02",
+      "left_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "right_id": "2f323f60ba7d4a7a861ab73a8c6fd038",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-03",
+      "left_id": "c6eae74a566f4870b5fbad292882d594",
+      "right_id": "82c5f4695c8c4f64b83127400411b90f",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "insufficient",
+        "reason_class": "insufficient",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "disagreement",
+        "disposition": "deferred",
+        "reason": "seat_disagreement"
+      }
+    },
+    {
+      "pair_id": "disjoint-04",
+      "left_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "right_id": "82c5f4695c8c4f64b83127400411b90f",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-05",
+      "left_id": "c6eae74a566f4870b5fbad292882d594",
+      "right_id": "87f4aae6987e42b69d0203915c20b3aa",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-06",
+      "left_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "right_id": "87f4aae6987e42b69d0203915c20b3aa",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "conflict",
+        "reason_class": "conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "conflict",
+        "reason_class": "conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "conflict",
+        "disposition": "accepted",
+        "reason": "both_seats_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-07",
+      "left_id": "c6eae74a566f4870b5fbad292882d594",
+      "right_id": "19d2aa2c09334e42ad21775edb74e975",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-08",
+      "left_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "right_id": "19d2aa2c09334e42ad21775edb74e975",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "conflict",
+        "reason_class": "conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "conflict",
+        "reason_class": "conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "conflict",
+        "disposition": "accepted",
+        "reason": "both_seats_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-09",
+      "left_id": "c6eae74a566f4870b5fbad292882d594",
+      "right_id": "8a93bd6790584a108b84cb758215802c",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    },
+    {
+      "pair_id": "disjoint-10",
+      "left_id": "e9074dd785b04f9783ba0c8ed004e04e",
+      "right_id": "8a93bd6790584a108b84cb758215802c",
+      "category": "disjoint",
+      "seat_a": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "seat_b": {
+        "verdict": "not_conflict",
+        "reason_class": "no_conflict_observed",
+        "status": "complete"
+      },
+      "result": {
+        "verdict": "not_conflict",
+        "disposition": "rejected",
+        "reason": "both_seats_not_conflict"
+      }
+    }
+  ],
+  "aggregate": {
+    "accepted": 2,
+    "rejected": 16,
+    "deferred": 2,
+    "unresolved": 0,
+    "seat_agreement": 0.9,
+    "genuine_conflict_found_by_either_seat": true,
+    "conflict_rate": 0.1,
+    "agreement_rate": 0.9,
+    "denominator": 20,
+    "tokens": {
+      "prompt": 9636,
+      "completion": 3597,
+      "total": 13233
+    }
+  },
+  "comparison": {
+    "run_2": "not_compared",
+    "run_2b": "not_compared",
+    "run_6": "not_compared"
+  },
+  "sampling": {
+    "method": "recall_probe_deduplication",
+    "probe_queries": [
+      "project",
+      "bug",
+      "meeting",
+      "design",
+      "deploy",
+      "test",
+      "error",
+      "plan",
+      "review",
+      "idea",
+      "config",
+      "deadline"
+    ],
+    "memories_collected": 58,
+    "shortfall": 0,
+    "sharing_pairs": 10,
+    "background_pairs": 10
+  },
+  "probe": {
+    "classification": "ok",
+    "http_status": 200,
+    "endpoint": "http://localhost:7788/memory/recall"
+  },
+  "luna": {
+    "status": "complete",
+    "model": "gpt-5.6-luna",
+    "route": "openai_compatible|gpt-5.6-luna|https://api.experientiallabs.ai/v1|EVAL_LUNA_KEY|120|8192",
+    "calls": 40,
+    "duration_seconds": 1195.8881858,
+    "tokens": {
+      "prompt": 9636,
+      "completion": 3597,
+      "total": 13233
+    }
+  }
+}
