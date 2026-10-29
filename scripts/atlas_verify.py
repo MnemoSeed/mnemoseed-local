@@ -289,21 +289,29 @@ def _windows_process_gone(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def _signal_group(pid: int, sig: int) -> None:
+def _signal_group(group: int, sig: int) -> None:
     """Signal the group a spawned process leads; an emptied group needs nothing."""
     try:
-        os.killpg(pid, sig)
+        os.killpg(group, sig)
     except ProcessLookupError:
         return
 
 
-def _group_is_populated(pid: int) -> bool:
+def _group_is_populated(group: int) -> bool:
     """Whether the group a spawned process led still holds a process."""
     try:
-        os.killpg(pid, 0)
+        os.killpg(group, 0)
     except ProcessLookupError:
         return False
     return True
+
+
+def _leading_group(process: subprocess.Popen[bytes]) -> int:
+    """The process group the spawned tree lives in, asked of the kernel at spawn."""
+    try:
+        return os.getpgid(process.pid)
+    except ProcessLookupError:
+        return process.pid
 
 
 class OwnedDaemon:
@@ -314,9 +322,12 @@ class OwnedDaemon:
     held has left, so a process this run never started stays out of reach.
     """
 
-    def __init__(self, process: subprocess.Popen[bytes], job: int | None = None) -> None:
+    def __init__(
+        self, process: subprocess.Popen[bytes], job: int | None = None, pgid: int | None = None
+    ) -> None:
         self.process = process
         self.job = job
+        self.pgid = process.pid if pgid is None else pgid
 
     @property
     def pid(self) -> int:
@@ -339,7 +350,9 @@ class OwnedDaemon:
         Windows asks the job for its members and waits on each one by handle,
         which reaches a descendant whose launcher already left. Elsewhere the
         process this run started is collected as this process's own child and
-        the group it led is probed whole, so a live group reports as its leader.
+        the group recorded at spawn is polled until the deadline, so a group
+        that is still emptying does not report as survivors; a live group
+        reports as its leader.
         """
         deadline = time.monotonic() + timeout
         if self.job is not None:
@@ -352,26 +365,33 @@ class OwnedDaemon:
             self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
-        return (self.pid,) if _group_is_populated(self.pid) else ()
+        while True:
+            if not _group_is_populated(self.pgid):
+                return ()
+            if time.monotonic() >= deadline:
+                return (self.pid,)
+            time.sleep(SURVIVOR_POLL_SECONDS)
 
     def _end_tree(self, sig: int) -> None:
         """End the whole owned tree through the container that holds it."""
         if self.job is not None:
             _terminate_job(self.job)
             return
-        _signal_group(self.pid, sig)
+        _signal_group(self.pgid, sig)
 
 
 def spawn_owned_daemon(argv: Sequence[str], *, env: Mapping[str, str], cwd: Path) -> OwnedDaemon:
     """Start a daemon and take ownership of its tree as that tree is created.
 
     What teardown acts on later is the record taken here: the pid this run
-    started, inside the container that holds its descendants. Nothing is
-    selected afterwards from a process list read back out of the operating
-    system, so only this run's own tree can be reached.
+    started and the process group that holds its descendants, both captured
+    before the spawner can exit. Nothing is selected afterwards from a process
+    list read back out of the operating system, so only this run's own tree can
+    be reached.
     """
     if os.name != "nt":
-        return OwnedDaemon(subprocess.Popen(list(argv), env=dict(env), cwd=cwd, start_new_session=True))
+        process = subprocess.Popen(list(argv), env=dict(env), cwd=cwd, start_new_session=True)
+        return OwnedDaemon(process, pgid=_leading_group(process))
     job = _create_job()
     try:
         process = subprocess.Popen(list(argv), env=dict(env), cwd=cwd)
