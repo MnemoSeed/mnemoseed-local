@@ -316,6 +316,8 @@ checkout:
 - `recall`: T4b live calibration coordinate-descent (locked config: focal
   floor 0.5, budget 2400 chars).
 
+General contact: [hello@mnemoseed.my](mailto:hello@mnemoseed.my).
+
 ## License
 
 MIT.
