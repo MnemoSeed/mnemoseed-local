@@ -1142,12 +1142,23 @@ def test_dry_run_uninstall_previews_without_writing(cx_home: Path, stable_comman
     hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
     config = cx_home / "config.toml"
     config.write_text(FOREIGN_TOML, encoding="utf-8")
+    exe, command = stable_command
     cx_install.install()
+    container = _nested(json.loads(hooks_file.read_text(encoding="utf-8")))
+    assert set(container) == set(cx_install.HOOK_EVENTS)
+    for event in cx_install.HOOK_EVENTS:
+        groups = container[event]
+        owned = [group for group in groups if any(cx_install.is_ours(h) for h in group.get("hooks", []))]
+        assert owned == [_group([_handler_for(command)])], event
+    entry = tomllib.loads(config.read_text(encoding="utf-8"))["mcp_servers"]["mnemoseed"]
+    assert entry == {"command": exe, "args": ["mcp"]}
+
+    hooks_before, config_before = _digest(hooks_file), _digest(config)
     _, would_change = cx_install.uninstall(dry_run=True)
     assert would_change is True
-    installed_hooks = hooks_file.read_text(encoding="utf-8")
-    installed_config = config.read_text(encoding="utf-8")
-    assert "mnemoseed" in installed_hooks and "[mcp_servers.mnemoseed]" in installed_config
+    assert _digest(hooks_file) == hooks_before, "the dry-run preview wrote no hooks bytes"
+    assert _digest(config) == config_before, "the dry-run preview wrote no config bytes"
+
     _, existed = cx_install.uninstall()
     assert existed is True
     assert json.loads(hooks_file.read_text(encoding="utf-8")) == FOREIGN_HOOKS
