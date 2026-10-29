@@ -30,6 +30,7 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, ClassVar, cast
 from urllib.parse import urlparse
 
@@ -56,6 +57,7 @@ from mnemoseed_local.daemon.auth import (
     auth_middleware,
     console_documents,
 )
+from mnemoseed_local.daemon.idle_flush import IdleFlushSweeper
 from mnemoseed_local.daemon.ingest import router as ingest_router
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
@@ -593,6 +595,16 @@ class DreamWorker:
             return False
 
 
+def _log_drain_failure(session_id: str, future: ConcurrentFuture[Any]) -> None:
+    """Done-callback for fire-and-forget lane users: log a drain exception the
+    moment the future resolves — nobody else ever reads that future."""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.warning("drain failed for session %s: %s", session_id, exc)
+
+
 class DrainLane:
     """Runs the capture drain off the event loop on one dedicated daemon thread.
 
@@ -617,8 +629,14 @@ class DrainLane:
         self._lock = threading.Lock()
 
     def submit(self, fn: Callable[[str], Any], session_id: str) -> None:
-        """Queue one drain without awaiting (teardown submits all, then stops)."""
+        """Queue one drain without awaiting (teardown submits all, then stops).
+
+        A done-callback logs any drain exception as it resolves: a
+        fire-and-forget submitter (the idle sweeper) never reads the future,
+        and ``stop()`` only sees futures still pending at teardown.
+        """
         future = self._executor.submit(fn, session_id)
+        future.add_done_callback(partial(_log_drain_failure, session_id))
         with self._lock:
             self._pending[session_id] = future
 
@@ -638,10 +656,10 @@ class DrainLane:
         """Complete every queued drain with a bounded wait, then close the lane.
 
         Returns (completed, failed, abandoned): the drains that finished, the
-        ones that raised (a teardown-time data-loss event with no awaiting
-        handler — logged per session with the exception), and the ones wedged
-        past the deadline (never joined — the daemon worker dies with the
-        process; the host-side B2.2 replay absorbs their undrained turns).
+        ones that raised (a teardown-time data-loss event — the submit
+        done-callback logged it with the exception), and the ones wedged past
+        the deadline (never joined — the daemon worker dies with the process;
+        the host-side B2.2 replay absorbs their undrained turns).
         Close is terminal: no drain can be submitted after stop.
         """
         deadline = time.monotonic() + self._stop_timeout
@@ -672,11 +690,6 @@ class DrainLane:
                 exc = afut.exception()
                 if exc is not None:
                     failed.append(session_id)
-                    logger.warning(
-                        "teardown: drain failed for session %s: %s",
-                        session_id,
-                        exc,
-                    )
                 else:
                     completed += 1
         if abandoned:
@@ -1099,6 +1112,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # unlike the never-closed scan singleton); teardown stops it before the
     # stores close.
     app.state.drain_lane = DrainLane()
+    # Idle-session flush sweeper: the periodic durability net that drains
+    # sessions whose open turn went idle past capture.idle_flush_sec (flush
+    # semantics, no settle). The segmenter flush runs on the event loop; the
+    # store drain rides the shared drain lane.
+    app.state.idle_flush = IdleFlushSweeper(
+        app.state.segmenter, app.state.capture, config, lane=app.state.drain_lane
+    )
+    app.state.idle_flush_task = asyncio.create_task(app.state.idle_flush.run_forever())
     # Dream chain thread (T1a): the capture/memory surface never blocks on a
     # dream. Started here so the worker consumes events from boot onward.
     app.state.dream_worker.start()
@@ -1159,9 +1180,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for deg in stores.report.missing:
             logger.warning("degraded: %s - %s", deg.feature, deg.behavior)
     yield
-    # Stop the background loops before the stores close (lifecycle order).
+    # Cancel the periodic loops before the stores close (lifecycle order); the
+    # idle sweeper stops before the drain lane closes.
     logger.info("teardown: stop background loops")
-    for task_name in ("decay_task", "scheduler_task"):
+    for task_name in ("decay_task", "scheduler_task", "idle_flush_task"):
         task = getattr(app.state, task_name, None)
         if task is not None:
             task.cancel()

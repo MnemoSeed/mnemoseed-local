@@ -157,19 +157,21 @@ def _capture_recent(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tupl
 
 
 @pytest.mark.parametrize(
-    "name,event_type",
+    "name,event_type,lane",
     [
-        ("user_prompt", IngestEventType.USER_PROMPT),
-        ("tool_use", IngestEventType.TOOL_USE),
-        ("stop", IngestEventType.ASSISTANT_MESSAGE),
+        ("user_prompt", IngestEventType.USER_PROMPT, "ingest"),
+        ("tool_use", IngestEventType.TOOL_USE, "ingest"),
+        ("stop", IngestEventType.ASSISTANT_MESSAGE, "stop"),
     ],
 )
-def test_capture_fixtures_ingest_with_zcode_attribution(name: str, event_type: IngestEventType) -> None:
+def test_capture_fixtures_ingest_with_zcode_attribution(
+    name: str, event_type: IngestEventType, lane: str
+) -> None:
     fixture = _fixture(name)
     action = events.normalize_event(fixture, now=1.0)
     assert action is not None
     kind, body = action
-    assert kind == "ingest"
+    assert kind == lane
     assert isinstance(body, IngestEvent)
     assert body.host is HostId.ZCODE
     assert body.event is event_type
@@ -212,7 +214,7 @@ def test_normalized_wire_bodies_validate_against_the_daemon_schema() -> None:
         action = events.normalize_event(_fixture(name), now=1.0)
         assert action is not None
         kind, body = action
-        assert kind == "ingest"
+        assert kind == ("stop" if name == "stop" else "ingest")
         assert isinstance(body, IngestEvent)
         IngestEvent.model_validate(body.model_dump(mode="json"))
 
@@ -489,7 +491,22 @@ def test_stop_and_tool_lanes_stay_capture_only(
     for name in ("stop", "tool_use"):
         assert _run_transformer(monkeypatch, _fixture(name)) == 0
         assert capsys.readouterr().out == ""
-    assert [path for path, _ in calls] == ["/ingest", "/ingest"]
+    assert [path for path, _ in calls] == ["/ingest", "/flush", "/ingest"]
+
+
+def test_stop_persists_buffered_turns_via_flush_after_the_ingest(
+    monkeypatch: pytest.MonkeyPatch, captured_posts: list[tuple[str, dict]]
+) -> None:
+    """Stop posts the assistant ingest, then /flush for the same session: the
+    buffered turn persists at every reply end (flush semantics, never a
+    settle), so the session stays open across turns."""
+    assert _run_transformer(monkeypatch, _fixture("stop")) == 0
+    assert [path for path, _ in captured_posts] == ["/ingest", "/flush"]
+    ingest_body = captured_posts[0][1]
+    flush_body = captured_posts[1][1]
+    assert ingest_body["event"] == "assistant_message"
+    assert ingest_body["session_id"] == flush_body["session_id"] == "zc-sess-01"
+    assert flush_body["profile_id"] == "default"
 
 
 # ---------------------------------------------------------------- stdin defense (§5.4)
@@ -620,11 +637,14 @@ def test_stop_transcript_failures_degrade_to_a_model_less_event(tmp_path: Path) 
 
 
 def test_stop_never_settles_the_session() -> None:
+    """The Stop lane is persist-without-settle: its routes are /ingest and
+    /flush only — no settle route exists, so the session stays open across
+    turns and settling happens only on an explicit session end."""
     action = events.normalize_event(_stop_payload(), now=7.0)
     assert action is not None
     kind, _ = action
-    assert kind == "ingest"
-    assert events.ENDPOINTS[kind] == "/ingest"
+    assert kind == "stop"
+    assert events.ENDPOINTS == {"ingest": "/ingest", "flush": "/flush"}
 
 
 def test_post_tool_use_caps_the_output_and_flattens_the_response(

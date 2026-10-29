@@ -429,6 +429,7 @@ def _capture_apply(config: Config, field: str, value: Any) -> None:
         "auto_recall": current.auto_recall,
         "auto_recall_focal_floor": current.auto_recall_focal_floor,
         "auto_recall_budget_chars": current.auto_recall_budget_chars,
+        "idle_flush_sec": current.idle_flush_sec,
     }
     if value is not None:
         fields[field] = value
@@ -707,6 +708,16 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
         validate=_validate_positive_int,
         read=lambda config: config.capture.auto_recall_budget_chars,
         apply=lambda config, value: _capture_apply(config, "auto_recall_budget_chars", value),
+        live_apply=True,
+    ),
+    # Idle-session flush threshold: live-applied — the daemon sweeper re-reads
+    # it each tick, so a change reaches the next sweep without a restart.
+    "capture.idle_flush_sec": ConfigKey(
+        key_path="capture.idle_flush_sec",
+        value_type="positive number",
+        validate=_validate_positive_float,
+        read=lambda config: config.capture.idle_flush_sec,
+        apply=lambda config, value: _capture_apply(config, "idle_flush_sec", value),
         live_apply=True,
     ),
     # Conversation visibility: the signal mode. Live-applied — the
@@ -1001,6 +1012,7 @@ class ConfigWriteService:
                     "auto_recall": self._config.capture.auto_recall,
                     "auto_recall_focal_floor": self._config.capture.auto_recall_focal_floor,
                     "auto_recall_budget_chars": self._config.capture.auto_recall_budget_chars,
+                    "idle_flush_sec": self._config.capture.idle_flush_sec,
                 },
                 "profiles": {
                     "agent_bindings": dict(self._config.profiles.agent_bindings),

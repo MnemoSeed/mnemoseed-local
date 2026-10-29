@@ -16,10 +16,12 @@ Event map v1 (the four subscribed events):
   ACK (ack-implies-ready) with the served selection emitted as
   ``additionalContext`` stdout;
 - ``PostToolUse``       -> ``tool_use`` /ingest (output capped);
-- ``Stop``              -> ``assistant_message`` /ingest — flush semantics
-  only, NEVER a session settle; the payload's ``last_assistant_message`` is
-  the primary text, with the transcript JSONL tail (Claude-Code dialect,
-  defensive) supplying the model id and the text fallback.
+- ``Stop``              -> ``assistant_message`` /ingest then ``POST /flush``
+  for the same session — Stop persists the buffered turns (flush semantics,
+  NEVER a session settle; settling happens only on an explicit session end);
+  the payload's ``last_assistant_message`` is the primary text, with the
+  transcript JSONL tail (Claude-Code dialect, defensive) supplying the model
+  id and the text fallback.
 
 The wire ``visibility`` field is the only rendering authority (#273): absent
 or off means no signal line and zero stdout. ZCode parses hook stdout as JSON
@@ -99,6 +101,7 @@ from mnemoseed_local.hosts.common.recall import (
 from mnemoseed_local.hosts.common.t2 import build_t2_context as build_t2_context
 from mnemoseed_local.hosts.common.visibility import visibility_mode as visibility_mode
 from mnemoseed_local.schema.turn import (
+    FlushRequest,
     HostId,
     IngestEvent,
     IngestEventType,
@@ -107,7 +110,7 @@ from mnemoseed_local.schema.turn import (
 )
 
 #: kind -> daemon REST endpoint.
-ENDPOINTS = {"ingest": "/ingest"}
+ENDPOINTS = {"ingest": "/ingest", "flush": "/flush"}
 
 #: The hook event that carries the T1 read lane (no ingest, no settle).
 T1_HOOK_EVENT = "SessionStart"
@@ -140,14 +143,14 @@ def normalize_event(payload: dict[str, Any], *, now: float) -> Action | None:
     return normalizer(payload, session_id, now) if normalizer else None
 
 
-def _ingest(
+def _ingest_body(
     event: IngestEventType,
     payload: dict[str, Any],
     session_id: str,
     now: float,
     content: MessageContent | ToolContent,
-) -> Action:
-    body = IngestEvent(
+) -> IngestEvent:
+    return IngestEvent(
         host=HostId.ZCODE,
         event=event,
         session_id=session_id,
@@ -156,7 +159,16 @@ def _ingest(
         content=content,
         raw=payload,
     )
-    return ("ingest", body)
+
+
+def _ingest(
+    event: IngestEventType,
+    payload: dict[str, Any],
+    session_id: str,
+    now: float,
+    content: MessageContent | ToolContent,
+) -> Action:
+    return ("ingest", _ingest_body(event, payload, session_id, now, content))
 
 
 @_normalizer("UserPromptSubmit")
@@ -173,12 +185,15 @@ def _stop(payload: dict[str, Any], session_id: str, now: float) -> Action | None
     text = payload.get("last_assistant_message")
     if not isinstance(text, str) or not text.strip():
         text = transcript_text
-    return _ingest(
-        IngestEventType.ASSISTANT_MESSAGE,
-        payload,
-        session_id,
-        now,
-        content=MessageContent(text=text, model_id=model),
+    return (
+        "stop",
+        _ingest_body(
+            IngestEventType.ASSISTANT_MESSAGE,
+            payload,
+            session_id,
+            now,
+            content=MessageContent(text=text, model_id=model),
+        ),
     )
 
 
@@ -240,6 +255,13 @@ def transform_event(raw: str) -> int:
             block = session_start_block(pull_session_tails(client, str(body)))
             if block is not None:
                 print(json.dumps(additional_context_payload(block, T1_HOOK_EVENT)))
+            return 0
+        if kind == "stop":
+            # persist-then-flush: the ingest ACKs first, then the flush closes
+            # and drains the buffered turns without settling the session
+            client.post(ENDPOINTS["ingest"], body.model_dump(mode="json"))
+            flush = FlushRequest(session_id=body.session_id, profile_id=body.profile_id)
+            client.post(ENDPOINTS["flush"], flush.model_dump(mode="json"))
             return 0
         client.post(ENDPOINTS[kind], body.model_dump(mode="json"))
         # only an ACKED user ingest parks the focal slot, so the pull runs

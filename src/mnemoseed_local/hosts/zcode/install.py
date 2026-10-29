@@ -52,6 +52,8 @@ from mnemoseed_local.hosts.install import HookStatus
 MARKER = "mnemoseed-local"
 
 #: The four hook events we register in v1 (ZCode's seven documented events).
+#: No SessionEnd: ZCode fires none and sessions stay open across turns —
+#: durability rides Stop's flush and the daemon's idle-session sweep.
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop")
 
 #: The reserved argv tail each registered handler runs (the hidden verb).

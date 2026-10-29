@@ -131,6 +131,12 @@ DEFAULT_EXPERIENCE_CHANNEL_ENABLED: bool = False
 DEFAULT_AUTO_RECALL_FOCAL_FLOOR: float = 0.5
 DEFAULT_AUTO_RECALL_BUDGET_CHARS: int = 2400
 
+#: Idle-session flush threshold (daemon sweeper): a session whose last ingest
+#: is at least this old has its open turn flushed and drained (flush semantics,
+#: never a settle). 10 minutes comfortably exceeds a normal thinking gap while
+#: catching every session that dies without its host's flush hook.
+DEFAULT_CAPTURE_IDLE_FLUSH_SEC: float = 600.0
+
 #: Cue-driven rescue band (design/09 §3.5): below the main candidate floor a
 #: flashbulb pin enters the recall pool only when its cue overlap clears
 #: ``rescue_cue_min``, down to ``rescue_floor``. Values landed by the
@@ -324,11 +330,15 @@ class CaptureConfig:
     most 1 — a zero floor would make every decayed chunk focal).
     ``auto_recall_budget_chars`` caps the pending-recall selection served to
     the hook (T1 budget semantics: greedy admission, boundary tail-slice).
+    ``idle_flush_sec`` is the idle-session flush threshold of the daemon's
+    durability sweeper (a session idle at least this long has its open turn
+    flushed and drained without settling).
     """
 
     auto_recall: bool = True
     auto_recall_focal_floor: float = DEFAULT_AUTO_RECALL_FOCAL_FLOOR
     auto_recall_budget_chars: int = DEFAULT_AUTO_RECALL_BUDGET_CHARS
+    idle_flush_sec: float = DEFAULT_CAPTURE_IDLE_FLUSH_SEC
 
 
 @dataclass(frozen=True)
@@ -882,10 +892,14 @@ def load_config(path: Path | None = None) -> Config:
         budget_raw = capture_table.get("auto_recall_budget_chars", DEFAULT_AUTO_RECALL_BUDGET_CHARS)
         if not isinstance(budget_raw, int) or isinstance(budget_raw, bool) or budget_raw <= 0:
             raise ConfigError("capture.auto_recall_budget_chars", "must be a positive integer")
+        idle_raw = capture_table.get("idle_flush_sec", DEFAULT_CAPTURE_IDLE_FLUSH_SEC)
+        if not _is_positive_number(idle_raw):
+            raise ConfigError("capture.idle_flush_sec", "must be a positive number")
         capture = CaptureConfig(
             auto_recall=auto_raw,
             auto_recall_focal_floor=float(floor_raw),
             auto_recall_budget_chars=int(budget_raw),
+            idle_flush_sec=float(idle_raw),
         )
 
     # [recall] table (design/09 §3.5): the MCP explicit-recall rescue band.
@@ -1071,10 +1085,14 @@ path = "~/.mnemoseed-local/isolated.db"
 #   auto_recall_budget_chars — the selection budget; the greedy admission and
 #                              boundary tail-slice follow the T1 semantics.
 #                              2400 = T4b calibrated value (ACCEPTED)
+#   idle_flush_sec          — the idle-session flush threshold: a session whose
+#                              last ingest is this old has its open turn
+#                              flushed and drained (never settled)
 # [capture]
 # auto_recall = true
 # auto_recall_focal_floor = 0.5
 # auto_recall_budget_chars = 2400
+# idle_flush_sec = 600.0
 
 # Multi-profile runtime (#109): agent->profile persona bindings. A bound
 # agent's captured chunks carry the bound profile id on their persona_id
