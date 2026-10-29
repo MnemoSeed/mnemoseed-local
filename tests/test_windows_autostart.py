@@ -37,8 +37,8 @@ _TEXT_CAPTURE = {"encoding": "utf-8", "errors": "replace"}
 def _run_captured(
     command: list[str], env: dict[str, str] | None = None, *, timeout: float = 15
 ) -> subprocess.CompletedProcess[str]:
-    # Child console encoding is locale/OEM dependent; only ASCII is asserted,
-    # so the reader must survive arbitrary bytes.
+    # Child console encoding is locale/OEM dependent; the reader must survive
+    # arbitrary bytes and preserve valid UTF-8 output.
     return subprocess.run(
         command,
         env=env,
@@ -131,6 +131,26 @@ def test_fixture_reader_survives_non_utf8_output() -> None:
     assert "bad:" in completed.stdout
     assert isinstance(completed.stderr, str)
     assert "err:" in completed.stderr
+
+
+def test_fixture_reader_preserves_valid_utf8_output() -> None:
+    completed = _run_captured(
+        [
+            sys.executable,
+            "-c",
+            "import sys;"
+            " sys.stdout.buffer.write('启动：中文输出'.encode('utf-8'));"
+            " sys.stderr.buffer.write('错误：中文'.encode('utf-8'))",
+        ],
+    )
+
+    assert completed.returncode == 0
+    assert isinstance(completed.stdout, str)
+    assert "启动：中文输出" in completed.stdout
+    assert isinstance(completed.stderr, str)
+    assert "错误：中文" in completed.stderr
+    assert "\ufffd" not in completed.stdout
+    assert "\ufffd" not in completed.stderr
 
 
 def test_off_before_start_does_not_probe_or_launch(tmp_path: Path) -> None:
