@@ -17,9 +17,9 @@ import json
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mnemoseed_local import __version__
 from mnemoseed_local.config import (
@@ -34,6 +34,9 @@ from mnemoseed_local.config import (
 from mnemoseed_local.dream.readiness import models_contain
 from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
+
+if TYPE_CHECKING:
+    from mnemoseed_local.daemon.observability import RefinementStatus
 
 #: The status the daemon answers a caller without a valid credential.
 _HTTP_UNAUTHORIZED = 401
@@ -502,6 +505,23 @@ def cmd_on(args: argparse.Namespace) -> int:
         lock.release()
 
 
+def _refinement_state() -> RefinementStatus | None:
+    """The shared computed refinement state from the file config, or None when
+    the config is unreadable. The daemon observability module owns the
+    computation; one bounded live route probe decides the enabled verdict."""
+    from mnemoseed_local.daemon.observability import refinement_status
+
+    try:
+        config = load_config()
+    except ValueError:
+        return None
+    return refinement_status(
+        auto_trigger=config.dream.auto_trigger,
+        auto_recall=config.capture.auto_recall,
+        routes=config.llm,
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from mnemoseed_local.rest_client import resolve_client
 
@@ -511,14 +531,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         config = client.get("/api/v1/config")["config"]
     except Exception as exc:
         return _client_error(exc)
+    refinement = _refinement_state()
     if args.json:
-        return _emit_json({"health": health, "config": config})
+        return _emit_json(
+            {
+                "health": health,
+                "config": config,
+                "refinement": asdict(refinement) if refinement is not None else None,
+            }
+        )
     gate = health.get("gate", {})
     gate_state = "ok" if gate.get("ok") else "FAIL"
     print(f"daemon: mnemoseed-local {__version__} (preset {health.get('preset', '?')}, gate {gate_state})")
     print(f"dream auto_trigger: {config['dream']['auto_trigger']}")
     print(f"dream llm driver:  {config['dream']['llm']['dream']['driver']}")
     print(f"profile: {client.profile_id}")
+    if refinement is None:
+        print("refinement: unknown (the config could not be loaded)")
+    else:
+        print(refinement.line())
     return 0
 
 
