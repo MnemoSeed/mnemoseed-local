@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import os
+import signal
 import socket
 import subprocess
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import httpx
 from playwright.sync_api import sync_playwright
@@ -20,6 +25,22 @@ REMEMBER_TEXT = "Atlas verification memory for isolated browser proof"
 #: Bounded wait for the isolated daemon's credential: its lifespan issues the
 #: file before serving, so this only covers the write landing.
 CREDENTIAL_WAIT_SECONDS = 30.0
+#: Bounded wait for the owned tree to leave, and the interval at which its
+#: members are asked again while the wait runs.
+STOP_GRACE_SECONDS = 15.0
+SURVIVOR_POLL_SECONDS = 0.1
+PORT_RELEASE_ATTEMPTS = 40
+PORT_RELEASE_INTERVAL_SECONDS = 0.25
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_SYNCHRONIZE = 0x00100000
+_WAIT_TIMEOUT = 0x00000102
+_ERROR_INVALID_PARAMETER = 87
+_JOB_MEMBER_CAPACITY = 64
 
 
 def free_port() -> int:
@@ -105,27 +126,312 @@ def issued_credential(home: Path) -> str:
             time.sleep(0.25)
 
 
-def stop_owned_daemon(process: subprocess.Popen[bytes], base_url: str) -> None:
-    print(f"Cleanup target: {process.pid} (owned child) at {base_url}")
-    process.terminate()
+@functools.lru_cache(maxsize=1)
+def _kernel32() -> Any:
+    """The kernel library, with the handle-returning prototypes declared."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return kernel32
+
+
+@functools.lru_cache(maxsize=1)
+def _job_structures() -> tuple[Any, Any]:
+    """The job-object structures: its extended limit, and its member pid list."""
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", ctypes.c_ulong),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_ulong),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_ulong),
+            ("SchedulingClass", ctypes.c_ulong),
+        ]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimit),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    class _MemberIds(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfAssignedProcesses", ctypes.c_ulong),
+            ("NumberOfProcessIdsInList", ctypes.c_ulong),
+            ("ProcessIdList", ctypes.c_size_t * 1),
+        ]
+
+    return _ExtendedLimit, _MemberIds
+
+
+def _create_job() -> int:
+    """A job object that ends every member it holds when its last handle closes."""
+    kernel32 = _kernel32()
+    extended_limit, _ = _job_structures()
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise RuntimeError("could not create the daemon ownership job object")
+    limits = extended_limit()
+    limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    armed = kernel32.SetInformationJobObject(
+        handle,
+        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    )
+    if not armed:
+        kernel32.CloseHandle(handle)
+        raise RuntimeError("could not arm the daemon ownership job object")
+    return int(handle)
+
+
+def _close_job(job: int) -> None:
+    """Release a job handle; the job ends its members as the last handle closes."""
+    _kernel32().CloseHandle(job)
+
+
+def _assign_to_job(job: int, pid: int) -> bool:
+    """Put a process inside the job, so every descendant it creates is held too."""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+    if not handle:
+        return False
     try:
-        process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-    if process.poll() is None and os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
+        return bool(kernel32.AssignProcessToJobObject(job, handle))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_job(job: int) -> None:
+    """End every process the ownership job holds."""
+    if not _kernel32().TerminateJobObject(job, 1):
+        raise RuntimeError("could not end the daemon ownership job object")
+
+
+def _job_member_pids(job: int) -> tuple[int, ...]:
+    """The pids the ownership job holds, asked of the job rather than of a list."""
+    kernel32 = _kernel32()
+    _, member_ids = _job_structures()
+    capacity = _JOB_MEMBER_CAPACITY
+    while True:
+        offset = member_ids.ProcessIdList.offset
+        size = offset + capacity * ctypes.sizeof(ctypes.c_size_t)
+        buffer = ctypes.create_string_buffer(size)
+        queried = kernel32.QueryInformationJobObject(
+            job, _JOB_OBJECT_BASIC_PROCESS_ID_LIST, buffer, size, None
+        )
+        if not queried:
+            raise RuntimeError("could not read the process list of the ownership job object")
+        head = ctypes.cast(buffer, ctypes.POINTER(member_ids)).contents
+        assigned = int(head.NumberOfAssignedProcesses)
+        listed = int(head.NumberOfProcessIdsInList)
+        if listed < assigned:
+            capacity = assigned
+            continue
+        held = (ctypes.c_size_t * listed).from_buffer(buffer, offset)
+        return tuple(int(pid) for pid in held)
+
+
+def _windows_process_gone(pid: int) -> bool:
+    """Whether a pid has left, asked of a handle rather than of a process list."""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_SYNCHRONIZE, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == _ERROR_INVALID_PARAMETER:
+            return True
+        raise RuntimeError(f"could not open owned process {pid} to confirm it left")
+    try:
+        return int(kernel32.WaitForSingleObject(handle, 0)) != _WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _signal_group(group: int, sig: int) -> None:
+    """Signal the group a spawned process leads; an emptied group needs nothing."""
+    try:
+        os.killpg(group, sig)
+    except ProcessLookupError:
+        return
+
+
+def _group_is_populated(group: int) -> bool:
+    """Whether the group a spawned process led still holds a process."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _leading_group(process: subprocess.Popen[bytes]) -> int:
+    """The process group the spawned tree lives in, asked of the kernel at spawn."""
+    try:
+        return os.getpgid(process.pid)
+    except ProcessLookupError:
+        return process.pid
+
+
+class OwnedDaemon:
+    """A daemon this run started, with the container that holds its tree.
+
+    Ownership is taken at spawn: a job object on Windows, a session and process
+    group elsewhere. Teardown ends that container and confirms every process it
+    held has left, so a process this run never started stays out of reach.
+    """
+
+    def __init__(
+        self, process: subprocess.Popen[bytes], job: int | None = None, pgid: int | None = None
+    ) -> None:
+        self.process = process
+        self.job = job
+        self.pgid = process.pid if pgid is None else pgid
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def owned_pids(self) -> tuple[int, ...]:
+        """The pids this run owns: the process it started and its job members."""
+        members = () if self.job is None else _job_member_pids(self.job)
+        return (self.pid, *(member for member in members if member != self.pid))
+
+    def stop(self) -> None:
+        """End the owned tree, asking first and forcing it after the grace period."""
+        self._end_tree(signal.SIGTERM)
+        if self.survivors(STOP_GRACE_SECONDS):
+            self._end_tree(signal.SIGKILL)
+
+    def survivors(self, timeout: float) -> tuple[int, ...]:
+        """The run-owned processes still present after a bounded wait.
+
+        Windows asks the job for its members and waits on each one by handle,
+        which reaches a descendant whose launcher already left. Elsewhere the
+        process this run started is collected as this process's own child and
+        the group recorded at spawn is polled until the deadline, so a group
+        that is still emptying does not report as survivors; a live group
+        reports as its leader.
+        """
+        deadline = time.monotonic() + timeout
+        if self.job is not None:
+            alive = self.owned_pids()
+            while alive and time.monotonic() < deadline:
+                alive = tuple(pid for pid in alive if not _windows_process_gone(pid))
+                time.sleep(SURVIVOR_POLL_SECONDS)
+            return alive
         try:
-            process.wait(timeout=15)
+            self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
-    if process.poll() is None:
-        raise RuntimeError(f"owned daemon {process.pid} did not stop")
-    for _ in range(40):
+        while True:
+            if not _group_is_populated(self.pgid):
+                return ()
+            if time.monotonic() >= deadline:
+                return (self.pid,)
+            time.sleep(SURVIVOR_POLL_SECONDS)
+
+    def _end_tree(self, sig: int) -> None:
+        """End the whole owned tree through the container that holds it."""
+        if self.job is not None:
+            _terminate_job(self.job)
+            return
+        _signal_group(self.pgid, sig)
+
+
+def spawn_owned_daemon(argv: Sequence[str], *, env: Mapping[str, str], cwd: Path) -> OwnedDaemon:
+    """Start a daemon and take ownership of its tree as that tree is created.
+
+    What teardown acts on later is the record taken here: the pid this run
+    started and the process group that holds its descendants, both captured
+    before the spawner can exit. Nothing is selected afterwards from a process
+    list read back out of the operating system, so only this run's own tree can
+    be reached.
+    """
+    if os.name != "nt":
+        process = subprocess.Popen(list(argv), env=dict(env), cwd=cwd, start_new_session=True)
+        return OwnedDaemon(process, pgid=_leading_group(process))
+    job = _create_job()
+    try:
+        process = subprocess.Popen(list(argv), env=dict(env), cwd=cwd)
+    except BaseException:
+        _close_job(job)
+        raise
+    if not _assign_to_job(job, process.pid):
+        process.kill()
+        process.wait()
+        _close_job(job)
+        raise RuntimeError("could not take ownership of the isolated daemon tree")
+    return OwnedDaemon(process, job)
+
+
+def stop_owned_daemon(daemon: OwnedDaemon, base_url: str) -> tuple[int, ...]:
+    """Stop the tree this run started, confirm every part of it left, free the port.
+
+    The owned pids are reported before the tree is ended and confirmed gone
+    afterwards. A descendant whose launcher already exited is still held by the
+    ownership container, which is the only reason it is reachable at all.
+    """
+    pids = daemon.owned_pids()
+    print(f"Run-owned PIDs: {', '.join(str(pid) for pid in pids)} (root {daemon.pid})")
+    daemon.stop()
+    survivors = daemon.survivors(STOP_GRACE_SECONDS)
+    if survivors:
+        raise RuntimeError(f"owned daemon processes survived teardown: {survivors}")
+    print(f"Run-owned PIDs confirmed gone: {', '.join(str(pid) for pid in pids)}")
+    _await_port_release(base_url)
+    return pids
+
+
+def _await_port_release(base_url: str) -> None:
+    """Refuse a run whose port still answers, however the tree was ended."""
+    for _ in range(PORT_RELEASE_ATTEMPTS):
         try:
             httpx.get(base_url + "/healthz", timeout=1.0)
         except httpx.HTTPError:
             return
-        time.sleep(0.25)
+        time.sleep(PORT_RELEASE_INTERVAL_SECONDS)
     raise RuntimeError(f"owned daemon port still answers: {base_url}")
 
 
@@ -152,7 +458,6 @@ def main() -> int:
     home = run_dir / "MNEMOSEED_LOCAL_HOME"
     home.mkdir()
     evidence = run_dir / "evidence.txt"
-    process: subprocess.Popen[bytes] | None = None
     print(f"Verification run: {run_dir}")
     print(f"MNEMOSEED_LOCAL_HOME: {home}")
     print(f"PLAYWRIGHT_BROWSERS_PATH: {browsers_path}")
@@ -203,7 +508,7 @@ def main() -> int:
         )
         daemon = venv_python(repo_root)
         print(f"Daemon executable (owned): {daemon}")
-        process = subprocess.Popen(
+        process = spawn_owned_daemon(
             [
                 daemon,
                 "-c",
@@ -289,8 +594,7 @@ def main() -> int:
                 "profile_isolation=PASS\nremember_to_atlas=PASS\n"
             )
         finally:
-            if process is not None:
-                stop_owned_daemon(process, base_url)
+            stop_owned_daemon(process, base_url)
         evidence.write_text(pending_evidence, encoding="utf-8")
         print(f"Atlas verification passed at {base_url}; evidence retained at {evidence}")
         return 0
