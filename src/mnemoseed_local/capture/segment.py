@@ -54,8 +54,10 @@ class _SessionState:
         self.turn_index = 0
         self.open_turn: Turn | None = None
         self.turn_range: TurnRange | None = None
+        self.last_ts = 0.0
 
     def ingest(self, event: IngestEvent, pipeline: CapturePipeline) -> None:
+        self.last_ts = max(self.last_ts, event.ts)
         if event.profile_id != self.profile_id:
             raise ProfileMismatchError(
                 f"session {self.session_id!r} is bound to profile {self.profile_id!r}, "
@@ -212,3 +214,20 @@ class TurnSegmenter:
             if state.turn_range is None:
                 closed += state.flush(state.profile_id, self._pipeline)
         return closed
+
+    def idle_sessions(self, *, now: float, idle_sec: float) -> list[tuple[str, str]]:
+        """Unsettled sessions holding an unflushed open turn whose last ingest
+        is at least ``idle_sec`` old, oldest activity first, as
+        ``(session_id, profile_id)``.
+
+        The idle-flush sweeper's candidate set: every ingest ends with an open
+        turn, so open-turn presence is exactly "has unpersisted RAM turns". A
+        session closed or already flushed (and drained by the caller) is
+        absent, so the sweep cannot churn no-op work.
+        """
+        candidates = [
+            (state.last_ts, state.session_id, state.profile_id)
+            for state in self._sessions.values()
+            if state.turn_range is None and state.open_turn is not None and now - state.last_ts >= idle_sec
+        ]
+        return [(session_id, profile_id) for _, session_id, profile_id in sorted(candidates)]
