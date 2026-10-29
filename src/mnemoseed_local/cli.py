@@ -49,23 +49,207 @@ OPENCODE_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.json"
 #: the dream route does not configure ``num_predict``.
 DREAM_MARGIN_TOKENS_DEFAULT = 2048
 
+#: Install-time setup modes: the selection maps onto the two existing config
+#: keys (the legacy auto-dream switch and the auto-recall gate). No new keys,
+#: no new runtime subsystem; an existing config is never rewritten.
+SETUP_CAPTURE_RECALL = "capture-recall"
+SETUP_REFINEMENT = "refinement"
+SETUP_MODES: tuple[str, ...] = (SETUP_CAPTURE_RECALL, SETUP_REFINEMENT)
+
+#: Appended to the default template by a mode setup: both keys already exist;
+#: the block pins them explicitly so the posture survives template edits.
+_SETUP_MODE_BLOCK = """
+
+# Setup-mode posture (capture-recall or refinement): capture, local embeddings
+# and recall run with the legacy dream schedule held off; refinement v2 is a
+# design proposal only (docs/zh/design/11-refinement-v2.md).
+[dream]
+auto_trigger = false
+
+[capture]
+auto_recall = true
+"""
+
+#: The status every refinement-mode setup prints verbatim.
+_REFINEMENT_STATUS = (
+    "refinement v2 is not yet accepted or available "
+    "(design proposal only: docs/zh/design/11-refinement-v2.md)"
+)
+
 
 def cmd_init(args: argparse.Namespace) -> int:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if CONFIG_PATH.exists() and not args.force:
-        print(f"config already exists: {CONFIG_PATH} (use --force to overwrite)")
-        return 1
-    CONFIG_PATH.write_text(default_config_toml(), encoding="utf-8")
+    if CONFIG_PATH.exists():
+        if args.mode is None:
+            if not args.force:
+                print(f"config already exists: {CONFIG_PATH} (use --force to overwrite)")
+                return 1
+            CONFIG_PATH.write_text(default_config_toml(), encoding="utf-8")
+            _print_init_done()
+            _print_legacy_next_steps()
+            return 0
+        if args.force:
+            print(
+                "error: a --mode setup never overwrites an existing config; "
+                "re-run without --force to report on it"
+            )
+            return 1
+        return _init_mode_on_existing(args.mode)
+    if args.mode is None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(default_config_toml(), encoding="utf-8")
+        _print_init_done()
+        _print_legacy_next_steps()
+        return 0
+    return _init_mode_fresh(args.mode)
+
+
+def _print_init_done() -> None:
     print(f"initialized {CONFIG_DIR}")
     print(f"config: {CONFIG_PATH}")
-    # A3 T5 (design/01 §6 Phase A3): point at self-check and the one-time model
-    # pull. Guidance only — the CLI never pulls a model silently.
+
+
+def _print_legacy_next_steps() -> None:
+    # Point at self-check and the one-time model pull (design/01 §6 A3 T5);
+    # guidance only — the CLI never pulls a model silently.
     model = DEFAULT_LLM_ROUTES["dream"].model
     print("next steps:")
     print("  1. mnemoseed-local doctor   (self-check incl. hardware tier)")
     print(f"  2. ollama pull {model}   (dream model, first time only)")
     print("  3. mnemoseed-local up")
+
+
+def _init_mode_fresh(mode: str) -> int:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(default_config_toml() + _SETUP_MODE_BLOCK, encoding="utf-8")
+    _print_init_done()
+    print(f"mode: {mode}")
+    if mode == SETUP_REFINEMENT:
+        print(f"  {_REFINEMENT_STATUS}")
+        print("  the setup holds the capture-recall posture so the legacy auto dream stays off")
+    print("  dream.auto_trigger = false   (legacy dream schedule off)")
+    print("  capture.auto_recall = true   (mid-session auto recall on)")
+    _print_embedder_readiness()
+    print("next steps:")
+    print("  1. mnemoseed-local doctor   (self-check incl. hardware tier)")
+    print("  2. mnemoseed-local up")
     return 0
+
+
+def _init_mode_on_existing(mode: str) -> int:
+    try:
+        config = load_config()
+    except ValueError as exc:
+        print(f"error: the existing config could not be loaded: {exc}")
+        print("the setup changed nothing; fix the file and re-run")
+        return 1
+    print(f"config: {CONFIG_PATH}")
+    print(f"current posture: {_posture(config)}")
+    if mode == SETUP_REFINEMENT:
+        print(f"note: {_REFINEMENT_STATUS}")
+        print("the setup never rewrites an existing config and did not change the legacy auto dream state")
+        _print_embedder_readiness()
+        return 0
+    print("mode capture-recall requests: dream.auto_trigger = false, capture.auto_recall = true")
+    conflicts = _capture_recall_conflicts(config)
+    if not conflicts:
+        print("the capture-recall posture is already in effect; nothing was changed")
+        _print_embedder_readiness()
+        return 0
+    print("conflicts (the setup never rewrites an existing config; convert by hand):")
+    for conflict in conflicts:
+        print(f"  {conflict}")
+    print(
+        "if you intended the legacy auto dream, keep it - "
+        "refinement v2 (its successor) is design-only and not yet available"
+    )
+    _print_embedder_readiness()
+    return 1
+
+
+def _is_explicit(config: Config, table: str, key: str) -> bool:
+    entry = config.raw.get(table)
+    return isinstance(entry, dict) and key in entry
+
+
+def _posture(config: Config) -> str:
+    dream_prov = "explicit" if _is_explicit(config, "dream", "auto_trigger") else "default"
+    capture_prov = "explicit" if _is_explicit(config, "capture", "auto_recall") else "default"
+    return (
+        f"dream.auto_trigger = {str(config.dream.auto_trigger).lower()} ({dream_prov}), "
+        f"capture.auto_recall = {str(config.capture.auto_recall).lower()} ({capture_prov})"
+    )
+
+
+def _capture_recall_conflicts(config: Config) -> list[str]:
+    conflicts: list[str] = []
+    if config.dream.auto_trigger:
+        provenance = (
+            "explicit" if _is_explicit(config, "dream", "auto_trigger") else "not set; the runtime default"
+        )
+        conflicts.append(
+            f"dream.auto_trigger = true ({provenance}) - "
+            "to convert: mnemoseed-local config set dream.auto_trigger false"
+        )
+    if not config.capture.auto_recall:
+        conflicts.append(
+            "capture.auto_recall = false (explicit) - "
+            "to convert: mnemoseed-local config set capture.auto_recall true"
+        )
+    return conflicts
+
+
+def _print_embedder_readiness() -> None:
+    try:
+        config = load_config()
+    except ValueError as exc:
+        print(f"embedding readiness: failed - the config could not be loaded: {exc}")
+        return
+    state, detail = _embedder_readiness(config)
+    print(f"embedding readiness: {state} - {detail}")
+
+
+def _embedder_readiness(config: Config) -> tuple[str, str]:
+    """Probe the configured embed layer's local resources without downloading.
+
+    The bge-m3 driver owns the artifact paths and the resume-marker semantics,
+    so the probe reads both from the driver instance and can never drift from
+    what the first daemon boot will fetch. One probe failure fails the report.
+    """
+    from mnemoseed_local.storage.drivers.bge_m3_onnx import BgeM3OnnxEmbedder
+
+    try:
+        instances = config.layer_instances("embed")
+    except ConfigError as exc:
+        return "failed", str(exc)
+    state = "ready"
+    details: list[str] = []
+    for instance in instances.values():
+        if instance.driver != "bge_m3_onnx":
+            state = "failed"
+            details.append(
+                f"embed instance {instance.name!r} runs driver {instance.driver!r}; "
+                "its local resource state cannot be probed here"
+            )
+            continue
+        try:
+            embedder = BgeM3OnnxEmbedder(**instance.params)
+            artifacts = (embedder._model_file, embedder._tokenizer_file, embedder._sparse_file)
+            missing = [path.name for path in artifacts if not embedder._is_complete(path)]
+        except (OSError, TypeError, ValueError) as exc:
+            state = "failed"
+            details.append(f"embed instance {instance.name!r} could not be probed: {exc}")
+            continue
+        target = str(embedder.model_path.parent)
+        if missing:
+            if state != "failed":
+                state = "needs download"
+            details.append(
+                f"embed instance {instance.name!r}: the first `mnemoseed-local up` fetches "
+                f"{', '.join(missing)} into {target}"
+            )
+        else:
+            details.append(f"embed instance {instance.name!r}: bge-m3 onnx artifacts cached in {target}")
+    return state, "; ".join(details)
 
 
 def _up_locked(args: argparse.Namespace, ready_callback: Any = None) -> int:
@@ -1474,6 +1658,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="create ~/.mnemoseed-local with a default config")
     p_init.add_argument("--force", action="store_true", help="overwrite an existing config")
+    p_init.add_argument(
+        "--mode",
+        choices=SETUP_MODES,
+        help="setup mode mapped onto the existing dream.auto_trigger / capture.auto_recall keys: "
+        "capture-recall holds the legacy auto dream off and auto recall on; refinement reports "
+        "that v2 is design-only; an existing config is never rewritten",
+    )
 
     p_up = sub.add_parser("up", help="start the daemon (embedded single-process)")
     p_up.add_argument("--host", default="127.0.0.1")

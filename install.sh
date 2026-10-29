@@ -3,27 +3,37 @@
 #
 # One-line entry:
 #   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced]
+#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
 # Or run as a file:
-#   sh ./install.sh [--dry-run] [--yes] [--tier <lite|standard|advanced>]
+#   sh ./install.sh [--dry-run] [--yes] [--tier <lite|standard|advanced>] [--mode <capture-recall|refinement>]
 #
 # Orchestration order (identical to install.ps1):
-#   1. detect / install ollama   (Linux: official install script; macOS/other:
-#      print an install hint and exit non-zero)
+#   1. detect / install ollama   (skipped in capture-recall mode: that mode runs
+#      capture, local embeddings and recall without Ollama; Linux: official
+#      install script; macOS/other: print an install hint and exit non-zero)
 #   2. detect / install uv       (official installer; well-known install dir is
 #      prepended to the current process PATH)
 #   3. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
 #      to the exact mnemoseed-local[codex]==<version> spec; never a floating latest)
-#   4. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
+#   4. mnemoseed-local init --mode <mode>   (skipped when ~/.mnemoseed-local/config.toml exists)
 #   5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
 #      the script never changes config keys itself
-#   6. ollama pull <dream model> (the dream route's model from config.toml
-#      [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
-#      only after an explicit [y/N] confirmation; --yes skips the prompt;
-#      a model is NEVER pulled without that confirmation)
+#   6. ollama pull <dream model> (skipped in capture-recall mode: the legacy
+#      auto dream stays off there; otherwise the dream route's model from
+#      config.toml [dream.llm.dream] `model`, else the built-in default
+#      qwen3.5:9b; runs only after an explicit [y/N] confirmation; --yes skips
+#      the prompt; a model is NEVER pulled without that confirmation)
 #   7. OpenCode host adapter hook (mnemoseed-local hook install opencode)
 #   8. final mnemoseed-local doctor re-check + next steps
 #      (mnemoseed-local up; hook already installed)
+#
+# --mode selects the install-time setup posture passed through to
+# `mnemoseed-local init --mode <mode>`, which maps it onto the two existing
+# config keys (dream.auto_trigger / capture.auto_recall); no new keys, and the
+# setup never rewrites an existing config. The default is capture-recall: the
+# first-trial setup runs capture, local embeddings and recall without Ollama.
+# refinement prints that v2 is a design proposal only and never re-enables the
+# legacy auto dream.
 #
 # Idempotent: every step skips when already satisfied. Every failed external
 # install operation prints a one-line reason to stderr and exits non-zero.
@@ -54,6 +64,7 @@ UV_URL='https://astral.sh/uv/install.sh'
 DRY_RUN=0
 YES=0
 TIER=""
+MODE='capture-recall'
 
 die() {
     printf '%s\n' "install.sh: error: $*" >&2
@@ -66,14 +77,17 @@ install.sh - MnemoSeed Local zero-dependency install orchestrator (Linux/macOS, 
 
 usage:
   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced]
-  sh ./install.sh [--dry-run] [--yes] [--tier lite|standard|advanced]
+  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
+  sh ./install.sh [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
 
 options:
   --dry-run        print the numbered plan with probe results; zero side effects
   --yes, -y        skip the [y/N] confirmation before `ollama pull`
   --tier <tier>    lite | standard | advanced - prints an explicit hint for
                    `config set dream.hardware_tier <tier>` (never changes config itself)
+  --mode <mode>    capture-recall (default) | refinement - the setup posture passed
+                   to `mnemoseed-local init --mode <mode>`; an existing config is
+                   never rewritten
   -h, --help       show this help
 
 orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> hook -> doctor
@@ -90,6 +104,12 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --tier=*) TIER="${1#--tier=}" ;;
+        --mode)
+            [ $# -ge 2 ] || die "--mode requires a value (capture-recall|refinement)"
+            MODE="$2"
+            shift
+            ;;
+        --mode=*) MODE="${1#--mode=}" ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -98,6 +118,10 @@ done
 case "$TIER" in
     ''|lite|standard|advanced) ;;
     *) die "unknown tier '$TIER' (expected lite|standard|advanced)" ;;
+esac
+case "$MODE" in
+    capture-recall|refinement) ;;
+    *) die "unknown mode '$MODE' (expected capture-recall|refinement)" ;;
 esac
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -206,22 +230,26 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' 'mnemoseed-local install plan (DRY-RUN: zero side effects; probes are command-existence checks only)'
     printf '\n'
     printf '%s\n' '[1] ollama'
-    if have ollama; then
-        printf '%s\n' "    probe: ollama command FOUND at $(command -v ollama)"
-        printf '%s\n' '    plan:  skip install (already present)'
+    if [ "$MODE" = "capture-recall" ]; then
+        printf '%s\n' '    plan:  skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
     else
-        printf '%s\n' '    probe: ollama command NOT FOUND'
-        case "$OS_NAME" in
-            Linux*)
-                printf '%s\n' "    plan:  install via the official script ($OLLAMA_URL | sh)"
-                ;;
-            Darwin*)
-                printf '%s\n' '    plan:  macOS - would print install hints (brew install ollama / https://ollama.com/download/mac) and exit non-zero'
-                ;;
-            *)
-                printf '%s\n' "    plan:  unsupported OS ($OS_NAME) for the official script - would print a manual hint (https://ollama.com/download) and exit non-zero"
-                ;;
-        esac
+        if have ollama; then
+            printf '%s\n' "    probe: ollama command FOUND at $(command -v ollama)"
+            printf '%s\n' '    plan:  skip install (already present)'
+        else
+            printf '%s\n' '    probe: ollama command NOT FOUND'
+            case "$OS_NAME" in
+                Linux*)
+                    printf '%s\n' "    plan:  install via the official script ($OLLAMA_URL | sh)"
+                    ;;
+                Darwin*)
+                    printf '%s\n' '    plan:  macOS - would print install hints (brew install ollama / https://ollama.com/download/mac) and exit non-zero'
+                    ;;
+                *)
+                    printf '%s\n' "    plan:  unsupported OS ($OS_NAME) for the official script - would print a manual hint (https://ollama.com/download) and exit non-zero"
+                    ;;
+            esac
+        fi
     fi
     printf '%s\n' '[2] uv'
     if have uv; then
@@ -244,7 +272,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
         printf '%s\n' "    plan:  would run \`uv tool install --python 3.12 $CLI_PIN\`"
     fi
     printf '%s\n' '[4] init'
-    printf '%s\n' "    plan:  would run \`mnemoseed-local init\` when $CONFIG_PATH does not exist; skipped when present"
+    printf '%s\n' "    plan:  would run \`mnemoseed-local init --mode $MODE\` when $CONFIG_PATH does not exist; skipped when present"
     printf '%s\n' '[5] doctor (first pass)'
     printf '%s\n' '    plan:  would run `mnemoseed-local doctor` (output shown verbatim), then compare the hardware-tier detail'
     printf '%s\n' '           (`recommended tier "<tier>"` vs `current tier "<tier>"`; a hint is printed when they differ; config is never changed)'
@@ -252,8 +280,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
         printf '%s\n' "    plan:  --tier $TIER given - would print the hint-only \`config set dream.hardware_tier $TIER\` instruction"
     fi
     printf '%s\n' '[6] model pull (requires confirmation)'
-    printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
-    printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
+    if [ "$MODE" = "capture-recall" ]; then
+        printf '%s\n' '    plan:  skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
+    else
+        printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
+        printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
+    fi
     printf '%s\n' '[7] OpenCode host adapter hook'
     printf '%s\n' '    plan:  would run `mnemoseed-local hook install opencode`'
     printf '%s\n' '[8] final doctor + guidance'
@@ -267,7 +299,10 @@ fi
 # --- step 1: ollama ---------------------------------------------------------
 
 printf '%s\n' '[1/8] ollama'
-if have ollama; then
+if [ "$MODE" = "capture-recall" ]; then
+    printf '%s\n' '      skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
+    printf '%s\n' '      to use the dream engine later: install Ollama (https://ollama.com/download), then re-run `mnemoseed-local doctor`'
+elif have ollama; then
     printf '%s\n' '      found - skipping install'
 else
     case "$OS_NAME" in
@@ -325,9 +360,10 @@ have mnemoseed-local || die "mnemoseed-local was installed but is not on PATH; a
 printf '%s\n' '[4/8] init'
 if [ -f "$CONFIG_PATH" ]; then
     printf '%s\n' "      $CONFIG_PATH already exists - skipping"
+    printf '%s\n' "      to inspect or convert its setup mode: mnemoseed-local init --mode $MODE"
 else
-    if ! mnemoseed-local init; then
-        die "'mnemoseed-local init' failed"
+    if ! mnemoseed-local init --mode "$MODE"; then
+        die "'mnemoseed-local init --mode $MODE' failed"
     fi
 fi
 
@@ -343,35 +379,40 @@ show_tier_hints "$DOCTOR_OUT"
 # --- step 6: confirmation-gated model pull -----------------------------------
 
 printf '%s\n' '[6/8] dream model pull'
-MODEL="$(resolve_model "$CONFIG_PATH")"
-if [ "$MODEL" = "$DEFAULT_MODEL" ]; then
-    printf '%s\n' "      model to pull: $MODEL (built-in default - the dream route's check target)"
+if [ "$MODE" = "capture-recall" ]; then
+    printf '%s\n' '      skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
+    printf '%s\n' '      for manual consolidation later: install Ollama, then `ollama pull <dream model>` (see `mnemoseed-local doctor`)'
 else
-    printf '%s\n' "      model to pull: $MODEL (from $CONFIG_PATH [dream.llm.dream] \`model\` - the dream route's check target)"
-fi
-PULL_CONFIRMED=0
-if [ "$YES" -eq 1 ]; then
-    PULL_CONFIRMED=1
-    printf '%s\n' '      --yes given - skipping the confirmation prompt'
-else
-    printf '%s' "      pull it now with \`ollama pull $MODEL\`? [y/N] "
-    ANSWER=""
-    if [ -t 0 ]; then
-        read -r ANSWER || ANSWER=""
-    elif [ -r /dev/tty ]; then
-        read -r ANSWER < /dev/tty || ANSWER=""
+    MODEL="$(resolve_model "$CONFIG_PATH")"
+    if [ "$MODEL" = "$DEFAULT_MODEL" ]; then
+        printf '%s\n' "      model to pull: $MODEL (built-in default - the dream route's check target)"
+    else
+        printf '%s\n' "      model to pull: $MODEL (from $CONFIG_PATH [dream.llm.dream] \`model\` - the dream route's check target)"
     fi
-    case "$ANSWER" in
-        y|Y|yes|YES|Yes) PULL_CONFIRMED=1 ;;
-    esac
-fi
-if [ "$PULL_CONFIRMED" -eq 0 ]; then
-    printf '%s\n' "      skipped (no confirmation); pull it later with: ollama pull $MODEL"
-else
-    if ! ollama pull "$MODEL"; then
-        die "'ollama pull $MODEL' failed; is the ollama server running? retry with: ollama pull $MODEL"
+    PULL_CONFIRMED=0
+    if [ "$YES" -eq 1 ]; then
+        PULL_CONFIRMED=1
+        printf '%s\n' '      --yes given - skipping the confirmation prompt'
+    else
+        printf '%s' "      pull it now with \`ollama pull $MODEL\`? [y/N] "
+        ANSWER=""
+        if [ -t 0 ]; then
+            read -r ANSWER || ANSWER=""
+        elif [ -r /dev/tty ]; then
+            read -r ANSWER < /dev/tty || ANSWER=""
+        fi
+        case "$ANSWER" in
+            y|Y|yes|YES|Yes) PULL_CONFIRMED=1 ;;
+        esac
     fi
-    printf '%s\n' '      pulled'
+    if [ "$PULL_CONFIRMED" -eq 0 ]; then
+        printf '%s\n' "      skipped (no confirmation); pull it later with: ollama pull $MODEL"
+    else
+        if ! ollama pull "$MODEL"; then
+            die "'ollama pull $MODEL' failed; is the ollama server running? retry with: ollama pull $MODEL"
+        fi
+        printf '%s\n' '      pulled'
+    fi
 fi
 
 # --- step 7: hook install ------------------------------------------------------

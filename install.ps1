@@ -7,11 +7,13 @@
   One-line entry:
     irm https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.ps1 | iex
   Or run as a file:
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [-DryRun] [-Yes] [-Tier <lite|standard|advanced>]
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [-DryRun] [-Yes] [-Tier <lite|standard|advanced>] [-Mode <CaptureRecall|Refinement>]
 
   Orchestration order (identical to install.sh):
-    1. detect / install ollama   (winget Ollama.Ollama; when winget is absent,
-       print a manual-download hint and exit non-zero)
+    1. detect / install ollama   (skipped in CaptureRecall mode: that mode runs
+       capture, local embeddings and recall without Ollama; winget
+       Ollama.Ollama; when winget is absent, print a manual-download hint and
+       exit non-zero)
     2. Ollama startup boundary  (Ollama keeps its native startup behavior;
        MnemoSeed never registers an Ollama task or launches `ollama serve`)
     3. detect / install uv       (official installer; well-known install dir is
@@ -20,16 +22,25 @@
        to the exact mnemoseed-local[codex]==<version> spec; never a floating latest)
     5. register MnemoSeed's current-user AtLogOn task (hidden, single instance,
        no periodic trigger and no restart policy)
-    6. mnemoseed-local init      (skipped when ~/.mnemoseed-local/config.toml exists)
+    6. mnemoseed-local init --mode <mode>   (skipped when ~/.mnemoseed-local/config.toml exists)
     7. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
        the script never changes config keys itself
-    8. ollama pull <dream model> (the dream route's model from config.toml
+    8. ollama pull <dream model> (skipped in CaptureRecall mode: the legacy auto
+       dream stays off there; otherwise the dream route's model from config.toml
        [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
     9. OpenCode host adapter hook (mnemoseed-local hook install opencode)
    10. final mnemoseed-local doctor re-check + next steps
        (mnemoseed-local up; hook already installed)
+
+  -Mode selects the install-time setup posture passed through to
+  `mnemoseed-local init --mode <mode>`, which maps it onto the two existing
+  config keys (dream.auto_trigger / capture.auto_recall); no new keys, and the
+  setup never rewrites an existing config. The default is CaptureRecall: the
+  first-trial setup runs capture, local embeddings and recall without Ollama.
+  Refinement prints that v2 is a design proposal only and never re-enables the
+  legacy auto dream.
 
   Idempotent: every step skips when already satisfied. Every failed external
   install operation prints a one-line reason to stderr and exits non-zero.
@@ -47,8 +58,14 @@ param(
     [switch]$DryRun,
     [switch]$Yes,
     [ValidateSet('', 'lite', 'standard', 'advanced')]
-    [string]$Tier = ''
+    [string]$Tier = '',
+    [ValidateSet('CaptureRecall', 'Refinement')]
+    [string]$Mode = 'CaptureRecall'
 )
+
+# The CLI's --mode takes kebab-case tokens; the installer's -Mode is the
+# PowerShell-facing shape. The default keeps the legacy auto dream off.
+$CliMode = if ($Mode -eq 'CaptureRecall') { 'capture-recall' } else { 'refinement' }
 
 # Unknown flags are silently bindable to $args under -File invocation — a
 # misspelled -DryRunn would otherwise fall through into the REAL install path.
@@ -227,16 +244,20 @@ if ($DryRun) {
     Write-Host 'mnemoseed-local install plan (DRY-RUN: zero side effects; probes are command-existence checks only)'
     Write-Host ''
     Write-Host '[1] ollama'
-    $ollamaCmd = Get-Command ollama -ErrorAction SilentlyContinue
-    if ($null -ne $ollamaCmd) {
-        Write-Host "    probe: ollama command FOUND at $($ollamaCmd.Source)"
-        Write-Host '    plan:  skip install (already present)'
+    if ($Mode -eq 'CaptureRecall') {
+        Write-Host '    plan:  skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
     } else {
-        Write-Host '    probe: ollama command NOT FOUND'
-        if (Test-CommandExists 'winget') {
-            Write-Host '    plan:  install via `winget install -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements`'
+        $ollamaCmd = Get-Command ollama -ErrorAction SilentlyContinue
+        if ($null -ne $ollamaCmd) {
+            Write-Host "    probe: ollama command FOUND at $($ollamaCmd.Source)"
+            Write-Host '    plan:  skip install (already present)'
         } else {
-            Write-Host '    plan:  winget NOT FOUND - would print a manual-download hint (https://ollama.com/download) and exit non-zero'
+            Write-Host '    probe: ollama command NOT FOUND'
+            if (Test-CommandExists 'winget') {
+                Write-Host '    plan:  install via `winget install -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements`'
+            } else {
+                Write-Host '    plan:  winget NOT FOUND - would print a manual-download hint (https://ollama.com/download) and exit non-zero'
+            }
         }
     }
     Write-Host '[2] Ollama startup boundary and legacy migration (native Ollama startup is preserved)'
@@ -265,7 +286,7 @@ if ($DryRun) {
     Write-Host '[5] MnemoSeed logon task'
     Write-Host "    plan:  register the current-user $MnemoSeedTaskName task after the CLI is installed; never use an unknown same-name task"
     Write-Host '[6] init'
-    Write-Host "    plan:  would run ``mnemoseed-local init`` when $ConfigPath does not exist; skipped when present"
+    Write-Host "    plan:  would run ``mnemoseed-local init --mode $CliMode`` when $ConfigPath does not exist; skipped when present"
     Write-Host '[7] doctor (first pass)'
     Write-Host '    plan:  would run `mnemoseed-local doctor` (output shown verbatim), then compare the hardware-tier detail'
     Write-Host '           (`recommended tier "<tier>"` vs `current tier "<tier>"`; a hint is printed when they differ; config is never changed)'
@@ -273,8 +294,12 @@ if ($DryRun) {
         Write-Host "    plan:  -Tier $Tier given - would print the hint-only ``config set dream.hardware_tier $Tier`` instruction"
     }
     Write-Host '[8] model pull (requires confirmation)'
-    Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
-    Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
+    if ($Mode -eq 'CaptureRecall') {
+        Write-Host '    plan:  skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
+    } else {
+        Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
+        Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
+    }
     Write-Host '[9] OpenCode host adapter hook'
     Write-Host '    plan:  would run `mnemoseed-local hook install opencode`'
     Write-Host '[10] final doctor + guidance'
@@ -288,7 +313,10 @@ if ($DryRun) {
 # --- step 1: ollama ---------------------------------------------------------
 
 Write-Host '[1/10] ollama'
-if (Test-CommandExists 'ollama') {
+if ($Mode -eq 'CaptureRecall') {
+    Write-Host '      skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
+    Write-Host '      to use the dream engine later: install Ollama (https://ollama.com/download), then re-run `mnemoseed-local doctor`'
+} elseif (Test-CommandExists 'ollama') {
     Write-Host '      found - skipping install'
 } else {
     if (-not (Test-CommandExists 'winget')) {
@@ -393,9 +421,10 @@ try {
 Write-Host '[6/10] init'
 if (Test-Path -LiteralPath $ConfigPath) {
     Write-Host "      $ConfigPath already exists - skipping"
+    Write-Host "      to inspect or convert its setup mode: mnemoseed-local init --mode $CliMode"
 } else {
-    & mnemoseed-local init
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "'mnemoseed-local init' failed (exit $LASTEXITCODE)" }
+    & mnemoseed-local init --mode $CliMode
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "'mnemoseed-local init --mode $CliMode' failed (exit $LASTEXITCODE)" }
 }
 
 # --- step 5: doctor (first pass) + hardware-tier hint ------------------------
@@ -410,33 +439,38 @@ Show-TierHints $firstDoctor.Text
 # --- step 6: confirmation-gated model pull -----------------------------------
 
 Write-Host '[8/10] dream model pull'
-$model = Get-DreamModel $ConfigPath
-if ($model -eq $DefaultModel) {
-    Write-Host "      model to pull: $model (built-in default - the dream route's check target)"
+if ($Mode -eq 'CaptureRecall') {
+    Write-Host '      skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
+    Write-Host '      for manual consolidation later: install Ollama, then `ollama pull <dream model>` (see `mnemoseed-local doctor`)'
 } else {
-    Write-Host "      model to pull: $model (from $ConfigPath [dream.llm.dream] ``model`` - the dream route's check target)"
-}
-$confirmed = $false
-if ($Yes) {
-    $confirmed = $true
-    Write-Host '      -Yes given - skipping the confirmation prompt'
-} else {
-    $answer = 'n'
-    try {
-        $answer = Read-Host "      pull it now with 'ollama pull $model'? [y/N]"
-    } catch {
+    $model = Get-DreamModel $ConfigPath
+    if ($model -eq $DefaultModel) {
+        Write-Host "      model to pull: $model (built-in default - the dream route's check target)"
+    } else {
+        Write-Host "      model to pull: $model (from $ConfigPath [dream.llm.dream] ``model`` - the dream route's check target)"
+    }
+    $confirmed = $false
+    if ($Yes) {
+        $confirmed = $true
+        Write-Host '      -Yes given - skipping the confirmation prompt'
+    } else {
         $answer = 'n'
+        try {
+            $answer = Read-Host "      pull it now with 'ollama pull $model'? [y/N]"
+        } catch {
+            $answer = 'n'
+        }
+        if ($answer -match '^(y|yes)$') { $confirmed = $true }
     }
-    if ($answer -match '^(y|yes)$') { $confirmed = $true }
-}
-if (-not $confirmed) {
-    Write-Host "      skipped (no confirmation); pull it later with: ollama pull $model"
-} else {
-    & ollama pull $model
-    if ($LASTEXITCODE -ne 0) {
-        Exit-WithError "'ollama pull $model' failed (exit $LASTEXITCODE); is the ollama server running? retry with: ollama pull $model"
+    if (-not $confirmed) {
+        Write-Host "      skipped (no confirmation); pull it later with: ollama pull $model"
+    } else {
+        & ollama pull $model
+        if ($LASTEXITCODE -ne 0) {
+            Exit-WithError "'ollama pull $model' failed (exit $LASTEXITCODE); is the ollama server running? retry with: ollama pull $model"
+        }
+        Write-Host '      pulled'
     }
-    Write-Host '      pulled'
 }
 
 # --- step 7: hook install ------------------------------------------------------
