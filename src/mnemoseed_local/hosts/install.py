@@ -53,6 +53,16 @@ DISABLED_SUFFIX = ".disabled"
 PROBE_TIMEOUT_SECONDS = 5.0
 
 
+def report_onboarding(host: str, hooks: str, mcp: str, trust: str | None = None) -> None:
+    """Print a host's onboarding outcome: hooks, MCP entry and trust are
+    reported on separate lines, so a hooks-only host (no MCP registration) can
+    never read as a complete setup and a manual trust step stays explicit."""
+    print(f"host {host}: hooks: {hooks}")
+    print(f"host {host}: mcp: {mcp}")
+    if trust is not None:
+        print(f"host {host}: trust: {trust}")
+
+
 @dataclass(frozen=True)
 class HookStatus:
     """Result of the status check.
@@ -109,10 +119,16 @@ def install_plugin(root: Path | None = None) -> tuple[Path, bool]:
     remnant = disabled.is_file()
     if remnant:
         disabled.unlink()
-    if path.is_file() and path.read_bytes() == source:
-        return path, remnant
-    path.write_bytes(source)
-    return path, True
+    changed = remnant
+    if not (path.is_file() and path.read_bytes() == source):
+        path.write_bytes(source)
+        changed = True
+    report_onboarding(
+        "opencode",
+        hooks="applied" if changed else "up to date",
+        mcp="manual step - register the MCP gateway in opencode.json if needed",
+    )
+    return path, changed
 
 
 def uninstall_plugin(root: Path | None = None) -> tuple[Path, bool]:

@@ -3,9 +3,9 @@
 #
 # One-line entry:
 #   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
+#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
 # Or run as a file:
-#   sh ./install.sh [--dry-run] [--yes] [--tier <lite|standard|advanced>] [--mode <capture-recall|refinement>]
+#   sh ./install.sh [--dry-run] [--yes] [--tier <lite|standard|advanced>] [--mode <capture-recall|refinement>] [--hosts <csv>]
 #
 # Orchestration order (identical to install.ps1):
 #   1. detect / install ollama   (skipped in capture-recall mode: that mode runs
@@ -23,9 +23,16 @@
 #      config.toml [dream.llm.dream] `model`, else the built-in default
 #      qwen3.5:9b; runs only after an explicit [y/N] confirmation; --yes skips
 #      the prompt; a model is NEVER pulled without that confirmation)
-#   7. OpenCode host adapter hook (mnemoseed-local hook install opencode)
+#   7. host adapter wiring (ONLY the hosts named in --hosts <csv>, or the
+#      hosts picked from an interactive offer of the detected ones: a host
+#      counts as installed when its CLI is on PATH or its adapter config
+#      directory exists; the offer runs only when stdin is a terminal, a
+#      non-interactive run without --hosts wires NOTHING and reports what it
+#      detected next to the exact per-host commands in the next steps; an
+#      unknown --hosts value refuses before anything is written)
 #   8. final mnemoseed-local doctor re-check + next steps
-#      (mnemoseed-local up; hook already installed)
+#      (mnemoseed-local up; the selected hosts are wired, or the per-host
+#      commands are printed when none were selected)
 #
 # --mode selects the install-time setup posture passed through to
 # `mnemoseed-local init --mode <mode>`, which maps it onto the two existing
@@ -65,6 +72,7 @@ DRY_RUN=0
 YES=0
 TIER=""
 MODE='capture-recall'
+HOSTS=''
 
 die() {
     printf '%s\n' "install.sh: error: $*" >&2
@@ -77,8 +85,8 @@ install.sh - MnemoSeed Local zero-dependency install orchestrator (Linux/macOS, 
 
 usage:
   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
-  sh ./install.sh [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement]
+  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
+  sh ./install.sh [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
 
 options:
   --dry-run        print the numbered plan with probe results; zero side effects
@@ -88,9 +96,16 @@ options:
   --mode <mode>    capture-recall (default) | refinement - the setup posture passed
                    to `mnemoseed-local init --mode <mode>`; an existing config is
                    never rewritten
+  --hosts <csv>    comma-separated host adapters to wire, from:
+                   claude_code | codex_cli | opencode | zcode
+                   (default: none - an interactive session is offered a
+                   selection of the detected hosts, a non-interactive run
+                   wires nothing and prints the exact per-host commands under
+                   'next steps'; 'all' is not accepted - name the hosts
+                   explicitly)
   -h, --help       show this help
 
-orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> hook -> doctor
+orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> hosts -> doctor
 EOF
 }
 
@@ -110,6 +125,12 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --mode=*) MODE="${1#--mode=}" ;;
+        --hosts)
+            [ $# -ge 2 ] || die "--hosts requires a value (claude_code|codex_cli|opencode|zcode)"
+            HOSTS="$2"
+            shift
+            ;;
+        --hosts=*) HOSTS="${1#--hosts=}" ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -124,7 +145,141 @@ case "$MODE" in
     *) die "unknown mode '$MODE' (expected capture-recall|refinement)" ;;
 esac
 
+# validate_host_list CSV -> the deduplicated adapter keys, one per line. Every
+# token must be an exact adapter key; anything else refuses. 'all' is rejected
+# on purpose: silently wiring every host is exactly what --hosts must never do.
+validate_host_list() {
+    _rest="$1,"
+    _seen="|"
+    while [ -n "$_rest" ]; do
+        _key="${_rest%%,*}"
+        _rest="${_rest#*,}"
+        case "$_key" in
+            claude_code|codex_cli|opencode|zcode) ;;
+            *) die "unknown host '$_key' (expected claude_code|codex_cli|opencode|zcode; 'all' is not accepted - name the hosts explicitly)" ;;
+        esac
+        case "$_seen" in
+            *"|$_key|"*) continue ;;
+        esac
+        _seen="$_seen$_key|"
+        printf '%s\n' "$_key"
+    done
+}
+
+# Host wiring is explicit-only (--hosts) or an interactive offer over the
+# detected hosts; the selection is fully validated BEFORE any step runs (a
+# refusal must precede every write; the die inside the substitution aborts
+# under set -e).
+HOST_SELECTED=""
+HOST_DETECTED=""
+if [ -n "$HOSTS" ]; then
+    HOST_SELECTED="$(validate_host_list "$HOSTS")"
+fi
+
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# host_config_dir KEY -> success when the host adapter's config directory
+# exists. The resolution mirrors each adapter's own install target (env
+# override first, then the well-known default), so detection agrees with what
+# `host install` would write.
+host_config_dir() {
+    case "$1" in
+        claude_code)
+            if [ -d "$HOME/.claude" ]; then return 0; fi
+            ;;
+        codex_cli)
+            if [ -n "${CODEX_HOME:-}" ]; then
+                if [ -d "$CODEX_HOME" ]; then return 0; fi
+            else
+                if [ -d "$HOME/.codex" ]; then return 0; fi
+            fi
+            ;;
+        opencode)
+            if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
+                if [ -d "$OPENCODE_CONFIG_DIR" ]; then return 0; fi
+            elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+                if [ -d "$XDG_CONFIG_HOME/opencode" ]; then return 0; fi
+            else
+                if [ -d "$HOME/.config/opencode" ]; then return 0; fi
+            fi
+            ;;
+        zcode)
+            if [ -d "$HOME/.zcode" ]; then return 0; fi
+            ;;
+    esac
+    return 1
+}
+
+# detect_installed_hosts -> the installed host keys, space-separated on one
+# line in registry order: a host counts as installed when its CLI is on PATH
+# or its adapter config directory exists.
+detect_installed_hosts() {
+    _detected=""
+    for _pair in claude_code:claude codex_cli:codex opencode:opencode zcode:zcode; do
+        _key="${_pair%%:*}"
+        _cli="${_pair#*:}"
+        if have "$_cli" || host_config_dir "$_key"; then
+            if [ -n "$_detected" ]; then
+                _detected="$_detected $_key"
+            else
+                _detected="$_key"
+            fi
+        fi
+    done
+    printf '%s\n' "$_detected"
+}
+
+# menu_select_hosts ANSWER KEY... -> the chosen keys, one per line in answer
+# order (deduplicated): only a menu number selects a host, so any other token
+# can never wire a host that was not offered.
+menu_select_hosts() {
+    _answer="$1"
+    shift
+    _seen="|"
+    _rest="$_answer,"
+    while [ -n "$_rest" ]; do
+        _token="${_rest%%,*}"
+        _rest="${_rest#*,}"
+        [ -n "$_token" ] || continue
+        case "$_token" in
+            *[!0-9]*) continue ;;
+            0) continue ;;
+        esac
+        _i=1
+        _key=""
+        for _candidate in "$@"; do
+            if [ "$_i" -eq "$_token" ]; then
+                _key="$_candidate"
+                break
+            fi
+            _i=$((_i + 1))
+        done
+        [ -n "$_key" ] || continue
+        case "$_seen" in
+            *"|$_key|"*) continue ;;
+        esac
+        _seen="$_seen$_key|"
+        printf '%s\n' "$_key"
+    done
+}
+
+# offer_installed_host_selection KEY... -> print the numbered menu to stderr,
+# read the answer from stdin (the caller gates on stdin being a terminal) and
+# echo only the chosen keys to stdout, so a command-substitution capture sees
+# the selection alone; an empty or unparsable answer selects nothing.
+offer_installed_host_selection() {
+    printf '%s\n' '      detected installed hosts:' >&2
+    _n=1
+    for _host in "$@"; do
+        printf '        %s) %s\n' "$_n" "$_host" >&2
+        _n=$((_n + 1))
+    done
+    _answer=""
+    printf '%s' '      wire which hosts? comma-separated numbers, empty to skip: ' >&2
+    read -r _answer || _answer=""
+    _answer="$(printf '%s' "$_answer" | tr -s ' \t' ',,')"
+    menu_select_hosts "$_answer" "$@"
+}
 
 # fetch_pipe URL -> stream URL to stdout with curl (preferred) or wget.
 fetch_pipe() {
@@ -286,11 +441,29 @@ if [ "$DRY_RUN" -eq 1 ]; then
         printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
         printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
     fi
-    printf '%s\n' '[7] OpenCode host adapter hook'
-    printf '%s\n' '    plan:  would run `mnemoseed-local hook install opencode`'
+    printf '%s\n' '[7] host adapter wiring (explicit --hosts or an interactive offer; never automatic)'
+    if [ -z "$HOST_SELECTED" ]; then
+        HOST_PROBED="$(detect_installed_hosts)"
+        if [ -n "$HOST_PROBED" ]; then
+            printf '%s\n' "    probe: detected installed hosts: $HOST_PROBED"
+        else
+            printf '%s\n' '    probe: no installed host detected (host CLIs on PATH or their config dirs)'
+        fi
+        printf '%s\n' '    plan:  no host adapter wiring (no --hosts value; the daemon-only install stays fully functional)'
+        printf '%s\n' '    plan:  an interactive session would be offered a selection of the detected hosts'
+        printf '%s\n' '    plan:  the exact per-host commands would be printed under next steps'
+    else
+        for _host in $HOST_SELECTED; do
+            case "$_host" in
+                opencode) printf '%s\n' '    plan:  would run `mnemoseed-local hook install opencode`' ;;
+                *) printf '%s\n' "    plan:  would run \`mnemoseed-local host install --host $_host\`" ;;
+            esac
+        done
+    fi
     printf '%s\n' '[8] final doctor + guidance'
     printf '%s\n' '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
-    printf '%s\n' '           (`mnemoseed-local up`; hook already installed)'
+    printf '%s\n' '           (mnemoseed-local up; the selected hosts are wired, or the exact per-host'
+    printf '%s\n' '           commands are printed when no --hosts value was given)'
     printf '\n'
     printf '%s\n' 'dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed'
     exit 0
@@ -415,13 +588,49 @@ else
     fi
 fi
 
-# --- step 7: hook install ------------------------------------------------------
+# --- step 7: host adapter wiring ---------------------------------------------
 
-printf '%s\n' '[7/8] OpenCode host adapter hook'
-if ! mnemoseed-local hook install opencode; then
-    printf '%s\n' "install.sh: note: 'mnemoseed-local hook install opencode' failed; you can run it manually later" >&2
+printf '%s\n' '[7/8] host adapter wiring'
+if [ -z "$HOST_SELECTED" ]; then
+    HOST_DETECTED="$(detect_installed_hosts)"
+    # The offer reads its answer from stdin, so it can run only when stdin is
+    # a terminal: a `curl ... | sh` pipe must never lose script bytes to an
+    # answer read, and a non-interactive session is never prompted.
+    if [ -n "$HOST_DETECTED" ] && [ -t 0 ]; then
+        HOST_SELECTED="$(offer_installed_host_selection $HOST_DETECTED)"
+    fi
+fi
+if [ -z "$HOST_SELECTED" ]; then
+    if [ -n "$HOST_DETECTED" ]; then
+        if [ -t 0 ]; then
+            printf '%s\n' '      nothing selected: no host adapter was wired; re-run with --hosts <csv> or use the commands under next steps'
+        else
+            printf '%s\n' "      detected installed hosts: $HOST_DETECTED"
+            printf '%s\n' '      non-interactive session: nothing was wired; re-run with --hosts <csv> or use the commands under next steps'
+        fi
+    else
+        printf '%s\n' '      detection: no installed host found (host CLIs on PATH or their config dirs)'
+    fi
+    printf '%s\n' '      skipped: no --hosts value given - no host adapter was wired'
+    printf '%s\n' '      the daemon install above is fully functional without a host adapter;'
+    printf '%s\n' "      wire hosts later with the exact commands under 'next steps' (or re-run with --hosts <csv>)"
 else
-    printf '%s\n' '      installed'
+    for _host in $HOST_SELECTED; do
+        case "$_host" in
+            opencode)
+                printf '%s\n' '      host opencode: running: mnemoseed-local hook install opencode'
+                if ! mnemoseed-local hook install opencode; then
+                    printf '%s\n' "install.sh: note: the opencode adapter install failed (installation continues); retry manually with: mnemoseed-local hook install opencode" >&2
+                fi
+                ;;
+            *)
+                printf '%s\n' "      host $_host: running: mnemoseed-local host install --host $_host"
+                if ! mnemoseed-local host install --host "$_host"; then
+                    printf '%s\n' "install.sh: note: the $_host adapter install failed (installation continues); retry manually with: mnemoseed-local host install --host $_host" >&2
+                fi
+                ;;
+        esac
+    done
 fi
 
 # --- step 8: final doctor + guidance -----------------------------------------
@@ -435,5 +644,13 @@ printf '\n'
 printf '%s\n' "installation complete: $CLI_PIN"
 printf '%s\n' 'next steps:'
 printf '%s\n' '  mnemoseed-local up            # start the daemon'
-printf '%s\n' '  (hook already installed; register MCP gateway in opencode.json if needed)'
+if [ -n "$HOST_SELECTED" ]; then
+    printf '%s\n' '  (host adapters were wired above; follow the hooks/mcp/trust notes printed per host)'
+else
+    printf '%s\n' '  no host adapter was wired; to wire hosts, run the exact command for each host:'
+    printf '%s\n' '    mnemoseed-local hook install opencode'
+    printf '%s\n' '    mnemoseed-local host install --host claude_code'
+    printf '%s\n' '    mnemoseed-local host install --host codex_cli'
+    printf '%s\n' '    mnemoseed-local host install --host zcode'
+fi
 exit 0

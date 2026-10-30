@@ -170,7 +170,14 @@ def install(path: Path | None = None) -> tuple[Path, bool]:
             # a malformed foreign value must be refused, never overwritten
             raise SettingsParseError(f"{target}: hooks.{event} exists but is not a list — fix it manually")
         hooks[event] = [{"hooks": [_handler()]}]
-    return target, config.write_atomic(target, data)
+    changed = config.write_atomic(target, data)
+    shared.report_onboarding(
+        "claude_code",
+        hooks="applied" if changed else "up to date",
+        mcp="not registered by this installer - hooks-only onboarding is incomplete "
+        "(register the MCP gateway manually if needed)",
+    )
+    return target, changed
 
 
 def uninstall(path: Path | None = None) -> tuple[Path, bool]:

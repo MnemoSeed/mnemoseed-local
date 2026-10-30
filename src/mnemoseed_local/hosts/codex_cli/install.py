@@ -418,8 +418,13 @@ def install(dry_run: bool = False) -> tuple[Path, bool]:
         hooks_changed = write_atomic(target, data, dry_run=dry_run)
     if mcp_changed:
         mcp_changed = write_text_atomic(config, new_config, dry_run=dry_run)
-    if hooks_changed and not dry_run:
-        print("next: review and trust the hooks once inside Codex via /hooks")
+    if not dry_run:
+        shared.report_onboarding(
+            "codex_cli",
+            hooks="applied" if hooks_changed else "up to date",
+            mcp="applied" if mcp_changed else "up to date",
+            trust="pending - review and approve the hooks in Codex via /hooks (manual, never automated)",
+        )
     return target, hooks_changed or mcp_changed
 
 
