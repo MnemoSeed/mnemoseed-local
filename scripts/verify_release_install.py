@@ -463,12 +463,20 @@ class _FakeHealthz:
     """A loopback-only /healthz listener standing in for the daemon."""
 
     def __init__(self) -> None:
-        self._server: ThreadingHTTPServer | None = None
+        self._server: _HealthzServer | None = None
         self._thread: threading.Thread | None = None
+        self._last_received = 0
         self.port = 0
 
+    @property
+    def requests_received(self) -> int:
+        """Requests received by the running listener; the last count once stopped."""
+        if self._server is not None:
+            return self._server.requests_received
+        return self._last_received
+
     def start(self) -> int:
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthzHandler)
+        self._server = _HealthzServer(("127.0.0.1", 0))
         self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -476,6 +484,7 @@ class _FakeHealthz:
 
     def stop(self) -> None:
         if self._server is not None:
+            self._last_received = self._server.requests_received
             self._server.shutdown()
             self._server.server_close()
             self._server = None
@@ -488,6 +497,7 @@ class _HealthzHandler(BaseHTTPRequestHandler):
     """Answers GET /healthz with a healthy payload; anything else is 404."""
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        self.server.count_request()
         if self.path.split("?", 1)[0] != "/healthz":
             self.send_response(404)
             self.end_headers()
@@ -501,6 +511,19 @@ class _HealthzHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+
+class _HealthzServer(ThreadingHTTPServer):
+    """Carries the received-request count for the fake /healthz listener."""
+
+    def __init__(self, address: tuple[str, int]) -> None:
+        super().__init__(address, _HealthzHandler)
+        self.requests_received = 0
+        self._lock = threading.Lock()
+
+    def count_request(self) -> None:
+        with self._lock:
+            self.requests_received += 1
 
 
 def _base_env(home: Path) -> dict[str, str]:
@@ -569,6 +592,13 @@ def _failure_detail(run: Run) -> str:
     if run.stdout.strip():
         parts.append("stdout: " + _tail(run.stdout, 1500))
     return " | ".join(parts) if parts else "no output"
+
+
+def _preserved_bytes_detail(label: str, before: bytes, after: bytes, changed: str) -> str:
+    """Observe preserved bytes when the comparison passes; keep the failure wording fixed."""
+    if after == before:
+        return f"{label} bytes preserved ({len(before)})"
+    return changed
 
 
 def _sha256(path: Path) -> str:
@@ -1066,10 +1096,11 @@ def proof_config_explicit_false(verifier: Verifier, context: Context) -> None:
         exit_code=1,
     )
     verifier.contains(init, "config already exists", "init reports that the config already exists")
+    after = config_file.read_bytes()
     verifier.check(
         "the explicit-false config bytes are unchanged",
-        config_file.read_bytes() == before,
-        "config.toml was rewritten",
+        after == before,
+        _preserved_bytes_detail("config.toml", before, after, changed="config.toml was rewritten"),
     )
     probe = session.probe(_CONFIG_PROBE, name="the installed loader reads the explicit-false config")
     payload = _parse_json_stdout(verifier, probe, "explicit-false config probe")
@@ -1148,6 +1179,22 @@ def _check_daemon_reachable(verifier: Verifier, run: Run, port: int, name: str) 
     verifier.check(name, "daemon: reachable" in text and f":{port}" in text, _tail(text, 500))
 
 
+def _status_health_count(
+    verifier: Verifier,
+    session: Session,
+    fake_daemon: _FakeHealthz,
+    checkpoint: str,
+    name: str,
+) -> Run:
+    """Run one host status check and record the health requests the fake daemon received."""
+    before = fake_daemon.requests_received
+    run = session.host("status", name=name)
+    counts: dict[str, int] = verifier.report.setdefault("health_requests", {})
+    counts[checkpoint] = fake_daemon.requests_received - before
+    verifier.report["health_requests_note"] = "per-checkpoint delta, not cumulative"
+    return run
+
+
 def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
     session = _session(verifier, context, "codex")
     codex_home = session.home / "codex-home"
@@ -1180,7 +1227,9 @@ def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
         codex_before = codex_config.read_bytes()
         hooks_file.write_text(json.dumps(_FOREIGN_HOOKS, indent=2) + "\n", encoding="utf-8", newline="\n")
 
-        status_before = session.host("status", name="host status runs before install")
+        status_before = _status_health_count(
+            verifier, session, fake_daemon, "before_install", "host status runs before install"
+        )
         verifier.contains(status_before, "host: not-installed", "the sandbox starts not-installed")
         _check_daemon_reachable(verifier, status_before, port, "status reports the fake daemon as reachable")
 
@@ -1247,7 +1296,9 @@ def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
             _tail(codex_text, 800),
         )
 
-        status_after = session.host("status", name="host status runs after install")
+        status_after = _status_health_count(
+            verifier, session, fake_daemon, "after_install", "host status runs after install"
+        )
         for needle in ("host: installed,", "unverified", "via /hooks"):
             verifier.contains(status_after, needle, f"status reports {needle}")
         _check_daemon_reachable(verifier, status_after, port, "status keeps the fake daemon reachability")
@@ -1280,10 +1331,13 @@ def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
             codex_config.read_bytes() == codex_before,
             _tail(codex_config.read_text(encoding="utf-8"), 800),
         )
+        mnemoseed_after = mnemoseed_config.read_bytes()
         verifier.check(
             "the host adapter never touched the mnemoseed config home",
-            mnemoseed_config.read_bytes() == mnemoseed_before,
-            "config.toml changed",
+            mnemoseed_after == mnemoseed_before,
+            _preserved_bytes_detail(
+                "mnemoseed config.toml", mnemoseed_before, mnemoseed_after, changed="config.toml changed"
+            ),
         )
         hooks_text = hooks_file.read_text(encoding="utf-8") if hooks_file.is_file() else ""
         verifier.check(
@@ -1296,7 +1350,9 @@ def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
             "third-party-noop" in hooks_text,
             _tail(hooks_text, 800),
         )
-        status_final = session.host("status", name="host status runs after uninstall")
+        status_final = _status_health_count(
+            verifier, session, fake_daemon, "after_uninstall", "host status runs after uninstall"
+        )
         verifier.contains(status_final, "host: not-installed", "the sandbox returns to not-installed")
         _check_daemon_reachable(
             verifier,
