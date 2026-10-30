@@ -149,8 +149,17 @@ remain available. Manual `dream once` reports `launched: false` with a reason
 while the route is unavailable. Use `mnemoseed-local on` to re-enable and start
 MnemoSeed immediately.
 
-The installer's final setup step is `mnemoseed-local hook install opencode`, so
-the OpenCode hook is installed automatically (restart OpenCode to load it).
+The installer's final setup step is host adapter wiring, and it is never
+automatic. Pass `--hosts a,b,c` (install.sh) or `-Hosts a,b,c` (install.ps1)
+with any of `claude_code`, `codex_cli`, `opencode`, `zcode` to wire exactly
+those adapters, or answer the interactive offer shown in a terminal session:
+the installer detects installed hosts by their CLI on PATH or their config
+directory and offers them as a numbered menu. A non-interactive run without a
+selection wires nothing — the daemon-only install stays fully functional and
+the exact per-host commands are printed as next steps. Each wired host reports
+its hooks, MCP and trust outcome on separate lines; manual trust steps (for
+example approving the hooks inside Codex via `/hooks`) stay printed next steps
+and are never automated.
 Hook lifecycle:
 `mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
 The ZCode and Codex CLI adapters install through the `host` command group:
