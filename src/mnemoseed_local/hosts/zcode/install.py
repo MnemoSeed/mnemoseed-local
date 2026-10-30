@@ -262,6 +262,12 @@ def install(path: Path | None = None, dry_run: bool = False) -> tuple[Path, bool
         found, _ = _read_prestate(target)
         if not found:
             write_atomic(_prestate_path(target), {PRESTATE_KEY: enabled_pre})
+    if not dry_run:
+        shared.report_onboarding(
+            "zcode",
+            hooks="applied" if changed else "up to date",
+            mcp="applied" if changed else "up to date",
+        )
     return target, changed
 
 

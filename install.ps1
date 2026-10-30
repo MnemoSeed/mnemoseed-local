@@ -7,7 +7,7 @@
   One-line entry:
     irm https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.ps1 | iex
   Or run as a file:
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [-DryRun] [-Yes] [-Tier <lite|standard|advanced>] [-Mode <CaptureRecall|Refinement>]
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [-DryRun] [-Yes] [-Tier <lite|standard|advanced>] [-Mode <CaptureRecall|Refinement>] [-Hosts <csv>]
 
   Orchestration order (identical to install.sh):
     1. detect / install ollama   (skipped in CaptureRecall mode: that mode runs
@@ -30,9 +30,16 @@
        [dream.llm.dream] `model`, else the built-in default qwen3.5:9b; runs
        only after an explicit [y/N] confirmation; -Yes skips the prompt;
        a model is NEVER pulled without that confirmation)
-    9. OpenCode host adapter hook (mnemoseed-local hook install opencode)
+    9. host adapter wiring (ONLY the hosts named in -Hosts <csv>, or the hosts
+       picked from an interactive offer of the detected ones: a host counts as
+       installed when its CLI is on PATH or its adapter config directory
+       exists; the offer runs only from an interactive host, a non-interactive
+       run without -Hosts wires NOTHING and reports what it detected next to
+       the exact per-host commands in the next steps; an unknown value refuses
+       before anything is written)
    10. final mnemoseed-local doctor re-check + next steps
-       (mnemoseed-local up; hook already installed)
+       (mnemoseed-local up; the selected hosts are wired, or the per-host
+       commands are printed when none were selected)
 
   -Mode selects the install-time setup posture passed through to
   `mnemoseed-local init --mode <mode>`, which maps it onto the two existing
@@ -60,7 +67,8 @@ param(
     [ValidateSet('', 'lite', 'standard', 'advanced')]
     [string]$Tier = '',
     [ValidateSet('CaptureRecall', 'Refinement')]
-    [string]$Mode = 'CaptureRecall'
+    [string]$Mode = 'CaptureRecall',
+    [string]$Hosts = ''
 )
 
 # The CLI's --mode takes kebab-case tokens; the installer's -Mode is the
@@ -238,6 +246,98 @@ function Invoke-Doctor {
     return @{ Code = $code; Text = ($lines -join "`n") }
 }
 
+# Get-HostSelection: split the -Hosts CSV into the deduplicated adapter keys.
+# Every token must be an exact adapter key; anything else refuses BEFORE any
+# step runs. 'all' is rejected on purpose: silently wiring every host is
+# exactly what -Hosts must never do.
+function Get-HostSelection([string]$Csv) {
+    $seen = @()
+    foreach ($token in $Csv.Split(',')) {
+        if (@('claude_code', 'codex_cli', 'opencode', 'zcode') -cnotcontains $token) {
+            Exit-WithError "unknown host '$token' (expected claude_code|codex_cli|opencode|zcode; 'all' is not accepted - name the hosts explicitly)"
+        }
+        if ($seen -notcontains $token) { $seen += $token }
+    }
+    return $seen
+}
+
+# Host wiring is explicit-only (-Hosts) or an interactive offer over the
+# detected hosts; the selection is fully validated before the dry-run plan or
+# any step runs.
+$HostSelection = @()
+$HostPromptAnswered = $false
+if ($Hosts -ne '') {
+    $HostSelection = Get-HostSelection $Hosts
+}
+
+# Test-HostConfigDir: whether the host adapter's config directory exists,
+# mirroring each adapter's own resolution (env override first, then the
+# well-known default), so detection agrees with what `host install` writes.
+function Test-HostConfigDir([string]$Key) {
+    $dir = ''
+    if ($Key -eq 'claude_code') {
+        $dir = Join-Path $env:USERPROFILE '.claude'
+    } elseif ($Key -eq 'codex_cli') {
+        $dir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    } elseif ($Key -eq 'opencode') {
+        if ($env:OPENCODE_CONFIG_DIR) { $dir = $env:OPENCODE_CONFIG_DIR }
+        elseif ($env:XDG_CONFIG_HOME) { $dir = Join-Path $env:XDG_CONFIG_HOME 'opencode' }
+        else { $dir = Join-Path $env:USERPROFILE '.config\opencode' }
+    } elseif ($Key -eq 'zcode') {
+        $dir = Join-Path $env:USERPROFILE '.zcode'
+    }
+    if ($dir -eq '') { return $false }
+    return (Test-Path -LiteralPath $dir -PathType Container)
+}
+
+# Get-InstalledHosts: the installed host keys in registry order - a host
+# counts as installed when its CLI is on PATH or its adapter config directory
+# exists.
+function Get-InstalledHosts {
+    $detected = @()
+    $candidates = [ordered]@{ claude_code = 'claude'; codex_cli = 'codex'; opencode = 'opencode'; zcode = 'zcode' }
+    foreach ($candidate in $candidates.GetEnumerator()) {
+        if ((Test-CommandExists $candidate.Value) -or (Test-HostConfigDir $candidate.Key)) {
+            $detected += $candidate.Key
+        }
+    }
+    return $detected
+}
+
+# ConvertFrom-HostMenuAnswer: map a menu answer onto the detected keys, in
+# answer order, deduplicated. Only a menu number selects a host, so any other
+# token can never wire a host that was not offered.
+function ConvertFrom-HostMenuAnswer([string]$Answer, [string[]]$Detected) {
+    $chosen = @()
+    foreach ($token in ($Answer -split '[,\s]+' | Where-Object { $_ -ne '' })) {
+        if ($token -notmatch '^[0-9]+$') { continue }
+        $index = [int]$token
+        if (($index -lt 1) -or ($index -gt $Detected.Count)) { continue }
+        $key = $Detected[$index - 1]
+        if ($chosen -notcontains $key) { $chosen += $key }
+    }
+    return $chosen
+}
+
+# Select-HostsInteractively: show the numbered menu of the detected hosts and
+# read the answer; a session that cannot prompt (e.g. -NonInteractive) throws
+# out of Read-Host and selects nothing, so a non-interactive run never wires a
+# host the user never saw offered. A successful Read-Host sets
+# $HostPromptAnswered, so a conscious empty answer can be reported as such.
+function Select-HostsInteractively([string[]]$Detected) {
+    Write-Host '      detected installed hosts:'
+    for ($i = 0; $i -lt $Detected.Count; $i++) {
+        Write-Host "        $($i + 1)) $($Detected[$i])"
+    }
+    try {
+        $answer = Read-Host '      wire which hosts? comma-separated numbers, empty to skip'
+    } catch {
+        return @()
+    }
+    $script:HostPromptAnswered = $true
+    return @(ConvertFrom-HostMenuAnswer $answer $Detected)
+}
+
 # --- dry-run plan ----------------------------------------------------------
 
 if ($DryRun) {
@@ -300,11 +400,30 @@ if ($DryRun) {
         Write-Host "    plan:  would resolve the dream model from $ConfigPath (an ACTIVE [dream.llm.dream] ``model`` key; default $DefaultModel),"
         Write-Host '           prompt [y/N] (skipped by -Yes), then run `ollama pull <model>` - NEVER without that confirmation'
     }
-    Write-Host '[9] OpenCode host adapter hook'
-    Write-Host '    plan:  would run `mnemoseed-local hook install opencode`'
+    Write-Host '[9] host adapter wiring (explicit -Hosts or an interactive offer; never automatic)'
+    if ($HostSelection.Count -eq 0) {
+        $probedHosts = @(Get-InstalledHosts)
+        if ($probedHosts.Count -gt 0) {
+            Write-Host "    probe: detected installed hosts: $($probedHosts -join ', ')"
+        } else {
+            Write-Host '    probe: no installed host detected (host CLIs on PATH or their config dirs)'
+        }
+        Write-Host '    plan:  no host adapter wiring (no -Hosts value; the daemon-only install stays fully functional)'
+        Write-Host '    plan:  an interactive session would be offered a selection of the detected hosts'
+        Write-Host '    plan:  the exact per-host commands would be printed under next steps'
+    } else {
+        foreach ($hostKey in $HostSelection) {
+            if ($hostKey -eq 'opencode') {
+                Write-Host '    plan:  would run `mnemoseed-local hook install opencode`'
+            } else {
+                Write-Host "    plan:  would run ``mnemoseed-local host install --host $hostKey``"
+            }
+        }
+    }
     Write-Host '[10] final doctor + guidance'
     Write-Host '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
-    Write-Host '           (`mnemoseed-local up`; hook already installed)'
+    Write-Host '           (mnemoseed-local up; the selected hosts are wired, or the exact per-host'
+    Write-Host '           commands are printed when no -Hosts value was given)'
     Write-Host ''
     Write-Host 'dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed'
     exit 0
@@ -473,14 +592,43 @@ if ($Mode -eq 'CaptureRecall') {
     }
 }
 
-# --- step 7: hook install ------------------------------------------------------
+# --- step 9: host adapter wiring ---------------------------------------------
 
-Write-Host '[9/10] OpenCode host adapter hook'
-& mnemoseed-local hook install opencode
-if ($LASTEXITCODE -ne 0) {
-    [Console]::Error.WriteLine("install.ps1: note: 'mnemoseed-local hook install opencode' failed (exit $LASTEXITCODE); you can run it manually later")
-} else {
-    Write-Host '      installed'
+Write-Host '[9/10] host adapter wiring'
+if ($HostSelection.Count -eq 0) {
+    $detectedHosts = @(Get-InstalledHosts)
+    if ($detectedHosts.Count -gt 0) {
+        $HostSelection = @(Select-HostsInteractively $detectedHosts)
+    }
+    if ($HostSelection.Count -eq 0) {
+        if ($detectedHosts.Count -gt 0) {
+            if ($HostPromptAnswered) {
+                Write-Host '      nothing selected: no host adapter was wired; re-run with -Hosts <csv> or use the commands under next steps'
+            } else {
+                Write-Host "      detected installed hosts: $($detectedHosts -join ', ')"
+                Write-Host '      non-interactive session: nothing was wired; re-run with -Hosts <csv> or use the commands under next steps'
+            }
+        } else {
+            Write-Host '      detection: no installed host found (host CLIs on PATH or their config dirs)'
+        }
+        Write-Host '      skipped: no -Hosts value given - no host adapter was wired'
+        Write-Host '      the daemon install above is fully functional without a host adapter;'
+        Write-Host "      wire hosts later with the exact commands under 'next steps' (or re-run with -Hosts <csv>)"
+    }
+}
+if ($HostSelection.Count -gt 0) {
+    foreach ($hostKey in $HostSelection) {
+        $cliArgs = if ($hostKey -eq 'opencode') {
+            @('hook', 'install', 'opencode')
+        } else {
+            @('host', 'install', '--host', $hostKey)
+        }
+        Write-Host "      host ${hostKey}: running: mnemoseed-local $($cliArgs -join ' ')"
+        & mnemoseed-local @cliArgs
+        if ($LASTEXITCODE -ne 0) {
+            [Console]::Error.WriteLine("install.ps1: note: the $hostKey adapter install failed (exit $LASTEXITCODE; installation continues); retry manually with: mnemoseed-local $($cliArgs -join ' ')")
+        }
+    }
 }
 
 # --- step 8: final doctor + guidance -----------------------------------------
@@ -494,5 +642,13 @@ Write-Host ''
 Write-Host "installation complete: $CliPin"
 Write-Host 'next steps:'
 Write-Host '  mnemoseed-local up            # start the daemon'
-Write-Host '  (hook already installed; register MCP gateway in opencode.json if needed)'
+if ($HostSelection.Count -gt 0) {
+    Write-Host '  (host adapters were wired above; follow the hooks/mcp/trust notes printed per host)'
+} else {
+    Write-Host '  no host adapter was wired; to wire hosts, run the exact command for each host:'
+    Write-Host '    mnemoseed-local hook install opencode'
+    Write-Host '    mnemoseed-local host install --host claude_code'
+    Write-Host '    mnemoseed-local host install --host codex_cli'
+    Write-Host '    mnemoseed-local host install --host zcode'
+}
 exit 0
