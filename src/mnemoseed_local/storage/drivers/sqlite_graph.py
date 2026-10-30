@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from collections.abc import Sequence as CSeq
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -161,31 +162,77 @@ def _reason_code(value: str) -> ReasonCode:
     return ReasonCode(value)
 
 
+def _receipt_version(row: sqlite3.Row, column: str) -> int:
+    """Versions must already be stored integers; SQLite INTEGER affinity keeps
+    non-integral REALs unconverted, so a float here is damage and rounding it
+    would silently rewrite the recorded revision. Rejection types mirror a
+    failed ``int()`` conversion: OverflowError for non-finite floats,
+    ValueError for everything else."""
+    value = row[column]
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    message = f"receipt column {column!r} holds non-integer version {value!r}; refusing to round"
+    if isinstance(value, float) and not math.isfinite(value):
+        raise OverflowError(message)
+    raise ValueError(message)
+
+
+def _receipt_applied_at(row: sqlite3.Row) -> float:
+    value = str(row["applied_at"])
+    try:
+        return epoch_from_iso(value)
+    except ValueError as exc:
+        raise ValueError(f"receipt column 'applied_at' is not an ISO8601 UTC timestamp: {value!r}") from exc
+
+
+def _receipt_evidence(row: sqlite3.Row) -> tuple[int, ...]:
+    raw = str(row["evidence_event_ids"])
+    try:
+        parsed: Any = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"receipt column 'evidence_event_ids' is not valid JSON: {raw!r}") from exc
+    if not isinstance(parsed, list):
+        raise TypeError(f"receipt column 'evidence_event_ids' is not a JSON array of integers: {raw!r}")
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in parsed):
+        raise ValueError(f"receipt column 'evidence_event_ids' is not a JSON array of integers: {raw!r}")
+    return tuple(parsed)
+
+
+def _receipt_enum[EnumT: StrEnum](row: sqlite3.Row, column: str, enum_type: type[EnumT]) -> EnumT:
+    value = str(row[column])
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ValueError(f"receipt column {column!r} is not a valid {enum_type.__name__}: {value!r}") from exc
+
+
 def _decode_receipt(row: sqlite3.Row) -> ReconciliationReceipt:
     return ReconciliationReceipt(
         nomination_id=str(row["nomination_id"]),
         profile_id=str(row["profile_id"]),
-        disposition=_disposition(str(row["disposition"])),
-        reason_code=_reason_code(str(row["reason_code"])),
+        disposition=_receipt_enum(row, "disposition", Disposition),
+        reason_code=_receipt_enum(row, "reason_code", ReasonCode),
         canonical_kind=str(row["canonical_kind"]),
         composite_group_id=str(row["composite_group_id"]),
-        evidence_event_ids=tuple(int(item) for item in json.loads(str(row["evidence_event_ids"]))),
+        evidence_event_ids=_receipt_evidence(row),
         verdict=str(row["verdict"]),
         quality=str(row["quality"]),
         left_node_id=str(row["left_node_id"]),
-        left_version=int(row["left_version"]),
+        left_version=_receipt_version(row, "left_version"),
         left_expected_peer_id=str(row["left_expected_peer_id"]),
         right_node_id=str(row["right_node_id"]),
-        right_version=int(row["right_version"]),
+        right_version=_receipt_version(row, "right_version"),
         right_expected_peer_id=str(row["right_expected_peer_id"]),
         winner_node_id=row["winner_node_id"],
         loser_node_id=row["loser_node_id"],
         loser_prior_version=(
-            int(row["loser_prior_version"]) if row["loser_prior_version"] is not None else None
+            _receipt_version(row, "loser_prior_version") if row["loser_prior_version"] is not None else None
         ),
-        loser_new_version=(int(row["loser_new_version"]) if row["loser_new_version"] is not None else None),
+        loser_new_version=(
+            _receipt_version(row, "loser_new_version") if row["loser_new_version"] is not None else None
+        ),
         downweight_factor=(float(row["downweight_factor"]) if row["downweight_factor"] is not None else None),
-        applied_at=epoch_from_iso(str(row["applied_at"])),
+        applied_at=_receipt_applied_at(row),
     )
 
 
