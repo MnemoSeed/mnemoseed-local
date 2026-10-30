@@ -25,6 +25,7 @@ from mnemoseed_local.instrument.ledger import (
 from mnemoseed_local.storage.drivers._time import epoch_from_iso
 
 if TYPE_CHECKING:
+    from mnemoseed_local.schema.graph import GraphNode
     from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
     from mnemoseed_local.storage.ports import ReconciliationReceipt
 
@@ -234,15 +235,23 @@ def read_outbox_rows(conn: sqlite3.Connection) -> list[OutboxRowSnapshot]:
 def read_unresolved_receipts(conn: sqlite3.Connection) -> list[ProjectionReceiptSnapshot]:
     """Read the persisted unresolved receipts with their raw applied-at text."""
     rows = _fetch_rows(conn, RECEIPT_UNRESOLVED_QUERY)
-    return [
-        ProjectionReceiptSnapshot(
-            nomination_id=str(row[0]),
-            disposition=str(row[1]),
-            reason_code=str(row[2]),
-            applied_at_raw=str(row[3]),
+    snapshots: list[ProjectionReceiptSnapshot] = []
+    for row in rows:
+        nomination_id = str(row[0])
+        applied_at = row[3]
+        if applied_at is None:
+            raise BindingIncompleteError(
+                {"reason": "receipt_applied_at_missing", "nomination_id": nomination_id}
+            )
+        snapshots.append(
+            ProjectionReceiptSnapshot(
+                nomination_id=nomination_id,
+                disposition=str(row[1]),
+                reason_code=str(row[2]),
+                applied_at_raw=str(applied_at),
+            )
         )
-        for row in rows
-    ]
+    return snapshots
 
 
 def read_schema_master(conn: sqlite3.Connection) -> str:
@@ -529,23 +538,37 @@ def _read_product_receipt(
     try:
         return graph.get_reconciliation_receipt(profile_id=profile_id, nomination_id=nomination_id)
     except sqlite3.Error as exc:
-        detail = _product_receipt_detail("product_receipt_query_error", profile_id, nomination_id, exc)
+        detail = _product_read_detail(
+            "product_receipt_query_error", exc, profile_id=profile_id, nomination_id=nomination_id
+        )
         raise BindingIncompleteError(detail) from exc
     except (ValueError, TypeError, OverflowError) as exc:
-        detail = _product_receipt_detail("product_receipt_decode_error", profile_id, nomination_id, exc)
+        detail = _product_read_detail(
+            "product_receipt_decode_error", exc, profile_id=profile_id, nomination_id=nomination_id
+        )
         raise BindingIncompleteError(detail) from exc
 
 
-def _product_receipt_detail(
-    reason: str, profile_id: str, nomination_id: str, error: BaseException
-) -> dict[str, Any]:
-    """The typed failure detail of one product receipt read."""
-    return {
-        "reason": reason,
-        "profile_id": profile_id,
-        "nomination_id": nomination_id,
-        "error": str(error),
-    }
+def _read_product_node(graph: SqliteGraphDriver, *, node_id: str) -> GraphNode | None:
+    """The product decode of one current node behind the typed read boundary.
+
+    A SQLite failure of the product connection and node content the product
+    cannot decode both become binding failures, each with its own reason, and
+    keep the original error as their cause.
+    """
+    try:
+        return graph.get_node(node_id)
+    except sqlite3.Error as exc:
+        detail = _product_read_detail("product_node_query_error", exc, node_id=node_id)
+        raise BindingIncompleteError(detail) from exc
+    except (ValueError, TypeError, OverflowError) as exc:
+        detail = _product_read_detail("product_node_decode_error", exc, node_id=node_id)
+        raise BindingIncompleteError(detail) from exc
+
+
+def _product_read_detail(reason: str, error: BaseException, **identifiers: str) -> dict[str, Any]:
+    """The typed failure detail of one product read."""
+    return {"reason": reason, **identifiers, "error": str(error)}
 
 
 def _row_values(rows: Sequence[Sequence[Any]]) -> list[list[Any]]:
@@ -567,7 +590,7 @@ def _version_row_hash(row: Sequence[Any]) -> str:
 
 def _current_node_hash(graph: SqliteGraphDriver, node_id: str) -> str:
     """The hash of the full current content of one node."""
-    node = graph.get_node(node_id)
+    node = _read_product_node(graph, node_id=node_id)
     if node is None:
         return sha256_hex(canonical_json(None).encode("utf-8"))
     return sha256_hex(canonical_node_json(node).encode("utf-8"))
