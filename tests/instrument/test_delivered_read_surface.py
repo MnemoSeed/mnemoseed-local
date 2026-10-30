@@ -696,10 +696,6 @@ def _corrupt_receipt_column(copy_path: Path, column: str, value: Any) -> None:
 @pytest.mark.parametrize(
     ("column", "value", "storage_class"),
     [
-        ("left_version", 1.5, "real"),
-        ("right_version", 1.5, "real"),
-        ("loser_prior_version", 1.5, "real"),
-        ("loser_new_version", 1.5, "real"),
         ("left_node_id", b"\x00corrupt-left-node-id", "blob"),
     ],
 )
@@ -749,6 +745,68 @@ def test_a_raw_type_mismatch_in_a_copied_receipt_row_is_flagged(
         assert len(checks) == 1
         assert checks[0].fields_match is False
         assert column in checks[0].mismatch_fields
+        assert _receipt_column_raw(paths.control_graph_db, column) == original_before
+    finally:
+        asyncio.run(copy_graph.close())
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "storage_class"),
+    [
+        ("left_version", 1.5, "real"),
+        ("right_version", 1.5, "real"),
+        ("loser_prior_version", 1.5, "real"),
+        ("loser_new_version", 1.5, "real"),
+    ],
+)
+def test_a_fractional_version_in_a_copied_receipt_row_fails_the_crosscheck_typed(
+    paths: InstrumentPaths,
+    tmp_path: Path,
+    column: str,
+    value: Any,
+    storage_class: str,
+) -> None:
+    """A fractional version rejects at product decode, so the crosscheck surfaces
+    binding_incomplete with the refusal as its cause instead of a mismatch flag."""
+    build_repair_control_fixture(
+        paths,
+        control_id=CONTROL_ID,
+        pending_count=1,
+        repair_limit=REPAIR_LIMIT,
+        seed_clock_epoch=SEED_EPOCH,
+    )
+    original_before = _receipt_column_raw(paths.control_graph_db, column)
+    copy_path = tmp_path / f"version-copy-{column}.db"
+    copy_graph = _copied_control_graph(paths.control_graph_db, copy_path)
+    try:
+        with _rows(copy_path) as connection:
+            baseline = crosscheck_receipts(
+                connection,
+                copy_graph,
+                nomination_ids=[_CORRUPTION_NOMINATION_ID],
+            )
+        assert len(baseline) == 1
+        assert baseline[0].fields_match is True
+        assert baseline[0].mismatch_fields == ()
+
+        _corrupt_receipt_column(copy_path, column, value)
+
+        with _rows(copy_path) as connection:
+            stored = connection.execute(
+                f"SELECT typeof({column}) FROM reconciliation_receipts WHERE nomination_id = ?",
+                (_CORRUPTION_NOMINATION_ID,),
+            ).fetchone()
+            with pytest.raises(BindingIncompleteError) as caught:
+                crosscheck_receipts(
+                    connection,
+                    copy_graph,
+                    nomination_ids=[_CORRUPTION_NOMINATION_ID],
+                )
+        assert stored is not None
+        assert str(stored[0]) == storage_class
+        assert caught.value.diag_code == "binding_incomplete"
+        assert isinstance(caught.value.__cause__, ValueError)
+        assert column in str(caught.value.__cause__)
         assert _receipt_column_raw(paths.control_graph_db, column) == original_before
     finally:
         asyncio.run(copy_graph.close())
