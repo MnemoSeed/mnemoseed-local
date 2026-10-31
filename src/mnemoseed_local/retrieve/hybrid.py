@@ -22,7 +22,10 @@ omission.
 The two tracks read independent stores and merge through an order-insensitive
 stable sort, so their evaluation order cannot affect the result: ``recall``
 issues them concurrently on a two-worker executor and the output is
-byte-identical to the sequential reference ``_recall_sequential``. The embedded
+byte-identical to the sequential reference ``_recall_sequential``. The temporal
+applicability tier (PRD-281) is set inside the shared vector-track candidate
+construction with ``now`` threaded to both paths the same way, so the
+flagged order stays byte-identical too. The embedded
 sqlite drivers keep one connection per thread, so parallel track reads never
 share a handle. The executor is cached per retriever (threads spawn lazily on
 the first recall) and runs on daemon threads never registered with the
@@ -48,6 +51,7 @@ from dataclasses import dataclass
 from mnemoseed_local.config import DEFAULT_RECALL_RESCUE_CUE_MIN, DEFAULT_RECALL_RESCUE_FLOOR
 from mnemoseed_local.retrieve.activation import ActivationSnapshot
 from mnemoseed_local.retrieve.cues import ExtractedCues
+from mnemoseed_local.retrieve.temporal import evaluate_temporal
 from mnemoseed_local.schema.graph import GraphNode
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, Cues
 from mnemoseed_local.storage.ports import (
@@ -121,7 +125,10 @@ class ScoreBreakdown:
 class Candidate:
     """One fused candidate: a chunk hit (kind="chunk") or graph node
     (kind="graph"). ``rescued`` marks a below-main-floor flashbulb pin that
-    entered the pool through the cue-driven rescue band (design/09 §3.5)."""
+    entered the pool through the cue-driven rescue band (design/09 §3.5).
+    ``expired_window`` marks a chunk whose verbatim text parses to an explicit
+    expiry instant at or before the reading instant (PRD-281): it demotes via
+    the rank tier, never excludes."""
 
     kind: str
     id: str
@@ -130,6 +137,7 @@ class Candidate:
     score: float
     breakdown: ScoreBreakdown
     rescued: bool = False
+    expired_window: bool = False
     selection_score: float | None = None
 
 
@@ -202,6 +210,7 @@ class HybridRetriever:
             vector_store,
             embedder,
             config,
+            now,
         )
         graph_future = self._executor.submit(
             self._graph_track,
@@ -229,15 +238,20 @@ class HybridRetriever:
         vector_store: VectorStore,
         graph_store: GraphStore,
         embedder: Embedder,
+        now: float | None = None,
     ) -> HybridRecall:
         """Reference path: both tracks on the calling thread (T2 semantics).
 
         Kept for the byte-equivalence tests and as a deterministic fallback;
-        ``recall`` runs exactly the same tracks on worker threads.
+        ``recall`` runs exactly the same tracks on worker threads. ``now``
+        threads into the same vector-track candidate construction so both paths
+        set the temporal flags identically.
         """
         config = self._config
         query = cues.cues
-        vector_candidates = self._vector_track(query_text, query, profile_id, vector_store, embedder, config)
+        vector_candidates = self._vector_track(
+            query_text, query, profile_id, vector_store, embedder, config, now
+        )
         graph_candidates = self._graph_track(query, profile_id, graph_store, config)
         return _merge(vector_candidates, graph_candidates, config=config)
 
@@ -251,6 +265,7 @@ class HybridRetriever:
         vector_store: VectorStore,
         embedder: Embedder,
         config: HybridConfig,
+        now: float | None = None,
     ) -> list[Candidate]:
         entities = tuple(query.entities)
         embedding = embedder.embed(query_text)
@@ -319,6 +334,7 @@ class HybridRetriever:
                     score=breakdown.total,
                     breakdown=breakdown,
                     rescued=rescued,
+                    expired_window=evaluate_temporal(chunk.text, now).expired_window,
                 )
             )
         return candidates
@@ -385,11 +401,20 @@ class HybridRetriever:
 # ---------------------------------------------------------------- helpers
 
 
-def _sort_key(candidate: Candidate) -> tuple[bool, float, str, str]:
-    """Rank order: rescued candidates ALWAYS trail normal ones (design/09 §3.5
-    enforced discipline — a cue-fished weak trace never displaces a healthy
-    memory), then score descending, then a stable (kind, id) tie-break."""
-    return (candidate.rescued, -candidate.score, candidate.kind, candidate.id)
+def _sort_key(candidate: Candidate) -> tuple[bool, bool, float, str, str]:
+    """Rank order: candidates with an expired explicit validity window trail
+    ALL others (PRD-281 D04 — an expired constraint holds no current-instruction
+    priority over rescued pins, presumed currently valid), then rescued
+    candidates trail normal ones (design/09 §3.5 enforced discipline — a
+    cue-fished weak trace never displaces a healthy memory), then score
+    descending, then a stable (kind, id) tie-break."""
+    return (
+        candidate.expired_window,
+        candidate.rescued,
+        -candidate.score,
+        candidate.kind,
+        candidate.id,
+    )
 
 
 def _merge(

@@ -18,6 +18,7 @@ most recent user prompt of a session:
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import auth_support
@@ -690,3 +691,62 @@ def test_recall_pending_chunk_precedes_node_on_identical_decay_and_stamp(
         assert [item["kind"] for item in items] == ["chunk", "node"], items
         assert items[0]["id"] == chunk_id
         assert items[1]["text"] == "user: 上一轮我们确认 LanceDb 的定位"
+
+
+# ---------------------------------------------------------------- expired-window tier (PRD-281)
+
+# Reading instant: the reported expiries (2026-09-08/09) lie weeks past it.
+_NOW = datetime(2026, 10, 31, tzinfo=UTC).timestamp()
+
+
+def _store_pending_pair(client, *, expired_chunk_id: str, fresh_chunk_id: str) -> None:
+    """One expired-window constraint chunk (higher decay, would win the old
+    decay-desc order) plus one fresh open-ended chunk (lower decay)."""
+    stores = client.app.state.stores
+    for chunk_id, text, decay in (
+        (expired_chunk_id, "user: LanceDb 临时约束 until 2026-09-08", 0.9),
+        (fresh_chunk_id, "user: LanceDb 现行方案说明", 0.6),
+    ):
+        stamp = ChunkStamp(
+            chunk_id=chunk_id,
+            profile_id=PROFILE,
+            text=text,
+            cognitive_tier=CognitiveTier.TIER_1,
+            model_id="test-model",
+            cues=Cues(entities=["LanceDb"]),
+            provenance=Provenance(asserted_by="user", session_id="sess-a", source="manual"),
+            decay_weight=decay,
+            ingested_at=1000.0,
+        )
+        embedded = stores.embed.embed(text)
+        stores.vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
+
+
+def test_recall_pending_expired_window_ranks_after_fresh_candidates(
+    recall_config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRD-281 case row 9 (T2 tier pin): an expired-window constraint chunk
+    ranks behind every fresh candidate in the focal scan — never first, still
+    served (tier, not exclusion)."""
+    with auth_support.boot(recall_config_path.parent) as client:
+        _store_pending_pair(client, expired_chunk_id="exp-chunk", fresh_chunk_id="fresh-chunk")
+        memory = client.app.state.memory
+        monkeypatch.setattr(memory, "_clock", lambda: _NOW)
+        memory.note_user_prompt(PROFILE, "sess-b", "LanceDb 相关")
+        items = _pull(client, "sess-b")["items"]
+        assert [item["id"] for item in items] == ["fresh-chunk", "exp-chunk"], items
+
+
+def test_recall_pending_expired_window_dropped_first_under_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRD-281 case row 9, budget edge: the expired candidate is the first to
+    fall out of the char budget even with the higher decay weight."""
+    _budget_config(tmp_path, monkeypatch, budget=40)
+    with auth_support.boot(tmp_path) as client:
+        _store_pending_pair(client, expired_chunk_id="exp-chunk", fresh_chunk_id="fresh-chunk")
+        memory = client.app.state.memory
+        monkeypatch.setattr(memory, "_clock", lambda: _NOW)
+        memory.note_user_prompt(PROFILE, "sess-b", "LanceDb 相关")
+        items = _pull(client, "sess-b")["items"]
+        assert [item["id"] for item in items] == ["fresh-chunk"], items

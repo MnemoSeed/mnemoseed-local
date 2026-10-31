@@ -294,6 +294,7 @@ class Assembler:
             for admission in sorted(
                 admitted,
                 key=lambda item: (
+                    item.candidate.expired_window,
                     item.candidate.rescued,
                     -item.candidate.score,
                     item.candidate.kind,
@@ -321,13 +322,15 @@ class Assembler:
     ) -> tuple[list[_Admission], int]:
         """Walk the ranked pool, admitting under top-k/budget and pairing
         conflict groups atomically. Admission re-applies the retriever's rank
-        discipline (design/09 §3.5: rescued candidates trail normal ones
-        regardless of fused score) so rendering order and top-k truncation
-        inherit it at the serving surface. Returns the admissions and the
-        count of candidates rejected by the gate (never silent)."""
+        discipline (PRD-281: expired-window candidates trail all others;
+        design/09 §3.5: rescued candidates trail non-rescued ones regardless of
+        fused score) so rendering order and top-k truncation inherit it at the
+        serving surface. Returns the admissions and the count of candidates
+        rejected by the gate (never silent)."""
         ordered = sorted(
             pool,
             key=lambda candidate: (
+                candidate.expired_window,
                 candidate.rescued,
                 -effective[candidate.id],
                 candidate.kind,
