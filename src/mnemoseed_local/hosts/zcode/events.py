@@ -43,6 +43,7 @@ from typing import Any
 from mnemoseed_local.hosts.common.daemon import (
     POST_TIMEOUT_SECONDS,
     debug,
+    enforce_project_binding,
     hook_client,
     profile_id,
 )
@@ -230,7 +231,8 @@ def transform_event(raw: str) -> int:
     Zero stdout on EVERY path EXCEPT a served T1 replay block or a served T2
     pull / visibility signal payload (see the module red line). Fire-and-
     forget: failures land in the opt-in stderr debug lane; a dropped or
-    malformed event is exit 0.
+    malformed event is exit 0. The project binding gate runs first: a refused
+    event is dropped with a visible stderr refusal and no daemon write.
     """
     try:
         event = json.loads(raw)
@@ -239,6 +241,8 @@ def transform_event(raw: str) -> int:
         return 0
     if not isinstance(event, dict):
         debug("dropped non-object stdin payload")
+        return 0
+    if not enforce_project_binding(event.get("cwd")):
         return 0
     try:
         action = normalize_event(event, now=time.time())
