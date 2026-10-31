@@ -4,8 +4,9 @@ Verbs: init / up / on / off / status / doctor / recall / remember / dream
 (--once, status) / forget / profile (create | list | archive | unarchive) /
 config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
 hook (install | uninstall | status) / host (install | uninstall | status) /
-mcp (MCP stdio gateway). Local loopback by default; every state-changing verb
-talks to the daemon REST (FR-7.12); no identity/accounts in the local MVP.
+project (bind | run) / mcp (MCP stdio gateway). Local loopback by default;
+every state-changing verb talks to the daemon REST (FR-7.12); no
+identity/accounts in the local MVP.
 """
 
 from __future__ import annotations
@@ -1444,6 +1445,109 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return _emit_json(body)
 
 
+# ------------------------------------------------------------ project binding
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    """Explicit project-root -> profile binding over the shared local registry."""
+    if args.project_command == "bind":
+        return _project_bind(args)
+    return _project_run(args)
+
+
+def _project_bind(args: argparse.Namespace) -> int:
+    from mnemoseed_local.hosts.common import project_binding as pb
+    from mnemoseed_local.rest_client import resolve_client
+
+    try:
+        client = resolve_client(args)
+        roster = client.get("/api/v1/profiles")["profiles"]
+        registered = {str(profile["profile_id"]) for profile in roster if not profile.get("archived")} | {
+            DEFAULT_PROFILE
+        }
+        result = pb.bind(
+            CONFIG_DIR,
+            Path(args.root),
+            args.profile,
+            replace=args.replace,
+            known_profile_ids=registered,
+        )
+    except pb.BindingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        return _client_error(exc)
+    root_text = str(result.project_root)
+    if result.action == "created":
+        print(f"bound {root_text} -> profile {result.profile_id}")
+    elif result.action == "replaced":
+        print(f"rebound {root_text} -> profile {result.profile_id}")
+        if result.backup_path is not None:
+            print(f"previous binding backed up to {result.backup_path}")
+    else:
+        print(f"already bound: {root_text} -> profile {result.profile_id} (no change)")
+    if result.profile_id == DEFAULT_PROFILE:
+        print(
+            f"note: profile {DEFAULT_PROFILE} is the machine's shared default namespace; "
+            "this root is deliberately not isolated from other default-profile work"
+        )
+    if result.shared_roots:
+        shown = ", ".join(str(path) for path in result.shared_roots)
+        print(f"note: profile {result.profile_id} is shared with other project root(s): {shown}")
+        print(
+            "      these roots deliberately use the same memory profile; "
+            "they are not isolated from each other"
+        )
+    return 0
+
+
+def _project_run(args: argparse.Namespace) -> int:
+    """Launch a host argv inside its bound project.
+
+    The root must match a binding exactly, the bound profile is handed to the
+    child process, and the host starts as an argv vector (never a shell
+    string), after the parent has switched into the bound root.
+    """
+    import os
+    import subprocess
+
+    from mnemoseed_local.hosts.common import project_binding as pb
+
+    argv = [str(value) for value in args.host_argv]
+    if not argv:
+        print(
+            "error: no host command given; usage: mnemoseed-local project run --root <dir> -- <host-argv...>",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        canonical = pb.canonical_root(args.root)
+        bindings = pb.load_bindings(pb.bindings_path(CONFIG_DIR))
+        profile = pb.resolve_profile(canonical, bindings)
+        if profile is None:
+            raise pb.BindingError(
+                f"{canonical} is not bound to a profile; bind it first with "
+                "'mnemoseed-local project bind --root <dir> --profile <existing-id>'"
+            )
+        pb.check_launch_profile_env(profile, os.environ)
+    except pb.BindingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        os.chdir(canonical)
+    except OSError as exc:
+        print(f"error: cannot enter {canonical}: {exc}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env[pb.PROFILE_ENV_VAR] = profile
+    try:
+        completed = subprocess.run(argv, env=env, shell=False, check=False)
+    except OSError as exc:
+        print(f"error: could not launch {argv[0]!r}: {exc}", file=sys.stderr)
+        return 1
+    return int(completed.returncode)
+
+
 # ------------------------------------------------------------ host hook (A3 T2)
 
 
@@ -1795,6 +1899,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_profile_unarchive.add_argument("--baseurl", default=None)
     p_profile_unarchive.add_argument("--json", action="store_true")
 
+    p_project = sub.add_parser("project", help="bind a project root to a memory profile: bind | run")
+    project_sub = p_project.add_subparsers(dest="project_command", required=True)
+    p_project_bind = project_sub.add_parser(
+        "bind",
+        help="bind a project root to an existing profile in the app home's project-bindings.json",
+    )
+    p_project_bind.add_argument(
+        "--root",
+        required=True,
+        help="the absolute project directory to bind (realpath-canonicalized; symlinks/junctions refused)",
+    )
+    p_project_bind.add_argument("--profile", required=True, help="an existing profile id to bind the root to")
+    p_project_bind.add_argument(
+        "--replace",
+        action="store_true",
+        help="rebind a root that is already bound to a different profile (previous value backed up)",
+    )
+    p_project_bind.add_argument("--baseurl", default=None)
+    p_project_run = project_sub.add_parser(
+        "run",
+        help="launch a host command inside a bound project with the bound profile",
+    )
+    p_project_run.add_argument(
+        "--root",
+        required=True,
+        help="the bound project directory (must match a binding exactly)",
+    )
+    p_project_run.add_argument("host_argv", nargs="*", help="the host command and its arguments, after '--'")
+
     p_hook = sub.add_parser("hook", help="manage a host hook (host adapter plugin lifecycle)")
     p_hook.add_argument(
         "hook_command",
@@ -1862,6 +1995,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_profile(args)
     if args.command == "credential":
         return cmd_credential(args)
+    if args.command == "project":
+        return cmd_project(args)
     if args.command == "uninstall":
         return cmd_uninstall(args)
     if args.command == "hook":
