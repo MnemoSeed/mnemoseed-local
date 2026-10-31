@@ -3,14 +3,17 @@
 #
 # One-line entry:
 #   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
+#   curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--skip-ollama] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
 # Or run as a file:
-#   sh ./install.sh [--dry-run] [--yes] [--tier <lite|standard|advanced>] [--mode <capture-recall|refinement>] [--hosts <csv>]
+#   sh ./install.sh [--dry-run] [--yes] [--skip-ollama] [--tier <lite|standard|advanced>] [--mode <capture-recall|refinement>] [--hosts <csv>]
 #
 # Orchestration order (identical to install.ps1):
 #   1. detect / install ollama   (skipped in capture-recall mode: that mode runs
 #      capture, local embeddings and recall without Ollama; Linux: official
-#      install script; macOS/other: print an install hint and exit non-zero)
+#      install script; macOS: `brew install ollama` behind an explicit [y/N]
+#      consent (--yes grants it), else the exact manual commands and a non-zero
+#      exit; --skip-ollama skips the setup and marks the dream route
+#      unavailable; other platforms: print a manual hint and exit non-zero)
 #   2. detect / install uv       (official installer; well-known install dir is
 #      prepended to the current process PATH)
 #   3. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
@@ -18,11 +21,12 @@
 #   4. mnemoseed-local init --mode <mode>   (skipped when ~/.mnemoseed-local/config.toml exists)
 #   5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
 #      the script never changes config keys itself
-#   6. ollama pull <dream model> (skipped in capture-recall mode: the legacy
-#      auto dream stays off there; otherwise the dream route's model from
-#      config.toml [dream.llm.dream] `model`, else the built-in default
-#      qwen3.5:9b; runs only after an explicit [y/N] confirmation; --yes skips
-#      the prompt; a model is NEVER pulled without that confirmation)
+#   6. ollama pull <dream model> (skipped in capture-recall mode and by
+#      --skip-ollama: the legacy auto dream stays off there; otherwise the
+#      dream route's model from config.toml [dream.llm.dream] `model`, else
+#      the built-in default qwen3.5:9b; runs only after an explicit [y/N]
+#      confirmation; --yes skips the prompt; a model is NEVER pulled without
+#      that confirmation)
 #   7. host adapter wiring (ONLY the hosts named in --hosts <csv>, or the
 #      hosts picked from an interactive offer of the detected ones: a host
 #      counts as installed when its CLI is on PATH or its adapter config
@@ -70,6 +74,7 @@ UV_URL='https://astral.sh/uv/install.sh'
 
 DRY_RUN=0
 YES=0
+SKIP_OLLAMA=0
 TIER=""
 MODE='capture-recall'
 HOSTS=''
@@ -85,12 +90,17 @@ install.sh - MnemoSeed Local zero-dependency install orchestrator (Linux/macOS, 
 
 usage:
   curl -fsSL https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/install.sh | sh
-  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
-  sh ./install.sh [--dry-run] [--yes] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
+  curl -fsSL .../install.sh | sh -s -- [--dry-run] [--yes] [--skip-ollama] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
+  sh ./install.sh [--dry-run] [--yes] [--skip-ollama] [--tier lite|standard|advanced] [--mode capture-recall|refinement] [--hosts <csv>]
 
 options:
   --dry-run        print the numbered plan with probe results; zero side effects
-  --yes, -y        skip the [y/N] confirmation before `ollama pull`
+  --yes, -y        skip the [y/N] confirmations (the Homebrew Ollama install on
+                   macOS and the `ollama pull` prompt)
+  --skip-ollama    skip the Ollama setup: no install attempt and no model pull;
+                   when Ollama is missing the install finishes and
+                   the dream route is marked unavailable (the exact re-enable
+                   steps are printed at run time)
   --tier <tier>    lite | standard | advanced - prints an explicit hint for
                    `config set dream.hardware_tier <tier>` (never changes config itself)
   --mode <mode>    capture-recall (default) | refinement - the setup posture passed
@@ -113,6 +123,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --yes|-y) YES=1 ;;
+        --skip-ollama) SKIP_OLLAMA=1 ;;
         --tier)
             [ $# -ge 2 ] || die "--tier requires a value (lite|standard|advanced)"
             TIER="$2"
@@ -292,6 +303,23 @@ fetch_pipe() {
     fi
 }
 
+# confirm PROMPT -> 0 only on an explicit yes: the prompt prints to stdout and
+# the answer is read from a terminal stdin or /dev/tty, never from a piped
+# stdin, because a `curl | sh` run streams the script itself on stdin.
+confirm() {
+    printf '%s' "$1"
+    _answer=""
+    if [ -t 0 ]; then
+        read -r _answer || _answer=""
+    elif [ -r /dev/tty ]; then
+        read -r _answer < /dev/tty || _answer=""
+    fi
+    case "$_answer" in
+        y|Y|yes|YES|Yes) return 0 ;;
+    esac
+    return 1
+}
+
 # prepend_path DIR -> add DIR to PATH for this process when it exists and is not present.
 prepend_path() {
     [ -d "$1" ] || return 0
@@ -379,33 +407,107 @@ run_doctor() {
     printf '%s\n' "$DOCTOR_OUT"
 }
 
+# plan_ollama -> the dry-run text of the step-1 Ollama plan for the selected
+# mode, flag and OS; every probe is a command-existence check only.
+plan_ollama() {
+    if [ "$MODE" = "capture-recall" ]; then
+        printf '%s\n' '    plan:  skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
+        return 0
+    fi
+    if have ollama; then
+        printf '%s\n' "    probe: ollama command FOUND at $(command -v ollama)"
+        printf '%s\n' '    plan:  skip install (already present)'
+        return 0
+    fi
+    printf '%s\n' '    probe: ollama command NOT FOUND'
+    if [ "$SKIP_OLLAMA" -eq 1 ]; then
+        printf '%s\n' '    plan:  skipped (--skip-ollama): no Ollama install attempt and no model pull;'
+        printf '%s\n' '           the install finishes and the dream route is marked unavailable when Ollama is absent'
+        return 0
+    fi
+    case "$OS_NAME" in
+        Linux*)
+            printf '%s\n' "    plan:  install via the official script ($OLLAMA_URL | sh)"
+            ;;
+        Darwin*)
+            if have brew; then
+                printf '%s\n' "    probe: brew command FOUND at $(command -v brew)"
+                printf '%s\n' '    plan:  would ask [y/N] consent, then install via `brew install ollama`'
+                printf '%s\n' '           (--yes grants the consent; declining exits non-zero with the exact manual commands)'
+            else
+                printf '%s\n' '    probe: brew command NOT FOUND'
+                printf '%s\n' '    plan:  would exit non-zero with the exact manual steps: install Homebrew'
+                printf '%s\n' '           (https://brew.sh) or Ollama (https://ollama.com/download/mac), or re-run with --skip-ollama'
+            fi
+            ;;
+        *)
+            printf '%s\n' "    plan:  unsupported OS ($OS_NAME) for the official script - would print a manual hint (https://ollama.com/download) and exit non-zero"
+            ;;
+    esac
+}
+
+# install_ollama -> the step-1 Ollama setup: skipped by mode, skipped when
+# present, skipped by --skip-ollama, installed on Linux via the official
+# script, installed on macOS via Homebrew behind an explicit consent, or a
+# refusal printing the exact manual commands (that refusal exits non-zero;
+# --skip-ollama finishes with the dream route marked unavailable).
+install_ollama() {
+    if [ "$MODE" = "capture-recall" ]; then
+        printf '%s\n' '      skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
+        printf '%s\n' '      to use the dream engine later: install Ollama (https://ollama.com/download), then re-run `mnemoseed-local doctor`'
+        return 0
+    fi
+    if have ollama; then
+        printf '%s\n' '      found - skipping install'
+        return 0
+    fi
+    if [ "$SKIP_OLLAMA" -eq 1 ]; then
+        printf '%s\n' '      skipped (--skip-ollama): ollama is not on PATH and no Ollama install was attempted'
+        printf '%s\n' '      the dream route is unavailable for this install. To enable it later:'
+        printf '%s\n' '        install Ollama (macOS: brew install ollama; Linux: re-run install.sh without --skip-ollama;'
+        printf '%s\n' '        manual: https://ollama.com/download), then re-run `mnemoseed-local doctor`'
+        return 0
+    fi
+    case "$OS_NAME" in
+        Linux*)
+            printf '%s\n' '      not found - installing via the official script...'
+            if ! fetch_pipe "$OLLAMA_URL" | sh; then
+                die "the official ollama installer failed; install it manually from https://ollama.com/download"
+            fi
+            have ollama || die "ollama is still not on PATH after the install; see https://ollama.com/download"
+            printf '%s\n' '      installed'
+            ;;
+        Darwin*)
+            if have brew; then
+                printf '%s\n' '      not found - Homebrew is available'
+                if [ "$YES" -eq 1 ]; then
+                    printf '%s\n' '      --yes given - skipping the confirmation prompt'
+                elif ! confirm '      install Ollama now with Homebrew (`brew install ollama`)? [y/N] '; then
+                    die "no Ollama install consent; re-run with --skip-ollama to finish the install without the dream route, or install Ollama yourself with 'brew install ollama' or from https://ollama.com/download/mac and re-run this script"
+                fi
+                printf '%s\n' '      installing Ollama via Homebrew...'
+                if ! brew install ollama; then
+                    die "'brew install ollama' failed; install it manually from https://ollama.com/download/mac and re-run this script"
+                fi
+                have ollama || die "ollama is still not on PATH after the brew install; open a new shell or install it from https://ollama.com/download/mac and re-run this script"
+                printf '%s\n' '      installed'
+            else
+                die "ollama not found and Homebrew is not installed; install Homebrew from https://brew.sh and re-run this script, or install Ollama from https://ollama.com/download/mac, or re-run with --skip-ollama to finish the install without the dream route"
+            fi
+            ;;
+        *)
+            die "ollama not found and this platform ($OS_NAME) has no script installer; install ollama manually from https://ollama.com/download, or re-run with --skip-ollama to finish the install without the dream route"
+            ;;
+    esac
+}
+
 # --- dry-run plan -----------------------------------------------------------
 
 if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' 'mnemoseed-local install plan (DRY-RUN: zero side effects; probes are command-existence checks only)'
     printf '\n'
     printf '%s\n' '[1] ollama'
-    if [ "$MODE" = "capture-recall" ]; then
-        printf '%s\n' '    plan:  skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
-    else
-        if have ollama; then
-            printf '%s\n' "    probe: ollama command FOUND at $(command -v ollama)"
-            printf '%s\n' '    plan:  skip install (already present)'
-        else
-            printf '%s\n' '    probe: ollama command NOT FOUND'
-            case "$OS_NAME" in
-                Linux*)
-                    printf '%s\n' "    plan:  install via the official script ($OLLAMA_URL | sh)"
-                    ;;
-                Darwin*)
-                    printf '%s\n' '    plan:  macOS - would print install hints (brew install ollama / https://ollama.com/download/mac) and exit non-zero'
-                    ;;
-                *)
-                    printf '%s\n' "    plan:  unsupported OS ($OS_NAME) for the official script - would print a manual hint (https://ollama.com/download) and exit non-zero"
-                    ;;
-            esac
-        fi
-    fi
+    plan_ollama
     printf '%s\n' '[2] uv'
     if have uv; then
         printf '%s\n' "    probe: uv command FOUND at $(command -v uv)"
@@ -437,6 +539,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' '[6] model pull (requires confirmation)'
     if [ "$MODE" = "capture-recall" ]; then
         printf '%s\n' '    plan:  skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
+    elif [ "$SKIP_OLLAMA" -eq 1 ]; then
+        printf '%s\n' '    plan:  skipped (--skip-ollama): no dream model pull is attempted'
     else
         printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
         printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
@@ -472,29 +576,7 @@ fi
 # --- step 1: ollama ---------------------------------------------------------
 
 printf '%s\n' '[1/8] ollama'
-if [ "$MODE" = "capture-recall" ]; then
-    printf '%s\n' '      skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)'
-    printf '%s\n' '      to use the dream engine later: install Ollama (https://ollama.com/download), then re-run `mnemoseed-local doctor`'
-elif have ollama; then
-    printf '%s\n' '      found - skipping install'
-else
-    case "$OS_NAME" in
-        Linux*)
-            printf '%s\n' '      not found - installing via the official script...'
-            if ! fetch_pipe "$OLLAMA_URL" | sh; then
-                die "the official ollama installer failed; install it manually from https://ollama.com/download"
-            fi
-            have ollama || die "ollama is still not on PATH after the install; see https://ollama.com/download"
-            printf '%s\n' '      installed'
-            ;;
-        Darwin*)
-            die "ollama not found; on macOS install it with 'brew install ollama' or from https://ollama.com/download/mac, then re-run this script"
-            ;;
-        *)
-            die "ollama not found and this platform ($OS_NAME) has no script installer; install ollama manually from https://ollama.com/download, then re-run this script"
-            ;;
-    esac
-fi
+install_ollama
 
 # --- step 2: uv -------------------------------------------------------------
 
@@ -555,6 +637,14 @@ printf '%s\n' '[6/8] dream model pull'
 if [ "$MODE" = "capture-recall" ]; then
     printf '%s\n' '      skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
     printf '%s\n' '      for manual consolidation later: install Ollama, then `ollama pull <dream model>` (see `mnemoseed-local doctor`)'
+elif [ "$SKIP_OLLAMA" -eq 1 ]; then
+    printf '%s\n' '      skipped (--skip-ollama): no dream model pull was attempted'
+    if have ollama; then
+        printf '%s\n' '      ollama is on PATH; pull a dream model later with: ollama pull <dream model> (see `mnemoseed-local doctor`)'
+    else
+        printf '%s\n' '      ollama is not on PATH: the dream route is unavailable for this install'
+        printf '%s\n' '      to enable it later: install Ollama (https://ollama.com/download), then `ollama pull <dream model>` (see `mnemoseed-local doctor`)'
+    fi
 else
     MODEL="$(resolve_model "$CONFIG_PATH")"
     if [ "$MODEL" = "$DEFAULT_MODEL" ]; then
@@ -566,17 +656,8 @@ else
     if [ "$YES" -eq 1 ]; then
         PULL_CONFIRMED=1
         printf '%s\n' '      --yes given - skipping the confirmation prompt'
-    else
-        printf '%s' "      pull it now with \`ollama pull $MODEL\`? [y/N] "
-        ANSWER=""
-        if [ -t 0 ]; then
-            read -r ANSWER || ANSWER=""
-        elif [ -r /dev/tty ]; then
-            read -r ANSWER < /dev/tty || ANSWER=""
-        fi
-        case "$ANSWER" in
-            y|Y|yes|YES|Yes) PULL_CONFIRMED=1 ;;
-        esac
+    elif confirm "      pull it now with \`ollama pull $MODEL\`? [y/N] "; then
+        PULL_CONFIRMED=1
     fi
     if [ "$PULL_CONFIRMED" -eq 0 ]; then
         printf '%s\n' "      skipped (no confirmation); pull it later with: ollama pull $MODEL"
