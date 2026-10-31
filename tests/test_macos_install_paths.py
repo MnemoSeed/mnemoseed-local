@@ -69,6 +69,33 @@ def _write_shim(directory: Path, name: str, body: str) -> None:
     shim.chmod(0o755)
 
 
+def _controlled_tools_dir(tmp_path: Path) -> str:
+    """The POSIX tools' directory for the controlled PATH. When the shell's own
+    directory also carries a system ollama (preinstalled on some CI runners),
+    a private bin replaces it, so `have ollama` is false unless a test's own
+    shim provides ollama."""
+    sh_dir = Path(shutil.which("sh")).parent
+    if not any((sh_dir / name).exists() for name in ("ollama", "ollama.exe")):
+        return str(sh_dir)
+    tools_bin = tmp_path / "tools-bin"
+    tools_bin.mkdir(exist_ok=True)
+    for name in ("sh", "uname", "sed", "awk", "head", "tr", "cat", "chmod"):
+        link = tools_bin / name
+        if link.exists():
+            continue
+        if name == "sh":
+            # /bin/sh resolves through the runtime mount even when the PATH
+            # lookup for sh itself is shadowed.
+            link.write_text('#!/bin/sh\nexec /bin/sh "$@"\n', encoding="utf-8", newline="\n")
+        else:
+            source = shutil.which(name)
+            if source is None:
+                continue
+            link.write_text(f"#!/bin/sh\nexec '{source}' \"$@\"\n", encoding="utf-8", newline="\n")
+        link.chmod(0o755)
+    return str(tools_bin)
+
+
 def _shim_environment(
     tmp_path: Path, names: tuple[str, ...] = (), *, fail_arg: str | None = None
 ) -> tuple[Path, dict[str, str]]:
@@ -83,7 +110,7 @@ def _shim_environment(
     env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path / "home" / ".mnemoseed-local")
     env["SHIM_LOG"] = str(tmp_path / "shim.log")
     env["SHIM_DIR"] = str(shim_dir)
-    env["PATH"] = str(shim_dir) + os.pathsep + str(Path(shutil.which("sh")).parent)
+    env["PATH"] = str(shim_dir) + os.pathsep + _controlled_tools_dir(tmp_path)
     return shim_dir, env
 
 

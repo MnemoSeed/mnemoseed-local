@@ -951,10 +951,15 @@ def proof_installed_surface(verifier: Verifier, context: Context) -> None:
         _normcase(prefix) != _normcase(base_prefix),
         f"{prefix} vs {base_prefix}",
     )
+    try:
+        probe_dir = paths["interpreter"].parent.resolve()
+        invoked_dir = context.installed_python.parent.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise Failure(f"the interpreter paths could not be resolved: {exc}") from exc
     verifier.check(
         "the probe ran under the invoked tool interpreter",
-        _normcase(os.path.normpath(paths["interpreter"]))
-        == _normcase(os.path.normpath(context.installed_python)),
+        _normcase(probe_dir / paths["interpreter"].name)
+        == _normcase(invoked_dir / context.installed_python.name),
         str(paths["interpreter"]),
     )
     for field, label in (
