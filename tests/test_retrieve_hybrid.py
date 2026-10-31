@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,6 +23,7 @@ from mnemoseed_local.retrieve.hybrid import (
     HybridRecall,
     HybridRetriever,
     ScoreBreakdown,
+    _merge,
 )
 from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, CognitiveTier, Cues, Provenance
@@ -34,6 +36,8 @@ from mnemoseed_local.storage.registry import GRAPH_DRIVERS, VECTOR_DRIVERS, regi
 _DIM = 64
 _PROFILE = "alice"
 _CUE_ENTITY_WEIGHT = 0.6  # beta-internal entity component (documented in hybrid.py)
+# PRD-281 reading instant: the reported expiries (2026-09-08/09) lie weeks past it.
+_NOW = datetime(2026, 10, 31, tzinfo=UTC).timestamp()
 
 
 @dataclass
@@ -80,6 +84,7 @@ def _chunk(
     consolidated: bool = False,
     profile: str = _PROFILE,
     source: str = "manual",
+    ingested_at: float = 1.0,
 ) -> ChunkStamp:
     return ChunkStamp(
         chunk_id=chunk_id,
@@ -105,7 +110,7 @@ def _chunk(
         decay_weight=decay,
         score=0.5,
         consolidated=consolidated,
-        ingested_at=1.0,
+        ingested_at=ingested_at,
         turn_start=1,
         turn_end=2,
     )
@@ -187,6 +192,8 @@ def _recall(
     text: str,
     cues: ExtractedCues,
     config: HybridConfig | None = None,
+    *,
+    now: float | None = None,
 ) -> HybridRecall:
     return HybridRetriever(config).recall(
         text,
@@ -195,6 +202,7 @@ def _recall(
         vector_store=stack.vector,
         graph_store=stack.graph,
         embedder=stack.embed,
+        now=now,
     )
 
 
@@ -393,6 +401,100 @@ def test_rescued_candidate_never_ranks_above_a_normal_one(stack) -> None:
     merged = _merge([strong_rescued], [modest_normal])
 
     assert [candidate.id for candidate in merged.candidates] == ["normal-low", "rescued-high"]
+
+
+# ------------------------------------------------- expired-window tier (PRD-281)
+
+
+def _rank_candidate(
+    candidate_id: str,
+    score: float,
+    *,
+    rescued: bool = False,
+    expired_window: bool = False,
+) -> Candidate:
+    breakdown = ScoreBreakdown(
+        semantic=score,
+        cue_overlap=0.0,
+        decay_weight=0.0,
+        graph_centrality=0.0,
+        cooccurrence=0.0,
+        total=score,
+    )
+    return Candidate(
+        kind="chunk",
+        id=candidate_id,
+        source="vector",
+        item=None,
+        score=score,
+        breakdown=breakdown,
+        rescued=rescued,
+        expired_window=expired_window,
+    )
+
+
+def test_expired_window_ranks_after_all_fresh_candidates() -> None:
+    """PRD-281 D04 tier: a candidate whose explicit expiry window has passed
+    ranks behind EVERY candidate without an expired window, regardless of fused
+    score (structural rank tier — not exclusion, not a score rewrite)."""
+    expired_high = _rank_candidate("expired-high", score=10.0, expired_window=True)
+    fresh_low = _rank_candidate("fresh-low", score=1.0)
+    merged = _merge([expired_high], [fresh_low])
+    assert [candidate.id for candidate in merged.candidates] == ["fresh-low", "expired-high"]
+
+
+def test_rescued_pin_ranks_above_expired_window_candidate() -> None:
+    """Revised rescue discipline (PRD-281 tier key freeze): rescued pins are
+    presumed currently valid (owner flashbulbs), so an expired constraint must
+    not rank above them — the expired tier precedes the rescue tier."""
+    expired_high = _rank_candidate("expired-high", score=10.0, expired_window=True)
+    rescued_low = _rank_candidate("rescued-low", score=1.0, rescued=True)
+    merged = _merge([expired_high], [rescued_low])
+    assert [candidate.id for candidate in merged.candidates] == ["rescued-low", "expired-high"]
+
+
+def test_expired_rescued_ranks_last() -> None:
+    """Full tier key pin (expired_window, rescued, -score, kind, id): only an
+    expired-AND-rescued candidate trails the expired tier."""
+    normal = _rank_candidate("normal", score=1.0)
+    rescued = _rank_candidate("rescued", score=9.0, rescued=True)
+    expired = _rank_candidate("expired", score=9.0, expired_window=True)
+    expired_rescued = _rank_candidate("expired-rescued", score=9.0, rescued=True, expired_window=True)
+    merged = _merge([expired_rescued, expired, rescued], [normal])
+    assert [candidate.id for candidate in merged.candidates] == [
+        "normal",
+        "rescued",
+        "expired",
+        "expired-rescued",
+    ]
+
+
+def test_vector_track_flags_expired_window_from_chunk_text(stack) -> None:
+    """The flag is set on the shared candidate-construction path from the chunk's
+    verbatim text; without a reading clock it fails open (never fires)."""
+    _write(stack, _chunk("c_exp", "use the shared ops runbook until 2026-09-08", entities=("Ops",)))
+    _write(stack, _chunk("c_fresh", "the shared ops runbook lives in the wiki", entities=("Ops",)))
+
+    result = _recall(stack, "ops runbook", _query_cues(("Ops",)), now=_NOW)
+    by_id = {c.id: c for c in _chunk_candidates(result)}
+    assert by_id["c_exp"].expired_window is True
+    assert by_id["c_fresh"].expired_window is False
+    assert _chunk_candidates(result)[-1].id == "c_exp"
+
+    fail_open = _recall(stack, "ops runbook", _query_cues(("Ops",)))
+    assert all(c.expired_window is False for c in _chunk_candidates(fail_open))
+
+
+def test_expired_window_flag_ignores_ingested_at_and_decay(stack) -> None:
+    """D04 age negative: the verdict reads only text + now — identical texts at
+    different ages and decays carry the same flag."""
+    text = "use the shared ops runbook until 2026-09-08"
+    _write(stack, _chunk("c_old", text, decay=0.9, ingested_at=1.0, entities=("Ops",)))
+    _write(stack, _chunk("c_new", text, decay=0.5, ingested_at=_NOW - 86400, entities=("Ops",)))
+    result = _recall(stack, "ops runbook", _query_cues(("Ops",)), now=_NOW)
+    flags = {c.id: c.expired_window for c in _chunk_candidates(result)}
+    assert flags["c_old"] is True
+    assert flags["c_new"] is True
 
 
 def test_vector_track_excludes_consolidated_chunks(stack) -> None:

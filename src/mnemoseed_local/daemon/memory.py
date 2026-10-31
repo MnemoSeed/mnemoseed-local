@@ -70,6 +70,7 @@ from mnemoseed_local.retrieve.assemble import (
 )
 from mnemoseed_local.retrieve.cues import CueExtractor
 from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRetriever
+from mnemoseed_local.retrieve.temporal import evaluate_temporal
 from mnemoseed_local.schema.stamp import (
     EXPLICIT_PIN_SOURCE,
     ChunkStamp,
@@ -599,7 +600,9 @@ class MemoryService:
             embedder=self._stores.embed,
             activation_snapshot=(self._activation.snapshot() if session_id is not None else None),
             session_id=session_id,
-            now=self._clock() if session_id is not None else None,
+            # The reading instant feeds the temporal applicability tier on every
+            # recall; short-term activation keeps its own session gate below.
+            now=self._clock(),
         )
         assembler = self._assembler
         if top_k is not None or budget is not None:
@@ -1376,8 +1379,9 @@ class MemoryService:
         read over the vector and graph stores at the focal decay floor; the
         requesting session and the daemon-seen ids are excluded; the budget
         admits greedily by decay (tie newest-first: ingested_at ms desc, then
-        turn_start desc) with the T1 slice semantics (D4). Returns (items,
-        non_focal_above_floor)."""
+        turn_start desc) with the T1 slice semantics (D4). Candidates carrying
+        an expired explicit validity window rank behind all others (PRD-281).
+        Returns (items, non_focal_above_floor)."""
         entities = tuple(self._cues.extract(text).cues.entities)
         query_folded = {str.casefold(e) for e in entities}
         if not entities:
@@ -1385,21 +1389,23 @@ class MemoryService:
             # probe still reports the decay-healthy population
             return [], self._non_focal_count(profile_id, session_id, query_folded, seen)
         floor = self._config.capture.auto_recall_focal_floor
+        now = self._clock()
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id, entities=entities, min_decay=floor),
             Page(0, _SCAN_PAGE_LIMIT),
         )
-        # decay, recency-stamp, turn_start, kind, id, text — sorted greedily
-        # by decay desc then newest-first (D4): stamp desc, then turn_start
-        # desc. The stamp is quantized to millisecond precision: the graph
-        # driver persists updated_at through an ISO8601 ms round-trip
+        # expired-window tier, decay, recency-stamp, turn_start, kind, id,
+        # text — the expired tier first (PRD-281), then greedily by decay desc
+        # and newest-first (D4): stamp desc, then turn_start desc. The stamp is
+        # quantized to millisecond precision: the graph driver persists
+        # updated_at through an ISO8601 ms round-trip
         # (storage/drivers/_time.py), so a chunk ingested_at with sub-ms noise
         # and a node updated_at from the same instant only tie when compared
         # at the coarser (representable) precision. The turn_start third key
         # breaks the same-stamp tie in reading order; nodes carry the -1
         # sentinel (they have no turn window) so a chunk always precedes a
         # node on a full tie (chunks first).
-        candidates: list[tuple[float, float, int, str, str, str, str]] = []
+        candidates: list[tuple[bool, float, float, int, str, str, str, str]] = []
         for chunk in page.items:
             if chunk.provenance.session_id == session_id:
                 continue  # the requesting session never sees its own chunks
@@ -1410,6 +1416,7 @@ class MemoryService:
                 continue  # the casefold authority (mirror of the Freshness probe)
             candidates.append(
                 (
+                    evaluate_temporal(chunk.text, now).expired_window,
                     chunk.decay_weight,
                     round(chunk.ingested_at, 3),
                     chunk.turn_start if chunk.turn_start is not None else -1,
@@ -1430,10 +1437,13 @@ class MemoryService:
             stored = {str.casefold(e) for e in node.entities}
             if not stored & query_folded:
                 continue
+            # Graph nodes keep their own bitemporal chain and stay outside the
+            # chunk grammar's scope (PRD-281): the expired tier is chunk-only.
             # Sentinel -1: node has no turn_start. -1 and 0 are equivalent for
             # chunks-first (both ≤ any chunk turn_start ≥ 0); -1 is canonical.
             candidates.append(
                 (
+                    False,
                     node.decay_weight,
                     round(node.updated_at, 3),
                     -1,
@@ -1446,8 +1456,8 @@ class MemoryService:
         budget = self._config.capture.auto_recall_budget_chars
         items: list[dict[str, str]] = []
         remaining = budget
-        for _decay, _stamp, _turn_start, kind, candidate_id, text, source in sorted(
-            candidates, key=lambda c: (-c[0], -c[1], -c[2])
+        for _expired, _decay, _stamp, _turn_start, kind, candidate_id, text, source in sorted(
+            candidates, key=lambda c: (c[0], -c[1], -c[2], -c[3])
         ):
             cost = len(text) + 1
             if cost <= remaining:
