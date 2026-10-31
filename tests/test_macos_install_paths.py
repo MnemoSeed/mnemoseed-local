@@ -96,16 +96,22 @@ def _controlled_tools_dir(tmp_path: Path) -> str:
     return str(tools_bin)
 
 
-def _inherited_path_without_ollama() -> list[str]:
-    """The inherited PATH entries minus every directory carrying an ollama
-    executable: on runners where ollama is preinstalled, both spellings of a
-    symlinked tools directory carry it and both filter out, so `have ollama`
-    is false unless a test's own shim provides it."""
+def _inherited_path_without_ollama_and_downloaders() -> list[str]:
+    """The inherited PATH entries minus every directory carrying ollama or a
+    downloader (curl/wget): on runners where ollama is preinstalled, both
+    spellings of a symlinked tools directory carry it and both filter out, and
+    directories carrying only a downloader filter out too. With this filter the
+    refinement-without-ollama Linux branch deterministically dies at 'neither
+    curl nor wget is available' and no network path can start, whatever
+    spelling the runner's tool directories use."""
     entries = []
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry:
             continue
-        if any(os.path.isfile(os.path.join(entry, name)) for name in ("ollama", "ollama.exe")):
+        if any(
+            os.path.isfile(os.path.join(entry, name))
+            for name in ("ollama", "ollama.exe", "curl", "curl.exe", "wget", "wget.exe")
+        ):
             continue
         entries.append(entry)
     return entries
@@ -126,7 +132,11 @@ def _shim_environment(
     env["SHIM_LOG"] = str(tmp_path / "shim.log")
     env["SHIM_DIR"] = str(shim_dir)
     env["PATH"] = os.pathsep.join(
-        [str(shim_dir), _controlled_tools_dir(tmp_path), *_inherited_path_without_ollama()]
+        [
+            str(shim_dir),
+            _controlled_tools_dir(tmp_path),
+            *_inherited_path_without_ollama_and_downloaders(),
+        ]
     )
     return shim_dir, env
 
@@ -227,6 +237,35 @@ def _make_installer(tmp_path: Path, *, extra_shims: tuple[str, ...] = ()):
         )
 
     return run, env
+
+
+# ---------------------------------------------------------------- path filter pin
+
+
+def test_inherited_path_filter_drops_ollama_and_downloader_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture's inherited PATH carries neither ollama nor a downloader:
+    a curl-bearing directory without ollama (the runner layout that reached a
+    real installer fetch) must filter out exactly like ollama-bearing ones."""
+    carrying = tmp_path / "carrying"
+    carrying.mkdir()
+    for name in ("ollama", "curl", "wget"):
+        (carrying / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+    downloader_only = tmp_path / "downloader-only"
+    downloader_only.mkdir()
+    (downloader_only / "curl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "uname").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(carrying), str(downloader_only), str(clean)]))
+    kept = _inherited_path_without_ollama_and_downloaders()
+    assert kept == [str(clean)]
+    for entry in kept:
+        assert not any(
+            os.path.isfile(os.path.join(entry, name))
+            for name in ("ollama", "ollama.exe", "curl", "curl.exe", "wget", "wget.exe")
+        )
 
 
 # ---------------------------------------------------------------- string-level
