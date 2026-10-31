@@ -96,10 +96,25 @@ def _controlled_tools_dir(tmp_path: Path) -> str:
     return str(tools_bin)
 
 
+def _inherited_path_without_ollama() -> list[str]:
+    """The inherited PATH entries minus every directory carrying an ollama
+    executable: on runners where ollama is preinstalled, both spellings of a
+    symlinked tools directory carry it and both filter out, so `have ollama`
+    is false unless a test's own shim provides it."""
+    entries = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        if any(os.path.isfile(os.path.join(entry, name)) for name in ("ollama", "ollama.exe")):
+            continue
+        entries.append(entry)
+    return entries
+
+
 def _shim_environment(
     tmp_path: Path, names: tuple[str, ...] = (), *, fail_arg: str | None = None
 ) -> tuple[Path, dict[str, str]]:
-    """Executable sh shims on a restricted PATH plus the isolated-home env."""
+    """Executable sh shims on a controlled PATH plus the isolated-home env."""
     shim_dir = tmp_path / "shims"
     shim_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
@@ -110,7 +125,9 @@ def _shim_environment(
     env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path / "home" / ".mnemoseed-local")
     env["SHIM_LOG"] = str(tmp_path / "shim.log")
     env["SHIM_DIR"] = str(shim_dir)
-    env["PATH"] = str(shim_dir) + os.pathsep + _controlled_tools_dir(tmp_path)
+    env["PATH"] = os.pathsep.join(
+        [str(shim_dir), _controlled_tools_dir(tmp_path), *_inherited_path_without_ollama()]
+    )
     return shim_dir, env
 
 
@@ -332,9 +349,17 @@ def test_refinement_without_ollama_still_refuses_on_unsupported_platforms(tmp_pa
     run, env = _make_installer(tmp_path)
     completed = run("--mode", "refinement")
     assert completed.returncode != 0
-    assert "install ollama manually from https://ollama.com/download" in completed.stderr
-    assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
+    assert "installation complete:" not in completed.stdout
     assert _shim_log_lines(env) == []
+    if os.name == "nt":
+        # The local runner OS has no script installer: the refusal offers the
+        # manual download and the --skip-ollama finish.
+        assert "install ollama manually from https://ollama.com/download" in completed.stderr
+        assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
+    else:
+        # A POSIX runner's controlled PATH carries no downloader, so the step
+        # refuses before any installer download can start.
+        assert "neither curl nor wget is available" in completed.stderr
 
 
 # ---------------------------------------------------------------- darwin fragments
@@ -476,6 +501,8 @@ def test_linux_refinement_with_ollama_present_skips_the_install(tmp_path: Path) 
     prelude = _ollama_prelude(shim_dir).replace("OS_NAME='Darwin'", "OS_NAME='Linux'")
     completed = _run_fragment(prelude + "install_ollama\n", env)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    # The test's own shim dir precedes the filtered inherited PATH, so the shim
+    # wins even where a system ollama exists.
     assert "      found - skipping install" in completed.stdout
     assert _shim_log_lines(env) == []
 
