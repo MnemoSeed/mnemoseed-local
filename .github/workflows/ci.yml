@@ -101,17 +101,18 @@ jobs:
 
   install-script-smoke:
     # Phase A3 (T1+T4): the zero-dependency install orchestrators must stay
-    # syntax-valid and their dry-run must be side-effect-free on both shells.
+    # syntax-valid and their dry-run must be side-effect-free on every matrix
+    # OS (install.sh on Linux and macOS, install.ps1 on Windows).
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Dry-run install.sh
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         shell: bash
         run: sh -n install.sh && sh install.sh --dry-run
       - name: Dry-run install.ps1
@@ -123,10 +124,13 @@ jobs:
     # Build the wheel and sdist from the checkout, install the wheel with its
     # codex extra into an isolated uv tool dir, and verify the installed
     # surface on a clean runner. The structured proof uploads even on failure.
+    # The macOS leg runs the same runner-level proof; a macOS run is
+    # not a real-host or model proof: no Ollama model is pulled and no host
+    # trust is granted (the report's coverage limits state this).
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
