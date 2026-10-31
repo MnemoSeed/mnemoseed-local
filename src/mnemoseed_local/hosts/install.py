@@ -24,6 +24,11 @@ with JSON surgery and (b) deliver ``options: null`` to a dir-scanned copy
 double-loading it. The shipped plugin still honors the tuple switch for users
 who register the array form manually (probe round 2 confirmed the options
 tuple is delivered).
+
+The module also hosts the shared adapter registry (``ADAPTER_MODULES``) and the
+structural detection the uninstaller builds on; the convention-named lifecycle
+aliases let this adapter answer the unified ``host`` verb group, while
+``hook ... opencode`` remains the documented alias.
 """
 
 from __future__ import annotations
@@ -207,6 +212,74 @@ def daemon_reachable(base_url: str, timeout: float = PROBE_TIMEOUT_SECONDS) -> b
     except Exception:
         return False
     return True
+
+
+# ------------------------------------ unified `host` verb lifecycle entries
+
+
+def install(root: Path | None = None) -> tuple[Path, bool]:
+    """Convention-named entry so this adapter answers the ``host`` verb group."""
+    return install_plugin(root)
+
+
+def uninstall(root: Path | None = None) -> tuple[Path, bool]:
+    """Convention-named entry so this adapter answers the ``host`` verb group."""
+    return uninstall_plugin(root)
+
+
+def status(root: Path | None = None, base_url: str | None = None) -> HookStatus:
+    """Convention-named entry so this adapter answers the ``host`` verb group."""
+    return hook_status(root, base_url)
+
+
+# ------------------------------------ shared adapter registry and detection
+
+
+#: The host adapters mnemoseed-local ships, mapped to the module holding their
+#: zero-arg install/uninstall/status lifecycle entries. The ``host`` verb
+#: group, the ``_hook-event`` choice table and the uninstaller's detection all
+#: enumerate this registry, so a host registers once.
+ADAPTER_MODULES: dict[str, str] = {
+    "claude_code": "mnemoseed_local.hosts.claude_code.install",
+    "codex_cli": "mnemoseed_local.hosts.codex_cli.install",
+    "opencode": "mnemoseed_local.hosts.install",
+    "zcode": "mnemoseed_local.hosts.zcode.install",
+}
+
+#: Base URL for detection's structural-only status probe. The port is chosen
+#: unroutable so the reachability leg normally refuses at once, but the only
+#: guarantee is the probe's own per-attempt budget (PROBE_TIMEOUT_SECONDS) —
+#: a proxy could traverse — so detection still decides on file structure alone.
+DETECTION_PROBE_BASE = "http://127.0.0.1:9"
+
+
+def uninstall_command(host: str) -> str:
+    """The exact per-host removal command for next steps and residual reports."""
+    return f"mnemoseed-local host uninstall --host {host}"
+
+
+def detect_installed_hosts() -> tuple[str, ...]:
+    """Adapters whose owned config surface is present under the current home,
+    in registry order. Read-only; its reachability probe is aimed at an
+    unroutable base and bounded by PROBE_TIMEOUT_SECONDS (see
+    DETECTION_PROBE_BASE). A host whose config cannot even be probed counts as
+    present, so the removal step reports the failure instead of silently
+    skipping it."""
+    return tuple(host for host in ADAPTER_MODULES if _adapter_present(host))
+
+
+def _adapter_present(host: str) -> bool:
+    import importlib
+
+    try:
+        module = importlib.import_module(ADAPTER_MODULES[host])
+    except ImportError:
+        return False
+    try:
+        info = module.status(base_url=DETECTION_PROBE_BASE)
+    except Exception:
+        return True
+    return bool(info.state != "not-installed")
 
 
 def hook_status(root: Path | None = None, base_url: str | None = None) -> HookStatus:

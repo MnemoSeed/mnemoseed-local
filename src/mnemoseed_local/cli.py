@@ -33,6 +33,11 @@ from mnemoseed_local.config import (
     load_config,
 )
 from mnemoseed_local.dream.readiness import models_contain
+from mnemoseed_local.hosts.install import (
+    ADAPTER_MODULES,
+    detect_installed_hosts,
+    uninstall_command,
+)
 from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
 
@@ -1233,8 +1238,24 @@ def cmd_credential(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The package removal is never performed (or claimed performed) by this CLI:
+#: the exact command is the printed final step.
+PACKAGE_REMOVAL_COMMAND = "uv tool uninstall mnemoseed-local"
+
+_PACKAGE_HANDOFF = (
+    "final step (not run by this command; the package is never uninstalled here):\n"
+    f"  {PACKAGE_REMOVAL_COMMAND}"
+)
+
+_PURGE_PROMPT = "proceed with the removals listed above? [y/N] "
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Remove the local config home and an owned Windows logon task."""
+    """Remove the local install: the owned Windows logon task always, then —
+    only with ``--purge``, explicit and confirmed — the detected host adapters
+    and the data home. Without ``--purge`` everything is kept and the exact
+    per-host removal commands are printed as next steps. The package itself is
+    never removed here: its exact command is the printed final step."""
     import subprocess
 
     if sys.platform == "win32":
@@ -1270,38 +1291,143 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         if result.returncode != 0:
             print(result.stderr.rstrip(), file=sys.stderr)
             return result.returncode
-    target = CONFIG_DIR
-    if not target.exists():
-        print("no mnemoseed-local data directory; nothing to uninstall")
-        return 0
-    print(f"data dir: {target}")
+    detected = detect_installed_hosts()
     if args.purge:
-        _purge(target, yes=args.yes)
+        return _uninstall_purge(args, detected)
+    return _uninstall_keep_data(detected)
+
+
+def _uninstall_keep_data(detected: tuple[str, ...]) -> int:
+    """The default path: every byte of data is kept, the detected adapters are
+    reported with their exact removal commands."""
+    if detected:
+        print("host adapters detected - remove each with:")
+        for host in detected:
+            print(f"  {uninstall_command(host)}")
     else:
-        print("run `mnemoseed-local uninstall --purge` to also delete the data files")
+        print("no host adapters detected")
+    if not CONFIG_DIR.exists():
+        print("no mnemoseed-local data directory; nothing to uninstall")
+        print(_PACKAGE_HANDOFF)
+        return 0
+    print(f"data dir: {CONFIG_DIR}")
+    print("run `mnemoseed-local uninstall --purge` to also delete the data files")
+    print(_PACKAGE_HANDOFF)
     return 0
 
 
-def _purge(target: Path, *, yes: bool) -> None:
-    """Delete the app's own config home (purge). The path is validated to live
-    exactly under the resolved config home before anything is removed."""
+def _uninstall_purge(args: argparse.Namespace, detected: tuple[str, ...]) -> int:
+    """Confirmed removal of the detected host adapters, then the data home.
+    The path is validated to live exactly under the config home before
+    anything is removed."""
+    resolved = _purge_target(CONFIG_DIR)
+    removable, deferred = _adapters_serving_this_install(detected)
+    if not removable and not deferred and not resolved.exists():
+        print("no mnemoseed-local data directory; nothing to uninstall")
+        return 0
+    _print_purge_plan(resolved, removable, deferred)
+    if not args.yes:
+        try:
+            answer = input(_PURGE_PROMPT).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("purge cancelled")
+            return 0
+    failures = _remove_host_adapters(removable)
+    if resolved.exists():
+        _purge_home(resolved)
+    else:
+        print("no mnemoseed-local data directory; nothing to uninstall")
+    return _uninstall_outcome(removable, deferred, failures)
+
+
+def _adapters_serving_this_install(
+    detected: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split the detected adapters into (auto-removable, deferred). The
+    adapters' config roots resolve from the real user profile, so they provably
+    serve THIS install only when the data home is the default one under it; any
+    other data home (an isolated or MNEMOSEED_LOCAL_HOME override) gets the
+    exact removal commands printed instead of a rewrite of wiring that may
+    belong to a different install."""
+    if CONFIG_DIR == Path.home() / ".mnemoseed-local":
+        return detected, ()
+    return (), detected
+
+
+def _print_purge_plan(resolved: Path, removable: tuple[str, ...], deferred: tuple[str, ...]) -> None:
+    if removable:
+        print("purge will remove the detected host adapters:")
+        for host in removable:
+            print(f"  {uninstall_command(host)}")
+    if deferred:
+        print(
+            "detected host adapters are NOT auto-removed (the data home is not the "
+            "default app home, so their wiring may serve a different install) - "
+            "remove each with:"
+        )
+        for host in deferred:
+            print(f"  {uninstall_command(host)}")
+    if resolved.exists():
+        print("purge will delete:")
+        for child in sorted(resolved.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            print(f"  {child}")
+        print(f"  {resolved}")
+
+
+def _remove_host_adapters(hosts: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Run each adapter's uninstall; a failure is recorded with its adapter and
+    reported at the end instead of aborting the remaining removals."""
+    failures: list[tuple[str, str]] = []
+    for host in hosts:
+        print(f"removing host adapter {host}...")
+        try:
+            path, existed = _host_lifecycle(host, "uninstall")()
+            print(f"  {'removed' if existed else 'not installed'}: {path}")
+        except Exception as exc:
+            failures.append((host, str(exc) or type(exc).__name__))
+    return failures
+
+
+def _purge_target(target: Path) -> Path:
     resolved = target.resolve()
     if not str(resolved).startswith(str(CONFIG_DIR.resolve())):
         print(f"error: refusing to delete {resolved} (outside the config home)", file=sys.stderr)
         sys.exit(1)
-    print("purge will delete:")
-    for child in sorted(resolved.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        print(f"  {child}")
-    print(f"  {resolved}")
-    if not yes:
-        answer = input("delete these mnemoseed-local data files? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            print("purge cancelled")
-            return
+    return resolved
+
+
+def _purge_home(resolved: Path) -> None:
     import shutil
 
     shutil.rmtree(resolved)
     print(f"data dir deleted: {resolved}")
+
+
+def _uninstall_outcome(
+    removable: tuple[str, ...], deferred: tuple[str, ...], failures: list[tuple[str, str]]
+) -> int:
+    """One honest ending: every host whose removal was recorded as failed
+    blocks completion even when re-detection reads clean — a failed multi-write
+    uninstall can leave an owned resource the structural detection cannot see —
+    and each blocker is named with its exact command (exit 1). A deferred-by-
+    design adapter is informational (exit 0); only a fully clean run hands off
+    to the package removal."""
+    remaining = set(detect_installed_hosts())
+    residual = {host for host in removable if host in remaining}
+    blockers = sorted(residual | {host for host, _ in failures})
+    if blockers:
+        print("error: mnemoseed-local owns resources that remain:", file=sys.stderr)
+        for host in blockers:
+            failure = next((detail for name, detail in failures if name == host), None)
+            detail = failure or "removal reported success but the adapter is still present"
+            print(f"  {host}: {detail}", file=sys.stderr)
+            print(f"    finish by hand: {uninstall_command(host)}", file=sys.stderr)
+        return 1
+    if not deferred:
+        print(_PACKAGE_HANDOFF)
+    return 0
 
 
 # ------------------------------------------------------------ config ops
@@ -1567,24 +1693,19 @@ class HostBinding:
     install: str
 
 
-#: The host adapters the CLI dispatches to. zcode / codex_cli ship no modules
-#: yet: their transformer entries fail open, their lifecycle entries fail loud.
+#: The host adapters the CLI dispatches to, derived from the shared adapter
+#: registry so a host registers once. A binding's ``events`` module is the
+#: stdin transformer (opencode's events ride its TypeScript plugin, so the
+#: Python module is absent by design and the hidden verb fails open for it);
+#: ``install`` is the adapter module whose convention-named lifecycle entries
+#: the ``host`` verb group calls.
 HOOK_HOSTS: dict[str, HostBinding] = {
-    "claude_code": HostBinding(
-        events="mnemoseed_local.hosts.claude_code.events",
+    host: HostBinding(
+        events=f"mnemoseed_local.hosts.{host}.events",
         events_entry="transform_event",
-        install="mnemoseed_local.hosts.claude_code.install",
-    ),
-    "zcode": HostBinding(
-        events="mnemoseed_local.hosts.zcode.events",
-        events_entry="transform_event",
-        install="mnemoseed_local.hosts.zcode.install",
-    ),
-    "codex_cli": HostBinding(
-        events="mnemoseed_local.hosts.codex_cli.events",
-        events_entry="transform_event",
-        install="mnemoseed_local.hosts.codex_cli.install",
-    ),
+        install=module,
+    )
+    for host, module in ADAPTER_MODULES.items()
 }
 
 
@@ -1722,6 +1843,17 @@ def cmd_hook_event(args: argparse.Namespace) -> int:
     return entry(_read_stdin_text())
 
 
+def _host_lifecycle(host: str, verb: str) -> Callable[[], Any]:
+    """The adapter's zero-arg lifecycle function. A missing adapter module or
+    entry fails loud (ModuleNotFoundError / LookupError), unlike the
+    transformer dispatch's fail-open."""
+    module = importlib.import_module(HOOK_HOSTS[host].install)
+    entry: Callable[[], Any] | None = getattr(module, verb, None)
+    if entry is None:
+        raise LookupError(f"not implemented yet for host {host}")
+    return entry
+
+
 def cmd_host(args: argparse.Namespace) -> int:
     """Host adapter lifecycle: install | uninstall | status.
 
@@ -1729,14 +1861,9 @@ def cmd_host(args: argparse.Namespace) -> int:
     zero-arg lifecycle functions. A missing adapter is a user-facing error
     (fail loud), unlike the hook transformer's fail-open dispatch.
     """
-    binding = HOOK_HOSTS[args.host]
     try:
-        module = importlib.import_module(binding.install)
-    except ModuleNotFoundError:
-        print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
-        return 1
-    entry = getattr(module, args.host_command, None)
-    if entry is None:
+        entry = _host_lifecycle(args.host, args.host_command)
+    except (ModuleNotFoundError, LookupError):
         print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
         return 1
     result = entry()
