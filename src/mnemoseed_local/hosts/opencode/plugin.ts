@@ -44,10 +44,10 @@
 // plugin and config-hook cfg.mcp mutations stick (B2.6 probe rounds 1+2).
 
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
-import { readFileSync } from "node:fs"
+import { readFileSync, realpathSync } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, sep } from "node:path"
 
 const HOST_ID = "opencode"
 const BASE_URL: string = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
@@ -2301,6 +2301,85 @@ function stringifyReplayedToolOutput(part: any): string {
   return text
 }
 
+// ---- project-binding gate (launch-root verification). Under an explicit
+// profile env the plugin verifies ONCE, at load, that its own process cwd is
+// a root bound to that profile. This host supplies no per-event cwd, so the
+// honest capability line is launch-root-only. A conflicting binding, a cwd
+// outside every bound root, or an unreadable registry disables the whole
+// bundle for this instance (console.error refusal with restart instructions)
+// — never a silent namespace switch, never a crash.
+const BINDINGS_FILENAME = "project-bindings.json"
+const BINDING_RESTART_INSTRUCTION =
+  "restart the host with 'mnemoseed-local project run --root <project> -- <host argv>' " +
+  "so the root and the profile stay pinned together"
+const BINDING_UNSUPPORTED_SUFFIX =
+  "this instance is recorded unsupported for the project binding"
+
+type BindingEntry = { project_root: string; profile_id: string }
+
+function foldRoot(path: string): string {
+  return process.platform === "win32" ? path.replace(/\//g, "\\").toLowerCase() : path
+}
+
+function isUnderRoot(root: string, directory: string): boolean {
+  const base = foldRoot(root)
+  const child = foldRoot(directory)
+  return child === base || child.startsWith(base + sep)
+}
+
+function bindingRefusal(): string | null {
+  // The profile VALUE is always the env selection; the registry only refuses
+  // inconsistencies. No env var, no registry file: legacy behavior, unbound.
+  const profile = (process.env.MNEMOSEED_LOCAL_PROFILE_ID || "").trim()
+  if (!profile) return null
+  const bindings: BindingEntry[] = []
+  try {
+    const home = process.env.MNEMOSEED_LOCAL_HOME || join(homedir(), ".mnemoseed-local")
+    const parsed: any = JSON.parse(readFileSync(join(home, BINDINGS_FILENAME), "utf8"))
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.bindings)
+    ) {
+      throw new Error("unsupported version or shape")
+    }
+    for (const entry of parsed.bindings) {
+      if (
+        entry === null ||
+        typeof entry !== "object" ||
+        typeof entry.project_root !== "string" ||
+        typeof entry.profile_id !== "string"
+      ) {
+        throw new Error("malformed binding entry")
+      }
+      bindings.push({ project_root: entry.project_root, profile_id: entry.profile_id })
+    }
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null
+    const reason = String(error?.message ?? error)
+    return `project binding registry is unreadable (${reason}); ${BINDING_RESTART_INSTRUCTION}; ${BINDING_UNSUPPORTED_SUFFIX}`
+  }
+  const roots = bindings
+    .filter((entry) => entry.profile_id === profile)
+    .map((entry) => entry.project_root)
+  let directory = process.cwd()
+  try {
+    directory = realpathSync(directory)
+  } catch {
+    // the cwd of a running process is real; keep the raw spelling
+  }
+  const bound = roots.length > 0 ? `bound root(s) for ${profile}: ${roots.join(", ")}` : "no bound root"
+  const exact = bindings.find((entry) => foldRoot(entry.project_root) === foldRoot(directory))
+  if (exact !== undefined) {
+    if (exact.profile_id === profile) return null
+    return `cwd ${directory} is bound to profile ${exact.profile_id}, not the active profile ${profile}; ${bound}; ${BINDING_RESTART_INSTRUCTION}; ${BINDING_UNSUPPORTED_SUFFIX}`
+  }
+  if (roots.some((root) => isUnderRoot(root, directory))) return null
+  if (roots.length === 0) return null
+  return `cwd ${directory} does not match the bound project for the active profile ${profile}; ${bound}; ${BINDING_RESTART_INSTRUCTION}; ${BINDING_UNSUPPORTED_SUFFIX}`
+}
+
 export default async function MnemoSeedLocalPlugin(
   input: { client?: unknown },
   options?: unknown,
@@ -2313,6 +2392,11 @@ export default async function MnemoSeedLocalPlugin(
     typeof options === "object" &&
     (options as JsonRecord)["enabled"] === false
   ) {
+    return {}
+  }
+  const bindingRefusalText = bindingRefusal()
+  if (bindingRefusalText !== null) {
+    console.error(`mnemoseed-local: ${bindingRefusalText}`)
     return {}
   }
   const client = input?.client as
