@@ -550,7 +550,14 @@ def test_pre_existing_pending_flag_surfaces_without_probe(stack) -> None:
 # ------------------------------------------------------------ rank discipline
 
 
-def _pool_candidate(chunk_id: str, text: str, *, score: float, rescued: bool = False) -> Candidate:
+def _pool_candidate(
+    chunk_id: str,
+    text: str,
+    *,
+    score: float,
+    rescued: bool = False,
+    expired_window: bool = False,
+) -> Candidate:
     breakdown = ScoreBreakdown(
         semantic=score,
         cue_overlap=0.0,
@@ -567,6 +574,7 @@ def _pool_candidate(chunk_id: str, text: str, *, score: float, rescued: bool = F
         score=score,
         breakdown=breakdown,
         rescued=rescued,
+        expired_window=expired_window,
     )
 
 
@@ -597,6 +605,57 @@ def test_top_k_truncation_never_drops_normal_for_rescued(stack) -> None:
 
     assert [entry.id for entry in result.entries] == ["c_normal"]
     assert result.dropped_count == 1
+
+
+# ------------------------------------------------- expired-window tier (PRD-281)
+
+
+def test_expired_window_ranks_last_at_the_serving_surface(stack) -> None:
+    """PRD-281 D04 tier at the serving surface: an expired-window candidate
+    renders after every candidate without an expired window, regardless of its
+    fused score — admission and rendering order both inherit the tier."""
+    expired_high = _pool_candidate("c_expired", "expired constraint text", score=3.0, expired_window=True)
+    fresh_low = _pool_candidate("c_fresh", "fresh memory text", score=1.0)
+    recall = HybridRecall(candidates=[expired_high, fresh_low], vector_hits=2, graph_hits=0)
+
+    result = _assemble(stack, recall)
+
+    assert [entry.id for entry in result.entries] == ["c_fresh", "c_expired"]
+
+
+def test_expired_window_truncation_drops_expired_first(stack) -> None:
+    """Truncation inherits the tier: with a single slot the fresh candidate
+    keeps it and the higher-scoring expired one is the honest drop."""
+    expired_high = _pool_candidate("c_expired", "expired constraint text", score=3.0, expired_window=True)
+    fresh_low = _pool_candidate("c_fresh", "fresh memory text", score=1.0)
+    recall = HybridRecall(candidates=[expired_high, fresh_low], vector_hits=2, graph_hits=0)
+
+    result = _assemble(stack, recall, AssembleConfig(top_k=1))
+
+    assert [entry.id for entry in result.entries] == ["c_fresh"]
+    assert result.dropped_count == 1
+
+
+def test_revised_rescue_discipline_with_expired_window(stack) -> None:
+    """Revised rescue discipline (PRD-281 tier key freeze): admission order is
+    (expired_window, rescued, ...) — non-rescued fresh first, then rescued pins
+    (presumed currently valid), then expired constraints, expired-rescued last."""
+    normal = _pool_candidate("c_normal", "normal memory text", score=1.0)
+    rescued = _pool_candidate("c_rescued", "rescued pin text", score=9.0, rescued=True)
+    expired = _pool_candidate("c_expired", "expired constraint text", score=9.0, expired_window=True)
+    expired_rescued = _pool_candidate(
+        "c_expired_rescued", "expired pin text", score=9.0, rescued=True, expired_window=True
+    )
+    recall = HybridRecall(candidates=[expired_rescued, expired, rescued, normal], vector_hits=4, graph_hits=0)
+
+    result = _assemble(stack, recall)
+
+    assert [entry.id for entry in result.entries] == [
+        "c_normal",
+        "c_rescued",
+        "c_expired",
+        "c_expired_rescued",
+    ]
 
 
 # ------------------------------------------------------------ honest empty

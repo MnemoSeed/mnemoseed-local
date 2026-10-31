@@ -161,7 +161,10 @@ its hooks, MCP and trust outcome on separate lines; manual trust steps (for
 example approving the hooks inside Codex via `/hooks`) stay printed next steps
 and are never automated.
 Hook lifecycle:
-`mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`.
+`mnemoseed-local host {install|uninstall|status} --host opencode` — the `host`
+verb group is the one entry for all four adapters. The original
+`mnemoseed-local hook {install|uninstall|status|disable|enable} opencode`
+remains working as the documented alias (it also serves claude_code).
 The ZCode and Codex CLI adapters install through the `host` command group:
 `mnemoseed-local host install --host zcode` registers four ZCode hook events
 plus the loopback MCP entry in `~/.zcode/cli/config.json`, and
@@ -178,7 +181,7 @@ MnemoSeed never reads or writes a Codex trust record, and daemon reachability
 is reported separately from the structure. Approving the hooks is your own
 one-time step inside Codex — nothing fires as trusted before you run `/hooks`
 and review them there. Lifecycle:
-`mnemoseed-local host {install|uninstall|status} --host zcode|codex_cli`.
+`mnemoseed-local host {install|uninstall|status} --host claude_code|codex_cli|opencode|zcode`.
 The Codex adapter needs the optional `[codex]` extra
 (`uv tool install --force '.[codex]'`), which provides `zstandard` for
 compressed rollout transcripts.
@@ -209,8 +212,37 @@ auto-recall block and the visibility signal line when `[visibility] mode` is
 not `off`).
 Settings files must stay plain JSON (Claude Code documents plain JSON) —
 commented (JSONC) files are refused untouched with manual-edit guidance.
-Lifecycle: `mnemoseed-local hook {install|uninstall|status|disable|enable}
-claude_code`.
+Lifecycle: `mnemoseed-local host {install|uninstall|status} --host claude_code`
+(`hook {install|uninstall|status|disable|enable} claude_code` keeps working as
+the documented alias, and is the only surface for its `disable`/`enable`
+switch).
+
+## Uninstall
+
+`mnemoseed-local uninstall` removes the MnemoSeed-owned Windows logon task and
+reports what remains, and it never deletes your memory data unless you ask:
+
+- By default (no `--purge`) your data home is kept exactly as it is, including
+  the project binding registry. Installed host adapters are detected and their
+  exact per-host removal commands are printed as next steps, for example
+  `mnemoseed-local host uninstall --host opencode` — one `host` verb covers
+  all four adapters (`hook ... opencode` stays as the alias).
+- `mnemoseed-local uninstall --purge` is the destructive path and it stays
+  explicit plus confirmed: it lists the detected host adapters and every data
+  file it will delete (the config home, the daemon credential and the project
+  binding registry included), asks for confirmation, then removes the adapters
+  before the data. `--yes` skips the confirmation. Adapter removal touches
+  only MnemoSeed's own marked entries — your own hook groups, MCP servers and
+  config files are preserved.
+- A data home that is not the default one under your user profile (an isolated
+  or `MNEMOSEED_LOCAL_HOME` override install) reports the detected adapters
+  without removing them — their wiring may serve a different install — and
+  prints the exact per-host commands instead.
+- A partial failure never reads as completion: whatever MnemoSeed still owns
+  is named with the exact command to finish by hand, and the exit code is
+  non-zero. Nothing is claimed removed while something it owns remains.
+- The CLI never uninstalls its own package and never claims that done: the
+  final step is printed for you to run — `uv tool uninstall mnemoseed-local`.
 
 ## MCP gateway
 

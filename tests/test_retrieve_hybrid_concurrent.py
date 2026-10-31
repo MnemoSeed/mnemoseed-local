@@ -14,6 +14,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -222,6 +223,44 @@ def test_concurrent_recall_deterministic_across_calls(stack) -> None:
     first = _canonical(_recall(stack, text, cues))
     for _ in range(5):
         assert _canonical(_recall(stack, text, cues)) == first
+
+
+def test_expired_window_flag_identical_on_concurrent_and_sequential_paths(stack) -> None:
+    """PRD-281 shared-path pin: ``expired_window`` is set inside the shared
+    candidate-construction path (``_vector_track``) with ``now`` threaded to
+    both paths the same way — the concurrent and sequential outputs stay
+    byte-identical AND carry the same temporal flags. Per-path duplicated
+    evaluation would violate the equivalence contract."""
+    _seed(stack)
+    _write(stack, _chunk("c-exp", "the LanceDb loader until 2026-09-08", entities=("LanceDb",)))
+    now = datetime(2026, 10, 31, tzinfo=UTC).timestamp()
+    text = "lancedb loader"
+    cues = _query_cues(("LanceDb",), host="cursor")
+    retriever = HybridRetriever()
+    concurrent = retriever.recall(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
+        now=now,
+    )
+    sequential = retriever._recall_sequential(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
+        now=now,
+    )
+    assert _canonical(concurrent) == _canonical(sequential)
+    concurrent_flags = {candidate.id: candidate.expired_window for candidate in concurrent.candidates}
+    sequential_flags = {candidate.id: candidate.expired_window for candidate in sequential.candidates}
+    assert concurrent_flags == sequential_flags
+    assert concurrent_flags["c-exp"] is True
+    assert concurrent_flags["c1"] is False
 
 
 # ------------------------------------------------------------ overlap
