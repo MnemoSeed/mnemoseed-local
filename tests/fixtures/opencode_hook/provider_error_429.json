@@ -1,31 +1,40 @@
 {
   "provenance": {
     "note": "Sanitized non-live entry-gate fixture (brief Section 9.4). Synthetic values only; no secrets, no live data.",
-    "source": "OpenCode message.updated event shape; provider/model/status read points at plugin.ts modelIdOf / onMessageCompleted (info.providerID, info.modelID, info.time.error, info.metadata.error).",
-    "opencode_version": "1.18.21 (local toolchain; shape pinned from shipped plugin.ts read points, not a live capture)",
-    "recorded": "2026-09-03",
-    "case": "real-429 with numeric time.error stamp present alongside the message text"
+    "source": "OpenCode V2 event stream (V2Event union via @opencode/client): session.step.failed with a structured error; provider/model ride the tracked session model (session.model.selected).",
+    "opencode_version": "2.0.32 (npm @opencode/cli binary + @opencode/plugin 2.0.32 SDK types)",
+    "recorded": "2026-11-03",
+    "case": "real-429 with a numeric status on the structured error"
+  },
+  "session_event": {
+    "type": "session.model.selected",
+    "data": {
+      "sessionID": "sess_example_429",
+      "model": {
+        "providerID": "anthropic",
+        "id": "claude-sonnet-4"
+      }
+    }
   },
   "bus_event": {
-    "type": "message.updated",
-    "properties": {
-      "info": {
-        "id": "msg_example_429",
-        "role": "assistant",
-        "sessionID": "sess_example_429",
-        "providerID": "anthropic",
-        "modelID": "claude-sonnet-4",
-        "time": { "error": 111 },
-        "metadata": { "error": "429 quota exceeded for model claude-sonnet-4" }
-      },
-      "sessionID": "sess_example_429"
+    "type": "session.step.failed",
+    "created": 111,
+    "data": {
+      "sessionID": "sess_example_429",
+      "assistantMessageID": "msg_example_429",
+      "error": {
+        "type": "APIError",
+        "message": "429 quota exceeded for model claude-sonnet-4",
+        "status": 429
+      }
     }
   },
   "pinned_contract": {
-    "provider": "info.providerID",
-    "model": "info.modelID (split from modelIdOf provider/model on first /)",
-    "status_text": "info.metadata.error (payload leads; info.time.error numeric stamp is fallback-only)",
+    "provider": "session_event.data.model.providerID",
+    "model": "session_event.data.model.id",
+    "status_text": "bus_event.data.error.message (payload wording leads; the structured status is fallback-only)",
     "expected_status_token": "quota",
-    "expected_reason": "provider_429_quota"
+    "expected_reason": "provider_429_quota",
+    "error_id": "bus_event.data.assistantMessageID"
   }
 }

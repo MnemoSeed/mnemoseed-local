@@ -583,9 +583,10 @@ def test_forget_via_existing_endpoint(b1_config: Path) -> None:
 
 def test_hook_detector_branch_exists() -> None:
     source = Path("src/mnemoseed_local/hosts/opencode/plugin.ts").read_text(encoding="utf-8")
-    # must have provider failure detection in session.error and message.updated
+    # must have provider failure detection on the V2 step/execution failure events
     assert "provider_error" in source.lower() or "provider_failure" in source.lower()
-    assert "session.error" in source
+    assert "session.step.failed" in source
+    assert "session.execution.failed" in source
     # must call post to /ingest with provider_error
     assert re.search(r"post\(.*provider_error", source, re.I) is not None or "provider_error" in source
     # debounce map must exist

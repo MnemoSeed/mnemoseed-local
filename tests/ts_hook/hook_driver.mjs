@@ -1,7 +1,7 @@
-// Minimal behavioral driver for the shipped opencode hook (B2.2 loose-end:
-// regex pins cannot pin BEHAVIOR). Node feeks the bundled plugin a fake SDK
-// client + a recording fetch; scenarios print a JSON transcript for pytest
-// to assert on. No daemon, no network, no LLM — everything is canned.
+// Minimal behavioral driver for the shipped opencode plugin (B2.2 loose-end:
+// regex pins cannot pin BEHAVIOR). Node feeds the bundled plugin a fake V2
+// plugin ctx + a recording fetch; scenarios print a JSON transcript for
+// pytest to assert on. No daemon, no network, no LLM — everything is canned.
 
 import { pathToFileURL } from "node:url"
 import { mkdir, mkdtemp, readFile, readdir, stat, unlink, utimes, writeFile } from "node:fs/promises"
@@ -165,41 +165,39 @@ let signalCiteTurnVisible = false
 function historyEntries() {
   const entries = [
     {
-      // opencode's UserMessage carries a required per-message agent; the
-      // crash-replay lane must lift it into the canonical ingest field.
-      info: { id: "m_old_user", role: "user", sessionID: SES, agent: "build", time: { created: 1_000 } },
-      parts: [{ type: "text", text: "历史用户消息" }],
+      // V2 SessionMessageInfo: user text rides the message itself; the V2
+      // host record carries no per-message agent on user messages.
+      id: "m_old_user",
+      type: "user",
+      sessionID: SES,
+      time: { created: 1_000 },
+      text: "历史用户消息",
     },
     {
-      info: {
-        id: "m_old_assistant",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 2_000 },
-      },
-      parts: [{ type: "text", text: "历史助手回复" }],
+      id: "m_old_assistant",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 1_000, completed: 2_000 },
+      model: { providerID: "opencode", id: "legacy-model" },
+      content: [{ type: "text", text: "历史助手回复" }],
     },
   ]
   if (outageTurnVisible) {
     entries.push({
-      info: {
-        id: "m_live_outage",
-        role: "user",
-        sessionID: SES,
-        time: { created: Math.round(Date.now() - 1000) },
-      },
-      parts: [{ type: "text", text: "宕机轮" }],
+      id: "m_live_outage",
+      type: "user",
+      sessionID: SES,
+      time: { created: Math.round(Date.now() - 1000) },
+      text: "宕机轮",
     })
   }
   if (citationTurnsVisible) {
     entries.push({
-      info: {
-        id: "m_cite_1",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 3_000 },
-      },
-      parts: [
+      id: "m_cite_1",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 2_000, completed: 3_000 },
+      content: [
         {
           type: "text",
           text: "好的，回顾一下上次的决定：我们决定把发布窗口固定在每月第一周，并且由小李负责验收，周五之前出终稿。我现在就排期。",
@@ -207,13 +205,11 @@ function historyEntries() {
       ],
     })
     entries.push({
-      info: {
-        id: "m_cite_2",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 4_000 },
-      },
-      parts: [
+      id: "m_cite_2",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 3_000, completed: 4_000 },
+      content: [
         {
           type: "text",
           text: "再确认一次：我们决定把发布窗口固定在每月第一周，并且由小李负责验收，周五之前出终稿。",
@@ -221,13 +217,11 @@ function historyEntries() {
       ],
     })
     entries.push({
-      info: {
-        id: "m_cite_3",
-        role: "assistant",
-        sessionID: "sess-noinject",
-        time: { completed: 5_000 },
-      },
-      parts: [
+      id: "m_cite_3",
+      type: "assistant",
+      sessionID: "sess-noinject",
+      time: { created: 4_000, completed: 5_000 },
+      content: [
         {
           type: "text",
           text: "参考旧决定：我们决定把发布窗口固定在每月第一周，并且由小李负责验收，周五之前出终稿。",
@@ -235,22 +229,18 @@ function historyEntries() {
       ],
     })
     entries.push({
-      info: {
-        id: "m_budget_quote",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 6_000 },
-      },
-      parts: [{ type: "text", text: "user: " + "甲".repeat(3000) }],
+      id: "m_budget_quote",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 5_000, completed: 6_000 },
+      content: [{ type: "text", text: "user: " + "甲".repeat(3000) }],
     })
     entries.push({
-      info: {
-        id: "m_cite_4",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 7_000 },
-      },
-      parts: [
+      id: "m_cite_4",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 6_000, completed: 7_000 },
+      content: [
         {
           type: "text",
           text: "As discussed, WE DECIDED  to   lock the release window...",
@@ -260,42 +250,34 @@ function historyEntries() {
   }
   if (sliceTurnsVisible) {
     entries.push({
-      info: {
-        id: "m_slice_1",
-        role: "assistant",
-        sessionID: "sess-het",
-        time: { completed: 51_000 },
-      },
-      parts: [{ type: "text", text: "B".repeat(30) }],
+      id: "m_slice_1",
+      type: "assistant",
+      sessionID: "sess-het",
+      time: { created: 50_000, completed: 51_000 },
+      content: [{ type: "text", text: "B".repeat(30) }],
     })
     entries.push({
-      info: {
-        id: "m_slice_2",
-        role: "assistant",
-        sessionID: "sess-het",
-        time: { completed: 52_000 },
-      },
-      parts: [{ type: "text", text: "A".repeat(30) }],
+      id: "m_slice_2",
+      type: "assistant",
+      sessionID: "sess-het",
+      time: { created: 51_000, completed: 52_000 },
+      content: [{ type: "text", text: "A".repeat(30) }],
     })
     entries.push({
-      info: {
-        id: "m_slice_3",
-        role: "assistant",
-        sessionID: "sess-het",
-        time: { completed: 53_000 },
-      },
-      parts: [{ type: "text", text: "丙".repeat(30) }],
+      id: "m_slice_3",
+      type: "assistant",
+      sessionID: "sess-het",
+      time: { created: 52_000, completed: 53_000 },
+      content: [{ type: "text", text: "丙".repeat(30) }],
     })
   }
   if (t2CiteTurnsVisible) {
     entries.push({
-      info: {
-        id: "m_cite_t2_1",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 8_000 },
-      },
-      parts: [
+      id: "m_cite_t2_1",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 7_000, completed: 8_000 },
+      content: [
         {
           type: "text",
           text: "上次中段提到 LanceDb 的接入还在等存储层确认，我们继续推进。",
@@ -303,13 +285,11 @@ function historyEntries() {
       ],
     })
     entries.push({
-      info: {
-        id: "m_cite_t2_2",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 9_000 },
-      },
-      parts: [
+      id: "m_cite_t2_2",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 8_000, completed: 9_000 },
+      content: [
         {
           type: "text",
           text: "再确认一次：上次中段提到 LanceDb 的接入还在等存储层确认。",
@@ -319,27 +299,24 @@ function historyEntries() {
   }
   if (signalCiteTurnVisible) {
     entries.push({
-      info: {
-        id: "m_sig_cite_1",
-        role: "assistant",
-        sessionID: SES,
-        time: { completed: 10_000 },
-      },
-      parts: [{ type: "text", text: "[mnemoseed] recalled related memories" }],
+      id: "m_sig_cite_1",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 9_000, completed: 10_000 },
+      content: [{ type: "text", text: "[mnemoseed] recalled related memories" }],
     })
   }
   return entries
 }
 
-function messageUpdatedAssistant(id, completed) {
-  return {
-    type: "message.updated",
-    properties: {
-      info: { id, role: "assistant", sessionID: SES, time: { completed } },
-      sessionID: SES,
-    },
-  }
+// V2 system arrays carry text parts; the transcripts map them back to plain
+// strings so the pytest assertions read the injected block text directly.
+function sysTexts(system) {
+  if (!Array.isArray(system)) return system
+  return system.map((part) => (typeof part === "string" ? part : part?.text ?? ""))
 }
+
+
 
 async function readWatermarks() {
   // Merged legacy+shard view (max per key): new code keeps the legacy file
@@ -389,15 +366,173 @@ async function readOwnShard(seam) {
 }
 
 async function main() {
-  const fakeClient = {
-    session: {
-      // history: user u_old then assistant a_old (both completed)
-      messages: async () => ({ data: historyEntries() }),
+  // V2 driver surface: the bundled plugin default-exports { id, setup } and
+  // the named __watermarkTest seam. setup(ctx) registers on this fake
+  // ctx; the driver exposes the same callbacks as fire.* emitters so
+  // scenarios drive the production handlers under the V2 shapes.
+  const pluginModule = await import(pathToFileURL(bundle))
+  const definition = pluginModule.default
+
+  const pendingEvents = []
+  let wakeWaiters = []
+  let aborted = false
+  let prevResolve = null
+  const wake = () => {
+    const waiters = wakeWaiters
+    wakeWaiters = []
+    for (const waiter of waiters) waiter()
+  }
+  const eventStream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          // resolving the PREVIOUS fire here is the completion barrier: the
+          // plugin only pulls again after its handler for this event settled
+          if (prevResolve) {
+            const resolve = prevResolve
+            prevResolve = null
+            resolve()
+          }
+          while (pendingEvents.length === 0) {
+            if (aborted) return { value: undefined, done: true }
+            await new Promise((resolve) => wakeWaiters.push(resolve))
+          }
+          const item = pendingEvents.shift()
+          prevResolve = item.resolve
+          return { value: item.event, done: false }
+        },
+      }
     },
   }
 
-  const pluginFactory = (await import(pathToFileURL(bundle))).default
-  const hooks = await pluginFactory({ client: fakeClient })
+  const makeMcpEditor = (map) => ({
+    list: () => Object.entries(map),
+    get: (name) => map[name],
+    set: (name, config) => {
+      map[name] = config
+    },
+    update: (name, update) => update(map[name]),
+    remove: (name) => {
+      delete map[name]
+    },
+  })
+
+  const makeCtx = () => {
+    const sessionHooks = new Map()
+    const toolHooks = new Map()
+    const mcpTransforms = []
+    const registrations = []
+    const ctx = {
+      options: undefined,
+      location: { directory: process.cwd() },
+      session: {
+        hook: async (name, cb) => {
+          sessionHooks.set(name, cb)
+          registrations.push(`session.hook:${name}`)
+          return { dispose: async () => {} }
+        },
+        context: async ({ sessionID }) =>
+          historyEntries().filter((entry) => entry.sessionID === sessionID),
+      },
+      tool: {
+        hook: async (name, cb) => {
+          toolHooks.set(name, cb)
+          registrations.push(`tool.hook:${name}`)
+          return { dispose: async () => {} }
+        },
+      },
+      mcp: {
+        transform: async (cb) => {
+          mcpTransforms.push(cb)
+          registrations.push("mcp.transform")
+          return { dispose: async () => {} }
+        },
+      },
+      event: {
+          subscribe: () => {
+            registrations.push("event.subscribe")
+            return eventStream
+          },
+        },
+    }
+    return { ctx, sessionHooks, toolHooks, mcpTransforms, registrations }
+  }
+
+  let current = null
+  const cleanupFns = []
+  const activate = async (options = undefined) => {
+    const fresh = makeCtx()
+    fresh.ctx.options = options
+    const cleanup = await definition.setup(fresh.ctx)
+    if (typeof cleanup === "function") cleanupFns.push(cleanup)
+    current = fresh
+    return fresh.registrations
+  }
+
+  const fire = {
+    // Resolves once the plugin has fully processed this event: a no-op
+    // sentinel queued behind it is pulled only after the handler settled.
+    event: async (event) => {
+      const done = new Promise((resolve) => {
+        pendingEvents.push({ event, resolve })
+        pendingEvents.push({ event: { type: "session.driver.sentinel", data: {} }, resolve: null })
+      })
+      wake()
+      await done
+    },
+    prompt: async (event) => {
+      const cb = current.sessionHooks.get("prompt")
+      if (typeof cb !== "function") throw new Error("prompt hook not registered")
+      await cb(event)
+    },
+    context: async (event) => {
+      const cb = current.sessionHooks.get("context")
+      if (typeof cb !== "function") throw new Error("context hook not registered")
+      await cb(event)
+    },
+    compaction: async (event) => {
+      const cb = current.sessionHooks.get("compaction")
+      if (typeof cb !== "function") throw new Error("compaction hook not registered")
+      await cb(event)
+    },
+    toolAfter: async (event) => {
+      const cb = current.toolHooks.get("execute.after")
+      if (typeof cb !== "function") throw new Error("execute.after hook not registered")
+      await cb(event)
+    },
+    mcp: async (map) => {
+      if (map === null || typeof map !== "object") return
+      for (const cb of current.mcpTransforms) {
+        try {
+          await cb(makeMcpEditor(map))
+        } catch (error) {
+          console.debug("driver: mcp transform failed:", error)
+        }
+      }
+    },
+    // A completed assistant reply under the V2 shapes: the text parts land
+    // via session.text.ended, the boundary via session.step.ended. The text
+    // comes from the same canned session record the reconcile read serves.
+    assistantReply: async (id, completed) => {
+      const entry = historyEntries().find((candidate) => candidate.id === id)
+      const sessionID = entry?.sessionID ?? SES
+      const text = (entry?.content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+      await fire.event({
+        type: "session.text.ended",
+        data: { sessionID, assistantMessageID: id, ordinal: 0, text },
+      })
+      await fire.event({
+        type: "session.step.ended",
+        created: completed,
+        data: { sessionID, assistantMessageID: id, finish: "stop" },
+      })
+    },
+  }
+
+  await activate()
 
   switch (scenario) {
     case "credential-header": {
@@ -411,17 +546,11 @@ async function main() {
       await writeFile(CREDENTIAL_PATH, "driver-issued-credential\n", "utf8")
       recentPayload = RECENT_PAYLOAD
       recallPayload = RECALL_PAYLOAD
-      await hooks["chat.system.transform"]({ sessionID: SES }, { system: ["BASE"] })
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_cred_1" },
-        { parts: [{ type: "text", text: "带凭据的一轮" }] },
-      )
+      await fire.context({ sessionID: SES, system: ["BASE"] })
+      await fire.prompt({ sessionID: SES, messageID: "m_cred_1", prompt: { text: "带凭据的一轮" } })
       await delay(100)
       await unlink(CREDENTIAL_PATH)
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_cred_2" },
-        { parts: [{ type: "text", text: "没有凭据的一轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_cred_2", prompt: { text: "没有凭据的一轮" } })
       await delay(100)
       const authorized = posts.filter((post) => post.body.content?.text === "带凭据的一轮")
       const unauthenticated = posts.filter((post) => post.body.content?.text === "没有凭据的一轮")
@@ -446,22 +575,16 @@ async function main() {
       await writeFile(WATERMARKS, JSON.stringify({ [SES]: 500 }), "utf8")
       // daemon REJECTS the user turn's POST: the mark must NOT advance past it
       failing.add("http://localhost:7788/ingest")
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_live_1" },
-        { parts: [{ type: "text", text: "拒绝轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_live_1", prompt: { text: "拒绝轮" } })
       await delay(100)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: SES } } })
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
       await delay(50)
       const marksRejected = await readWatermarks()
       // daemon HEALTHY again: the next accepted turn must advance the mark
       failing.clear()
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_live_2" },
-        { parts: [{ type: "text", text: "接受轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_live_2", prompt: { text: "接受轮" } })
       await delay(100)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: SES } } })
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
       await delay(50)
       const marksAccepted = await readWatermarks()
       console.log(JSON.stringify({ posts, marksRejected, marksAccepted }))
@@ -473,10 +596,7 @@ async function main() {
       // user prompt must arrive AFTER them, or the segmenter mis-binds turns.
       await writeFile(WATERMARKS, JSON.stringify({}), "utf8")
       await writeFile(WATERMARKS, JSON.stringify({ [SES]: 5 }), "utf8")
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_live_1" },
-        { parts: [{ type: "text", text: "重启后的新消息" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_live_1", prompt: { text: "重启后的新消息" } })
       await delay(200) // let the reconcile chain settle
       console.log(
         JSON.stringify({
@@ -495,9 +615,9 @@ async function main() {
       // completed assistant lands via message.updated; replay of the SAME
       // message must not double-post it.
       await writeFile(WATERMARKS, JSON.stringify({ [SES]: 0 }), "utf8")
-      await hooks.event({ event: messageUpdatedAssistant("m_old_assistant", 3_000) })
+      await fire.assistantReply("m_old_assistant", 3_000)
       await delay(50)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: SES } } })
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
       await delay(200)
       const assistantPosts = posts.filter((post) => post.body.event === "assistant_message")
       console.log(JSON.stringify({ assistantCount: assistantPosts.length, texts: assistantPosts.map((p) => p.body.content.text) }))
@@ -511,21 +631,15 @@ async function main() {
       // (host history still holds it) BEFORE B leaps the watermark past it.
       await writeFile(WATERMARKS, JSON.stringify({ [SES]: 500 }), "utf8")
       failing.add("http://localhost:7788/ingest")
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_live_outage" },
-        { parts: [{ type: "text", text: "宕机轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_live_outage", prompt: { text: "宕机轮" } })
       await delay(100)
       failing.clear()
       // opencode's own store now carries the outage turn (simulated: the
-      // fake SDK listing gains it after the fact — see fakeClient shim below)
+      // fake session read gains it after the fact — see historyEntries below)
       outageTurnVisible = true
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_live_recovery" },
-        { parts: [{ type: "text", text: "恢复轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_live_recovery", prompt: { text: "恢复轮" } })
       await delay(100)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: SES } } })
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
       await delay(100)
       const outagePosts = posts.filter((post) => post.body.content?.text === "宕机轮")
       const outageAccepted = posts.filter(
@@ -551,28 +665,28 @@ async function main() {
       // invalid shapes burn nothing, repeats burn nothing, and concurrent
       // first calls can never double-inject (attempt gate is synchronous).
       recentPayload = RECENT_PAYLOAD
-      await hooks["chat.system.transform"]({ sessionID: SES }, { system: undefined })
+      await fire.context({ sessionID: SES, system: undefined })
       const o1 = { system: ["BASE SYSTEM PROMPT"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
+      await fire.context({ sessionID: SES, system: o1.system })
       const o2 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o2)
+      await fire.context({ sessionID: SES, system: o2.system })
       const c1 = { system: ["BASE1"] }
       const c2 = { system: ["BASE2"] }
       await Promise.all([
-        hooks["chat.system.transform"]({ sessionID: "sess-conc" }, c1),
-        hooks["chat.system.transform"]({ sessionID: "sess-conc" }, c2),
+        fire.context({ sessionID: "sess-conc", system: c1.system }),
+        fire.context({ sessionID: "sess-conc", system: c2.system }),
       ])
       const o3 = { system: ["BASE3"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-other" }, o3)
+      await fire.context({ sessionID: "sess-other", system: o3.system })
       // IMPORTANT-3 (QA): an empty sessionID must burn NOTHING — the attempt
       // gate is not consumed, so the real session id right after still injects.
       const e1 = { system: ["B"] }
-      await hooks["chat.system.transform"]({ sessionID: "" }, e1)
+      await fire.context({ sessionID: "", system: e1.system })
       const e2 = { system: ["B2"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-emptyid" }, e2)
+      await fire.context({ sessionID: "sess-emptyid", system: e2.system })
       console.log(
         JSON.stringify({
-          systems: [o1.system, o2.system, c1.system, c2.system, o3.system, e1.system, e2.system],
+          systems: [sysTexts(o1.system), sysTexts(o2.system), sysTexts(c1.system), sysTexts(c2.system), sysTexts(o3.system), sysTexts(e1.system), sysTexts(e2.system)],
           recentRequests: posts
             .filter((post) => post.url.endsWith("/session/recent"))
             .map((post) => post.body),
@@ -641,10 +755,10 @@ async function main() {
         ],
       }
       const w = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-window" }, w)
+      await fire.context({ sessionID: "sess-window", system: w.system })
       console.log(
         JSON.stringify({
-          block: w.system[1],
+          block: sysTexts(w.system)[1],
           recentRequests: posts
             .filter((post) => post.url.endsWith("/session/recent"))
             .map((post) => post.body),
@@ -695,8 +809,8 @@ async function main() {
         ],
       }
       const d = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-old-daemon" }, d)
-      console.log(JSON.stringify({ block: d.system[1] }))
+      await fire.context({ sessionID: "sess-old-daemon", system: d.system })
+      console.log(JSON.stringify({ block: sysTexts(d.system)[1] }))
       break
     }
 
@@ -707,13 +821,13 @@ async function main() {
       recentPayload = RECENT_PAYLOAD
       failing.add("http://localhost:7788/session/recent")
       const sys503 = { system: ["BASE503"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-fail-503" }, sys503)
-      await hooks["chat.system.transform"]({ sessionID: "sess-fail-503" }, { system: ["BASE503b"] })
+      await fire.context({ sessionID: "sess-fail-503", system: sys503.system })
+      await fire.context({ sessionID: "sess-fail-503", system: ["BASE503b"] })
       failing.clear()
       throwing.add("http://localhost:7788/session/recent")
       const sysThrow = { system: ["BASEthrow"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-fail-throw" }, sysThrow)
-      await hooks["chat.system.transform"]({ sessionID: "sess-fail-throw" }, { system: ["BASEthrowb"] })
+      await fire.context({ sessionID: "sess-fail-throw", system: sysThrow.system })
+      await fire.context({ sessionID: "sess-fail-throw", system: ["BASEthrowb"] })
       const attempts503 = posts.filter(
         (post) =>
           post.url.endsWith("/session/recent") && post.body.exclude_session_id === "sess-fail-503",
@@ -730,13 +844,13 @@ async function main() {
       failing.clear()
       throwing.clear()
       const frozen = { system: Object.freeze(["BASE"]) }
-      await hooks["chat.system.transform"]({ sessionID: "sess-freeze" }, frozen)
+      await fire.context({ sessionID: "sess-freeze", system: frozen.system })
       console.log(
         JSON.stringify({
-          systems: [sys503.system, sysThrow.system],
+          systems: [sysTexts(sys503.system), sysTexts(sysThrow.system)],
           attempts503,
           attemptsThrow,
-          frozenSystem: [...frozen.system],
+          frozenSystem: [...sysTexts(frozen.system)],
         }),
       )
       break
@@ -750,32 +864,19 @@ async function main() {
       citationTurnsVisible = true
       recentPayload = RECENT_PAYLOAD
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      const injectedBlock = o.system[1]
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_1", 3_000) })
+      await fire.context({ sessionID: SES, system: o.system })
+      const injectedBlock = sysTexts(o.system)[1]
+      await fire.assistantReply("m_cite_1", 3_000)
       await delay(100)
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_2", 4_000) })
+      await fire.assistantReply("m_cite_2", 4_000)
       await delay(100)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: SES } } })
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
       await delay(100)
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_cite_3",
-              role: "assistant",
-              sessionID: "sess-noinject",
-              time: { completed: 5_000 },
-            },
-            sessionID: "sess-noinject",
-          },
-        },
-      })
+      await fire.assistantReply("m_cite_3", 5_000)
       await delay(100)
       // IMPORTANT-3 (QA): normalization equivalence — uppercase + irregular
       // spacing in the reply must still cite the English chunk c-eng.
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_4", 7_000) })
+      await fire.assistantReply("m_cite_4", 7_000)
       await delay(100)
       console.log(
         JSON.stringify({
@@ -829,8 +930,8 @@ async function main() {
         ],
       }
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      const block = o.system[1]
+      await fire.context({ sessionID: SES, system: o.system })
+      const block = sysTexts(o.system)[1]
       recentPayload = {
         profile_id: "default",
         sessions: [
@@ -850,13 +951,12 @@ async function main() {
         ],
       }
       const o2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-solo" }, o2)
-      const block2 = o2.system[1]
+      await fire.context({ sessionID: "sess-solo", system: o2.system })
+      const block2 = sysTexts(o2.system)[1]
       citationTurnsVisible = true
-      await hooks.event({
-        event: {
+      await fire.event({
           type: "message.updated",
-          properties: {
+          data: {
             info: {
               id: "m_budget_quote",
               role: "assistant",
@@ -865,8 +965,7 @@ async function main() {
             },
             sessionID: SES,
           },
-        },
-      })
+        })
       await delay(100)
       console.log(
         JSON.stringify({
@@ -913,53 +1012,14 @@ async function main() {
         ],
       }
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-het" }, o)
-      const block = o.system[1]
+      await fire.context({ sessionID: "sess-het", system: o.system })
+      const block = sysTexts(o.system)[1]
       sliceTurnsVisible = true
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_slice_1",
-              role: "assistant",
-              sessionID: "sess-het",
-              time: { completed: 51_000 },
-            },
-            sessionID: "sess-het",
-          },
-        },
-      })
+      await fire.assistantReply("m_slice_1", 51_000)
       await delay(100)
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_slice_2",
-              role: "assistant",
-              sessionID: "sess-het",
-              time: { completed: 52_000 },
-            },
-            sessionID: "sess-het",
-          },
-        },
-      })
+      await fire.assistantReply("m_slice_2", 52_000)
       await delay(100)
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_slice_3",
-              role: "assistant",
-              sessionID: "sess-het",
-              time: { completed: 53_000 },
-            },
-            sessionID: "sess-het",
-          },
-        },
-      })
+      await fire.assistantReply("m_slice_3", 53_000)
       await delay(100)
       console.log(
         JSON.stringify({
@@ -979,22 +1039,19 @@ async function main() {
       // later transform pulls nothing more.
       recallPayload = RECALL_PAYLOAD
       const g1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, g1)
-      const posted = hooks["chat.message"](
-        { sessionID: SES, messageID: "m_pull_1" },
-        { parts: [{ type: "text", text: "LanceDb 现在什么状态" }] },
-      )
+      await fire.context({ sessionID: SES, system: g1.system })
+      const posted = fire.prompt({ sessionID: SES, messageID: "m_pull_1", prompt: { text: "LanceDb 现在什么状态" } })
       await posted // the handler resolves; the ack microtask may not have run
       const g2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, g2)
+      await fire.context({ sessionID: SES, system: g2.system })
       await delay(50) // now the ack has landed
       const g3 = { system: ["BASE3"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, g3)
+      await fire.context({ sessionID: SES, system: g3.system })
       const g4 = { system: ["BASE4"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, g4)
+      await fire.context({ sessionID: SES, system: g4.system })
       console.log(
         JSON.stringify({
-          systems: [g1.system, g2.system, g3.system, g4.system],
+          systems: [sysTexts(g1.system), sysTexts(g2.system), sysTexts(g3.system), sysTexts(g4.system)],
           pullBodies: posts
             .filter((post) => post.url.endsWith("/session/recall-pending"))
             .map((post) => post.body),
@@ -1015,22 +1072,16 @@ async function main() {
         budget_chars: 1200,
       }
       const e1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_e1" },
-        { parts: [{ type: "text", text: "第一轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_e1", prompt: { text: "第一轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, e1)
+      await fire.context({ sessionID: SES, system: e1.system })
       const e2 = { system: ["BASE2"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_e2" },
-        { parts: [{ type: "text", text: "第二轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_e2", prompt: { text: "第二轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, e2)
+      await fire.context({ sessionID: SES, system: e2.system })
       console.log(
         JSON.stringify({
-          systems: [e1.system, e2.system],
+          systems: [sysTexts(e1.system), sysTexts(e2.system)],
           pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
         }),
       )
@@ -1044,20 +1095,14 @@ async function main() {
       recallPayload = RECALL_PAYLOAD
       failing.add("http://localhost:7788/session/recall-pending")
       const f1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_f1" },
-        { parts: [{ type: "text", text: "失败轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_f1", prompt: { text: "失败轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, f1)
+      await fire.context({ sessionID: SES, system: f1.system })
       failing.clear()
       const f2 = { system: ["BASE2"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_f2" },
-        { parts: [{ type: "text", text: "恢复轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_f2", prompt: { text: "恢复轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, f2)
+      await fire.context({ sessionID: SES, system: f2.system })
       recallPayload = {
         enabled: false,
         items: [],
@@ -1066,15 +1111,12 @@ async function main() {
         budget_chars: 1200,
       }
       const f3 = { system: ["BASE3"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_f3" },
-        { parts: [{ type: "text", text: "禁用轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_f3", prompt: { text: "禁用轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, f3)
+      await fire.context({ sessionID: SES, system: f3.system })
       console.log(
         JSON.stringify({
-          systems: [f1.system, f2.system, f3.system],
+          systems: [sysTexts(f1.system), sysTexts(f2.system), sysTexts(f3.system)],
           pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
         }),
       )
@@ -1091,26 +1133,23 @@ async function main() {
       recentPayload = RECENT_PAYLOAD
       recallPayload = RECALL_PAYLOAD
       const i1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, i1)
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_pull_2" },
-        { parts: [{ type: "text", text: "继续 LanceDb 的话题" }] },
-      )
+      await fire.context({ sessionID: SES, system: i1.system })
+      await fire.prompt({ sessionID: SES, messageID: "m_pull_2", prompt: { text: "继续 LanceDb 的话题" } })
       await delay(50)
       // the host hands the transform the ACCUMULATED system array (i1's block
       // is already in it): the T2 block must COEXIST with the T1 block, never
       // replace or re-inject it. The copy keeps the transcript snapshot of
       // i1.system honest (a fresh array per call, like the real host).
-      const i2 = { system: [...i1.system] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, i2)
+      const i2 = { system: [...sysTexts(i1.system)] }
+      await fire.context({ sessionID: SES, system: i2.system })
       t2CiteTurnsVisible = true
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_1", 8_000) })
+      await fire.assistantReply("m_cite_t2_1", 8_000)
       await delay(100)
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_2", 9_000) })
+      await fire.assistantReply("m_cite_t2_2", 9_000)
       await delay(100)
       console.log(
         JSON.stringify({
-          systems: [i1.system, i2.system],
+          systems: [sysTexts(i1.system), sysTexts(i2.system)],
           pullBodies: posts
             .filter((post) => post.url.endsWith("/session/recall-pending"))
             .map((post) => post.body),
@@ -1138,16 +1177,13 @@ async function main() {
         budget_chars: 2000,
       }
       const b1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_budget" },
-        { parts: [{ type: "text", text: "预算轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_budget", prompt: { text: "预算轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, b1)
+      await fire.context({ sessionID: SES, system: b1.system })
       console.log(
         JSON.stringify({
-          systems: [b1.system],
-          blockLength: b1.system.length > 1 ? b1.system[1].length : 0,
+          systems: [sysTexts(b1.system)],
+          blockLength: sysTexts(b1.system).length > 1 ? sysTexts(b1.system)[1].length : 0,
         }),
       )
       break
@@ -1167,16 +1203,13 @@ async function main() {
         budget_chars: 150,
       }
       const b1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_lowbudget" },
-        { parts: [{ type: "text", text: "低预算轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_lowbudget", prompt: { text: "低预算轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, b1)
+      await fire.context({ sessionID: SES, system: b1.system })
       console.log(
         JSON.stringify({
-          systems: [b1.system],
-          blockLength: b1.system.length > 1 ? b1.system[1].length : 0,
+          systems: [sysTexts(b1.system)],
+          blockLength: sysTexts(b1.system).length > 1 ? sysTexts(b1.system)[1].length : 0,
         }),
       )
       break
@@ -1195,17 +1228,14 @@ async function main() {
         budget_chars: 1200,
       }
       const s1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_consumed" },
-        { parts: [{ type: "text", text: "已消费轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_consumed", prompt: { text: "已消费轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, s1)
+      await fire.context({ sessionID: SES, system: s1.system })
       const s2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, s2)
+      await fire.context({ sessionID: SES, system: s2.system })
       console.log(
         JSON.stringify({
-          systems: [s1.system, s2.system],
+          systems: [sysTexts(s1.system), sysTexts(s2.system)],
           pullCount: posts.filter((post) => post.url.endsWith("/session/recall-pending")).length,
         }),
       )
@@ -1242,16 +1272,13 @@ async function main() {
         budget_chars: 1200,
       }
       const p1 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_pin" },
-        { parts: [{ type: "text", text: "偏好的事" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_pin", prompt: { text: "偏好的事" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, p1)
+      await fire.context({ sessionID: SES, system: p1.system })
       console.log(
         JSON.stringify({
-          systems: [p1.system],
-          block: p1.system.length > 1 ? p1.system[1] : "",
+          systems: [sysTexts(p1.system)],
+          block: sysTexts(p1.system).length > 1 ? sysTexts(p1.system)[1] : "",
         }),
       )
       break
@@ -1277,12 +1304,9 @@ async function main() {
         slot_consumed: false,
         budget_chars: 150,
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_pinbnd" },
-        { parts: [{ type: "text", text: "紧预算轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_pinbnd", prompt: { text: "紧预算轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      await fire.context({ sessionID: SES, system: a.system })
       const b = { system: ["BASE2"] }
       recallPayload = {
         enabled: true,
@@ -1298,16 +1322,13 @@ async function main() {
         slot_consumed: false,
         budget_chars: 1200,
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_pinover" },
-        { parts: [{ type: "text", text: "超预算轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_pinover", prompt: { text: "超预算轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, b)
+      await fire.context({ sessionID: SES, system: b.system })
       console.log(
         JSON.stringify({
-          systems: [a.system, b.system],
-          blockLength: a.system.length > 1 ? a.system[1].length : 0,
+          systems: [sysTexts(a.system), sysTexts(b.system)],
+          blockLength: sysTexts(a.system).length > 1 ? sysTexts(a.system)[1].length : 0,
         }),
       )
       break
@@ -1331,16 +1352,13 @@ async function main() {
         slot_consumed: false,
         budget_chars: 100,
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_shed_a" },
-        { parts: [{ type: "text", text: "紧并排轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_shed_a", prompt: { text: "紧并排轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      await fire.context({ sessionID: SES, system: a.system })
       console.log(
         JSON.stringify({
-          systems: [a.system],
-          block: a.system.length > 1 ? a.system[1] : "",
+          systems: [sysTexts(a.system)],
+          block: sysTexts(a.system).length > 1 ? sysTexts(a.system)[1] : "",
         }),
       )
       break
@@ -1364,16 +1382,13 @@ async function main() {
         slot_consumed: false,
         budget_chars: 100,
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_shed_x" },
-        { parts: [{ type: "text", text: "裸计账轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_shed_x", prompt: { text: "裸计账轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      await fire.context({ sessionID: SES, system: a.system })
       console.log(
         JSON.stringify({
-          systems: [a.system],
-          block: a.system.length > 1 ? a.system[1] : "",
+          systems: [sysTexts(a.system)],
+          block: sysTexts(a.system).length > 1 ? sysTexts(a.system)[1] : "",
         }),
       )
       break
@@ -1402,16 +1417,13 @@ async function main() {
         slot_consumed: false,
         budget_chars: 2400,
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_two_sheds" },
-        { parts: [{ type: "text", text: "二次剥离轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_two_sheds", prompt: { text: "二次剥离轮" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, a)
+      await fire.context({ sessionID: SES, system: a.system })
       console.log(
         JSON.stringify({
-          systems: [a.system],
-          block: a.system.length > 1 ? a.system[1] : "",
+          systems: [sysTexts(a.system)],
+          block: sysTexts(a.system).length > 1 ? sysTexts(a.system)[1] : "",
         }),
       )
       break
@@ -1435,8 +1447,8 @@ async function main() {
         },
       }
       const o1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
-      console.log(JSON.stringify({ systems: [o1.system] }))
+      await fire.context({ sessionID: SES, system: o1.system })
+      console.log(JSON.stringify({ systems: [sysTexts(o1.system)] }))
       break
     }
 
@@ -1456,8 +1468,8 @@ async function main() {
         },
       }
       const o1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
-      console.log(JSON.stringify({ systems: [o1.system] }))
+      await fire.context({ sessionID: SES, system: o1.system })
+      console.log(JSON.stringify({ systems: [sysTexts(o1.system)] }))
       break
     }
 
@@ -1465,34 +1477,23 @@ async function main() {
       // the DEBUG-gated shape lane: aborted assistant messages (no
       // time.completed) are logged into hook-debug.jsonl BEFORE the gate
       // drops them — with and without host error fields.
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_aborted_meta",
-              role: "assistant",
-              sessionID: SES,
-              time: { error: 42 },
-              metadata: { error: "The operation was aborted due to timeout" },
-            },
-            sessionID: SES,
-          },
+            await fire.event({
+        type: "session.step.failed",
+        created: 42,
+        data: {
+          sessionID: SES,
+          assistantMessageID: "m_aborted_meta",
+          error: { type: "abort", message: "The operation was aborted due to timeout" },
         },
       })
       await delay(100)
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m_aborted_plain",
-              role: "assistant",
-              sessionID: SES,
-              time: { error: 42 },
-            },
-            sessionID: SES,
-          },
+            await fire.event({
+        type: "session.step.failed",
+        created: 42,
+        data: {
+          sessionID: SES,
+          assistantMessageID: "m_aborted_plain",
+          error: { type: "abort", message: "The operation was aborted" },
         },
       })
       await delay(100)
@@ -1505,7 +1506,7 @@ async function main() {
         .split("\n")
         .filter(Boolean)
         .map((line) => JSON.parse(line))
-        .filter((line) => line.tag === "assistant completion shape")
+        .filter((line) => line.tag === "assistant step shape")
         .map((line) => line.payload)
       console.log(JSON.stringify({ shapes }))
       break
@@ -1517,14 +1518,11 @@ async function main() {
       recentPayload = RECENT_PAYLOAD
       recallPayload = RECALL_PAYLOAD
       const d1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, d1)
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_dbg" },
-        { parts: [{ type: "text", text: "调试轮" }] },
-      )
+      await fire.context({ sessionID: SES, system: d1.system })
+      await fire.prompt({ sessionID: SES, messageID: "m_dbg", prompt: { text: "调试轮" } })
       await delay(50)
       const d2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, d2)
+      await fire.context({ sessionID: SES, system: d2.system })
       await delay(100)
       const raw = await readFile(
         join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"),
@@ -1549,7 +1547,7 @@ async function main() {
       const cap = 10 * 1024 * 1024
       const oversized = "x".repeat(cap + 4096)
       await writeFile(logPath, oversized, "utf8")
-      await hooks.event({ event: messageUpdatedAssistant("m_rot_1", 1000) })
+      await fire.assistantReply("m_rot_1", 1000)
       await delay(150)
       const archived = await readFile(archivePath, "utf8").catch(() => "")
       const fresh = await readFile(logPath, "utf8").catch(() => "")
@@ -1558,7 +1556,7 @@ async function main() {
           rotated: archived.length > 0,
           archivedBytes: archived.length,
           capBytes: cap,
-          freshHasLine: fresh.includes("assistant completion shape"),
+          freshHasLine: fresh.includes("assistant step shape"),
           freshBytes: fresh.length,
         }),
       )
@@ -1572,7 +1570,7 @@ async function main() {
       const archivePath = join(dataDir, "hook-debug.jsonl.1")
       await mkdir(dataDir, { recursive: true })
       await writeFile(logPath, "seed\n", "utf8")
-      await hooks.event({ event: messageUpdatedAssistant("m_norot_1", 1000) })
+      await fire.assistantReply("m_norot_1", 1000)
       await delay(150)
       const archiveExists = await stat(archivePath).then(
         () => true,
@@ -1582,7 +1580,7 @@ async function main() {
       console.log(
         JSON.stringify({
           rotated: archiveExists,
-          linePresent: fresh.includes("assistant completion shape"),
+          linePresent: fresh.includes("assistant step shape"),
         }),
       )
       break
@@ -1599,7 +1597,7 @@ async function main() {
       const cap = 10 * 1024 * 1024
       const oversized = "x".repeat(cap + 4096)
       await writeFile(logPath, oversized, "utf8")
-      await hooks.event({ event: messageUpdatedAssistant("m_rot_rep_1", 1000) })
+      await fire.assistantReply("m_rot_rep_1", 1000)
       await delay(150)
       const archiveBytes = await readFile(archivePath, "utf8").catch(() => "")
       const secondExists = await stat(secondArchive).then(
@@ -1611,7 +1609,7 @@ async function main() {
         JSON.stringify({
           replaced: archiveBytes.length > "old-generation".length,
           noSecondGeneration: !secondExists,
-          freshHasLine: fresh.includes("assistant completion shape"),
+          freshHasLine: fresh.includes("assistant step shape"),
         }),
       )
       break
@@ -1631,11 +1629,9 @@ async function main() {
       const cap = 10 * 1024 * 1024
       const oversized = "x".repeat(cap + 4096)
       await writeFile(logPath, oversized, "utf8")
-      const e1 = messageUpdatedAssistant("m_conc_1", 1000)
-      const e2 = messageUpdatedAssistant("m_conc_2", 2000)
       await Promise.all([
-        hooks.event({ event: e1 }),
-        hooks.event({ event: e2 }),
+        fire.assistantReply("m_conc_1", 1000),
+        fire.assistantReply("m_conc_2", 2000),
       ])
       await delay(200)
       const archiveBytes = await readFile(archivePath, "utf8").catch(() => "")
@@ -1650,7 +1646,7 @@ async function main() {
         .split("\n")
         .filter(Boolean)
         .map((line) => JSON.parse(line))
-        .filter((l) => l.tag === "assistant completion shape" || (l.payload && l.payload.tag === "assistant completion shape"))
+        .filter((l) => l.tag === "assistant step shape" || (l.payload && l.payload.tag === "assistant step shape"))
       const bothLines = shapeLines.length >= 2
       console.log(
         JSON.stringify({
@@ -1668,20 +1664,17 @@ async function main() {
       // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
       // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual
       // registration (which must win untouched); a null cfg is a no-op.
-      const empty = {}
-      await hooks.config(empty)
+      const empty = { mcp: {} }
+      await fire.mcp(empty.mcp)
       const bare = { mcp: {} }
-      await hooks.config(bare)
+      await fire.mcp(bare.mcp)
       const manual = {
         mcp: { mnemoseed: { type: "remote", url: "http://mcp.example", headers: { "X-Custom": "1" } } },
       }
-      await hooks.config(manual)
-      let noThrow = true
-      try {
-        await hooks.config(null)
-      } catch {
-        noThrow = false
-      }
+      await fire.mcp(manual.mcp)
+      // a null editor map is a no-op (the callback guards the shape)
+      await fire.mcp(null)
+      const noThrow = true
       console.log(JSON.stringify({ empty, bare, manual, noThrow }))
       break
     }
@@ -1694,17 +1687,17 @@ async function main() {
       const factory = {
         mcp: { mnemoseed: { type: "local", command: ["mnemoseed-local", "mcp"], enabled: true } },
       }
-      await hooks.config(factory)
+      await fire.mcp(factory.mcp)
       const disabled = {
         mcp: { mnemoseed: { type: "local", command: ["mnemoseed-local", "mcp"], enabled: false } },
       }
-      await hooks.config(disabled)
+      await fire.mcp(disabled.mcp)
       const foreign = {
         mcp: { mnemoseed: { type: "local", command: ["other-tool", "mcp"], enabled: true } },
       }
-      await hooks.config(foreign)
+      await fire.mcp(foreign.mcp)
       const manual = { mcp: { mnemoseed: { type: "remote", url: "http://mcp.example" } } }
-      await hooks.config(manual)
+      await fire.mcp(manual.mcp)
       console.log(JSON.stringify({ factory, disabled, foreign, manual }))
       break
     }
@@ -1715,11 +1708,11 @@ async function main() {
       // entry still injects (the daemon refuses it honestly).
       await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
       await writeFile(CREDENTIAL_PATH, "driver-issued-credential\n", "utf8")
-      const seeded = {}
-      await hooks.config(seeded)
+      const seeded = { mcp: {} }
+      await fire.mcp(seeded.mcp)
       await unlink(CREDENTIAL_PATH)
-      const bare = {}
-      await hooks.config(bare)
+      const bare = { mcp: {} }
+      await fire.mcp(bare.mcp)
       console.log(JSON.stringify({ seeded, bare }))
       break
     }
@@ -1728,39 +1721,42 @@ async function main() {
       // B2.6 I3: the config hook must be fail-open on frozen objects — a frozen
       // cfg and a frozen cfg.mcp must not throw, and must not overwrite other
       // keys. Both cases exercise the ??= paths with Object.freeze.
-      let noThrow = true
+      const noThrow = { value: true }
       let frozenCfgOther = null
-      let frozenMcpOther = null
       let frozenCfgMcp = null
       let frozenCfgHasMnemoseed = null
+      let frozenMcpOther = null
       let frozenMcpHasMnemoseed = null
       try {
-        const frozenCfg = Object.freeze({ other: "keep" })
-        await hooks.config(frozenCfg)
+        // a frozen mcp map: the editor's set throws inside the transform
+        // callback, which must surface as a swallowed fail-open, not a throw
+        const frozenMcpMap = Object.freeze({ otherMcp: "keep1" })
+        const frozenCfg = { other: "keep", mcp: frozenMcpMap }
+        await fire.mcp(frozenCfg.mcp)
         frozenCfgOther = frozenCfg.other
-        frozenCfgMcp = frozenCfg.mcp ?? null
+        frozenCfgMcp = frozenCfg.mcp
         frozenCfgHasMnemoseed = frozenCfg.mcp?.mnemoseed ?? null
       } catch {
-        noThrow = false
+        noThrow.value = false
       }
       try {
-        const frozenMcp = { other: "keep2", mcp: Object.freeze({ otherMcp: "keep2" }) }
-        await hooks.config(frozenMcp)
+        const frozenMcp = { other: "keep2", mcp: Object.freeze({ otherMcp: "keep2", mnemoseed: { type: "remote", url: "http://frozen.example" } }) }
+        await fire.mcp(frozenMcp.mcp)
         frozenMcpOther = frozenMcp.other
         frozenMcpHasMnemoseed = frozenMcp.mcp?.mnemoseed ?? null
       } catch {
-        noThrow = false
+        noThrow.value = false
       }
-      // also check that a normal cfg still works after frozen attempts
+      // also check that a normal map still works after frozen attempts
       const after = { other: "keep3", mcp: {} }
       try {
-        await hooks.config(after)
+        await fire.mcp(after.mcp)
       } catch {
-        noThrow = false
+        noThrow.value = false
       }
       console.log(
         JSON.stringify({
-          noThrow,
+          noThrow: noThrow.value,
           frozenCfgOther,
           frozenCfgMcp,
           frozenCfgHasMnemoseed,
@@ -1773,19 +1769,20 @@ async function main() {
     }
 
     case "switch-short-circuit": {
-      // B2.6: the ["spec", {enabled:false}] tuple short-circuits the WHOLE
-      // bundle — the factory returns {} (no config hook, no hooks);
-      // enabled:true, empty options and absent options all load normally.
-      const off = await pluginFactory({ client: fakeClient }, { enabled: false })
-      const on = await pluginFactory({ client: fakeClient }, { enabled: true })
-      const bare = await pluginFactory({ client: fakeClient }, {})
-      const none = await pluginFactory({ client: fakeClient })
+      // B2.6: the {enabled:false} options entry short-circuits the WHOLE
+      // bundle — setup registers nothing (no mcp transform, no hooks, no
+      // event subscription); enabled:true, empty options and absent options
+      // all register the full bundle.
+      const off = await activate({ enabled: false })
+      const on = await activate({ enabled: true })
+      const bare = await activate({})
+      const none = await activate()
       console.log(
         JSON.stringify({
-          offKeys: Object.keys(off),
-          onKeys: Object.keys(on),
-          bareKeys: Object.keys(bare),
-          noneKeys: Object.keys(none),
+          offKeys: off,
+          onKeys: on,
+          bareKeys: bare,
+          noneKeys: none,
         }),
       )
       break
@@ -1793,20 +1790,21 @@ async function main() {
 
     case "provider-error-nomination": {
       // B1 joined seam: the REAL bundled plugin sees the committed synthetic
-      // bus_event fixtures; the transcript carries the exact POST bodies the
-      // daemon must accept. True 429 (with a numeric time.error stamp present,
-      // so a timestamp-shadowing mutant misreads it) must nominate quota; a
-      // status-less hang on session.error must nominate timeout; a build
-      // failure with providerID present must emit NOTHING.
+      // V2 event fixtures; the transcript carries the exact POST bodies the
+      // daemon must accept. True 429 (with a numeric status on the structured
+      // error) must nominate quota; a status-less abort must nominate timeout;
+      // a build failure with provider/model tracked must emit NOTHING.
       const fx429 = await loadFixture("provider_error_429.json")
       const fxTimeout = await loadFixture("provider_error_timeout_no_status.json")
       const fxBuild = await loadFixture("provider_build_error_negative.json")
-      await hooks.event({ event: fx429.bus_event })
+      await fire.event(fx429.session_event)
+      await fire.event(fx429.bus_event)
       await delay(100)
-      await hooks.event({ event: fxTimeout.bus_event })
+      await fire.event(fxTimeout.session_event)
+      await fire.event(fxTimeout.bus_event)
       await delay(100)
       const beforeBuild = posts.filter((post) => post.body.event === "provider_error").length
-      await hooks.event({ event: fxBuild.bus_event })
+      await fire.event(fxBuild.bus_event)
       await delay(100)
       const afterBuild = posts.filter((post) => post.body.event === "provider_error").length
       console.log(JSON.stringify({ posts, buildErrorPosts: afterBuild - beforeBuild }))
@@ -1823,18 +1821,19 @@ async function main() {
       // (one post), and a key incorrectly including status (three posts).
       const fx429 = await loadFixture("provider_error_429.json")
       const fxTimeout = await loadFixture("provider_error_timeout_no_status.json")
-      const alternateError = fxTimeout.bus_event.properties.error
+      const alternateError = fxTimeout.bus_event.data.error.message
       const base = JSON.parse(JSON.stringify(fx429.bus_event))
       const alt = JSON.parse(JSON.stringify(fx429.bus_event))
-      alt.properties.info.metadata.error = alternateError
+      alt.data.error.message = alternateError
       const distinct = JSON.parse(JSON.stringify(fx429.bus_event))
-      distinct.properties.info.id = "msg_storm_b"
-      distinct.properties.info.metadata.error = alternateError
-      await hooks.event({ event: base })
+      distinct.data.assistantMessageID = "msg_storm_b"
+      distinct.data.error.message = alternateError
+      await fire.event(fx429.session_event)
+      await fire.event(base)
       await delay(100)
-      await hooks.event({ event: alt })
+      await fire.event(alt)
       await delay(100)
-      await hooks.event({ event: distinct })
+      await fire.event(distinct)
       await delay(150) // let the fire-and-forget provider_error POSTs land
       console.log(JSON.stringify({ posts }))
       break
@@ -1844,24 +1843,21 @@ async function main() {
       // B1 M4: secret-bearing raw hook input must reach the plugin
       // normalization/redaction and leave NO secret bytes in the POST body.
       // The message still carries a real 429 signal so it nominates.
-      await hooks.event({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "m-b1-secret",
-              role: "assistant",
-              sessionID: "sess-b1-secret",
-              providerID: "openai",
-              modelID: "gpt-4o",
-              time: { error: 789 },
-              metadata: {
-                error:
-                  "HTTP 429: rate limit exceeded for key sk-live-abcdef1234567890 " +
-                  "(Bearer abcdef, token=hunter2, see https://api.provider.example/v1/keys)",
-              },
-            },
-            sessionID: "sess-b1-secret",
+      await fire.event({
+        type: "session.model.selected",
+        data: { sessionID: "sess-b1-secret", model: { providerID: "openai", id: "gpt-4o" } },
+      })
+      await fire.event({
+        type: "session.step.failed",
+        created: 789,
+        data: {
+          sessionID: "sess-b1-secret",
+          assistantMessageID: "m-b1-secret",
+          error: {
+            type: "APIError",
+            message:
+              "HTTP 429: rate limit exceeded for key sk-live-abcdef1234567890 " +
+              "(Bearer abcdef, token=hunter2, see https://api.provider.example/v1/keys)",
           },
         },
       })
@@ -1909,13 +1905,10 @@ async function main() {
         conflict_reason: null,
       }
       const adv0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_adv_1" },
-        { parts: [{ type: "text", text: "quota hit, what should I do" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_adv_1", prompt: { text: "quota hit, what should I do" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, adv0)
-      console.log(JSON.stringify({ system: adv0.system, advisory: ADVISORY }))
+      await fire.context({ sessionID: SES, system: adv0.system })
+      console.log(JSON.stringify({ system: sysTexts(adv0.system), advisory: ADVISORY }))
       break
     }
 
@@ -1956,15 +1949,12 @@ async function main() {
         conflict_reason: null,
       }
       const tr0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_trunc_1" },
-        { parts: [{ type: "text", text: "quota hit" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_trunc_1", prompt: { text: "quota hit" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, tr0)
+      await fire.context({ sessionID: SES, system: tr0.system })
       console.log(
         JSON.stringify({
-          system: tr0.system,
+          system: sysTexts(tr0.system),
           fullContent: ADVISORY,
         }),
       )
@@ -2006,13 +1996,10 @@ async function main() {
         conflict_reason: null,
       }
       const wr0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_wr_1" },
-        { parts: [{ type: "text", text: "quota hit with recall" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_wr_1", prompt: { text: "quota hit with recall" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, wr0)
-      console.log(JSON.stringify({ system: wr0.system, advisory: ADVISORY }))
+      await fire.context({ sessionID: SES, system: wr0.system })
+      console.log(JSON.stringify({ system: sysTexts(wr0.system), advisory: ADVISORY }))
       break
     }
 
@@ -2038,13 +2025,10 @@ async function main() {
         conflict_reason: null,
       }
       const ro0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_ro_1" },
-        { parts: [{ type: "text", text: "recall only" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_ro_1", prompt: { text: "recall only" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, ro0)
-      console.log(JSON.stringify({ system: ro0.system }))
+      await fire.context({ sessionID: SES, system: ro0.system })
+      console.log(JSON.stringify({ system: sysTexts(ro0.system) }))
       break
     }
 
@@ -2087,13 +2071,10 @@ async function main() {
         conflict_reason: null,
       }
       const dr0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_drop_1" },
-        { parts: [{ type: "text", text: "quota hit, no room" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_drop_1", prompt: { text: "quota hit, no room" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, dr0)
-      console.log(JSON.stringify({ system: dr0.system }))
+      await fire.context({ sessionID: SES, system: dr0.system })
+      console.log(JSON.stringify({ system: sysTexts(dr0.system) }))
       break
     }
 
@@ -2124,13 +2105,10 @@ async function main() {
         conflict_reason: null,
       }
       const rl0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_rl_1" },
-        { parts: [{ type: "text", text: "large recall only" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_rl_1", prompt: { text: "large recall only" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, rl0)
-      console.log(JSON.stringify({ system: rl0.system }))
+      await fire.context({ sessionID: SES, system: rl0.system })
+      console.log(JSON.stringify({ system: sysTexts(rl0.system) }))
       break
     }
 
@@ -2168,19 +2146,16 @@ async function main() {
         conflict_reason: null,
       }
       const sa0 = { system: ["BASE"] }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_sa_1" },
-        { parts: [{ type: "text", text: "quota hit" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_sa_1", prompt: { text: "quota hit" } })
       await delay(50)
-      await hooks["chat.system.transform"]({ sessionID: SES }, sa0)
-      console.log(JSON.stringify({ system: sa0.system, advisory: ADVISORY }))
+      await fire.context({ sessionID: SES, system: sa0.system })
+      console.log(JSON.stringify({ system: sysTexts(sa0.system), advisory: ADVISORY }))
       break
     }
 
     case "watermark-overlap": {
       // P1: same-process overlapping persists through the real persist path.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-overlap" }))
         break
@@ -2240,7 +2215,7 @@ async function main() {
       // on the next persist; the higher value wins by max; a later smaller
       // value never regresses the shard. Removing enumeration, the legacy
       // read, or max fails here.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-fold-cases" }))
         break
@@ -2303,7 +2278,7 @@ async function main() {
 
     case "watermark-eperm": {
       // P3: owned-target rename EPERM injection then bounded recovery.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-eperm" }))
         break
@@ -2385,7 +2360,7 @@ async function main() {
 
     case "watermark-merge": {
       // P6: legacy read-only + peer shard maxima fold into the own shard.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-merge" }))
         break
@@ -2420,7 +2395,7 @@ async function main() {
 
     case "watermark-corrupt": {
       // P4: corrupt files/keys skipped and preserved; good keys converge.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-corrupt" }))
         break
@@ -2465,7 +2440,7 @@ async function main() {
 
     case "watermark-gc": {
       // P5: GC dead/alive/EPERM/unknown rules and fold-before-delete.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-gc" }))
         break
@@ -2573,7 +2548,7 @@ async function main() {
     case "watermark-mixed": {
       // Mixed-version: an old whole-map legacy write folds forward; new code
       // never overwrites the legacy file.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-mixed" }))
         break
@@ -2604,7 +2579,7 @@ async function main() {
       // Bounded own-tmp recovery: injected unlink failures orphan owned tmps
       // on a failed persist; the next serialized persist sweeps the exact own
       // prefix. Legacy Date.now tmps and unrelated files are never touched.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-tmp-sweep" }))
         break
@@ -2650,7 +2625,7 @@ async function main() {
       // are rejected at the ack-clock entry; the first valid early note
       // survives the lazy load via the pending map; a real acked turn through
       // chat.message/idle converges into the same own shard bytes.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-early-ack" }))
         break
@@ -2659,14 +2634,9 @@ async function main() {
       seam.note("wm-test-early-bad-inf", Infinity)
       seam.note("wm-test-early-bad-nan", NaN)
       seam.note("wm-test-early-keep", 650)
-      await hooks["chat.message"](
-        { sessionID: "wm-test-early-session", messageID: "m_early_1" },
-        { parts: [{ type: "text", text: "early ack turn" }] },
-      )
+      await fire.prompt({ sessionID: "wm-test-early-session", messageID: "m_early_1", prompt: { text: "early ack turn" } })
       await delay(100)
-      await hooks.event({
-        event: { type: "session.idle", properties: { sessionID: "wm-test-early-session" } },
-      })
+      await fire.event({ type: "session.idle", data: { sessionID: "wm-test-early-session" } })
       await delay(100)
       const shard = await readOwnShard(seam)
       console.log(
@@ -2691,7 +2661,7 @@ async function main() {
       // A note that advances while a persist is parked inside its write
       // window must be flushed by the same serialized persist call via a
       // bounded follow-up cycle — deterministic via the seam I/O barrier.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-note-during-io" }))
         break
@@ -2718,7 +2688,7 @@ async function main() {
     case "watermark-selectors": {
       // Strict filename predicate: decoys are excluded from the merged view
       // and preserved on disk; legacy plus valid shards still converge.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-selectors" }))
         break
@@ -2770,7 +2740,7 @@ async function main() {
       // Age-based sweep of stale watermark tmp artifacts. An old
       // legacy `.tmp` is reaped; a young tmp and an unrelated tmp survive; the
       // interval guard suppresses a second sweep until forced.
-      const seam = hooks.__watermarkTest
+      const seam = pluginModule.__watermarkTest
       if (!seam) {
         console.log(JSON.stringify({ seamMissing: true, scenario: "watermark-stale-sweep" }))
         break
@@ -2820,8 +2790,8 @@ async function main() {
       // line, before the disclaimer; the block stays within the 4000 cap.
       recentPayload = { ...RECENT_PAYLOAD, visibility: { mode: "compact" } }
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      console.log(JSON.stringify({ block: o.system[1], length: o.system[1].length }))
+      await fire.context({ sessionID: SES, system: o.system })
+      console.log(JSON.stringify({ block: sysTexts(o.system)[1], length: sysTexts(o.system)[1].length }))
       break
     }
 
@@ -2830,8 +2800,8 @@ async function main() {
       // (sessions / memories / chars of the included content).
       recentPayload = { ...RECENT_PAYLOAD, visibility: { mode: "verbose" } }
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      console.log(JSON.stringify({ block: o.system[1], length: o.system[1].length }))
+      await fire.context({ sessionID: SES, system: o.system })
+      console.log(JSON.stringify({ block: sysTexts(o.system)[1], length: sysTexts(o.system)[1].length }))
       break
     }
 
@@ -2856,16 +2826,16 @@ async function main() {
       }
       recentPayload = { ...filled, visibility: { mode: "compact" } }
       const withVis = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-vis-on" }, withVis)
+      await fire.context({ sessionID: "sess-vis-on", system: withVis.system })
       recentPayload = filled
       const withoutVis = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-vis-off" }, withoutVis)
+      await fire.context({ sessionID: "sess-vis-off", system: withoutVis.system })
       console.log(
         JSON.stringify({
-          withVis: withVis.system[1],
-          withoutVis: withoutVis.system[1],
-          withVisLength: withVis.system[1]?.length ?? 0,
-          withoutVisLength: withoutVis.system[1]?.length ?? 0,
+          withVis: sysTexts(withVis.system)[1],
+          withoutVis: sysTexts(withoutVis.system)[1],
+          withVisLength: sysTexts(withVis.system)[1]?.length ?? 0,
+          withoutVisLength: sysTexts(withoutVis.system)[1]?.length ?? 0,
         }),
       )
       break
@@ -2874,14 +2844,11 @@ async function main() {
     case "visibility-t2-compact": {
       // compact T2: exactly one signal line inside the block.
       recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "compact", capture: false } }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_vis_t2" },
-        { parts: [{ type: "text", text: "触发一轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_vis_t2", prompt: { text: "触发一轮" } })
       await delay(50)
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      console.log(JSON.stringify({ systems: [o.system] }))
+      await fire.context({ sessionID: SES, system: o.system })
+      console.log(JSON.stringify({ systems: [sysTexts(o.system)] }))
       break
     }
 
@@ -2889,14 +2856,11 @@ async function main() {
       // verbose T2: the compact signal line plus the count line
       // (memories / chars of the served items).
       recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "verbose", capture: false } }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_vis_t2v" },
-        { parts: [{ type: "text", text: "触发一轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_vis_t2v", prompt: { text: "触发一轮" } })
       await delay(50)
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
-      console.log(JSON.stringify({ systems: [o.system] }))
+      await fire.context({ sessionID: SES, system: o.system })
+      console.log(JSON.stringify({ systems: [sysTexts(o.system)] }))
       break
     }
 
@@ -2911,25 +2875,19 @@ async function main() {
         budget_chars: 150,
       }
       recallPayload = { ...tight, visibility: { mode: "compact", capture: false } }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_vis_shed" },
-        { parts: [{ type: "text", text: "紧预算轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_vis_shed", prompt: { text: "紧预算轮" } })
       await delay(50)
       const withVis = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, withVis)
+      await fire.context({ sessionID: SES, system: withVis.system })
       recallPayload = tight
-      await hooks["chat.message"](
-        { sessionID: "sess-vis-t2b", messageID: "m_vis_shed2" },
-        { parts: [{ type: "text", text: "紧预算轮" }] },
-      )
+      await fire.prompt({ sessionID: "sess-vis-t2b", messageID: "m_vis_shed2", prompt: { text: "紧预算轮" } })
       await delay(50)
       const withoutVis = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: "sess-vis-t2b" }, withoutVis)
+      await fire.context({ sessionID: "sess-vis-t2b", system: withoutVis.system })
       console.log(
         JSON.stringify({
-          withVisSystems: withVis.system,
-          withoutVisSystems: withoutVis.system,
+          withVisSystems: sysTexts(withVis.system),
+          withoutVisSystems: sysTexts(withoutVis.system),
         }),
       )
       break
@@ -2947,23 +2905,17 @@ async function main() {
         budget_chars: 1200,
         visibility: { mode: "compact", capture: false },
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_cap1" },
-        { parts: [{ type: "text", text: "第一轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_cap1", prompt: { text: "第一轮" } })
       await delay(50)
       const c1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, c1)
+      await fire.context({ sessionID: SES, system: c1.system })
       const c2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, c2)
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_cap2" },
-        { parts: [{ type: "text", text: "第二轮" }] },
-      )
+      await fire.context({ sessionID: SES, system: c2.system })
+      await fire.prompt({ sessionID: SES, messageID: "m_cap2", prompt: { text: "第二轮" } })
       await delay(50)
       const c3 = { system: ["BASE3"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, c3)
-      console.log(JSON.stringify({ systems: [c1.system, c2.system, c3.system] }))
+      await fire.context({ sessionID: SES, system: c3.system })
+      console.log(JSON.stringify({ systems: [sysTexts(c1.system), sysTexts(c2.system), sysTexts(c3.system)] }))
       break
     }
 
@@ -2977,16 +2929,13 @@ async function main() {
         budget_chars: 1200,
         visibility: { mode: "off", capture: true },
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_capo1" },
-        { parts: [{ type: "text", text: "关灯轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_capo1", prompt: { text: "关灯轮" } })
       await delay(50)
       const o1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o1)
+      await fire.context({ sessionID: SES, system: o1.system })
       const o2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o2)
-      console.log(JSON.stringify({ systems: [o1.system, o2.system] }))
+      await fire.context({ sessionID: SES, system: o2.system })
+      console.log(JSON.stringify({ systems: [sysTexts(o1.system), sysTexts(o2.system)] }))
       break
     }
 
@@ -3002,13 +2951,10 @@ async function main() {
         budget_chars: 1200,
         visibility: { mode: "verbose", capture: 2 },
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_capv1" },
-        { parts: [{ type: "text", text: "计数轮一" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_capv1", prompt: { text: "计数轮一" } })
       await delay(50)
       const v1 = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, v1)
+      await fire.context({ sessionID: SES, system: v1.system })
       recallPayload = {
         enabled: false,
         items: [],
@@ -3017,38 +2963,61 @@ async function main() {
         budget_chars: 1200,
         visibility: { mode: "verbose", capture: false },
       }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_capv2" },
-        { parts: [{ type: "text", text: "计数轮二" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_capv2", prompt: { text: "计数轮二" } })
       await delay(50)
       const v2 = { system: ["BASE2"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, v2)
-      console.log(JSON.stringify({ systems: [v1.system, v2.system] }))
+      await fire.context({ sessionID: SES, system: v2.system })
+      console.log(JSON.stringify({ systems: [sysTexts(v1.system), sysTexts(v2.system)] }))
       break
     }
 
     case "visibility-signal-not-citable": {
       // Signal-line quote: zero reinforce. c-mid quote: exactly one (positive control).
       recallPayload = { ...RECALL_PAYLOAD, visibility: { mode: "compact", capture: false } }
-      await hooks["chat.message"](
-        { sessionID: SES, messageID: "m_vis_cite" },
-        { parts: [{ type: "text", text: "引用轮" }] },
-      )
+      await fire.prompt({ sessionID: SES, messageID: "m_vis_cite", prompt: { text: "引用轮" } })
       await delay(50)
       const o = { system: ["BASE"] }
-      await hooks["chat.system.transform"]({ sessionID: SES }, o)
+      await fire.context({ sessionID: SES, system: o.system })
       citationTurnsVisible = true
       t2CiteTurnsVisible = true
       signalCiteTurnVisible = true
-      await hooks.event({ event: messageUpdatedAssistant("m_cite_t2_1", 8_000) })
+      await fire.assistantReply("m_cite_t2_1", 8_000)
       await delay(100)
-      await hooks.event({ event: messageUpdatedAssistant("m_sig_cite_1", 10_000) })
+      await fire.assistantReply("m_sig_cite_1", 10_000)
       await delay(100)
       console.log(
         JSON.stringify({
-          systems: [o.system],
+          systems: [sysTexts(o.system)],
           reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+        }),
+      )
+      break
+    }
+
+    case "agent-attribution": {
+      // B2.9 on the V2 surface: the V2 host has no per-message agent, so the
+      // plugin tracks the SESSION-level agent (session.created data.agent,
+      // then session.agent.selected) and rides it on the canonical user_prompt
+      // body field; a session with no tracked agent stays unattributed.
+      await fire.event({
+        type: "session.created",
+        data: { sessionID: "sess-agent", agent: "build" },
+      })
+      await fire.prompt({ sessionID: "sess-agent", messageID: "m_ag_1", prompt: { text: "归属轮" } })
+      await delay(100)
+      await fire.event({
+        type: "session.agent.selected",
+        data: { sessionID: "sess-agent", agent: "review" },
+      })
+      await fire.prompt({ sessionID: "sess-agent", messageID: "m_ag_2", prompt: { text: "切换轮" } })
+      await delay(100)
+      await fire.prompt({ sessionID: "sess-untracked", messageID: "m_ag_3", prompt: { text: "无归属轮" } })
+      await delay(100)
+      console.log(
+        JSON.stringify({
+          agents: posts
+            .filter((post) => post.body.event === "user_prompt")
+            .map((post) => ({ text: post.body.content?.text, agent: post.body.agent ?? null })),
         }),
       )
       break
@@ -3058,6 +3027,17 @@ async function main() {
       console.error(`unknown scenario: ${scenario}`)
       process.exit(64)
   }
+
+  // Release the event subscription so node can exit cleanly (the loop's
+  // pending pull would otherwise leave the top-level await unfinished).
+  aborted = true
+  wake()
+  for (const cleanup of cleanupFns) {
+    try {
+      await cleanup()
+    } catch {}
+  }
+  await delay(20)
 }
 
 await main()

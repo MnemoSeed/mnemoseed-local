@@ -236,43 +236,51 @@ def test_plugin_ts_is_shipped_as_package_data() -> None:
 
 
 def test_plugin_registers_the_required_hooks() -> None:
+    """V2 registration surface: every lane rides the plugin context — session
+    hooks (prompt / context / compaction), the tool execute.after hook, the
+    mcp transform, and one event-subscription loop for the bus events."""
     source = _plugin_source()
-    assert '"config": async' in source
-    assert '"chat.message": async' in source
-    assert '"chat.system.transform": async' in source
-    assert '"tool.execute.after": async' in source
-    assert '"experimental.session.compacting": async' in source
-    assert re.search(r"(?m)^\s*event: async", source)
+    assert 'ctx.session.hook("prompt"' in source
+    assert 'ctx.session.hook("context"' in source
+    assert 'ctx.session.hook("compaction"' in source
+    assert 'ctx.tool.hook("execute.after"' in source
+    assert "ctx.mcp.transform(" in source
+    assert "ctx.event.subscribe(" in source
+    # the V2 definition shape: default export carries id + setup
+    assert 'id: "mnemoseed-local"' in source
+    assert re.search(r"export default \{", source)
+    assert re.search(r"(?m)^  setup\(ctx: any\)", source)
 
 
-def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_config_hook() -> None:
-    """B2.6 host-plugin bundling plus the HTTP MCP transport: the config hook
-    registers the daemon's MCP server into the loading host's config (per-host
-    isolation — cfg belongs to the host whose plugin dir loaded this file).
-    Create-if-absent at BOTH levels — cfg.mcp ??= {} (the map) and the entry —
-    so a user's existing manual "mnemoseed" registration (README §MCP gateway)
-    is never overwritten; the one rewrite is the factory stdio entry, which
-    migrates to the remote HTTP shape. The injected entry is remote, without
-    OAuth auto-detection, and carries an explicit timeout."""
+def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_mcp_transform() -> None:
+    """B2.6 host-plugin bundling plus the HTTP MCP transport: the mcp
+    transform registers the daemon's MCP server into the loading host's config
+    (per-host isolation — the editor belongs to the host whose plugin dir
+    loaded this file). Create-if-absent: a user's existing manual "mnemoseed"
+    registration (README §MCP gateway) is never overwritten; the one rewrite
+    is the factory stdio entry, which migrates to the remote HTTP shape with
+    the disabled flag carried over (a legacy enabled:false maps onto it). The
+    injected entry is remote, without OAuth auto-detection, and carries an
+    explicit timeout."""
     source = _plugin_source()
-    assert "cfg.mcp ??=" in source, "the mcp map must be created when absent"
-    assert "installMcpEntry(mcp)" in source, "the entry install must run create-if-absent"
-    for token in ('"mnemoseed"', '"mnemoseed-local"', '"mcp"', '"type": "remote"', '"oauth": false'):
+    assert "function installMcpEntry(editor: any)" in source, (
+        "the entry install must run through the V2 mcp editor"
+    )
+    assert "editor.set(MCP_ENTRY_NAME" in source, "the entry install must use the editor"
+    for token in ('"mnemoseed"', '"mcp"', '"type": "remote"', '"oauth": false', '"disabled": false'):
         assert token in source, token
 
 
-def test_plugin_short_circuits_the_whole_bundle_on_the_options_tuple_switch() -> None:
-    """B2.6 single switch: the ["spec", {enabled:false}] plugin-array tuple
-    short-circuits the WHOLE bundle — the entry returns {} so neither the
-    config hook nor any hook is registered (research doc §7: the options
-    tuple is the only official per-plugin channel; probe round 2 confirmed
-    the options object reaches the plugin's second argument)."""
+def test_plugin_short_circuits_the_whole_bundle_on_the_options_switch() -> None:
+    """B2.6 single switch: {enabled:false} via the V2 { package, options }
+    entry short-circuits the WHOLE bundle — setup registers nothing (no mcp
+    transform, no hooks, no event subscription) and returns a no-op cleanup."""
     source = _plugin_source()
-    assert re.search(r"export default async function MnemoSeedLocalPlugin\([^)]*options", source, re.S), (
-        "the plugin entry must accept the tuple's options argument"
+    assert '(ctx.options as JsonRecord)["enabled"] === false' in source, (
+        "the switch must read the V2 options object"
     )
     assert "=== false" in source, "only an explicit enabled:false disables"
-    assert "return {}" in source, "the disabled bundle registers nothing"
+    assert "return () => {}" in source, "the disabled bundle registers nothing"
 
 
 def test_plugin_mentions_all_daemon_endpoints_and_host_id() -> None:
@@ -313,80 +321,75 @@ def test_plugin_maps_idle_to_flush_and_only_deleted_settles() -> None:
     source = _plugin_source()
     idle_block = re.search(r'case "session\.idle":.*?break', source, re.S)
     assert idle_block is not None
-    assert 'case "session.error":' in idle_block.group(0)
-    assert "flushSession(" in idle_block.group(0), "idle/error must flush, not settle"
+    assert 'case "session.execution.failed":' in idle_block.group(0), (
+        "the V2 terminal-failure event must share the flush arm"
+    )
+    assert "flushSession(" in idle_block.group(0), "idle/execution-failed must flush, not settle"
     assert "settle(" not in idle_block.group(0), "idle is NOT session end"
     deleted_block = re.search(r'case "session\.deleted":.*?break', source, re.S)
     assert deleted_block is not None
     assert "settle(" in deleted_block.group(0), "deleted is the terminal settle"
 
 
-def test_plugin_pins_settle_once_dedup_and_assistant_pending_sweep() -> None:
+def test_plugin_pins_settle_once_dedup_and_event_driven_assistant_capture() -> None:
     """Settle-once keeps a noisy host from spamming /session/end. Assistant
-    capture reliability (senior QA review 2026-08-19, findings 1+2): the old
-    rollback-on-failure retried ONLY if the host happened to re-fire
-    message.updated for that message — the final reply of a session had no
-    retry point at all, and a settle racing an in-flight fetch silently
-    409-dropped the last assistant turn. The contract is now a PENDING SET
-    with a deterministic sweep: a failed or textless fetch parks the
-    messageID per session; `session.idle`/`session.error`/`session.deleted`
-    ENQUEUE the sweep and the drain through the per-session FIFO chain (the
-    same chain that keeps crash replay strictly before live posts — ordering
-    is a CHAIN property, as deterministic as the old inline await, and it
-    cannot interleave with content posts), so the last reply always gets a
-    final retry and settle can never overtake an outstanding fetch. Pin the
-    set, the enqueued sweep sites, and the settle-once dedup."""
+    capture under the V2 stream is EVENT-DRIVEN: the reply text arrives as
+    session.text.ended parts and posts at the step boundary
+    (session.step.ended / session.step.failed) — no host fetch on the live
+    lane, so the parked-fetch sweep machinery is gone. Recovery for a failed
+    POST is the fingerprint rollback + re-armed reconciliation: the
+    un-advanced watermark makes the session's next reconcile replay the turn
+    from ctx.session.context through the same FIFO chain (ordering is a
+    CHAIN property and cannot interleave with content posts). Pin the
+    accumulator, the step-boundary post sites, the fingerprint dedup, and
+    the settle-once dedup."""
     source = _plugin_source()
-    assert "pendingAssistant" in source, "failed/textless fetches must park, not vanish"
-    assert "sweepPendingAssistant(" in source, "the deterministic retry sweep must exist"
+    assert "assistantTextParts" in source, "reply text accumulates from session.text.ended"
+    assert "accumulateAssistantText(" in source
+    assert "settleAssistantStep(" in source, "the step boundary posts the assembled reply"
+    assert 'case "session.text.ended":' in source
+    assert 'case "session.step.ended":' in source
+    assert 'case "session.step.failed":' in source
+    assert "pendingAssistant" not in source, "the v1 parked-fetch sweep is gone"
+    assert "sweepPendingAssistant" not in source
     assert "enqueueForSession(" in source, "turn content is FIFO-chained per session"
     idle_block = re.search(r'case "session\.idle":.*?break', source, re.S)
-    assert idle_block is not None and "sweepPendingAssistant(" in idle_block.group(0)
+    assert idle_block is not None and "flushSession(" in idle_block.group(0)
     deleted_block = re.search(r'case "session\.deleted":.*?break', source, re.S)
-    assert deleted_block is not None and "sweepPendingAssistant(" in deleted_block.group(0), (
-        "settle must be ordered after the sweep — via the chain, not a sleep"
-    )
+    assert deleted_block is not None and "settle(" in deleted_block.group(0)
     assert "seen(settledSessions," in source
     assert "DEDUP_CAP = 1000" in source
 
 
-def test_plugin_fetch_has_a_timeout_so_a_hung_sdk_call_cannot_park_forever() -> None:
-    """Senior QA review 2026-08-19, finding 1 variant 4: the SDK parts fetch
-    had NO timeout (only daemon POSTs got AbortSignal.timeout) — a
-    never-resolving client.session.messages() lost the assistant turn AND
-    leaked the promise. The fetch now races a bounded timeout; the loser
-    parks in the pending set (retried at the next sweep)."""
+def test_plugin_history_read_has_a_timeout_so_a_hung_sdk_call_cannot_leak() -> None:
+    """The one awaited SDK read (ctx.session.context for crash replay) races a
+    bounded timeout — a never-resolving SDK promise must neither leak nor
+    stall the reconcile chain; the loser returns null and the session stays
+    unflagged for the next event's retry."""
     source = _plugin_source()
     assert "FETCH_TIMEOUT_MS" in source
-    assert re.search(r"Promise\.race\(", source), "SDK fetch must be timeout-raced"
+    assert re.search(r"Promise\.race\(", source), "the history read must be timeout-raced"
 
 
-def test_plugin_fetches_assistant_parts_via_session_messages_plural() -> None:
-    """Live dogfood findings (2026-08-19, PRD-B2.1 baseline fix 3): the
-    original failure AND its first 'fix' were the SAME JS method-unbinding
-    TypeError (``Cannot read properties of undefined (reading '_client')``)
-    — the hey-api gen client body is ``(options.client ?? this._client)``
-    and ``const list = client?.session?.messages`` strips the receiver. The
-    console.debug-only failure reporting misdiagnosed it as 'singular
-    endpoint missing' (the singular ``session.message`` endpoint DOES exist
-    in SDK 1.18.18 with dual path params; the hook just must not use it).
-    Pin: the plural call on its RECEIVER, NO singular form, NO extraction
-    alias of any shape, the request's path-param shape, and the info.id
-    lookup — so SDK-contract AND binding-form drift fail the Python gate
-    instead of the memory store."""
+def test_plugin_reads_history_via_the_session_context_domain() -> None:
+    """The V2 SDK has no client.session.messages on the plugin context — the
+    crash-replay lane reads the host's active context messages through
+    ctx.session.context({ sessionID }) (SessionMessageInfo[]: user text on
+    the message, assistant text/tool parts in the content array). Pin the
+    guard, the call shape, and the response unwrapping — SDK-contract drift
+    fails the Python gate instead of the memory store."""
     source = _plugin_source()
-    assert re.search(r"\.session\?\.messages\b", source), "must guard client.session.messages (plural)"
-    assert not re.search(r"\.session\??\.[\"']?message\b(?!s)", source), (
-        "no singular session.message access in any form (optional chain or bracket)"
+    assert re.search(r'ctx\?\.session\?\.context !== "function"', source), (
+        "the history read must guard the V2 domain method"
     )
-    assert re.search(r"client\.session\.messages\(\{", source), (
-        "the call must run on its receiver — extracting the method loses `this`"
+    assert re.search(r"ctx\.session\.context\(\{ sessionID \}\)", source), (
+        "the call must run on its receiver with the V2 input shape"
     )
-    assert not re.search(r"(?:const|let|var)\s+[\w{}\s,]*=\s*client\?\.session\?\.messages\b", source), (
-        "method extraction unbinds `this` (TypeError: reading '_client')"
+    assert ".session?.messages" not in source, "the v1 client.session.messages surface is gone"
+    assert "message.time.created" in source, "user messages carry their created time"
+    assert 'message?.type === "user"' in source and 'message?.type === "assistant"' in source, (
+        "the replay loop discriminates on the V2 message type field"
     )
-    assert "path: { id: sessionID }" in source, "pin the list call's path-param shape"
-    assert re.search(r"info\??\.id === messageID", source), "must look the message up by info.id"
 
 
 def test_plugin_pins_runtime_host_id_in_code() -> None:
@@ -412,24 +415,32 @@ def test_plugin_endpoint_call_sites_have_the_pinned_arities() -> None:
     assert len(re.findall(r'post\(\s*"/memory/reinforce"', source)) == 1
 
 
-def test_plugin_lifts_host_agent_into_the_canonical_ingest_body() -> None:
-    """B2.9 hook slice: hookInput.agent rides the canonical user-prompt ingest
-    body as `agent` (the segmenter's turn-attribution anchor); raw.agent stays
-    for one transition generation so an older daemon still sees the label. The
-    crash-replay lane lifts the same attribution from the host history's
-    per-message agent (UserMessage.agent in the SDK types)."""
+def test_plugin_rides_the_session_level_agent_on_user_prompts() -> None:
+    """B2.9 wire slice on the V2 surface: the canonical `agent` body field
+    anchors the daemon's turn routing (agent-bound profile routing), but the
+    V2 host provides NO per-message agent on user prompts (SessionMessageUser)
+    and the prompt hook event carries none either. The plugin therefore tracks
+    the SESSION-level agent — session.created data.agent, updated by
+    session.agent.selected — and rides it on live user ingests; an untracked
+    session and replayed prompts stay honestly unattributed. Pin the tracker,
+    both arming sites, the canonical-field lift, and the absence of any
+    fabricated per-message agent."""
     source = _plugin_source()
-    assert "if (agent) body.agent = agent" in source
-    assert "function agentOf(info: any)" in source, "one shared per-message agent extractor"
-    assert len(re.findall(r"if \(agent\) raw\.agent = agent", source)) == 2, (
-        "live AND crash-replay lanes both keep the raw.agent transition generation"
+    assert "const sessionAgents = new Map<string, string>()" in source, (
+        "the session-level agent tracker must exist"
     )
+    assert 'case "session.agent.selected":' in source, "the explicit agent switch must arm the tracker"
+    created_block = re.search(r'case "session\.created":.*?break', source, re.S)
+    assert created_block is not None and "data?.agent" in created_block.group(0), (
+        "session.created with an agent must arm the tracker"
+    )
+    assert "if (agent) body.agent = agent" in source, "the canonical field carries the tracked session agent"
+    assert "agentOf(" not in source, "no per-message agent extractor may survive without a source field"
+    assert "raw.agent" not in source, "no agent may be fabricated into raw"
     assert re.search(r"postUserIngest\(\s*sessionID,\s*text,\s*stamp,\s*raw,\s*agent\s*\)", source), (
-        "the chat.message lane must pass the canonical agent through"
+        "the prompt lane must pass the tracked session agent through"
     )
-    assert re.search(r"postUserIngest\(sessionID, text, createdS, raw, agent\)", source), (
-        "the crash-replay lane must attribute replayed prompts from the host's per-message agent"
-    )
+    assert "sessionAgents.delete(sessionID)" in source, "the tracker is dropped with the session"
 
 
 def test_plugin_pins_the_t1_t3_recall_injection_and_consumption_guard() -> None:
@@ -459,11 +470,11 @@ def test_plugin_pins_the_t1_t3_recall_injection_and_consumption_guard() -> None:
     window = source[reinforce_site : reinforce_site + 300]
     assert "noteWatermark" not in window, "reinforce is not content — no watermark ack"
     assert "scheduleRecovery" not in window, "reinforce failure must not re-arm reconciliation"
-    # IMPORTANT-1 (QA): the transform is the only handler the host AWAITS on
-    # the model-call path — it must fail open via try/catch like its siblings
-    # (a fault must never reject the awaited call nor mutate the system array).
-    transform_block = re.search(r"async function onChatSystemTransform.*?\n}", source, re.S)
-    assert transform_block is not None, "onChatSystemTransform handler block not found"
+    # IMPORTANT-1: the SessionContext hook is the only handler the host AWAITS
+    # on the model-call path — it must fail open via try/catch like its
+    # siblings (a fault must never reject the awaited call nor mutate system).
+    transform_block = re.search(r"async function onSessionContext.*?\n}", source, re.S)
+    assert transform_block is not None, "onSessionContext handler block not found"
     assert "try {" in transform_block.group(0), "the awaited transform handler must fail open"
     assert "catch" in transform_block.group(0), "the awaited transform handler must fail open"
 
@@ -512,7 +523,7 @@ def test_plugin_pins_the_b24_time_awareness_hook_slice() -> None:
     assert ' started="' in source
     assert "window_truncated" in source
     assert len(re.findall(r'post\(\s*"/session/recent"', source)) == 0
-    assert "The ONLY awaited network calls in the transform handler are" in source
+    assert "The ONLY awaited network calls in the SessionContext handler are" in source
 
 
 def test_plugin_escapes_attributes_in_injected_lines() -> None:
@@ -621,11 +632,11 @@ def test_plugin_pins_the_crash_replay_mechanism() -> None:
     assert "reconcileSession(" in source and "reconciledSessions" in source, (
         "lazy, once-per-session-per-process reconciliation (T2)"
     )
-    assert re.search(r"case \"session\.idle\":.*?reconcile", source) or re.search(
-        r"chat\.message.*?reconcile", source, re.S
-    ), "reconciliation hooks into the lazy first-event path"
-    assert re.search(r"client\.session\.messages\(\{", source), (
-        "host history is read via the bound list call (no new API surface)"
+    assert re.search(r"reconcileSession\(pluginCtx, sessionID\)", source), (
+        "reconciliation hooks into the lazy first-event path"
+    )
+    assert re.search(r"ctx\.session\.context\(\{ sessionID \}\)", source), (
+        "host history is read via the V2 context domain (no new API surface)"
     )
 
 
@@ -633,14 +644,14 @@ def test_plugin_replay_keeps_the_engineering_red_lines() -> None:
     """PRD-B2.2 T4: (a) TOKEN red-line — the replay path must never construct
     or call any LLM client (the whole plugin talks to exactly two parties:
     the daemon REST and the host's own SDK); (b) hot-path zero-cost — the
-    existing chat.message/ingest lane gains no awaited I/O (reconcile is
+    existing prompt/ingest lane gains no awaited I/O (reconcile is
     fire-and-forget like every other post); (c) reversibility — the only new
     filesystem artifact is the single watermark file."""
     source = _plugin_source()
     assert ".chat(" not in source and "LLM" not in source, (
         "no LLM client anywhere in the hook — replay is byte-reshuffling only"
     )
-    chat_block = re.search(r"async function onChatMessage.*?\n  \}", source, re.S)
+    chat_block = re.search(r"async function onPromptAdmitted.*?\n  \}", source, re.S)
     assert chat_block is not None and "await reconcileSession" not in chat_block.group(0), (
         "reconcile must stay fire-and-forget — the hot path awaits nothing"
     )

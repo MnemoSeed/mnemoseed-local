@@ -18,10 +18,8 @@ process.env.MNEMOSEED_LOCAL_WATERMARK_TEST = "1";
 
 globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
 
-const fakeClient = { session: { messages: async () => ({ data: [] }) } };
-const pluginFactory = (await import(pathToFileURL(bundle))).default;
-const hooks = await pluginFactory({ client: fakeClient });
-const seam = hooks.__watermarkTest;
+const mod = await import(pathToFileURL(bundle));
+const seam = mod.__watermarkTest;
 if (!seam) {
   console.error("watermark test seam missing");
   process.exit(50);

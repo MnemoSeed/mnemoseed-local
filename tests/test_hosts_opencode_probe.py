@@ -35,28 +35,25 @@ def test_probe_is_shipped_as_package_data() -> None:
 
 
 def test_probe_pins_the_observation_surface() -> None:
-    """Sentinel append through the config hook, options-tuple logging, the
-    50-event cap and the DEBUG-gated JSONL sink; every shipped-plugin hook
-    surface is mirrored with seq+name logging."""
+    """Sentinel append through the mcp transform, options logging, the
+    50-event cap and the DEBUG-gated JSONL sink; the V2 setup surface is
+    observed (ctx.options, location, event subscription)."""
     source = _probe_source()
     for token in (
         "b26-probe-sentinel",
         "b26-probe-noop",
-        "enabled: false",
-        "config: async",
+        "disabled: true",
+        "ctx.mcp.transform(",
         "probe-b26.jsonl",
         "MNEMOSEED_LOCAL_DEBUG",
         "EVENT_CAP = 50",
     ):
         assert token in source, token
-    assert "options === undefined ? null : options" in source, "the options arg must be logged fully"
-    for hook in (
-        '"chat.message"',
-        '"chat.system.transform"',
-        '"tool.execute.after"',
-        '"experimental.session.compacting"',
-    ):
-        assert hook in source, hook
+    assert "ctx?.options === undefined ? null : ctx.options" in source, (
+        "the V2 options object must be logged fully"
+    )
+    assert 'id: "mnemoseed-b26-probe"' in source, "the V2 definition carries a stable id"
+    assert "ctx.event.subscribe(" in source, "the event subscription is observed"
 
 
 def test_probe_has_no_process_or_network_capabilities() -> None:

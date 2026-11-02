@@ -5,7 +5,9 @@
 MnemoSeed Local is a single-user memory layer that runs on your machine. It
 captures conversations, retrieves relevant context across sessions, and provides
 a local web console. Adapters are available for OpenCode, Claude Code, ZCode,
-and Codex CLI.
+and Codex CLI. The OpenCode plugin is a V2 plugin definition and requires
+OpenCode 2.x; V1-shape plugin functions do not run on 2.x, and this plugin
+does not run on 1.x.
 
 [Website](https://mnemoseed.my) · [Complete guide](docs/guide.md) ·
 [GitHub Sponsors](https://github.com/sponsors/MnemoSeed)

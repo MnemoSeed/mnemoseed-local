@@ -100,12 +100,30 @@ def test_replayed_tail_arrives_before_the_live_turn(tmp_path: Path) -> None:
     assert replay_user_index < replay_assistant_index < live_index, (
         f"replay must fully precede the live turn: {order}"
     )
-    # B2.9 attribution: the crash-replay lane lifts the host history's
-    # per-message agent (UserMessage.agent) into the canonical body field; a
-    # live hookInput without one stays honestly unattributed.
+    # Agent mechanism: the V2 host record carries no per-message agent
+    # on user messages (SessionMessageUser), so the plugin rides the
+    # SESSION-level agent (session.created data.agent / session.agent.selected)
+    # on LIVE prompt ingests only — the session's agent at admission time IS
+    # the admitting agent. Replayed prompts' historical agent is unknowable
+    # from the V2 record, so they stay honestly unattributed here.
     agents = {post["text"]: post.get("agent") for post in transcript["order"]}
-    assert agents["历史用户消息"] == "build", f"replayed prompt lost its agent: {transcript['order']}"
+    assert agents["历史用户消息"] is None, f"replayed prompt must stay unattributed: {transcript['order']}"
     assert agents["重启后的新消息"] is None
+
+
+def test_session_agent_rides_the_canonical_user_prompt_field(tmp_path: Path) -> None:
+    """B2.9 on the V2 surface: the canonical `agent` body field anchors the
+    daemon's agent-bound profile routing. The V2 host has no per-message
+    agent, so the plugin tracks the SESSION-level agent — session.created
+    data.agent, updated by session.agent.selected — and rides it on live
+    user_prompt ingests; a session with no tracked agent stays honestly
+    unattributed (no fabrication)."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "agent-attribution")
+    agents = {entry["text"]: entry["agent"] for entry in transcript["agents"]}
+    assert agents["归属轮"] == "build", f"session.created agent must ride the ingest: {agents}"
+    assert agents["切换轮"] == "review", f"session.agent.selected must update the tracker: {agents}"
+    assert agents["无归属轮"] is None, f"an untracked session must stay unattributed: {agents}"
 
 
 def test_completed_assistant_posts_exactly_once_across_live_and_replay(tmp_path: Path) -> None:
@@ -117,11 +135,10 @@ def test_completed_assistant_posts_exactly_once_across_live_and_replay(tmp_path:
 
 
 def test_aborted_assistant_shape_lands_in_the_debug_sink(tmp_path: Path) -> None:
-    """An aborted assistant message (time.error, no time.completed) must be
-    logged into hook-debug.jsonl BEFORE the completion gate drops it — the
-    shape line is how a live abort becomes distinguishable from a completed
-    reply in the debug lane. Both the metadata.error trace and the error-less
-    abort trace are recorded."""
+    """A failed assistant step (session.step.failed) must be logged into
+    hook-debug.jsonl BEFORE the settle gate drops it — the shape line is how a
+    live abort becomes distinguishable from a completed reply in the debug
+    lane. Both the error-payload trace and the bare error trace are recorded."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "completion-shape-debug")
     shapes = transcript["shapes"]
@@ -129,15 +146,13 @@ def test_aborted_assistant_shape_lands_in_the_debug_sink(tmp_path: Path) -> None
     by_id = {shape["messageID"]: shape for shape in shapes}
     meta = by_id["m_aborted_meta"]
     assert meta["sessionID"] == "sess-behavior"
-    assert meta["role"] == "assistant"
-    assert meta["hasCompleted"] is False, f"an abort must not look completed: {meta}"
-    assert meta.get("completed") is None
+    assert meta["failed"] is True, f"a failed step must read as failed: {meta}"
     assert meta["hasError"] is True
-    assert meta["error"] == "The operation was aborted due to timeout"
+    assert meta["error"]["message"] == "The operation was aborted due to timeout"
     plain = by_id["m_aborted_plain"]
-    assert plain["hasCompleted"] is False
-    assert plain["hasError"] is False
-    assert plain["error"] is None
+    assert plain["failed"] is True
+    assert plain["hasError"] is True
+    assert plain["error"]["message"] == "The operation was aborted"
 
 
 def test_outage_hole_is_replayed_in_process_before_later_acks_leapfrog_it(tmp_path: Path) -> None:
@@ -636,15 +651,15 @@ def test_debug_lane_stays_silent_without_the_env(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------- B2.6 host-plugin bundling
 
-#: The first-party remote MCP entry the config hook injects: the daemon's
+#: The first-party remote MCP entry the mcp transform injects: the daemon's
 #: loopback HTTP surface, the three-header identity contract, no OAuth
-#: auto-detection, and the daemon client's own timeout.
+#: auto-detection, and the daemon client's own timeout (V2 flag: disabled).
 _REMOTE_ENTRY = {
     "type": "remote",
     "url": "http://localhost:7788/mcp",
     "headers": {"x-mnemoseed-profile": "default", "x-mnemoseed-actor": "mcp"},
     "oauth": False,
-    "enabled": True,
+    "disabled": False,
     "timeout": 30000,
 }
 _REMOTE_ENTRY_WITH_CREDENTIAL = {
@@ -658,10 +673,9 @@ _REMOTE_ENTRY_WITH_CREDENTIAL = {
 
 
 def test_config_hook_injects_the_remote_mcp_registration_create_if_absent(tmp_path: Path) -> None:
-    """B2.6 bundling plus the HTTP MCP transport: the config hook registers
-    cfg.mcp["mnemoseed"] as the remote entry, creating the mcp map when
-    absent; a user's existing manual registration is never overwritten; a null
-    cfg is a no-op."""
+    """B2.6 bundling plus the HTTP MCP transport: the mcp transform registers
+    mcp["mnemoseed"] as the remote entry; a user's existing manual
+    registration is never overwritten; a null editor map is a no-op."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "config-inject")
     assert transcript["empty"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
@@ -681,7 +695,7 @@ def test_config_hook_migrates_the_factory_stdio_entry_to_remote(tmp_path: Path) 
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "config-inject-migrate")
     assert transcript["factory"]["mcp"]["mnemoseed"] == _REMOTE_ENTRY
-    assert transcript["disabled"]["mcp"]["mnemoseed"] == {**_REMOTE_ENTRY, "enabled": False}, (
+    assert transcript["disabled"]["mcp"]["mnemoseed"] == {**_REMOTE_ENTRY, "disabled": True}, (
         "a user-disabled entry must stay disabled after the rewrite"
     )
     assert transcript["foreign"]["mcp"]["mnemoseed"] == {
@@ -703,33 +717,43 @@ def test_config_hook_reads_the_daemon_credential_into_the_remote_entry(tmp_path:
     assert "authorization" not in transcript["bare"]["mcp"]["mnemoseed"]["headers"]
 
 
-def test_options_tuple_switch_short_circuits_the_whole_bundle(tmp_path: Path) -> None:
-    """B2.6 single switch: {enabled:false} via the ["spec", options] tuple
-    makes the factory return {} — NO config hook, NO hooks; enabled:true,
-    empty options and absent options all load the full bundle."""
+def test_options_switch_short_circuits_the_whole_bundle(tmp_path: Path) -> None:
+    """B2.6 single switch: {enabled:false} via the V2 { package, options }
+    entry makes setup register NOTHING — no mcp transform, no hooks, no event
+    subscription; enabled:true, empty options and absent options all load the
+    full bundle."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "switch-short-circuit")
     assert transcript["offKeys"] == [], f"enabled:false must short-circuit everything: {transcript}"
     for keys in ("onKeys", "bareKeys", "noneKeys"):
-        assert "config" in transcript[keys], keys
-        assert "chat.message" in transcript[keys], keys
-        assert "chat.system.transform" in transcript[keys], keys
+        for name in (
+            "session.hook:prompt",
+            "session.hook:context",
+            "session.hook:compaction",
+            "tool.hook:execute.after",
+            "mcp.transform",
+            "event.subscribe",
+        ):
+            assert name in transcript[keys], (keys, name)
 
 
-def test_config_hook_is_fail_open_on_frozen_objects(tmp_path: Path) -> None:
-    """B2.6 I3: the config hook try/catch is fail-open — Object.freeze(cfg) and
-    freeze(cfg.mcp) must not throw, must not overwrite other keys, and a
-    subsequent normal cfg still injects."""
+def test_mcp_transform_is_fail_open_on_frozen_objects(tmp_path: Path) -> None:
+    """B2.6 I3: the mcp transform is fail-open — a frozen mcp map must not
+    throw, must not overwrite other keys, and a subsequent normal map still
+    injects. A frozen map with an EXISTING entry is untouched (get succeeds,
+    set is never reached)."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "config-inject-frozen")
-    assert transcript["noThrow"] is True, "frozen cfg must not throw"
-    assert transcript["frozenCfgOther"] == "keep", "other keys on frozen cfg must survive"
-    assert transcript["frozenMcpOther"] == "keep2", "other keys on cfg with frozen mcp must survive"
-    # frozen paths are fail-open: no throw and other keys survive; a frozen cfg
-    # without mcp cannot be injected (??= throws), a frozen mcp cannot gain the
-    # entry — both must not overwrite other keys
+    assert transcript["noThrow"] is True, "frozen maps must not throw"
+    assert transcript["frozenCfgOther"] == "keep", "other keys on the frozen map must survive"
+    assert transcript["frozenMcpOther"] == "keep2", "other keys on the frozen map must survive"
+    # fail-open: the frozen map without the entry cannot gain it (set throws,
+    # swallowed), and the frozen map WITH an existing entry stays as-is
     assert transcript["frozenCfgHasMnemoseed"] is None
-    assert transcript["frozenMcpHasMnemoseed"] is None
+    assert transcript["frozenMcpHasMnemoseed"] == {
+        "type": "remote",
+        "url": "http://frozen.example",
+    }
     assert transcript["afterMnemoseed"] == _REMOTE_ENTRY
 
 

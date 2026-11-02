@@ -39,7 +39,7 @@ class IngestEventType(StrEnum):
 
     USER_PROMPT = "user_prompt"  # Claude Code/Codex UserPromptSubmit
     ASSISTANT_MESSAGE = "assistant_message"  # CC Stop / Cursor afterAgentResponse / Gemini Stop
-    TOOL_USE = "tool_use"  # CC/Cursor PostToolUse / OpenCode tool.execute.after
+    TOOL_USE = "tool_use"  # CC/Cursor PostToolUse / OpenCode execute.after hook
     PROVIDER_ERROR = "provider_error"  # B1 provider-failure nomination
 
 
