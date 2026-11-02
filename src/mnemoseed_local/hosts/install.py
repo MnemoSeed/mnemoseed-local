@@ -242,6 +242,7 @@ def status(root: Path | None = None, base_url: str | None = None) -> HookStatus:
 ADAPTER_MODULES: dict[str, str] = {
     "claude_code": "mnemoseed_local.hosts.claude_code.install",
     "codex_cli": "mnemoseed_local.hosts.codex_cli.install",
+    "cursor": "mnemoseed_local.hosts.cursor.install",
     "opencode": "mnemoseed_local.hosts.install",
     "zcode": "mnemoseed_local.hosts.zcode.install",
 }
