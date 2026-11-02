@@ -795,21 +795,67 @@ def test_gateway_config_entries_pin_no_profile_value() -> None:
 DRIVER_SOURCE = """
 import { pathToFileURL } from "node:url"
 const [bundle] = process.argv.slice(2)
-const { default: plugin } = await import(pathToFileURL(bundle).href)
+const { default: definition } = await import(pathToFileURL(bundle).href)
 const errors = []
 const realError = console.error
 console.error = (...args) => {
   errors.push(args.map((a) => String(a)).join(" "))
 }
 try {
-  const result = await plugin({}, undefined)
-  const out = { keys: Object.keys(result), errors }
-  if (typeof result.config === "function") {
-    const cfg = {}
-    await result.config(cfg)
-    out.mcp = cfg.mcp
+  const registrations = []
+  let mcpTransform
+  const ctx = {
+    options: undefined,
+    location: { directory: process.cwd() },
+    session: {
+      hook: async (name) => {
+        registrations.push(`session.hook:${name}`)
+        return { dispose: async () => {} }
+      },
+    },
+    tool: {
+      hook: async (name) => {
+        registrations.push(`tool.hook:${name}`)
+        return { dispose: async () => {} }
+      },
+    },
+    mcp: {
+      transform: async (cb) => {
+        mcpTransform = cb
+        registrations.push("mcp.transform")
+        return { dispose: async () => {} }
+      },
+    },
+    event: {
+      subscribe: () => {
+        registrations.push("event.subscribe")
+        return {
+          [Symbol.asyncIterator]() {
+            return { next: async () => ({ value: undefined, done: true }) }
+          },
+        }
+      },
+    },
+  }
+  const cleanup = await definition.setup(ctx)
+  const out = { keys: registrations, errors }
+  if (typeof mcpTransform === "function") {
+    const map = {}
+    await mcpTransform({
+      list: () => Object.entries(map),
+      get: (name) => map[name],
+      set: (name, config) => {
+        map[name] = config
+      },
+      update: (name, update) => update(map[name]),
+      remove: (name) => {
+        delete map[name]
+      },
+    })
+    out.mcp = map
   }
   process.stdout.write(JSON.stringify(out))
+  if (typeof cleanup === "function") await cleanup()
 } finally {
   console.error = realError
 }
@@ -856,7 +902,7 @@ def test_plugin_launch_root_verification_and_refusal(tmp_path: Path, plugin_bund
 
     pb.bind(home, root, ALPHA)
     ok = _run_plugin(plugin_bundle, driver, root, home, profile=ALPHA)
-    assert "config" in ok["keys"]
+    assert "mcp.transform" in ok["keys"]
     assert ok["errors"] == []
 
     outside = _run_plugin(plugin_bundle, driver, other, home, profile=ALPHA)
@@ -876,12 +922,12 @@ def test_plugin_launch_root_verification_and_refusal(tmp_path: Path, plugin_bund
     assert "registry" in " ".join(malformed["errors"])
 
     legacy = _run_plugin(plugin_bundle, driver, root, home, profile=None)
-    assert "config" in legacy["keys"]
+    assert "mcp.transform" in legacy["keys"]
     assert legacy["errors"] == []
 
     pb.bindings_path(home).unlink()
     manual = _run_plugin(plugin_bundle, driver, other, home, profile=ALPHA)
-    assert "config" in manual["keys"]
+    assert "mcp.transform" in manual["keys"]
     assert manual["errors"] == []
 
 

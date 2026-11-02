@@ -1,23 +1,37 @@
 {
   "provenance": {
     "note": "Sanitized non-live entry-gate fixture (brief Section 9.4). Synthetic values only; no secrets, no live data.",
-    "source": "OpenCode session.error event shape; provider/model read points at plugin.ts session.error branch (properties.info.providerID/modelID, properties.error). No numeric status exists for this class.",
-    "opencode_version": "1.18.21 (local toolchain; shape pinned from shipped plugin.ts read points, not a live capture)",
-    "recorded": "2026-09-03",
+    "source": "OpenCode V2 event stream: session.step.failed carrying a status-less abort/no-response error; provider/model ride the tracked session model (session.model.selected). No numeric status exists for this class.",
+    "opencode_version": "2.0.32 (npm @opencode/cli binary + @opencode/plugin 2.0.32 SDK types)",
+    "recorded": "2026-11-03",
     "case": "status-less hang (180s no-response class) carried as SDK abort text"
   },
-  "bus_event": {
-    "type": "session.error",
-    "properties": {
+  "session_event": {
+    "type": "session.model.selected",
+    "data": {
       "sessionID": "sess_example_timeout",
-      "info": { "providerID": "openai", "modelID": "gpt-4o" },
-      "error": "The operation was aborted due to timeout after 180s with no response"
+      "model": {
+        "providerID": "openai",
+        "id": "gpt-4o"
+      }
+    }
+  },
+  "bus_event": {
+    "type": "session.step.failed",
+    "created": 333,
+    "data": {
+      "sessionID": "sess_example_timeout",
+      "assistantMessageID": "msg_example_timeout",
+      "error": {
+        "type": "abort",
+        "message": "The operation was aborted due to timeout after 180s with no response"
+      }
     }
   },
   "pinned_contract": {
-    "provider": "properties.info.providerID",
-    "model": "properties.info.modelID",
-    "status_text": "properties.error (abort/no-response wording; no numeric status)",
+    "provider": "session_event.data.model.providerID",
+    "model": "session_event.data.model.id",
+    "status_text": "bus_event.data.error.message (abort/no-response wording; no numeric status)",
     "expected_status_token": "timeout",
     "expected_reason": "provider_timeout_no_status"
   }

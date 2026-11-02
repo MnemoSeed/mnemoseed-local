@@ -266,9 +266,14 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def _bus_info(fx: dict) -> dict:
-    """The message.updated bus_event's info record, verbatim from the fixture."""
-    return fx["bus_event"]["properties"]["info"]
+def _bus_data(fx: dict) -> dict:
+    """The V2 step-failure event's data record, verbatim from the fixture."""
+    return fx["bus_event"]["data"]
+
+
+def _tracked_model(fx: dict) -> dict:
+    """The session model the V2 stream tracks for this fixture's session."""
+    return fx["session_event"]["data"]["model"]
 
 
 def _provider_bodies(transcript: dict) -> list[dict]:
@@ -281,13 +286,14 @@ def test_plugin_true_429_nominates_quota_not_other(tmp_path: Path) -> None:
     bodies = _provider_bodies(transcript)
     assert bodies, "real plugin emitted no provider_error POST for the 429 fixture"
     fx = _load_fixture("provider_error_429.json")
-    info = _bus_info(fx)
+    data = _bus_data(fx)
+    model = _tracked_model(fx)
     expected = {
-        "provider": info["providerID"],
-        "model": info["modelID"],
+        "provider": model["providerID"],
+        "model": model["id"],
         "status": fx["pinned_contract"]["expected_status_token"],
         "reason": fx["pinned_contract"]["expected_reason"],
-        "error_id": info["id"],
+        "error_id": data["assistantMessageID"],
     }
     assert expected in [b["content"] for b in bodies], (
         f"429 fixture drift or misclassification: {[b['content'] for b in bodies]}"
@@ -310,17 +316,18 @@ def test_plugin_timeout_no_status_nominates_timeout(tmp_path: Path) -> None:
     transcript = _run(bundle, "provider-error-nomination", fixture_dir=FIXTURES)
     bodies = _provider_bodies(transcript)
     fx = _load_fixture("provider_error_timeout_no_status.json")
-    props = fx["bus_event"]["properties"]
+    data = _bus_data(fx)
+    model = _tracked_model(fx)
     expected = {
-        "provider": props["info"]["providerID"],
-        "model": props["info"]["modelID"],
+        "provider": model["providerID"],
+        "model": model["id"],
         "status": fx["pinned_contract"]["expected_status_token"],
         "reason": fx["pinned_contract"]["expected_reason"],
     }
     assert expected in [{k: v for k, v in b["content"].items() if k != "error_id"} for b in bodies], (
         f"timeout fixture drift or misclassification: {[b['content'] for b in bodies]}"
     )
-    assert props["sessionID"] in [b["session_id"] for b in bodies], (
+    assert data["sessionID"] in [b["session_id"] for b in bodies], (
         "timeout fixture session never nominated: the driver did not consume the fixture bus_event"
     )
 
@@ -340,16 +347,17 @@ def test_plugin_storm_same_error_debounced_distinct_error_independent(tmp_path: 
     assert len(bodies) == 2, f"storm must nominate exactly twice: {[b['content'] for b in bodies]}"
     fx = _load_fixture("provider_error_429.json")
     alternate_fx = _load_fixture("provider_error_timeout_no_status.json")
-    info = _bus_info(fx)
-    base_error_id = info["id"]
+    data = _bus_data(fx)
+    model = _tracked_model(fx)
+    base_error_id = data["assistantMessageID"]
     ids = [b["content"]["error_id"] for b in bodies]
     assert sorted(ids) == sorted([base_error_id, "msg_storm_b"]), ids
     statuses = {b["content"]["error_id"]: b["content"]["status"] for b in bodies}
     assert statuses[base_error_id] == fx["pinned_contract"]["expected_status_token"]
     assert statuses["msg_storm_b"] == alternate_fx["pinned_contract"]["expected_status_token"]
-    assert [b["session_id"] for b in bodies] == [info["sessionID"]] * 2
-    assert [b["content"]["provider"] for b in bodies] == [info["providerID"]] * 2
-    assert [b["content"]["model"] for b in bodies] == [info["modelID"]] * 2
+    assert [b["session_id"] for b in bodies] == [data["sessionID"]] * 2
+    assert [b["content"]["provider"] for b in bodies] == [model["providerID"]] * 2
+    assert [b["content"]["model"] for b in bodies] == [model["id"]] * 2
 
 
 def test_joined_hook_body_through_ingest_persists_row(tmp_path: Path, b1_config: Path) -> None:

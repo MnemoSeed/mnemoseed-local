@@ -7,15 +7,16 @@
 // Wire contract (pinned — keep in sync with tests/fixtures/opencode_hook/ and
 // tests/test_hosts_opencode.py, which parses this table):
 //
-//   chat.message                        -> user_prompt       -> POST /ingest
-//   event message.updated (assistant)   -> assistant_message -> POST /ingest
-//   tool.execute.after                  -> tool_use          -> POST /ingest
-//   provider failure (message/session.error) -> provider_error -> POST /ingest
-//   event session.idle|error            -> flush             -> POST /flush
+//   session.hook("prompt")              -> user_prompt       -> POST /ingest
+//   event session.text.ended + session.step.ended (assistant) -> assistant_message -> POST /ingest
+//   tool.hook("execute.after")          -> tool_use          -> POST /ingest
+//   provider failure (session.step.failed / session.execution.failed) -> provider_error -> POST /ingest
+//   session-level agent (session.created.agent / session.agent.selected) rides the canonical user_prompt body field
+//   event session.idle|execution.failed -> flush             -> POST /flush
 //   event session.deleted               -> session_end       -> POST /session/end
-//   experimental.session.compacting     -> flush             -> POST /flush
-//   chat.system.transform (first call per session) -> session_recall_read -> POST /session/recent
-//   chat.system.transform (armed∧acked user ingest) -> session_recall_pending -> POST /session/recall-pending
+//   session.hook("compaction")          -> flush             -> POST /flush
+//   SessionContext hook (first call per session) -> session_recall_read -> POST /session/recent
+//   SessionContext hook (armed∧acked user ingest) -> session_recall_pending -> POST /session/recall-pending
 //   citation guard in postAssistantIngest -> memory_reinforce -> POST /memory/reinforce
 //
 // Invariants: HostId is always "opencode"; every daemon call is
@@ -24,24 +25,37 @@
 // (env MNEMOSEED_LOCAL_DEBUG: failures escalate to console.error + a JSONL
 // sink, and every daemon POST's status is inspected — a swallowed non-2xx is
 // how the settle-sealing bug hid); requests time out after 2s via
-// AbortSignal. The ONLY awaited network calls in the transform handler are
+// AbortSignal. The ONLY awaited network calls in the SessionContext handler are
 // the session-tails read (bounded by AbortSignal and fail-open, at most once
 // per session — B2.1 T1) and the bounded pending-recall pull (B2.1 T2, gated
 // on an ACKED user ingest, 300ms timeout, fail-open).
 //
+// Honest capability bounds of the V2 host surface:
+// - Crash replay is COMPACTION-BOUNDED: the session read lists only the
+//   messages after the last compaction, so a daemon outage spanning a
+//   compaction boundary loses pre-compaction unacked turns (the V1 read
+//   covered the whole record; the V2 read cannot).
+// - Provider nomination is COVERED ONLY WHERE A MODEL IS TRACKED: the
+//   tracker arms from session.created carrying a model or an explicit
+//   session.model.selected. A fresh session on the default model that never
+//   switches has no tracked model, so a provider failure there nominates
+//   nothing (fail-closed under-nomination; the classifier itself is
+//   untouched).
+//
 // Type reference only (NOT a runtime import — the plugin is dependency-free):
-//   import type { Plugin } from "@opencode-ai/plugin"
-// The module's default export is the plugin function; OpenCode's loader
-// treats every exported function-valued value as a plugin instance.
+//   import type { Plugin } from "@opencode/plugin"
+// The module's default export is a V2 plugin definition ({ id, setup }) — the
+// shape the loader validates ("id" string + "setup" function) and the ONLY
+// shape a V2 host executes. Plugin.define() is the identity function, so the
+// plain object literal is the definition; setup(ctx) registers every hook and
+// subscription on the plugin ctx and returns the abort cleanup.
 //
 // B2.6 host-plugin bundling: the bundle carries its own MCP registration —
-// the config hook injects cfg.mcp["mnemoseed"] create-if-absent (a user's
-// existing manual entry wins untouched) into the cfg of the HOST that loaded
-// this file (per-host isolation: each host's plugin dir and config are its
-// own). The single switch is the ["spec", { enabled: false }] plugin-array
-// tuple: the entry short-circuits the WHOLE bundle (no hooks, no config
-// injection). Probe-confirmed on this version: the options tuple reaches the
-// plugin and config-hook cfg.mcp mutations stick (B2.6 probe rounds 1+2).
+// setup transforms ctx.mcp and injects mcp["mnemoseed"] create-if-absent (a
+// user's existing manual entry wins untouched) for the HOST that loaded this
+// file (per-host isolation: each host's plugin dir and config are its own).
+// The single switch is ctx.options.enabled === false (the V2
+// { package, options } entry): setup registers nothing.
 
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { readFileSync, realpathSync } from "node:fs"
@@ -439,23 +453,23 @@ function remoteMcpEntry(): Record<string, unknown> {
     "url": BASE_URL + "/mcp",
     "headers": mcpEntryHeaders(),
     "oauth": false,
-    "enabled": true,
+    "disabled": false,
     "timeout": MCP_REMOTE_TIMEOUT_MS,
   }
 }
 
-function installMcpEntry(mcp: Record<string, unknown>): void {
+function installMcpEntry(editor: any): void {
   // Create-if-absent: a manual or foreign registration wins untouched. The
   // one rewrite is the factory stdio entry, which becomes the remote entry
-  // with the user's enabled flag carried over.
-  const existing = mcp[MCP_ENTRY_NAME]
-  if (existing === undefined || existing === null) {
-    mcp[MCP_ENTRY_NAME] = remoteMcpEntry()
-    return
-  }
-  if (!isFactoryStdioEntry(existing)) return
-  const enabled = (existing as JsonRecord).enabled
-  mcp[MCP_ENTRY_NAME] = { ...remoteMcpEntry(), "enabled": enabled !== false }
+  // with the user's disabled flag carried over (a legacy enabled:false maps
+  // onto the V2 disabled flag).
+  if (editor === null || typeof editor !== "object") return
+  const existing = typeof editor.get === "function" ? editor.get(MCP_ENTRY_NAME) : undefined
+  if (existing !== undefined && existing !== null && !isFactoryStdioEntry(existing)) return
+  const disabled =
+    (existing as JsonRecord | undefined)?.disabled === true ||
+    (existing as JsonRecord | undefined)?.enabled === false
+  editor.set(MCP_ENTRY_NAME, { ...remoteMcpEntry(), "disabled": disabled })
 }
 
 async function rotateDebugLogIfOversized(): Promise<void> {
@@ -540,22 +554,39 @@ function seen(mark: Map<string, true>, key: string): boolean {
 }
 
 // assistant_message marks its (sessionID, messageID) fingerprint up front
-// (message.updated re-fires per part flush; the mark suppresses duplicate
-// posts AND concurrent in-flight duplicates). A failed or textless fetch does
-// NOT roll the mark back — it PARKS the id in pendingAssistant instead, and
-// the next session sweep (idle/error/deleted) retries deterministically.
+// (the event stream re-delivers step boundaries; the mark suppresses duplicate
+// posts AND concurrent in-flight duplicates). A failed POST rolls the mark
+// back and re-arms reconciliation — the watermark did not advance, so the
+// session's next reconcile replays the turn from the host's own session store.
 const sentAssistant = new Map<string, true>()
 // session_end settles ONCE per session_id (session.deleted is the only
 // terminal signal — see onBusEvent).
 const settledSessions = new Map<string, true>()
 
-// Per-session set of assistant messageIDs whose parts fetch has not yet
-// succeeded with text (pending retry at the next sweep point).
-const pendingAssistant = new Map<string, Set<string>>()
+// Assistant reply text arrives as session.text.ended events (one per text
+// part, keyed by ordinal): "${sessionID}:${messageID}" -> ordinal -> part text.
+// The step boundary (session.step.ended / session.step.failed) assembles and
+// posts the accumulated text, then clears it — no host fetch on the live lane.
+const assistantTextParts = new Map<string, Map<number, string>>()
+
+// The V2 event stream carries no per-message model info; the session's current
+// model rides session.created / session.model.selected. Assistant ingests use
+// it for content.model_id; absent tracking means the field is honestly omitted.
+const sessionModels = new Map<string, JsonRecord>()
+
+// The V2 event stream carries no per-message agent either; the SESSION-level
+// agent rides session.created (data.agent) / session.agent.selected. User
+// ingests carry it on the canonical body.agent field — the daemon routes
+// captures by it (agent-bound profiles) — so an untracked session stays
+// honestly unattributed rather than mis-routed. The session's agent at
+// admission time IS the agent that prompt is admitted under; replayed prompts
+// (whose historical agent is unknowable) stay unattributed.
+const sessionAgents = new Map<string, string>()
 
 // B2 scoped-resume lineage (issue #187): sessionID -> parentID cache populated
-// from session.created's properties.info.parentID (a subagent/spawned session
-// names its parent; root sessions carry none). Absent = unknown, never a guess.
+// from session.created / session.forked data.parentID (a subagent/spawned
+// session records its parent; root sessions carry none). Absent = unknown, never
+// a guess.
 const sessionParentIds = new Map<string, string | null>()
 // sessionID -> the FIRST user prompt text of the session: the raw resume_query
 // for scoped-resume anchor matching (a prompt naming a repo/session identifier
@@ -564,23 +595,6 @@ const sessionFirstMessages = new Map<string, string>()
 
 function parentIdOfSessionID(cache: Map<string, string | null>, sessionID: string): string | null {
   return cache.has(sessionID) ? (cache.get(sessionID) ?? null) : null
-}
-
-
-function parkAssistant(sessionID: string, messageID: string): void {
-  let set = pendingAssistant.get(sessionID)
-  if (set === undefined) {
-    set = new Set<string>()
-    pendingAssistant.set(sessionID, set)
-  }
-  if (set.size < DEDUP_CAP) set.add(messageID)
-}
-
-function unparkAssistant(sessionID: string, messageID: string): void {
-  const set = pendingAssistant.get(sessionID)
-  if (set === undefined) return
-  set.delete(messageID)
-  if (set.size === 0) pendingAssistant.delete(sessionID)
 }
 
 // ---- B2.1 T1/T3 session-start recall injection (attempt-once + consumption
@@ -1085,23 +1099,24 @@ async function pullPendingRecall(sessionID: string): Promise<any | null> {
   }
 }
 
-async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<void> {
+async function onSessionContext(event: any): Promise<void> {
   // B2.1 T1 gate semantics (PRD): a falsy session or a non-array system burns
-  // NOTHING (the host may invoke the transform with an empty shape on a
+  // NOTHING (the host may invoke the SessionContext hook with an empty shape on a
   // warmup call — that must not cost the session its first-turn replay); once
   // armed, the attempt is consumed no matter what the read returns. The body
   // is wrapped in try/catch because this is the ONLY handler the host awaits
   // on the model-call path — a fault (out-of-range latest_at in isoEnded, a
   // frozen system array, a malformed payload) must fail open like every
   // sibling: debug-only, never reject the model call, never mutate.
-  const sessionID = String(hookInput?.sessionID ?? "")
+  // Injected blocks ride the V2 system array as text parts (SystemPart).
+  const sessionID = String(event?.sessionID ?? "")
   if (!sessionID) return
-  if (!Array.isArray(hookOutput?.system)) return
+  if (!Array.isArray(event?.system)) return
   try {
     // the once-per-session capture signal renders at the next transform,
     // only under the most recently observed compact mode (off holds the latch).
     if (lastVisibilityMode.get(sessionID) === "compact" && takeCaptureSignal(sessionID)) {
-      hookOutput.system.push(CAPTURE_SIGNAL)
+      event.system.push({ type: "text", text: CAPTURE_SIGNAL })
     }
     // T1 (session-start replay) and T2 (mid-session recall) are INDEPENDENT
     // branches: the T1 attempt gate must NEVER early-return past the T2 pull
@@ -1146,7 +1161,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         })
       }
       if (built !== null) {
-        hookOutput.system.push(built.block)
+        event.system.push({ type: "text", text: built.block })
         injectedRegistry.set(sessionID, built.registry)
         // the T2 seen list = every chunk the T1 injection ADMITTED (needle
         // or not): the daemon merges it so a focal hit never re-serves a T1
@@ -1159,7 +1174,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       // of the memory-recall block's budget.
       if (data !== null) {
         const rulesBlock = buildRulesBudgetInjection(data.rules_budget)
-        if (rulesBlock !== null) hookOutput.system.push(rulesBlock)
+        if (rulesBlock !== null) event.system.push({ type: "text", text: rulesBlock })
       }
     }
     const pull = pendingPull.get(sessionID)
@@ -1177,7 +1192,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       // the first-observed-mode render — the mode may arrive in THIS
       // transform's pull, so the latch is re-checked here after observing it.
       if (servedMode === "compact" && takeCaptureSignal(sessionID)) {
-        hookOutput.system.push(CAPTURE_SIGNAL)
+        event.system.push({ type: "text", text: CAPTURE_SIGNAL })
       }
       // verbose capture: the daemon's capture count rides the pull; each
       // count>0 pull renders one count line ahead of any block.
@@ -1186,7 +1201,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         typeof served.visibility?.capture === "number" &&
         served.visibility.capture > 0
       ) {
-        hookOutput.system.push(captureCountLine(served.visibility.capture))
+        event.system.push({ type: "text", text: captureCountLine(served.visibility.capture) })
       }
       let injectedChars = 0
       if (served.enabled === true && served.items.length > 0) {
@@ -1219,7 +1234,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
           }
           return
         }
-        hookOutput.system.push(built.block)
+        event.system.push({ type: "text", text: built.block })
         pendingPull.delete(sessionID) // a non-empty serve consumes the flags (D8)
         injectedChars = built.block.length
         let registry = injectedRegistry.get(sessionID)
@@ -1249,7 +1264,7 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
         if (advisory.block === null) {
           debugLog("rules advisory dropped: remaining capacity exhausted", { sessionID, remaining })
         } else {
-          hookOutput.system.push(advisory.block)
+          event.system.push({ type: "text", text: advisory.block })
           if (advisory.truncated) {
             debugLog("rules advisory truncated (rule_partial=true)", { sessionID })
           }
@@ -1269,14 +1284,14 @@ async function onChatSystemTransform(hookInput: any, hookOutput: any): Promise<v
       }
     }
   } catch (err) {
-    console.debug("mnemoseed-local: chat.system.transform failed:", err)
-    debugLog("chat.system.transform failed", { sessionID, error: String(err) })
+    console.debug("mnemoseed-local: session context hook failed:", err)
+    debugLog("session context hook failed", { sessionID, error: String(err) })
   }
 }
 
 // ---- B2.2 crash durability (PRD-B2.2, single mechanism): the host persists
 // the full session history itself, so crash recovery = replay the missing
-// tail from client.session.messages into the same ingest lane. Watermarks live
+// tail from the host session read into the same ingest lane. Watermarks live
 // in one deletable file family `hook-watermarks*.json`: the legacy
 // `hook-watermarks.json` (read-only for new code) plus one exclusive
 // per-process shard `hook-watermarks.<pid>.<uuid>.json`. The overlap margin
@@ -1895,85 +1910,55 @@ async function persistWatermarks(): Promise<void> {
   }
 }
 
-function textOf(parts: unknown): string {
-  if (!Array.isArray(parts)) return ""
-  return parts
-    .filter(
-      (part) =>
-        part &&
-        part.type === "text" &&
-        typeof part.text === "string" &&
-        part.synthetic !== true &&
-        part.ignored !== true,
-    )
+function assistantContentText(content: unknown): string {
+  if (!Array.isArray(content)) return ""
+  return content
+    .filter((part) => part && part.type === "text" && typeof part.text === "string")
     .map((part) => String(part.text))
     .join("\n")
     .trim()
 }
 
-async function listSessionMessages(
-  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
-  sessionID: string,
-): Promise<any[] | null> {
-  // The opencode SDK (gen client, hey-api): session.messages({ path: { id } })
-  // lists [{ info, parts }]. Call it ON ITS RECEIVER — extracting the method
-  // unbinds `this` and the body `(options.client ?? this._client).get(...)`
-  // throws TypeError reading '_client' (dogfood 2026-08-19: BOTH the original
-  // singular-endpoint failure AND this unbound extraction died silently into
-  // console.debug before probe instrumentation exposed them). The call is
-  // timeout-raced so a hung SDK promise never leaks (senior QA finding 1).
-  if (typeof client?.session?.messages !== "function") return null
+async function readSessionContext(ctx: any, sessionID: string): Promise<any[] | null> {
+  // V2 SDK: the ctx.session read ({ sessionID }) lists the session's active
+  // messages — user text on the message, assistant text/tool parts in
+  // the content array. The call is timeout-raced so a hung SDK promise never
+  // leaks (the v1 fetches carried the same bound).
+  if (typeof ctx?.session?.context !== "function") return null
   try {
     const response: any = await Promise.race([
-      client.session.messages({ path: { id: sessionID } }),
+      ctx.session.context({ sessionID }),
       new Promise((_resolve, reject) =>
-        setTimeout(() => reject(new Error("session messages fetch timeout")), FETCH_TIMEOUT_MS),
+        setTimeout(() => reject(new Error("session context fetch timeout")), FETCH_TIMEOUT_MS),
       ),
     ])
     const entries = Array.isArray(response?.data) ? response.data : response
     return Array.isArray(entries) ? entries : null
   } catch (error) {
-    console.debug("mnemoseed-local: session messages fetch failed:", error)
-    debugLog("session messages fetch failed", { sessionID, error: String(error) })
+    console.debug("mnemoseed-local: session context fetch failed:", error)
+    debugLog("session context fetch failed", { sessionID, error: String(error) })
     return null
   }
 }
 
-async function fetchAssistantText(
-  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
-  sessionID: string,
-  messageID: string,
-): Promise<{ ok: boolean; text: string }> {
-  const entries = await listSessionMessages(client, sessionID)
-  if (entries === null) return { ok: false, text: "" }
-  const found = entries.find((entry: any) => entry?.info?.id === messageID)
-  // Not yet retrievable (parts not flushed): fail the fetch so the caller
-  // parks the id for the next sweep (宁可重复不丢).
-  if (!found) return { ok: false, text: "" }
-  return { ok: true, text: textOf(found.parts) }
+function modelRefOf(value: unknown): JsonRecord | undefined {
+  if (value === null || typeof value !== "object") return undefined
+  const ref = value as JsonRecord
+  if (typeof ref.providerID !== "string" && typeof ref.id !== "string") return undefined
+  return ref
 }
 
-function agentOf(info: any): string | undefined {
-  return typeof info?.agent === "string" && info.agent ? info.agent : undefined
-}
-
-function modelIdOf(info: any): string | undefined {
-  const provider = typeof info?.providerID === "string" ? info.providerID : ""
-  const model = typeof info?.modelID === "string" ? info.modelID : ""
+function modelIdOfRef(ref: JsonRecord | undefined): string | undefined {
+  const provider = typeof ref?.providerID === "string" ? ref.providerID : ""
+  const model = typeof ref?.id === "string" ? ref.id : ""
   if (provider && model) return `${provider}/${model}`
   if (model) return model
   return undefined
 }
 
 function sessionIdOfEvent(event: any): string {
-  const props = event?.properties ?? {}
-  if (typeof props.sessionID === "string") return props.sessionID
-  // session.deleted carries the session record — prefer its sessionID field;
-  // bare info.id is a MESSAGE id and must never seed phantom session keys
-  // into the watermark file (re-review NIT-7).
-  if (typeof props.info?.sessionID === "string") return props.info.sessionID
-  if (typeof props.info?.id === "string") return props.info.id
-  return ""
+  const data = event?.data ?? {}
+  return typeof data.sessionID === "string" ? data.sessionID : ""
 }
 
 // opencode fires session.idle after EVERY completed reply — idle means the
@@ -2015,7 +2000,7 @@ function postUserIngest(
   // B2.1 T2: posting a user prompt ARMS the mid-session pending-recall pull;
   // the daemon's 2xx is the ACK (ack-implies-ready — the ingest handler parks
   // the focal slot before answering). A rejected/nacked prompt stays armed but
-  // un-acked: the transform cannot pull a slot that never existed.
+  // un-acked: the SessionContext handler cannot pull a slot that never existed.
   const pull = pendingPull.get(sessionID) ?? { armed: false, acked: false }
   pull.armed = true
   pull.acked = false
@@ -2029,6 +2014,10 @@ function postUserIngest(
     content: { text },
     raw,
   }
+  // B2.9: the canonical `agent` field anchors the daemon's turn routing
+  // (agent-bound profile routing). The V2 host has no per-message agent; the
+  // session-level tracker supplies it live, and an untracked session stays
+  // honestly unattributed.
   if (agent) body.agent = agent
   const spid = parentIdOfSessionID(sessionParentIds, sessionID)
   if (spid !== null) body.session_parent_id = spid
@@ -2048,13 +2037,12 @@ function postUserIngest(
 function postAssistantIngest(
   sessionID: string,
   messageID: string,
-  info: any,
+  modelId: string | undefined,
   text: string,
   ts?: number,
 ): void {
   const stamp = ts ?? Date.now() / 1000
   const content: JsonRecord = { text }
-  const modelId = modelIdOf(info)
   if (modelId) content.model_id = modelId
   const astBody: JsonRecord = {
       host: HOST_ID,
@@ -2073,15 +2061,12 @@ function postAssistantIngest(
     () => {
       noteWatermark(sessionID, stamp)
       armCaptureSignal(sessionID)
-      if (messageID) unparkAssistant(sessionID, messageID)
     },
     () => {
       // failure: the fingerprint was marked at issue — roll it back and
-      // re-park so the sweep gets a retry (re-review IMPORTANT-NEW-2).
-      if (messageID) {
-        sentAssistant.delete(`${sessionID}:${messageID}`)
-        parkAssistant(sessionID, messageID)
-      }
+      // re-arm reconciliation; the un-advanced watermark makes the next
+      // reconcile replay the turn from the host's own session store.
+      if (messageID) sentAssistant.delete(`${sessionID}:${messageID}`)
       scheduleRecovery(sessionID)()
     },
   )
@@ -2156,35 +2141,11 @@ function noteConsumption(sessionID: string, text: string): void {
   }
 }
 
-// Deterministic retry for parked assistant fetches (senior QA findings 1+2):
-// the host is NOT relied on to re-fire message.updated (the last reply of a
-// session never re-fires), and settle can never overtake an outstanding
-// fetch — the sweep is AWAITED before /flush and /session/end are posted.
-// A fetch that stays textless AT the sweep is final (tool-only reply).
-async function sweepPendingAssistant(
-  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
-  sessionID: string,
-): Promise<void> {
-  const parked = pendingAssistant.get(sessionID)
-  if (parked === undefined || parked.size === 0) return
-  for (const messageID of Array.from(parked)) {
-    try {
-      const fetched = await fetchAssistantText(client, sessionID, messageID)
-      if (!fetched.ok) continue // stays parked for the next sweep
-      unparkAssistant(sessionID, messageID)
-      if (!fetched.text) continue // final verdict: genuinely textless reply
-      postAssistantIngest(sessionID, messageID, undefined, fetched.text)
-    } catch (error) {
-      console.debug("mnemoseed-local: pending sweep failed:", error)
-    }
-  }
-}
-
 // Per-session FIFO task chain (B2.2 BLOCKER): turn boundaries at the daemon
 // are cut on ARRIVAL order, so every lane that posts turn CONTENT for one
-// session — live ingest, crash replay, parked sweep — is serialized through
-// one promise chain. The replay leg is enqueued at the session's first event
-// and therefore lands strictly before that session's live posts; the hook
+// session — live ingest, crash replay — is serialized through one promise
+// chain. The replay leg is enqueued at the session's first event and
+// therefore lands strictly before that session's live posts; the hook
 // handlers themselves still await nothing on the hot path.
 const sessionChains = new Map<string, Promise<void>>()
 
@@ -2197,7 +2158,7 @@ function enqueueForSession(sessionID: string, task: () => unknown): void {
   sessionChains.set(sessionID, next)
 }
 
-// B2.2 T2: crash-resume reconciliation. Runs ONCE per session per hook
+// B2.2 T2: crash-resume reconciliation. Runs ONCE per session per plugin
 // process, lazily at the session's first event — never eagerly scanning the
 // host. Replays the tail after (watermark - overlap) from the host's own
 // persisted history through the SAME ingest lane; the overlap rides the
@@ -2206,10 +2167,7 @@ function enqueueForSession(sessionID: string, task: () => unknown): void {
 // turns live in the daemon's store, and the FIRST acked turn from now on
 // writes the watermark that makes the NEXT crash recoverable (KISS boundary;
 // the skip decision is logged in the debug lane, not silent).
-async function reconcileSession(
-  client: { session?: { messages?: (options: unknown) => Promise<unknown> } } | undefined,
-  sessionID: string,
-): Promise<void> {
+async function reconcileSession(ctx: any, sessionID: string): Promise<void> {
   if (!sessionID) return
   if (reconciledSessions.has(sessionID)) return
   try {
@@ -2221,43 +2179,42 @@ async function reconcileSession(
       reconciledSessions.set(sessionID, true)
       return
     }
-    const entries = await listSessionMessages(client, sessionID)
+    const entries = await readSessionContext(ctx, sessionID)
     if (entries === null) return // stays unflagged: retried at the next event
+    // The V2 read is compaction-bounded (only messages after the last
+    // compaction): the replay window is min(watermark - overlap, the
+    // compaction boundary). A daemon outage spanning that boundary loses the
+    // pre-compaction unacked tail — logged so the loss is never silent.
+    debugLog("reconcile window is compaction-bounded", { sessionID })
     const sinceSeconds = mark - REPLAY_OVERLAP_MS / 1000
-    for (const entry of entries) {
-      const info = entry?.info
-      const role = info?.role
+    for (const message of entries) {
       const createdS =
-        typeof info?.time?.created === "number" ? info.time.created / 1000 : undefined
+        typeof message?.time?.created === "number" ? message.time.created / 1000 : undefined
       const completedS =
-        typeof info?.time?.completed === "number"
-          ? info.time.completed / 1000
-          : typeof info?.time?.error === "number"
-            ? info.time.error / 1000
-            : undefined
-      if (role === "user" && createdS !== undefined && createdS > sinceSeconds) {
-        const text = textOf(entry?.parts)
+        typeof message?.time?.completed === "number" ? message.time.completed / 1000 : undefined
+      if (message?.type === "user" && createdS !== undefined && createdS > sinceSeconds) {
+        const text = typeof message?.text === "string" ? String(message.text).trim() : ""
         if (text) {
           const raw: JsonRecord = { replayed: true }
-          if (typeof info?.id === "string") raw.messageID = info.id
-          // The host history carries a per-message agent, so crash-recovery
-          // tails keep turn-level attribution like the live lane.
-          const agent = agentOf(info)
-          if (agent) raw.agent = agent
-          postUserIngest(sessionID, text, createdS, raw, agent)
+          if (typeof message?.id === "string") raw.messageID = message.id
+          postUserIngest(sessionID, text, createdS, raw)
         }
-      } else if (role === "assistant" && completedS !== undefined && completedS > sinceSeconds) {
-        const text = textOf(entry?.parts)
-        const messageID = typeof info?.id === "string" ? info.id : ""
-        // The live lane (completion handler / parked sweep) owns a fingerprint
-        // the moment it touches the message — replay defers to it, and a
-        // successful replay resolves anything still parked.
+      } else if (message?.type === "assistant" && completedS !== undefined && completedS > sinceSeconds) {
+        const text = assistantContentText(message?.content)
+        const messageID = typeof message?.id === "string" ? message.id : ""
+        // The live lane (step boundary handler) owns a fingerprint the moment
+        // it touches the message — replay defers to it.
         if (text && !(messageID && seen(sentAssistant, `${sessionID}:${messageID}`))) {
-          postAssistantIngest(sessionID, messageID, info, text, completedS)
-          if (messageID) unparkAssistant(sessionID, messageID)
+          postAssistantIngest(
+            sessionID,
+            messageID,
+            modelIdOfRef(modelRefOf(message?.model)),
+            text,
+            completedS,
+          )
         }
-        if (Array.isArray(entry?.parts)) {
-          for (const part of entry.parts) {
+        if (Array.isArray(message?.content)) {
+          for (const part of message.content) {
             if (part && part.type === "tool") {
               const args =
                 part.state?.input && typeof part.state.input === "object"
@@ -2265,7 +2222,7 @@ async function reconcileSession(
                   : {}
               postToolIngest(
                 sessionID,
-                String(part.tool ?? "tool"),
+                String(part.name ?? "tool"),
                 args,
                 stringifyReplayedToolOutput(part),
                 completedS,
@@ -2283,31 +2240,37 @@ async function reconcileSession(
   }
 }
 
-function stringifyReplayedToolOutput(part: any): string {
-  const output = part?.state?.output
-  let text: string
-  if (typeof output === "string") text = output
-  else if (output === undefined || output === null) text = ""
-  else {
-    try {
-      text = JSON.stringify(output)
-    } catch {
-      text = String(output)
-    }
-  }
+function truncateToolOutput(text: string): string {
   if (text.length > MAX_TOOL_OUTPUT_CHARS) {
     return `${text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[... truncated at ${MAX_TOOL_OUTPUT_CHARS} chars]`
   }
   return text
 }
 
+function stringifyReplayedToolOutput(part: any): string {
+  // V2 replayed tool parts carry state.content (text/file items) or an error
+  // string — no raw output value like the v1 parts had.
+  const state: any = part?.state
+  const content = state?.content
+  let text = ""
+  if (typeof content === "string") text = content
+  else if (Array.isArray(content)) {
+    text = content
+      .filter((item: any) => item && item.type === "text" && typeof item.text === "string")
+      .map((item: any) => String(item.text))
+      .join("\n")
+  }
+  if (!text && state?.error !== undefined && state?.error !== null) text = String(state.error)
+  return truncateToolOutput(text)
+}
+
 // ---- project-binding gate (launch-root verification). Under an explicit
-// profile env the plugin verifies ONCE, at load, that its own process cwd is
-// a root bound to that profile. This host supplies no per-event cwd, so the
-// honest capability line is launch-root-only. A conflicting binding, a cwd
-// outside every bound root, or an unreadable registry disables the whole
-// bundle for this instance (console.error refusal with restart instructions)
-// — never a silent namespace switch, never a crash.
+// profile env the plugin verifies ONCE, at setup, that the location it loaded
+// for is a root bound to that profile. This host supplies no per-event cwd,
+// so the honest capability line is launch-root-only. A conflicting binding, a
+// location outside every bound root, or an unreadable registry disables the
+// whole bundle for this instance (console.error refusal with restart
+// instructions) — never a silent namespace switch, never a crash.
 const BINDINGS_FILENAME = "project-bindings.json"
 const BINDING_RESTART_INSTRUCTION =
   "restart the host with 'mnemoseed-local project run --root <project> -- <host argv>' " +
@@ -2327,7 +2290,7 @@ function isUnderRoot(root: string, directory: string): boolean {
   return child === base || child.startsWith(base + sep)
 }
 
-function bindingRefusal(): string | null {
+function bindingRefusal(directory: string): string | null {
   // The profile VALUE is always the env selection; the registry only refuses
   // inconsistencies. No env var, no registry file: legacy behavior, unbound.
   const profile = (process.env.MNEMOSEED_LOCAL_PROFILE_ID || "").trim()
@@ -2363,11 +2326,10 @@ function bindingRefusal(): string | null {
   const roots = bindings
     .filter((entry) => entry.profile_id === profile)
     .map((entry) => entry.project_root)
-  let directory = process.cwd()
   try {
     directory = realpathSync(directory)
   } catch {
-    // the cwd of a running process is real; keep the raw spelling
+    // the launch root of a running host is real; keep the raw spelling
   }
   const bound = roots.length > 0 ? `bound root(s) for ${profile}: ${roots.join(", ")}` : "no bound root"
   const exact = bindings.find((entry) => foldRoot(entry.project_root) === foldRoot(directory))
@@ -2380,324 +2342,368 @@ function bindingRefusal(): string | null {
   return `cwd ${directory} does not match the bound project for the active profile ${profile}; ${bound}; ${BINDING_RESTART_INSTRUCTION}; ${BINDING_UNSUPPORTED_SUFFIX}`
 }
 
-export default async function MnemoSeedLocalPlugin(
-  input: { client?: unknown },
-  options?: unknown,
-) {
-  // B2.6 single bundle switch: the ["spec", { enabled: false }] plugin-array
-  // tuple short-circuits the WHOLE bundle — no hooks, no config injection
-  // (the config hook lives in the return object, so returning {} skips it).
-  if (
-    options !== null &&
-    typeof options === "object" &&
-    (options as JsonRecord)["enabled"] === false
-  ) {
-    return {}
-  }
-  const bindingRefusalText = bindingRefusal()
-  if (bindingRefusalText !== null) {
-    console.error(`mnemoseed-local: ${bindingRefusalText}`)
-    return {}
-  }
-  const client = input?.client as
-    | { session?: { messages?: (options: unknown) => Promise<unknown> } }
-    | undefined
 
-  async function onChatMessage(hookInput: any, hookOutput: any): Promise<void> {
-    try {
-      const text = textOf(hookOutput?.parts)
-      if (!text) return
-      const sessionID = String(hookInput?.sessionID ?? "")
-      if (!sessionID) return
-      // Cache the first user prompt text as the session's resume_query
-      if (!sessionFirstMessages.has(sessionID)) {
-        sessionFirstMessages.set(sessionID, text)
-      }
-      const raw: JsonRecord = {}
-      const messageID = hookInput?.messageID ?? hookOutput?.message?.id
-      if (typeof messageID === "string" && messageID) raw.messageID = messageID
-      // Origin attribution rides the canonical body `agent`; raw.agent stays
-      // one transition generation so an older daemon still sees the label.
-      const agent = agentOf(hookInput)
-      if (agent) raw.agent = agent
-      const stamp = Date.now() / 1000
-      // B2.2 lazy reconcile: enqueued FIRST so the replayed host-history tail
-      // reaches the daemon strictly before this session's live posts; both
-      // legs are fire-and-forget for the handler (T4 hot-path red line).
-      enqueueForSession(sessionID, () => reconcileSession(client, sessionID))
-      enqueueForSession(sessionID, () => postUserIngest(sessionID, text, stamp, raw, agent))
-    } catch (error) {
-      console.debug("mnemoseed-local: chat.message hook failed:", error)
-    }
-  }
+// ---- V2 event-stream capture: assistant replies arrive as session.text.ended
+// parts (one per text part, ordinal-keyed) and post at the step boundary. The
+// stream carries no per-message model info, so the session's current model is
+// tracked from session.created / session.model.selected for content.model_id.
 
-  async function onMessageCompleted(info: any): Promise<void> {
-    if (info?.role !== "assistant") return
-    const completedAt = typeof info?.time?.completed === "number" ? info.time.completed : undefined
-    const errorAt = typeof info?.time?.error === "number" ? info.time.error : undefined
-    // DEBUG: log the completion shape for abort diagnosis (senior QA finding 12b)
-    if (DEBUG) {
-      debugLog("assistant completion shape", {
-        sessionID: info?.sessionID,
-        messageID: info?.id,
-        role: info?.role,
-        hasCompleted: typeof info?.time?.completed === "number",
-        completed: info?.time?.completed,
-        hasError: !!info?.metadata?.error,
-        error: info?.metadata?.error ?? info?.error ?? null,
-      })
-    }
-    // B1 provider-failure nomination gate (message.updated with time.error or metadata.error).
-    // Fail-closed: a bare numeric time.error with no error payload never
-    // nominates — the actual error payload must be present. The classifier
-    // drops app/build/tool text and unknown status (returns null).
-    const rawError = info?.metadata?.error ?? info?.error ?? null
-    const hasProviderError = rawError != null
-    if (hasProviderError) {
-      const combined = modelIdOf(info)
-      let provider: string | undefined
-      let model: string | undefined
-      if (combined && combined.includes("/")) {
-        const slash = combined.indexOf("/")
-        provider = combined.slice(0, slash)
-        model = combined.slice(slash + 1)
-      } else if (combined) {
-        model = combined
-        provider = typeof info?.providerID === "string" ? info.providerID : undefined
-      } else {
-        provider = typeof info?.providerID === "string" ? info.providerID : undefined
-        model = typeof info?.modelID === "string" ? info.modelID : undefined
-      }
-      // The actual error payload/text leads; the numeric time.error stamp is
-      // consulted last so it can never shadow a real 429/timeout message.
-      const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? (rawError as any)?.type ?? rawError ?? errorAt
-      const sessionIDForError = String(info?.sessionID ?? "")
-      if (sessionIDForError) {
-        noteProviderFailure(sessionIDForError, provider, model, statusRaw, info?.id, rawError)
-      }
-    }
-    if (completedAt === undefined && errorAt === undefined) return
-    const sessionID = String(info?.sessionID ?? "")
-    const messageID = String(info?.id ?? "")
-    if (!sessionID || !messageID) return
-    const fingerprint = `${sessionID}:${messageID}`
-    if (seen(sentAssistant, fingerprint)) return
-    const fetched = await fetchAssistantText(client, sessionID, messageID)
-    if (!fetched.ok || !fetched.text) {
-      // Not retrievable yet (or still textless at completion): park it — the
-      // next session sweep retries (a genuinely tool-only reply is dropped
-      // for good at sweep time, after one retry).
-      parkAssistant(sessionID, messageID)
-      return
-    }
-    postAssistantIngest(sessionID, messageID, info, fetched.text)
-  }
+function assistantPartKey(sessionID: string, messageID: string): string {
+  return `${sessionID}:${messageID}`
+}
 
-  async function onBusEvent(event: any): Promise<void> {
-    try {
-      // B2.2: lazily reconcile this session once per hook process (the
-      // session's first event of any kind is the trigger), chained BEFORE
-      // the event's own content posts so replayed history lands first.
-      const triggerSession = sessionIdOfEvent(event)
-      if (triggerSession) enqueueForSession(triggerSession, () => reconcileSession(client, triggerSession))
-      switch (event?.type) {
-        case "session.created":
-        case "session.updated": {
-          const sessionID = sessionIdOfEvent(event)
-          const parentID = (event as any)?.properties?.info?.parentID
-          if (sessionID) {
-            if (typeof parentID === "string" && parentID) sessionParentIds.set(sessionID, parentID)
-            else if (!sessionParentIds.has(sessionID)) sessionParentIds.set(sessionID, null)
-          }
-          break
+function accumulateAssistantText(sessionID: string, messageID: string, ordinal: number, text: string): void {
+  const key = assistantPartKey(sessionID, messageID)
+  const parts = assistantTextParts.get(key) ?? new Map<number, string>()
+  parts.set(ordinal, text)
+  assistantTextParts.set(key, parts)
+}
+
+function assembledAssistantText(sessionID: string, messageID: string): string {
+  const parts = assistantTextParts.get(assistantPartKey(sessionID, messageID))
+  if (parts === undefined) return ""
+  return Array.from(parts.entries())
+    .sort(([left], [right]) => left - right)
+    .map(([, text]) => text)
+    .join("\n")
+    .trim()
+}
+
+// B1 provider-failure nomination over the V2 shapes: the step/execution error
+// payload leads; provider/model come from the tracked session model. The
+// classifier (normalizeProviderStatus) stays fail-closed and unchanged.
+function noteProviderFailureFromStep(sessionID: string, rawId: string, rawError: unknown): void {
+  if (rawError === null || rawError === undefined) return
+  const tracked = sessionModels.get(sessionID)
+  // The error MESSAGE leads (it carries the quota/usage nuance the bare
+  // numeric status cannot); the structured status is the fallback, mirroring
+  // the v1 payload-leads contract.
+  const statusRaw =
+    (rawError as any)?.message ??
+    (rawError as any)?.code ??
+    (rawError as any)?.type ??
+    (rawError as any)?.status ??
+    rawError
+  noteProviderFailure(
+    sessionID,
+    tracked?.providerID as string | undefined,
+    tracked?.id as string | undefined,
+    statusRaw,
+    rawId,
+    rawError,
+  )
+}
+
+// The step boundary assembles and posts the accumulated reply text exactly
+// once (the fingerprint also covers the replay lane). A failed step posts its
+// partial text the same way — the error path still produced real content.
+async function settleAssistantStep(event: any, failed: boolean): Promise<void> {
+  const data: any = event?.data ?? {}
+  const sessionID = String(data?.sessionID ?? "")
+  const messageID = String(data?.assistantMessageID ?? "")
+  if (!sessionID || !messageID) return
+  // DEBUG: log the boundary shape for abort diagnosis
+  if (DEBUG) {
+    debugLog("assistant step shape", {
+      sessionID,
+      messageID,
+      failed,
+      finish: data?.finish,
+      hasError: data?.error != null,
+      error: data?.error ?? null,
+    })
+  }
+  if (failed) noteProviderFailureFromStep(sessionID, messageID, data?.error)
+  const text = assembledAssistantText(sessionID, messageID)
+  assistantTextParts.delete(assistantPartKey(sessionID, messageID))
+  if (!text) return
+  const fingerprint = `${sessionID}:${messageID}`
+  if (seen(sentAssistant, fingerprint)) return
+  const createdMs = typeof event?.created === "number" ? event.created : Date.now()
+  postAssistantIngest(sessionID, messageID, modelIdOfRef(sessionModels.get(sessionID)), text, createdMs / 1000)
+}
+
+async function onBusEvent(event: any): Promise<void> {
+  try {
+    const type = String(event?.type ?? "")
+    const data: any = event?.data ?? {}
+    const sessionID = typeof data?.sessionID === "string" ? data.sessionID : ""
+    // B2.2: lazily reconcile this session once per plugin process (the
+    // session's first event of any kind is the trigger), chained BEFORE the
+    // event's own content posts so replayed turns land first.
+    if (sessionID) enqueueForSession(sessionID, () => reconcileSession(pluginCtx, sessionID))
+    switch (type) {
+      case "session.created":
+      case "session.forked": {
+        if (sessionID) {
+          const parentID = data?.parentID
+          if (typeof parentID === "string" && parentID) sessionParentIds.set(sessionID, parentID)
+          else if (!sessionParentIds.has(sessionID)) sessionParentIds.set(sessionID, null)
+          const model = modelRefOf(data?.model)
+          if (model) sessionModels.set(sessionID, model)
+          const agent = data?.agent
+          if (typeof agent === "string" && agent) sessionAgents.set(sessionID, agent)
         }
-        case "message.updated": {
-          const sessionID = sessionIdOfEvent(event)
-          if (sessionID) {
-            enqueueForSession(sessionID, () => onMessageCompleted(event?.properties?.info))
-          } else {
-            await onMessageCompleted(event?.properties?.info)
-          }
-          break
-        }
-        case "session.idle":
-        case "session.error": {
-          const sessionID = sessionIdOfEvent(event)
-          // B1: session.error may carry provider failure; nominate before flush
-          if (event?.type === "session.error") {
-            const props: any = (event as any)?.properties ?? {}
-            const info: any = props.info ?? props
-            const rawError = props.error ?? info?.metadata?.error ?? info?.error ?? props
-            const combined = modelIdOf(info)
-            let provider: string | undefined
-            let model: string | undefined
-            if (combined && combined.includes("/")) {
-              const slash = combined.indexOf("/")
-              provider = combined.slice(0, slash)
-              model = combined.slice(slash + 1)
-            } else if (combined) {
-              model = combined
-              provider = typeof info?.providerID === "string" ? info.providerID : undefined
-            } else {
-              provider = typeof info?.providerID === "string" ? info.providerID : (typeof props.providerID === "string" ? props.providerID : undefined)
-              model = typeof info?.modelID === "string" ? info.modelID : (typeof props.modelID === "string" ? props.modelID : undefined)
-            }
-            const statusRaw = (rawError as any)?.status ?? (rawError as any)?.code ?? (rawError as any)?.message ?? rawError
-            const rawId = (info as any)?.id ?? (props as any)?.sessionID ?? sessionID
-            if (sessionID) {
-              // fire-and-forget nomination; debounce is hook-local
-              noteProviderFailure(sessionID, provider, model, statusRaw, rawId, rawError)
-            }
-          }
-          enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
-          await persistWatermarks()
-          enqueueForSession(sessionID, () => flushSession(sessionID))
-          break
-        }
-        case "session.deleted": {
-          const sessionID = sessionIdOfEvent(event)
-          // B2.1 T1/T2/T3 lifecycle cleanup: a settled session's injection
-          // gate, consumption registry, cited set, pending-recall arm and T1
-          // seen list are dropped with it.
-          injectedSessions.delete(sessionID)
-          injectedRegistry.delete(sessionID)
-          citedChunks.delete(sessionID)
-          pendingPull.delete(sessionID)
-          t1InjectedChunkIds.delete(sessionID)
-          firstCaptureSeen.delete(sessionID)
-          lastVisibilityMode.delete(sessionID)
-          sessionParentIds.delete(sessionID)
-          sessionFirstMessages.delete(sessionID)
-          enqueueForSession(sessionID, () => sweepPendingAssistant(client, sessionID))
-          await persistWatermarks()
-          enqueueForSession(sessionID, () => settle(sessionID))
-          break
-        }
-        default:
-          break
+        break
       }
-    } catch (error) {
-      console.debug("mnemoseed-local: event hook failed:", error)
-    }
-  }
-
-  async function onSessionCompacting(hookInput: any): Promise<void> {
-    try {
-      const sessionID = String(hookInput?.sessionID ?? "")
-      if (sessionID) post("/flush", { session_id: sessionID, profile_id: PROFILE_ID })
-      void persistWatermarks()
-    } catch (error) {
-      console.debug("mnemoseed-local: session.compacting hook failed:", error)
-    }
-  }
-
-  function stringifyToolOutput(value: unknown): string {
-    let text: string
-    if (typeof value === "string") text = value
-    else if (value === undefined || value === null) text = ""
-    else {
-      try {
-        text = JSON.stringify(value)
-      } catch {
-        text = String(value)
+      case "session.agent.selected": {
+        const agent = data?.agent
+        if (sessionID && typeof agent === "string" && agent) sessionAgents.set(sessionID, agent)
+        break
       }
-    }
-    if (text.length > MAX_TOOL_OUTPUT_CHARS) {
-      return `${text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[... truncated at ${MAX_TOOL_OUTPUT_CHARS} chars]`
-    }
-    return text
-  }
-
-  async function onToolExecuteAfter(hookInput: any, hookOutput: any): Promise<void> {
-    try {
-      const sessionID = String(hookInput?.sessionID ?? "")
-      if (!sessionID) return
-      const args =
-        hookInput?.args && typeof hookInput.args === "object" ? (hookInput.args as JsonRecord) : {}
-      const raw: JsonRecord = {}
-      if (typeof hookInput?.callID === "string" && hookInput.callID) raw.callID = hookInput.callID
-      const stamp = Date.now() / 1000
-      const toolName = String(hookInput?.tool ?? "")
-      const output = stringifyToolOutput(hookOutput?.output)
-      enqueueForSession(sessionID, () => reconcileSession(client, sessionID))
-      enqueueForSession(sessionID, () => postToolIngest(sessionID, toolName, args, output, stamp, raw))
-    } catch (error) {
-      console.debug("mnemoseed-local: tool.execute.after hook failed:", error)
-    }
-  }
-  return {
-    // B2.6 bundling: register the daemon's MCP server into the loading host's
-    // config. Create-if-absent at BOTH levels — cfg.mcp ??= {} (the map) and
-    // the entry — so a user's existing manual "mnemoseed" registration (README
-    // §MCP gateway) wins untouched; the factory stdio entry this bundle's
-    // older versions injected is rewritten to the remote HTTP entry with its
-    // enabled flag preserved.
-    "config": async (cfg: any): Promise<void> => {
-      try {
-        if (cfg === null || typeof cfg !== "object") return
-        const mcp = (cfg.mcp ??= {}) as Record<string, unknown>
-        installMcpEntry(mcp)
-      } catch (error) {
-        console.debug("mnemoseed-local: config hook failed:", error)
+      case "session.model.selected": {
+        const model = modelRefOf(data?.model)
+        if (sessionID && model) sessionModels.set(sessionID, model)
+        break
       }
-    },
-    "chat.message": async (hookInput: any, hookOutput: any) => onChatMessage(hookInput, hookOutput),
-    "chat.system.transform": async (hookInput: any, hookOutput: any) =>
-      onChatSystemTransform(hookInput, hookOutput),
-    // The bus dispatcher voids this promise: awaiting the parts fetch here
-    // never blocks the host.
-    event: async ({ event }: { event: unknown }) => onBusEvent(event),
-    "tool.execute.after": async (hookInput: any, hookOutput: any) =>
-      onToolExecuteAfter(hookInput, hookOutput),
-    "experimental.session.compacting": async (hookInput: any) => onSessionCompacting(hookInput),
-    ...(process.env.MNEMOSEED_LOCAL_WATERMARK_TEST === "1"
-      ? {
-          __watermarkTest: {
-            shardPath: () => WATERMARK_SHARD_PATH,
-            shardBasename: () => WATERMARK_SHARD_BASENAME,
-            // Delegates straight to the production entry (no cache
-            // pre-initialization) so pre-load accumulation is exercised.
-            note: (sessionID: string, tsSeconds: number) => {
-              noteWatermark(sessionID, tsSeconds)
-            },
-            persist: () => persistWatermarks(),
-            load: async () => {
-              if (watermarksCache === null) await loadWatermarks()
-              const disk = await readMergedWatermarksFromDisk()
-              const view: Record<string, number> = { ...(watermarksCache ?? {}) }
-              for (const [key, value] of Object.entries(disk)) {
-                const prev = view[key] ?? 0
-                if (value > prev) view[key] = value
-              }
-              watermarksCache = view
-              return { ...view }
-            },
-            setRenameFault: (mode: string) => {
-              watermarkRenameFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
-            },
-            setUnlinkFault: (mode: string) => {
-              watermarkUnlinkFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
-            },
-            setLivenessFault: (mode: string) => {
-              watermarkLivenessFault = mode === "dead" ? "dead" : "off"
-            },
-            runGc: () => collectWatermarkGarbage(),
-            runStaleSweep: (force: boolean) => sweepStaleWatermarkArtifacts(force === true),
-            maxConcurrency: () => persistInnerMaxActive,
-            armIoBarrier: () => {
-              armWatermarkIoBarrier()
-            },
-            whenPaused: () => {
-              if (watermarkIoBarrierHit) return Promise.resolve()
-              return new Promise<void>((resolve) => {
-                watermarkIoBarrierWaiters.push(resolve)
-              })
-            },
-            releaseBarrier: () => {
-              watermarkIoBarrierRelease()
-            },
-          },
+      case "session.text.ended": {
+        const messageID = String(data?.assistantMessageID ?? "")
+        const ordinal = typeof data?.ordinal === "number" ? data.ordinal : 0
+        const text = typeof data?.text === "string" ? data.text : ""
+        if (sessionID && messageID && text) accumulateAssistantText(sessionID, messageID, ordinal, text)
+        break
+      }
+      case "session.step.ended": {
+        enqueueForSession(sessionID, () => settleAssistantStep(event, false))
+        break
+      }
+      case "session.step.failed": {
+        enqueueForSession(sessionID, () => settleAssistantStep(event, true))
+        break
+      }
+      case "session.idle":
+      case "session.execution.failed": {
+        // B1: execution failure may carry provider failure; nominate before flush
+        if (type === "session.execution.failed") {
+          noteProviderFailureFromStep(sessionID, sessionID, data?.error)
         }
-      : {}),
+        await persistWatermarks()
+        enqueueForSession(sessionID, () => flushSession(sessionID))
+        break
+      }
+      case "session.deleted": {
+        // B2.1 T1/T2/T3 lifecycle cleanup: a settled session's injection
+        // gate, consumption registry, cited set, pending-recall arm and T1
+        // seen list are dropped with it.
+        injectedSessions.delete(sessionID)
+        injectedRegistry.delete(sessionID)
+        citedChunks.delete(sessionID)
+        pendingPull.delete(sessionID)
+        t1InjectedChunkIds.delete(sessionID)
+        firstCaptureSeen.delete(sessionID)
+        lastVisibilityMode.delete(sessionID)
+        sessionParentIds.delete(sessionID)
+        sessionFirstMessages.delete(sessionID)
+        sessionModels.delete(sessionID)
+        sessionAgents.delete(sessionID)
+        await persistWatermarks()
+        enqueueForSession(sessionID, () => settle(sessionID))
+        break
+      }
+      default:
+        break
+    }
+  } catch (error) {
+    console.debug("mnemoseed-local: event hook failed:", error)
   }
 }
+
+async function onSessionCompacting(event: any): Promise<void> {
+  try {
+    const sessionID = String(event?.sessionID ?? "")
+    if (sessionID) post("/flush", { session_id: sessionID, profile_id: PROFILE_ID })
+    void persistWatermarks()
+  } catch (error) {
+    console.debug("mnemoseed-local: session compaction hook failed:", error)
+  }
+}
+
+function stringifyToolOutput(value: unknown): string {
+  let text: string
+  if (typeof value === "string") text = value
+  else if (value === undefined || value === null) text = ""
+  else {
+    try {
+      text = JSON.stringify(value)
+    } catch {
+      text = String(value)
+    }
+  }
+  return truncateToolOutput(text)
+}
+
+// The V2 tool result carries content (text/file items) and optionally a raw
+// output value; the error status carries the tool error instead.
+function toolResultText(event: any): string {
+  const result: any = event?.result
+  if (event?.status === "error") return stringifyToolOutput(event?.error)
+  if (result === null || result === undefined) return ""
+  if (typeof result.output === "string") return result.output
+  const content = result.content
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((item: any) => item && item.type === "text" && typeof item.text === "string")
+      .map((item: any) => String(item.text))
+      .join("\n")
+  }
+  return stringifyToolOutput(result)
+}
+
+async function onToolExecuteAfter(event: any): Promise<void> {
+  try {
+    const sessionID = String(event?.sessionID ?? "")
+    if (!sessionID) return
+    const args = event?.input && typeof event.input === "object" ? (event.input as JsonRecord) : {}
+    const raw: JsonRecord = {}
+    if (typeof event?.id === "string" && event.id) raw.callID = event.id
+    const stamp = Date.now() / 1000
+    const toolName = String(event?.tool ?? "")
+    const output = toolResultText(event)
+    enqueueForSession(sessionID, () => reconcileSession(pluginCtx, sessionID))
+    enqueueForSession(sessionID, () => postToolIngest(sessionID, toolName, args, output, stamp, raw))
+  } catch (error) {
+    console.debug("mnemoseed-local: tool execute.after hook failed:", error)
+  }
+}
+
+async function onPromptAdmitted(event: any): Promise<void> {
+  try {
+    const text = String(event?.prompt?.text ?? "").trim()
+    if (!text) return
+    const sessionID = String(event?.sessionID ?? "")
+    if (!sessionID) return
+    // Cache the first user prompt text as the session's resume_query
+    if (!sessionFirstMessages.has(sessionID)) {
+      sessionFirstMessages.set(sessionID, text)
+    }
+    const raw: JsonRecord = {}
+    const messageID = event?.messageID
+    if (typeof messageID === "string" && messageID) raw.messageID = messageID
+    const stamp = Date.now() / 1000
+    // B2.9: the session's agent at admission time is the agent this prompt is
+    // admitted under — the daemon's agent-bound profile routing rides it. An
+    // untracked session stays honestly unattributed.
+    const agent = sessionAgents.get(sessionID)
+    // B2.2 lazy reconcile: enqueued FIRST so the replayed host tail
+    // reaches the daemon strictly before this session's live posts; both
+    // legs are fire-and-forget for the handler (T4 hot-path red line).
+    enqueueForSession(sessionID, () => reconcileSession(pluginCtx, sessionID))
+    enqueueForSession(sessionID, () => postUserIngest(sessionID, text, stamp, raw, agent))
+  } catch (error) {
+    console.debug("mnemoseed-local: prompt hook failed:", error)
+  }
+}
+
+// The V2 plugin definition. The loader validates the default export's
+// "id" string + "setup" function and runs setup once with the plugin
+// ctx; every registration rides it and the returned cleanup aborts
+// the event subscription. The module stays dependency-free: Plugin.define()
+// is the identity function, so the plain object literal is the definition.
+let pluginCtx: any = undefined
+
+export default {
+  id: "mnemoseed-local",
+  setup(ctx: any): () => void {
+    // Single bundle switch: an explicit options.enabled === false registers
+    // nothing — no hooks, no MCP injection (the V2 { package, options } entry).
+    if (
+      ctx?.options !== null &&
+      typeof ctx?.options === "object" &&
+      (ctx.options as JsonRecord)["enabled"] === false
+    ) {
+      return () => {}
+    }
+    const bindingRefusalText = bindingRefusal(String(ctx?.location?.directory ?? process.cwd()))
+    if (bindingRefusalText !== null) {
+      console.error(`mnemoseed-local: ${bindingRefusalText}`)
+      return () => {}
+    }
+    pluginCtx = ctx
+
+    // The prompt and SessionContext hooks are awaited by the host on the admission
+    // and model-call paths — they must fail open like every sibling (the
+    // handlers catch internally) and stay fire-and-forget on the daemon POSTs.
+    // A failed registration (unknown hook designator on a drifted host) is
+    // logged, never an unhandled rejection.
+    const register = (lane: string, registration: Promise<unknown>): void => {
+      void registration.catch((error: unknown) =>
+        console.debug(`mnemoseed-local: ${lane} registration failed:`, error),
+      )
+    }
+    register("prompt hook", ctx.session.hook("prompt", (event: any) => onPromptAdmitted(event)))
+    register("context hook", ctx.session.hook("context", (event: any) => onSessionContext(event)))
+    register("compaction hook", ctx.session.hook("compaction", (event: any) => onSessionCompacting(event)))
+    register("tool hook", ctx.tool.hook("execute.after", (event: any) => onToolExecuteAfter(event)))
+    try {
+      register("mcp transform", ctx.mcp.transform((editor: any) => installMcpEntry(editor)))
+    } catch (error) {
+      console.debug("mnemoseed-local: mcp transform failed:", error)
+    }
+
+    // The bus dispatcher runs this loop detached: awaiting the parts
+    // assembly never blocks the host. Unknown event types fall through the
+    // switch's default arm; per-event faults are swallowed fail-open.
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          await onBusEvent(event)
+        }
+      } catch (error) {
+        console.debug("mnemoseed-local: event subscription failed:", error)
+      }
+    })()
+    return () => controller.abort()
+  },
+}
+
+// Opt-in watermark test seam (env-gated named export — the host loader only
+// reads the default export's id/setup). Delegates straight to the production
+// entries (no cache pre-initialization) so pre-load accumulation is exercised.
+export const __watermarkTest =
+  process.env.MNEMOSEED_LOCAL_WATERMARK_TEST === "1"
+    ? {
+        shardPath: () => WATERMARK_SHARD_PATH,
+        shardBasename: () => WATERMARK_SHARD_BASENAME,
+        note: (sessionID: string, tsSeconds: number) => {
+          noteWatermark(sessionID, tsSeconds)
+        },
+        persist: () => persistWatermarks(),
+        load: async () => {
+          if (watermarksCache === null) await loadWatermarks()
+          const disk = await readMergedWatermarksFromDisk()
+          const view: Record<string, number> = { ...(watermarksCache ?? {}) }
+          for (const [key, value] of Object.entries(disk)) {
+            const prev = view[key] ?? 0
+            if (value > prev) view[key] = value
+          }
+          watermarksCache = view
+          return { ...view }
+        },
+        setRenameFault: (mode: string) => {
+          watermarkRenameFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
+        },
+        setUnlinkFault: (mode: string) => {
+          watermarkUnlinkFault = mode === "once" ? "once" : mode === "always" ? "always" : "off"
+        },
+        setLivenessFault: (mode: string) => {
+          watermarkLivenessFault = mode === "dead" ? "dead" : "off"
+        },
+        runGc: () => collectWatermarkGarbage(),
+        runStaleSweep: (force: boolean) => sweepStaleWatermarkArtifacts(force === true),
+        maxConcurrency: () => persistInnerMaxActive,
+        armIoBarrier: () => {
+          armWatermarkIoBarrier()
+        },
+        whenPaused: () => {
+          if (watermarkIoBarrierHit) return Promise.resolve()
+          return new Promise<void>((resolve) => {
+            watermarkIoBarrierWaiters.push(resolve)
+          })
+        },
+        releaseBarrier: () => {
+          watermarkIoBarrierRelease()
+        },
+      }
+    : undefined
