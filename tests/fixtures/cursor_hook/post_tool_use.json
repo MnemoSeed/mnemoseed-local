@@ -1,0 +1,1 @@
+{"hook_event_name":"postToolUse","conversation_id":"cur-conv-01","generation_id":"gen-0003","model":"gpt-5","workspace_roots":["G:/dev/demo"],"transcript_path":"G:/dev/demo/.cursor/transcripts/cur-conv-01.jsonl","tool_name":"Terminal","tool_input":{"command":"uv run pytest -q"},"tool_output":"938 passed, 5 skipped","cwd":"G:/dev/demo","duration":420}

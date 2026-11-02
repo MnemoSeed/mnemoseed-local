@@ -1,0 +1,1 @@
+{"hook_event_name":"sessionEnd","conversation_id":"cur-conv-01","generation_id":"gen-0006","model":"gpt-5","workspace_roots":["G:/dev/demo"],"transcript_path":"G:/dev/demo/.cursor/transcripts/cur-conv-01.jsonl","session_id":"cur-conv-01","reason":"completed","duration_ms":42000,"is_background_agent":false,"final_status":"completed","error_message":null}
