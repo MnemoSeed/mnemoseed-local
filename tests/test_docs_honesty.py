@@ -1,6 +1,6 @@
 """Docs honesty invariants.
 
-The public README and the Chinese MVP docs make present-tense product claims;
+The public overview, linked guide, and Chinese MVP docs make product claims;
 these tests pin the claims that drifted from shipped reality, so a stale claim
 cannot silently return. They assert documented surface, not editorial wording.
 """
@@ -12,6 +12,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+GUIDE_PATH = REPO_ROOT / "docs" / "guide.md"
+GUIDE = GUIDE_PATH.read_text(encoding="utf-8")
+PUBLIC_TEXT = "\n".join((README, GUIDE))
 ZH_README = (REPO_ROOT / "docs" / "zh" / "README.md").read_text(encoding="utf-8")
 ZH_MVP = (REPO_ROOT / "docs" / "zh" / "MVP.md").read_text(encoding="utf-8")
 ZH_DESIGN_07 = (REPO_ROOT / "docs" / "zh" / "design" / "07-durability-and-reliability.md").read_text(
@@ -25,50 +28,53 @@ def test_readme_does_not_teach_the_removed_supervisor_chain() -> None:
         "supervise.ps1",
         'Register-ScheduledTask -TaskName "MnemoSeedLocalDaemon"',
     ):
-        assert gone not in README, f"README still teaches the removed supervisor chain: {gone!r}"
+        assert gone not in PUBLIC_TEXT, f"Public docs still teach the removed supervisor chain: {gone!r}"
 
 
 def test_readme_documents_manual_restart_recovery() -> None:
-    assert "does not auto-restart" in README
-    assert "mnemoseed-local up" in README
+    assert "does not auto-restart" in GUIDE
+    assert "mnemoseed-local up" in GUIDE
 
 
 def test_readme_does_not_claim_opus_class_local_inference() -> None:
-    assert "Opus-class" not in README
+    assert "Opus-class" not in PUBLIC_TEXT
 
 
 def test_readme_does_not_claim_no_model_runs_at_ingest() -> None:
-    lowered = README.lower()
+    lowered = PUBLIC_TEXT.lower()
     for gone in (
         "no model at ingest",
         "no model runs at ingest",
         "no model runs on ingest",
     ):
-        assert gone not in lowered, f"README still claims no model runs at ingest: {gone!r}"
+        assert gone not in lowered, f"Public docs still claim no model runs at ingest: {gone!r}"
 
 
 def test_readme_does_not_claim_memory_plaintext_never_leaves_local_storage() -> None:
-    lowered = README.lower()
+    lowered = PUBLIC_TEXT.lower()
     for gone in ("never leaves the machine", "never leaves the disk"):
-        assert gone not in lowered, f"README still claims plaintext {gone}: {gone!r}"
+        assert gone not in lowered, f"Public docs still claim plaintext {gone}: {gone!r}"
 
 
 def test_readme_does_not_attribute_prev_version_id_to_corrections_or_supersedes() -> None:
-    lowered = README.lower()
+    lowered = PUBLIC_TEXT.lower()
     sentences = [
         sentence
         for sentence in re.split(r"[.!?]", " ".join(lowered.split()))
         if "prev_version_id" in sentence
     ]
-    assert sentences, "README must document prev_version_id for this rule to hold"
+    assert "prev_version_id" in GUIDE, "The linked guide must document the version-history field"
+    assert sentences, "Public docs must document prev_version_id for this rule to hold"
     for sentence in sentences:
-        assert "correction" not in sentence, f"README credits prev_version_id to a correction: {sentence!r}"
-        assert "supersed" not in sentence, f"README credits prev_version_id to a supersede: {sentence!r}"
+        assert "correction" not in sentence, (
+            f"Public docs credit prev_version_id to a correction: {sentence!r}"
+        )
+        assert "supersed" not in sentence, f"Public docs credit prev_version_id to a supersede: {sentence!r}"
 
 
 def test_readme_names_the_not_yet_surface() -> None:
     assert "What it does NOT do yet" in README
-    lowered = README.lower()
+    lowered = PUBLIC_TEXT.lower()
     assert "learns from mistakes" not in lowered
 
 
@@ -88,14 +94,14 @@ def test_design_07_contains_no_supervisor_chain_teaching() -> None:
 
 
 def test_readme_documents_the_daemon_credential_boundary() -> None:
-    assert "## Daemon credential" in README
-    assert "mnemoseed-local credential rotate" in README
-    assert "uninstall --purge" in README
-    assert "does **not** defend against" in README
+    assert "## Daemon credential" in GUIDE
+    assert "mnemoseed-local credential rotate" in GUIDE
+    assert "uninstall --purge" in GUIDE
+    assert "does **not** defend against" in GUIDE
     # naming discipline: the credential is never called a token
-    lowered = README.lower()
+    lowered = PUBLIC_TEXT.lower()
     for phrase in ("bearer token", "auth token", "access token", "refresh token"):
-        assert phrase not in lowered, f"README still calls the daemon credential a token: {phrase!r}"
+        assert phrase not in lowered, f"Public docs still call the daemon credential a token: {phrase!r}"
 
 
 def test_design_04_documents_the_credential_boundary_and_its_threat_model() -> None:
@@ -134,9 +140,9 @@ def test_readme_tools_line_matches_the_gateway_tool_schemas() -> None:
 
     documented = {
         name: [part.strip() for part in params.split(",") if part.strip()]
-        for name, params in re.findall(r"`(\w+)\(([^)]*)\)`", README)
+        for name, params in re.findall(r"`(\w+)\(([^)]*)\)`", GUIDE)
     }
-    assert documented, "README must spell out the gateway tools"
+    assert documented, "The linked guide must spell out the gateway tools"
 
     for tool in TOOLS:
         schema = tool["inputSchema"]
@@ -157,3 +163,30 @@ def test_zh_mvp_does_not_claim_manual_only_dream() -> None:
 
 def test_zh_mvp_does_not_defer_installation() -> None:
     assert "一键安装属后续阶段" not in ZH_MVP
+
+
+def test_overview_links_to_the_complete_guide_and_valid_sections() -> None:
+    """Entry navigation must keep relocated details reachable from the overview."""
+    links = re.findall(r"\]\((docs/guide\.md(?:#[^)]+)?)\)", README)
+    assert "docs/guide.md" in links, "The overview must link directly to the complete guide"
+    assert GUIDE_PATH.is_file()
+    anchors = {
+        re.sub(r"[^\w -]", "", heading.lower()).replace(" ", "-")
+        for heading in re.findall(r"^#{1,6} +(.+)$", GUIDE, flags=re.MULTILINE)
+    }
+    for link in links:
+        if "#" in link:
+            assert link.split("#", 1)[1] in anchors, f"Broken guide entry point: {link}"
+    for anchor in ("host-setup", "dream-model-setup", "mcp-gateway", "daemon-credential", "daemon-lifecycle"):
+        assert f"docs/guide.md#{anchor}" in links, f"The overview must expose {anchor}"
+    assert "](../README.md)" in GUIDE, "The guide must link back to the overview"
+
+
+def test_public_docs_use_the_source_install_route_and_correct_manual_dream_command() -> None:
+    for document in (README, GUIDE):
+        assert 'uv tool install --python 3.12 --force ".[codex]"' in document
+        assert "init --mode capture-recall" in document
+        assert "not yet published" in document and "PyPI" in document
+        assert "dream once" not in document
+    assert "dream --once" in GUIDE
+    assert GUIDE.index("## Install from source") < GUIDE.index("## Package-index installers")
