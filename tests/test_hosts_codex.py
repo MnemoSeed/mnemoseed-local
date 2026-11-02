@@ -888,6 +888,26 @@ FOREIGN_TOML = (
     'trust_level = "trusted"\n'
 )
 
+#: A foreign multiline string whose body merely contains the canonical table
+#: header text (a bootstrap script echoing a config) — never our table.
+FOREIGN_SCRIPT_TOML = (
+    "# user tuning\n"
+    'model = "gpt-5-codex"\n'
+    "\n"
+    '[projects."G:/dev/demo"]\n'
+    'trust_level = "trusted"\n'
+    "\n"
+    "[agent.bootstrap]\n"
+    'script = """\n'
+    "#!/bin/sh\n"
+    "cat > \"$CODEX_HOME/config.toml\" <<'EOF'\n"
+    "[mcp_servers.mnemoseed]\n"
+    'command = "mnemoseed-local"\n'
+    'args = ["mcp"]\n'
+    "EOF\n"
+    '"""\n'
+)
+
 #: Our gateway table as a previous install left it (same keys, stale command).
 STALE_MCP_BLOCK = '[mcp_servers.mnemoseed]\ncommand = "C:/tools/stale.exe"\nargs = ["mcp"]\n'
 
@@ -915,11 +935,11 @@ def _nested(hooks: dict[str, Any]) -> dict[str, Any]:
 
 def _own_commands(hooks: dict[str, Any]) -> list[str]:
     """Every marker-matched command in the nested container and in the legacy
-    flat root shape."""
+    flat root shape, across every event present."""
     containers = [_nested(hooks), {key: value for key, value in hooks.items() if key != "hooks"}]
     found: list[str] = []
     for container in containers:
-        for event in cx_install.HOOK_EVENTS:
+        for event in container:
             groups = container.get(event)
             if not isinstance(groups, list):
                 continue
@@ -1125,6 +1145,60 @@ def test_uninstall_strips_owned_entries_from_both_shapes(
     assert remaining == {"hooks": {"Stop": [_group([dict(FOREIGN_HANDLER)], matcher="Bash")]}}
 
 
+def test_uninstall_sweeps_owned_handlers_from_unregistered_events(
+    cx_home: Path, stable_command: tuple[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Config drift can leave our handlers under an event this installer never
+    registers: uninstall still removes exactly those, foreign handlers in the
+    same event keep their group metadata, and kept foreign commands that
+    merely mention the marker are noted on unregistered events too."""
+    _, command = stable_command
+    drift_foreign = _handler_for("mnemoseed-local-helper.exe watch")
+    drifted = {
+        "hooks": {
+            "Stop": [_FOREIGN_STOP],
+            "PreToolUse": [
+                _group([_handler_for(command), drift_foreign], matcher="Bash|Write"),
+                _group([_handler_for(LEGACY_OWN_SHIM)], matcher="Read"),
+            ],
+            "Notification": [_group([_handler_for(command)])],
+        },
+    }
+    hooks_file = _seed_hooks(cx_home, drifted)
+    _, existed = cx_install.uninstall()
+    assert existed is True, "the sweep must report the drift it removed"
+    remaining = json.loads(hooks_file.read_text(encoding="utf-8"))
+    assert remaining == {
+        "hooks": {
+            "Stop": [_FOREIGN_STOP],
+            "PreToolUse": [
+                _group([drift_foreign], matcher="Bash|Write"),
+                _group([], matcher="Read"),
+            ],
+        }
+    }, "the foreign handler, its matcher and the metadata-only group survive"
+    assert _own_commands(remaining) == []
+    assert "mnemoseed-local-helper" in capsys.readouterr().err
+
+
+def test_uninstall_sweeps_flat_root_drift_from_unregistered_events(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    """The historical flat shape gets the same whole-document sweep."""
+    hooks_file = _seed_hooks(
+        cx_home,
+        {
+            "PreToolUse": [_group([_handler_for(LEGACY_OWN_MODULE), dict(FOREIGN_HANDLER)])],
+            "Notification": [_group([_handler_for(LEGACY_OWN_SHIM)])],
+        },
+    )
+    _, existed = cx_install.uninstall()
+    assert existed is True
+    remaining = json.loads(hooks_file.read_text(encoding="utf-8"))
+    assert remaining == {"PreToolUse": [_group([dict(FOREIGN_HANDLER)])]}
+    assert _own_commands(remaining) == []
+
+
 def test_dry_run_previews_without_writing(cx_home: Path, stable_command: tuple[str, str]) -> None:
     hooks_file = _seed_hooks(cx_home, FOREIGN_HOOKS)
     seeded = hooks_file.read_text(encoding="utf-8")
@@ -1267,6 +1341,76 @@ def test_foreign_keys_under_our_mcp_table_refuse(cx_home: Path, stable_command: 
     with pytest.raises(cx_install.ConfigParseError):
         cx_install.install()
     assert config.read_text(encoding="utf-8") == original
+
+
+def test_foreign_multiline_string_with_table_text_survives_install_and_uninstall(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    """A foreign multiline string that merely contains the canonical table
+    header text is not the MCP table: install appends the real table without
+    touching the string, uninstall removes exactly that table, and the foreign
+    bytes round-trip unchanged."""
+    config = cx_home / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(FOREIGN_SCRIPT_TOML, encoding="utf-8")
+    seeded = config.read_text(encoding="utf-8")
+    exe, _ = stable_command
+    _, changed = cx_install.install()
+    assert changed is True, "install must not refuse or no-op on the foreign string"
+    written = config.read_text(encoding="utf-8")
+    assert written.startswith(seeded), "the foreign bytes stay ahead of our block"
+    entry = tomllib.loads(written)["mcp_servers"]["mnemoseed"]
+    assert entry == {"command": exe, "args": ["mcp"]}, "the real table lands, not the string text"
+    _, existed = cx_install.uninstall()
+    assert existed is True
+    assert config.read_text(encoding="utf-8") == seeded
+
+
+def test_uninstall_recovers_the_real_table_behind_a_foreign_string(
+    cx_home: Path, stable_command: tuple[str, str]
+) -> None:
+    """Header text inside an earlier foreign string must not hijack the line
+    span: uninstall removes the real table that follows and keeps the string
+    bytes, instead of refusing on a broken rewrite."""
+    config = cx_home / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(FOREIGN_SCRIPT_TOML + "\n" + STALE_MCP_BLOCK, encoding="utf-8")
+    _, existed = cx_install.uninstall()
+    assert existed is True
+    assert config.read_text(encoding="utf-8") == FOREIGN_SCRIPT_TOML + "\n", (
+        "only the real table goes; the string and the blank separator line survive"
+    )
+
+
+@pytest.mark.parametrize("break_hooks", [True, False])
+def test_drifted_unregistered_events_still_refuse_before_any_write(
+    cx_home: Path, stable_command: tuple[str, str], break_hooks: bool
+) -> None:
+    """The whole-document sweep never jumps the pre-validation gate: a
+    malformed file on either side refuses install and uninstall with both
+    files byte-identical."""
+    _, command = stable_command
+    drifted = {
+        "hooks": {
+            "Stop": [_FOREIGN_STOP],
+            "Notification": [_group([_handler_for(command)])],
+        },
+    }
+    hooks_file = _seed_hooks(cx_home, drifted)
+    config = cx_home / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if break_hooks:
+        hooks_file.write_text("{broken", encoding="utf-8")
+        config.write_text(FOREIGN_SCRIPT_TOML, encoding="utf-8")
+    else:
+        config.write_text(FOREIGN_SCRIPT_TOML + "\n[broken\n", encoding="utf-8")
+    hooks_before, config_before = _digest(hooks_file), _digest(config)
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.install()
+    with pytest.raises(cx_install.ConfigParseError):
+        cx_install.uninstall()
+    assert _digest(hooks_file) == hooks_before
+    assert _digest(config) == config_before
 
 
 def _seed_trusted_hash(cx_home: Path, digest: str) -> None:
