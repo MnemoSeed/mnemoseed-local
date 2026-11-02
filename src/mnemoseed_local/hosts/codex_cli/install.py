@@ -16,18 +16,22 @@ call operator with a single-quoted literal on Windows, POSIX shell quoting
 elsewhere.
 
 Surgery rewrites only marker-owned handlers, harvesting both the nested
-container and the historical flat root shape. Foreign groups, their matcher and
-metadata fields, foreign handler values and the whole ``config.toml`` text stay
-untouched: our canonical group is appended, and a group left without handlers
-survives only when it carries metadata of its own.
+container and the historical flat root shape across every event present, so
+uninstall also clears drifted events the installer never registers. Foreign
+groups, their matcher and metadata fields, foreign handler values and the
+whole ``config.toml`` text stay untouched: our canonical group is appended,
+and a group left without handlers survives only when it carries metadata of
+its own.
 
 Both files validate before either write lands: strict JSON/TOML parse first,
 then the container/known-event/group schema, so an unexpected shape refuses
 with ``ConfigParseError`` and both files keep their bytes. The ``config.toml``
-rewrite swaps the line span of our canonical table and re-verifies the parse
-before it is stored; every rewrite is atomic (temp file + fsync +
-``os.replace``) and UTF-8 regardless of the process locale, and
-``install(dry_run=True)`` previews without writing.
+rewrite swaps the line span of our canonical table — recognized structurally
+as the parsed ``mcp_servers.mnemoseed`` object, so header text inside a
+foreign multiline string never matches — and re-verifies the parse before it
+is stored; every rewrite is atomic (temp file + fsync + ``os.replace``) and
+UTF-8 regardless of the process locale, and ``install(dry_run=True)``
+previews without writing.
 
 Status is structural: a complete canonical install reports trust unverified,
 because Codex asks the user to review the hooks once inside ``/hooks``. This
@@ -206,11 +210,12 @@ def _strip_event_in(holder: dict[str, object], event: str) -> bool:
 
 
 def _strip_own(data: dict[str, object], container: dict[str, object] | None) -> bool:
-    """Remove every marker-owned handler from both shapes; an emptied nested
-    container goes too. Returns whether the document would change."""
+    """Remove every marker-owned handler from both shapes, across every event
+    present — registered or drifted; an emptied nested container goes too.
+    Returns whether the document would change."""
     changed = False
     for holder in [container, data] if container is not None else [data]:
-        for event in HOOK_EVENTS:
+        for event in list(holder):
             changed = _strip_event_in(holder, event) or changed
     if container is not None and not container and changed:
         data.pop(HOOKS_KEY, None)
@@ -251,7 +256,7 @@ def _loose_commands(data: dict[str, object], container: dict[str, object] | None
     """Commands that merely mention the marker — never decisions, only notes."""
     found: set[str] = set()
     for holder in [container, data] if container is not None else [data]:
-        for event in HOOK_EVENTS:
+        for event in list(holder):
             for _, handler in _iter_group_handlers(holder.get(event)):
                 if _looks_like_ours(handler) and not is_ours(handler):
                     found.add(str(handler.get("command", "")))
@@ -332,13 +337,18 @@ def _verify_toml(target: Path, text: str) -> None:
         raise ConfigParseError(f"{target}: the rewrite does not parse ({exc}); file left untouched") from exc
 
 
+def _own_entry(parsed: dict[str, Any]) -> object | None:
+    """The document's ``mcp_servers.mnemoseed`` value, or None when absent."""
+    servers = parsed.get("mcp_servers")
+    return servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+
+
 def _require_replaceable(target: Path, parsed: dict[str, Any]) -> None:
     """A table under our name must be ours to manage: exactly the canonical
     keys, or absent. Anything richer belongs to the user and refuses."""
-    servers = parsed.get("mcp_servers")
-    if not isinstance(servers, dict) or MCP_SERVER_NAME not in servers:
+    entry = _own_entry(parsed)
+    if entry is None:
         return
-    entry = servers[MCP_SERVER_NAME]
     if not isinstance(entry, dict):
         raise ConfigParseError(f"{target}: mcp_servers.{MCP_SERVER_NAME} is not a table — fix it manually")
     if set(entry) - {MCP_COMMAND_KEY, MCP_ARGS_KEY}:
@@ -356,23 +366,45 @@ def _canonical_mcp_block() -> str:
     )
 
 
-def _table_span(lines: list[str]) -> tuple[int, int] | None:
-    """(start, end) line span of our table: the header line through the line
-    before the next top-level table header."""
-    start = next((i for i, line in enumerate(lines) if line.rstrip("\r\n") == MCP_TABLE_HEADER), None)
-    if start is None:
+def _chunk_entry(chunk: str) -> object | None:
+    """``_own_entry`` for a text chunk: None when the chunk does not parse or
+    does not define our table."""
+    try:
+        return _own_entry(tomllib.loads(chunk))
+    except tomllib.TOMLDecodeError:
         return None
-    end = start + 1
-    while end < len(lines) and not lines[end].startswith("["):
-        end += 1
-    return start, end
 
 
-def _replace_table(text: str, block: str) -> tuple[str, bool]:
+def _table_span(lines: list[str], parsed: dict[str, Any]) -> tuple[int, int] | None:
+    """(start, end) line span of the real canonical table: a header line the
+    document reaches outside any string (the text before it parses), through
+    the first line boundary at which the span chunk parses back to the table
+    object the document carries. Header text inside a foreign multiline
+    string never matches, and a ``[`` line inside one of the table's own
+    string values does not cut the span short."""
+    entry = _own_entry(parsed)
+    if not isinstance(entry, dict):
+        return None
+    boundaries = [i for i, line in enumerate(lines) if line.startswith("[")]
+    boundaries.append(len(lines))
+    for start, line in enumerate(lines):
+        if line.rstrip("\r\n") != MCP_TABLE_HEADER:
+            continue
+        try:
+            tomllib.loads("".join(lines[:start]))
+        except tomllib.TOMLDecodeError:
+            continue
+        for end in (end for end in boundaries if end > start):
+            if _chunk_entry("".join(lines[start:end])) == entry:
+                return start, end
+    return None
+
+
+def _replace_table(text: str, parsed: dict[str, Any], block: str) -> tuple[str, bool]:
     """Swap our table's line span for the canonical block (append when the
-    header is absent); the rest of the file stays byte-identical."""
+    table is absent); the rest of the file stays byte-identical."""
     lines = text.splitlines(keepends=True)
-    span = _table_span(lines)
+    span = _table_span(lines, parsed)
     canonical = block.splitlines(keepends=True)
     if span is None:
         head = text if not text or text.endswith("\n") else text + "\n"
@@ -383,10 +415,10 @@ def _replace_table(text: str, block: str) -> tuple[str, bool]:
     return "".join(lines[:start] + canonical + lines[end:]), True
 
 
-def _remove_table(text: str) -> tuple[str, bool]:
+def _remove_table(text: str, parsed: dict[str, Any]) -> tuple[str, bool]:
     """Drop our table's line span; the rest of the file stays byte-identical."""
     lines = text.splitlines(keepends=True)
-    span = _table_span(lines)
+    span = _table_span(lines, parsed)
     if span is None:
         return text, False
     start, end = span
@@ -406,8 +438,9 @@ def install(dry_run: bool = False) -> tuple[Path, bool]:
     container = _validate(target, data)
     config = config_path()
     text = _load_config(config)
-    _require_replaceable(config, _parsed(text))
-    new_config, mcp_changed = _replace_table(text, _canonical_mcp_block())
+    parsed = _parsed(text)
+    _require_replaceable(config, parsed)
+    new_config, mcp_changed = _replace_table(text, parsed, _canonical_mcp_block())
     if mcp_changed:
         _verify_toml(config, new_config)
     if container is None:
@@ -429,17 +462,19 @@ def install(dry_run: bool = False) -> tuple[Path, bool]:
 
 
 def uninstall(dry_run: bool = False) -> tuple[Path, bool]:
-    """Remove only marker-owned hook entries and the canonical MCP table;
-    foreign groups, metadata, handlers and config text stay value-identical.
-    Returns ``(hooks path, existed)``."""
+    """Remove every marker-owned hook entry — across every event present in
+    hooks.json, including events this tool never registers — and the canonical
+    MCP table; foreign groups, metadata, handlers and config text stay
+    value-identical. Returns ``(hooks path, existed)``."""
     target = hooks_path()
     data = load_object(target)
     container = _validate(target, data)
     loose = _loose_commands(data, container)
     config = config_path()
     text = _load_config(config)
-    _require_replaceable(config, _parsed(text))
-    new_config, removed = _remove_table(text)
+    parsed = _parsed(text)
+    _require_replaceable(config, parsed)
+    new_config, removed = _remove_table(text, parsed)
     if removed:
         _verify_toml(config, new_config)
     hooks_changed = _strip_own(data, container)
@@ -459,9 +494,8 @@ def uninstall(dry_run: bool = False) -> tuple[Path, bool]:
 
 
 def _mcp_present(parsed: dict[str, Any]) -> bool:
-    servers = parsed.get("mcp_servers")
-    entry = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
-    return entry == {MCP_COMMAND_KEY: transform_executable(), MCP_ARGS_KEY: list(MCP_GATEWAY_ARGS)}
+    canonical = {MCP_COMMAND_KEY: transform_executable(), MCP_ARGS_KEY: list(MCP_GATEWAY_ARGS)}
+    return _own_entry(parsed) == canonical
 
 
 def _has_own(groups: object) -> bool:
