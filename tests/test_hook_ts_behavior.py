@@ -17,7 +17,26 @@ import subprocess
 from importlib import resources
 from pathlib import Path
 
+import auth_support
 import pytest
+from _ports import unused_loopback_port
+
+from mnemoseed_local.daemon.app import create_app
+from mnemoseed_local.rest_client import DaemonClient
+from mnemoseed_local.storage.drivers import (
+    bge_m3_onnx,
+    lancedb_embedded,
+    sqlite_graph,
+    sqlite_meta,
+    synthetic_embedder,
+)
+from mnemoseed_local.storage.registry import (
+    EMBED_DRIVERS,
+    GRAPH_DRIVERS,
+    META_DRIVERS,
+    VECTOR_DRIVERS,
+    register,
+)
 
 DRIVER = Path(__file__).parent / "ts_hook" / "hook_driver.mjs"
 
@@ -29,6 +48,25 @@ def _hermetic_plugin_env(monkeypatch: pytest.MonkeyPatch) -> None:
     developer shell happens to carry."""
     for var in ("MNEMOSEED_LOCAL_DEBUG", "MNEMOSEED_LOCAL_PROFILE_ID", "MNEMOSEED_LOCAL_BASEURL"):
         monkeypatch.delenv(var, raising=False)
+
+
+# test_registry.py clears the driver registries wholesale; any daemon-booting
+# module ordered after it must defensively re-register (test_preset_embedded
+# precedent).
+_DRIVERS = (
+    (VECTOR_DRIVERS, lancedb_embedded.LanceDbEmbeddedStore),
+    (GRAPH_DRIVERS, sqlite_graph.SqliteGraphDriver),
+    (META_DRIVERS, sqlite_meta.SqliteMetaDriver),
+    (EMBED_DRIVERS, bge_m3_onnx.BgeM3OnnxEmbedder),
+    (EMBED_DRIVERS, synthetic_embedder.SyntheticEmbedder),
+)
+
+
+@pytest.fixture(autouse=True)
+def _ensure_registered() -> None:
+    for registry, cls in _DRIVERS:
+        if not registry.contains(cls.info.name):
+            register(registry)(cls)
 
 
 def _bundle(tmp_path: Path) -> Path:
@@ -48,7 +86,13 @@ def _bundle(tmp_path: Path) -> Path:
     return out
 
 
-def _run(bundle: Path, scenario: str, *, debug: str | None = "1") -> dict:
+def _run(
+    bundle: Path,
+    scenario: str,
+    *,
+    debug: str | None = "1",
+    extra_env: dict[str, str] | None = None,
+) -> dict:
     # Scenarios that pin the debug sink need the opt-in lane ARMED — it is
     # read from the env at plugin load, so pass it explicitly instead of
     # inheriting whatever the invoking shell carries. debug=None runs the
@@ -57,6 +101,8 @@ def _run(bundle: Path, scenario: str, *, debug: str | None = "1") -> dict:
     env.pop("MNEMOSEED_LOCAL_DEBUG", None)
     if debug is not None:
         env["MNEMOSEED_LOCAL_DEBUG"] = debug
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         ["node", str(DRIVER), str(bundle), scenario],
         shell=False,
@@ -186,6 +232,83 @@ def test_every_daemon_fetch_carries_the_daemon_credential(tmp_path: Path) -> Non
 
     assert transcript["unauthenticatedCount"] == 1
     assert transcript["unauthenticatedAuthorization"] == [None]
+
+
+# Every daemon endpoint the plugin's hook lanes POST to; the MCP config entry
+# is a separate lane with its own pinned actor (config-inject tests).
+DAEMON_LANE_ENDPOINTS = (
+    "/ingest",
+    "/flush",
+    "/session/end",
+    "/memory/reinforce",
+    "/session/recent",
+    "/session/recall-pending",
+)
+
+
+def test_every_daemon_lane_carries_the_hook_actor(tmp_path: Path) -> None:
+    """The plugin identifies its actor to the daemon exactly as the other
+    adapters do — the X-MnemoSeed-Actor header on every daemon call — because
+    the daemon attributes capture ingest (capture_ingest_count) to the hook
+    actor only. Every daemon-writing lane (ingest, flush, settle, reinforce)
+    plus the awaited reads must carry exactly that header value."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "actor-header")
+
+    lanes: dict[str, set[str | None]] = {}
+    for lane in transcript["lanes"]:
+        lanes.setdefault(lane["endpoint"], set()).add(lane["actor"])
+    missing = set(DAEMON_LANE_ENDPOINTS) - set(lanes)
+    assert not missing, f"daemon lanes never fired: {missing}"
+    for endpoint in DAEMON_LANE_ENDPOINTS:
+        assert lanes[endpoint] == {"hook"}, f"{endpoint}: {lanes[endpoint]}"
+
+
+def _daemon_config_toml(home: Path) -> str:
+    return (
+        'preset = "embedded"\n'
+        f'[storage.vector]\nuri = "{(home / "chunks.lance").as_posix()}"\ndimensions = 64\n'
+        f'[storage.graph]\npath = "{(home / "cortex.db").as_posix()}"\n'
+        f'[storage.graph.instances.isolated]\npath = "{(home / "isolated.db").as_posix()}"\n'
+        f'[storage.meta]\npath = "{(home / "meta.db").as_posix()}"\n'
+        f'[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
+        "[dream.llm.dream]\n"
+        'driver = "stub"\n'
+        'model = "stub"\n'
+        "[capture]\nauto_recall = true\n"
+    )
+
+
+def test_driven_session_moves_the_daemon_capture_ingest_counter(tmp_path: Path) -> None:
+    """End to end on a real daemon: one driven opencode session lands its
+    ingest (202) AND the daemon's capture_ingest_count counts it — the hook
+    actor header is what the counter keys on, so a session without it reads 0
+    while the daemon accepted every POST."""
+    bundle = _bundle(tmp_path)
+    home = tmp_path / "daemon-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(_daemon_config_toml(home), encoding="utf-8")
+    with auth_support.isolated_home(home):
+        credential = auth_support.seed_credential(home)
+        app = create_app()
+        with auth_support.live_server(app, unused_loopback_port()) as base_url:
+            transcript = _run(
+                bundle,
+                "daemon-e2e",
+                extra_env={
+                    "MNEMOSEED_LOCAL_BASEURL": base_url,
+                    "MNEMOSEED_E2E_CREDENTIAL": credential,
+                },
+            )
+            ingests = transcript["ingests"]
+            assert ingests, "the driven session produced no daemon ingest"
+            for ingest in ingests:
+                assert ingest["status"] == 202, ingest
+                assert ingest["actor"] == "hook", ingest
+            client = DaemonClient(base_url=base_url, token=credential)
+            body = client.get("/api/v1/observability")
+            assert body["capture_ingest_count"] == len(ingests), body
+            assert body["authenticated_actor_counts"]["hook"] == len(ingests), body
 
 
 def test_inject_once_injects_a_fenced_recall_block_and_is_attempt_once(tmp_path: Path) -> None:

@@ -29,6 +29,10 @@ const WATERMARKS = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-watermarks.j
 const posts = []
 const failing = new Set()
 const throwing = new Set()
+// daemon-e2e: pass fetches through to the REAL loopback daemon pytest booted;
+// responses are the daemon's own, the recording stays (status included).
+const realFetch = globalThis.fetch.bind(globalThis)
+let liveDaemon = false
 // The daemon credential lane: the driver seeds the same file the daemon would
 // write (inside the plugin's own data dir), so the recorded requests prove the
 // plugin attaches the credential header rather than merely promising to.
@@ -39,8 +43,13 @@ const CREDENTIAL_PATH = join(
 )
 globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init.body)
+  if (liveDaemon) {
+    const response = await realFetch(url, init)
+    posts.push({ url, body, headers: init?.headers ?? null, accepted: response.ok, status: response.status })
+    return response
+  }
   const accepted = !failing.has(url)
-  posts.push({ url, body, headers: init?.headers ?? null, accepted })
+  posts.push({ url, body, headers: init?.headers ?? null, accepted, status: accepted ? 200 : 503 })
   // thrown failures ("network down") take precedence over the 503 lane
   if (throwing.has(url)) throw new Error("network down")
   if (!accepted) return { ok: false, status: 503 }
@@ -565,6 +574,77 @@ async function main() {
           unauthenticatedAuthorization: unauthenticated.map(
             (post) => post.headers?.authorization ?? post.headers?.Authorization ?? null,
           ),
+        }),
+      )
+      break
+    }
+
+    case "actor-header": {
+      // Every daemon lane identifies its actor with the same header the other
+      // adapters present; the daemon attributes capture ingest — and counts
+      // it — only for that actor. The transcript dumps one (endpoint, actor)
+      // pair per daemon call; pytest asserts every lane carries exactly
+      // "hook". Drives every daemon-writing lane: user/assistant/tool ingest,
+      // flush (idle), settle (deleted), reinforce (cited injection), plus the
+      // awaited reads (session/recent, session/recall-pending).
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "driver-issued-credential\n", "utf8")
+      recentPayload = RECENT_PAYLOAD
+      recallPayload = RECALL_PAYLOAD
+      citationTurnsVisible = true
+      await fire.context({ sessionID: SES, system: ["BASE"] })
+      await fire.prompt({ sessionID: SES, messageID: "m_actor_1", prompt: { text: "actor轮" } })
+      await delay(100)
+      await fire.context({ sessionID: SES, system: ["BASE2"] })
+      await delay(50)
+      await fire.toolAfter({
+        sessionID: SES,
+        tool: "bash",
+        input: { command: "echo actor" },
+        result: { output: "actor" },
+      })
+      await delay(100)
+      await fire.assistantReply("m_cite_1", 3_000)
+      await delay(100)
+      await fire.event({ type: "session.idle", data: { sessionID: SES } })
+      await delay(100)
+      await fire.event({ type: "session.deleted", data: { sessionID: SES } })
+      await delay(100)
+      console.log(
+        JSON.stringify({
+          lanes: posts.map((post) => ({
+            endpoint: post.url.replace(/^https?:\/\/[^/]+/, ""),
+            actor: post.headers?.["x-mnemoseed-actor"] ?? post.headers?.["X-MnemoSeed-Actor"] ?? null,
+          })),
+        }),
+      )
+      break
+    }
+
+    case "daemon-e2e": {
+      // The real-daemon leg: pytest boots the daemon on a spare port and hands
+      // the credential through the env; the driver seeds the plugin's own
+      // credential file and lets the POSTs reach the live daemon, whose
+      // observability counter is the acceptance surface.
+      const credential = String(process.env.MNEMOSEED_E2E_CREDENTIAL ?? "").trim()
+      if (!credential) throw new Error("daemon-e2e needs MNEMOSEED_E2E_CREDENTIAL")
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, credential + "\n", "utf8")
+      liveDaemon = true
+      await fire.prompt({
+        sessionID: "sess-opencode-e2e",
+        messageID: "m_e2e_1",
+        prompt: { text: "端到端归因轮" },
+      })
+      await delay(300)
+      console.log(
+        JSON.stringify({
+          ingests: posts
+            .filter((post) => post.url.endsWith("/ingest"))
+            .map((post) => ({
+              status: post.status ?? null,
+              actor: post.headers?.["x-mnemoseed-actor"] ?? post.headers?.["X-MnemoSeed-Actor"] ?? null,
+            })),
         }),
       )
       break
