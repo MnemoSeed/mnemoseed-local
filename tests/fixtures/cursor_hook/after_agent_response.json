@@ -1,0 +1,1 @@
+{"hook_event_name":"afterAgentResponse","conversation_id":"cur-conv-01","generation_id":"gen-0004","model":"gpt-5","workspace_roots":["G:/dev/demo"],"transcript_path":"G:/dev/demo/.cursor/transcripts/cur-conv-01.jsonl","text":"失败原因是测试里的时钟断言没有冻结；我给你改成注入时钟。"}

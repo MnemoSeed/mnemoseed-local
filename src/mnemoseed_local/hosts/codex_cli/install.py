@@ -43,15 +43,17 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import shutil
 import sys
 import tomllib
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from mnemoseed_local.hosts import install as shared
+from mnemoseed_local.hosts.common.commands import (
+    render_command as render_command,
+)
 from mnemoseed_local.hosts.common.config import ConfigParseError, load_object, write_atomic, write_text_atomic
 from mnemoseed_local.hosts.install import HookStatus
 
@@ -109,16 +111,6 @@ def transform_executable() -> str:
     interpreter."""
     shim = shutil.which("mnemoseed-local")
     return str(Path(shim).resolve()) if shim else sys.executable
-
-
-def render_command(head: str, tail: Sequence[str], *, windows: bool) -> str:
-    """One handler command line: ``head`` stays a single literal argument — a
-    PowerShell single-quoted string after the call operator on Windows, a
-    POSIX-quoted shell word elsewhere."""
-    if windows:
-        literal = "'" + head.replace("'", "''") + "'"
-        return " ".join(["&", literal, *tail])
-    return " ".join([shlex.quote(head), *tail])
 
 
 def transform_command() -> str:
