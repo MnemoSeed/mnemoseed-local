@@ -1506,6 +1506,71 @@ def test_status_reports_the_config_path_and_daemon_probe(
     assert seen["base_url"] == "http://localhost:7788"
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"hooks": {"Notification": [_group([_handler_for(LEGACY_OWN_MODULE)])]}},
+        {"Notification": [_group([_handler_for(LEGACY_OWN_MODULE)])]},
+    ],
+    ids=["nested", "flat"],
+)
+def test_status_names_drifted_events_holding_owned_handlers(
+    cx_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    document: dict[str, Any],
+) -> None:
+    """Drift can park our handler solely under an event this installer never
+    registers: status applies the same all-events owned sweep uninstall does
+    and names the drifted event instead of claiming not-installed."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    _seed_hooks(cx_home, document)
+    state = cx_install.status().state
+    assert state != "not-installed", document
+    assert "partial" in state, state
+    assert "Notification" in state, state
+
+
+def test_status_install_and_uninstall_agree_on_a_drifted_config(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One drifted file, three agreeing surfaces: install lands the canonical
+    entries, an injected unregistered-event handler keeps status honestly
+    present-with-drift (never a clean complete install), and the uninstall
+    sweep that removes it returns status to not-installed."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    cx_install.install()
+    hooks_file = cx_home / "hooks.json"
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+    _nested(hooks)["Notification"] = [_group([_handler_for(LEGACY_OWN_SHIM)])]
+    hooks_file.write_text(json.dumps(hooks, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    state = cx_install.status().state
+    assert "unverified" not in state.lower(), state
+    assert "partial" in state, state
+    assert "Notification" in state, state
+
+    _, existed = cx_install.uninstall()
+    assert existed is True, "uninstall removes exactly what status reported"
+    assert cx_install.status().state == "not-installed"
+
+
+def test_status_treats_unregistered_garbage_as_foreign_content(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-list value under an unregistered event is foreign content: status
+    neither claims it as owned nor refuses (no crash), matching the uninstall
+    sweep that skips and preserves it byte-identically."""
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    hooks_file = _seed_hooks(cx_home, {"hooks": {"Notification": "garbage", "PreToolUse": [42]}})
+    seeded = hooks_file.read_text(encoding="utf-8")
+    assert cx_install.status().state == "not-installed"
+
+    _, existed = cx_install.uninstall()
+    assert existed is False
+    assert hooks_file.read_text(encoding="utf-8") == seeded
+
+
 WINDOWS_HOSTILE_PATHS = [
     r"C:\Program Files\MnemoSeed\mnemoseed-local.exe",
     r"C:\Users\O'Brien\mnemoseed-local.exe",

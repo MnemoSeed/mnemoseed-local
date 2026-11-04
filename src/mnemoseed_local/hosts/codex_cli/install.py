@@ -17,7 +17,9 @@ elsewhere.
 
 Surgery rewrites only marker-owned handlers, harvesting both the nested
 container and the historical flat root shape across every event present, so
-uninstall also clears drifted events the installer never registers. Foreign
+uninstall also clears drifted events the installer never registers, and
+status reports the same all-events owned scan, naming the drifted events.
+Foreign
 groups, their matcher and metadata fields, foreign handler values and the
 whole ``config.toml`` text stay untouched: our canonical group is appended,
 and a group left without handlers survives only when it carries metadata of
@@ -494,15 +496,11 @@ def _has_own(groups: object) -> bool:
     return any(is_ours(handler) for _, handler in _iter_group_handlers(groups))
 
 
-def _flat_own(data: dict[str, object]) -> bool:
-    """Marker-owned handlers in the flat root shape."""
-    return any(_has_own(data.get(event)) for event in HOOK_EVENTS)
-
-
-def _any_own(data: dict[str, object], container: dict[str, object] | None) -> bool:
-    if _flat_own(data):
-        return True
-    return container is not None and any(_has_own(container.get(event)) for event in HOOK_EVENTS)
+def _own_events(holder: dict[str, object]) -> set[str]:
+    """Events in one holder (nested container or flat root) holding
+    marker-owned handlers — the same all-events sweep uninstall applies; a
+    non-list value is foreign content, never owned."""
+    return {event for event, groups in holder.items() if _has_own(groups)}
 
 
 def _structural_state(target: Path) -> str:
@@ -514,15 +512,23 @@ def _structural_state(target: Path) -> str:
     except ConfigParseError:
         return "malformed"
     handler = _handler()
+    flat_owned = _own_events(data)
+    container_owned = _own_events(container) if container is not None else set()
+    drift = sorted((flat_owned | container_owned) - set(HOOK_EVENTS))
     complete = (
-        isinstance(container, dict)
-        and not _flat_own(data)
+        container is not None
+        and not flat_owned
+        and not drift
         and _mcp_present(parsed)
         and all(_is_canonical(container.get(event), handler) for event in HOOK_EVENTS)
     )
     if complete:
         return TRUST_UNVERIFIED
-    return "partial" if _any_own(data, container) else "not-installed"
+    if not flat_owned and not container_owned:
+        return "not-installed"
+    if drift:
+        return f"partial (own handlers under unregistered events: {', '.join(drift)})"
+    return "partial"
 
 
 def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
@@ -530,7 +536,8 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     reachability probe.
 
     States: ``not-installed`` / ``partial`` (a known event lacks our canonical
-    handler, the shape is legacy flat, or the MCP entry is missing or drifted) /
+    handler, the shape is legacy flat, the MCP entry is missing or drifted, or
+    marker-owned handlers sit under unregistered events — the state names them) /
     ``malformed`` (hooks.json or config.toml does not parse or has an unexpected
     shape) / the trust-unverified state of a complete canonical install.
     """
