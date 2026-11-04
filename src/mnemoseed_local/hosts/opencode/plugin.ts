@@ -20,7 +20,8 @@
 //   citation guard in postAssistantIngest -> memory_reinforce -> POST /memory/reinforce
 //
 // Invariants: HostId is always "opencode"; every daemon call is
-// fire-and-forget (the host session is never blocked); every failure is
+// fire-and-forget (the host session is never blocked) and carries the hook
+// audit actor (X-MnemoSeed-Actor: hook); every failure is
 // swallowed into console.debug UNLESS the opt-in observability lane is armed
 // (env MNEMOSEED_LOCAL_DEBUG: failures escalate to console.error + a JSONL
 // sink, and every daemon POST's status is inspected — a swallowed non-2xx is
@@ -407,10 +408,14 @@ function credentialHeaders(): Record<string, string> {
   return { authorization: `Bearer ${credential}` }
 }
 
-// The one header set every daemon fetch carries: the content type plus the
-// credential when the home has one.
+// The audit actor every daemon lane presents (X-MnemoSeed-Actor): the daemon
+// attributes capture ingest — capture_ingest_count — to the hook actor only.
+const HOOK_ACTOR = "hook"
+
+// The one header set every daemon fetch carries: the content type, the hook
+// audit actor, and the credential when the home has one.
 function daemonHeaders(): Record<string, string> {
-  return { "content-type": "application/json", ...credentialHeaders() }
+  return { "content-type": "application/json", "x-mnemoseed-actor": HOOK_ACTOR, ...credentialHeaders() }
 }
 
 // ---- B2.6 bundling / HTTP MCP transport: the config hook registers the
