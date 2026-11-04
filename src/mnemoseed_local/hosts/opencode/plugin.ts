@@ -419,8 +419,12 @@ function daemonHeaders(): Record<string, string> {
 // REMOTE: it connects to the running daemon instead of spawning a long-lived
 // stdio gateway process. The entry carries oauth:false (a first-party 401 must
 // not open a browser OAuth/DCR loop) and an explicit timeout aligned with the
-// daemon client's REQUEST_TIMEOUT_SECONDS. The credential is the same file the
-// daemon writes, read at config-hook time; a home that has none leaves the
+// daemon client's REQUEST_TIMEOUT_SECONDS. The host schema-decodes the
+// transformed config, so the timeout must be the host's three-bucket
+// TimeoutConfig object (startup/catalog/execution) — a plain number dies the
+// decode and the host disables the whole plugin after the transform. The
+// credential is the same file the daemon writes, read at config-hook time; a
+// home that has none leaves the
 // entry without an authorization header, and the daemon refuses it honestly.
 const MCP_ENTRY_NAME = "mnemoseed"
 const MCP_REMOTE_TIMEOUT_MS = 30000
@@ -454,7 +458,11 @@ function remoteMcpEntry(): Record<string, unknown> {
     "headers": mcpEntryHeaders(),
     "oauth": false,
     "disabled": false,
-    "timeout": MCP_REMOTE_TIMEOUT_MS,
+    "timeout": {
+      "startup": MCP_REMOTE_TIMEOUT_MS,
+      "catalog": MCP_REMOTE_TIMEOUT_MS,
+      "execution": MCP_REMOTE_TIMEOUT_MS,
+    },
   }
 }
 

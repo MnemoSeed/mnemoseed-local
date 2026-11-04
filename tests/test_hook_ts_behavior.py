@@ -653,14 +653,16 @@ def test_debug_lane_stays_silent_without_the_env(tmp_path: Path) -> None:
 
 #: The first-party remote MCP entry the mcp transform injects: the daemon's
 #: loopback HTTP surface, the three-header identity contract, no OAuth
-#: auto-detection, and the daemon client's own timeout (V2 flag: disabled).
+#: auto-detection, and the daemon client's own timeout as the host's
+#: three-bucket TimeoutConfig object (a plain number fails the host's schema
+#: decode and the host disables the whole plugin after the transform).
 _REMOTE_ENTRY = {
     "type": "remote",
     "url": "http://localhost:7788/mcp",
     "headers": {"x-mnemoseed-profile": "default", "x-mnemoseed-actor": "mcp"},
     "oauth": False,
     "disabled": False,
-    "timeout": 30000,
+    "timeout": {"startup": 30000, "catalog": 30000, "execution": 30000},
 }
 _REMOTE_ENTRY_WITH_CREDENTIAL = {
     **_REMOTE_ENTRY,
