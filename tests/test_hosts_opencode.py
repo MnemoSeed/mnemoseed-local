@@ -261,7 +261,9 @@ def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_mcp_transform
     is the factory stdio entry, which migrates to the remote HTTP shape with
     the disabled flag carried over (a legacy enabled:false maps onto it). The
     injected entry is remote, without OAuth auto-detection, and carries an
-    explicit timeout."""
+    explicit timeout in the host's three-bucket TimeoutConfig object shape —
+    a plain number fails the host's schema decode of the edited config and
+    the host disables the whole plugin after the transform."""
     source = _plugin_source()
     assert "function installMcpEntry(editor: any)" in source, (
         "the entry install must run through the V2 mcp editor"
@@ -269,6 +271,8 @@ def test_plugin_injects_the_mnemoseed_mcp_registration_through_the_mcp_transform
     assert "editor.set(MCP_ENTRY_NAME" in source, "the entry install must use the editor"
     for token in ('"mnemoseed"', '"mcp"', '"type": "remote"', '"oauth": false', '"disabled": false'):
         assert token in source, token
+    for bucket in ('"startup"', '"catalog"', '"execution"'):
+        assert bucket in source, f"the timeout must carry the {bucket} bucket"
 
 
 def test_plugin_short_circuits_the_whole_bundle_on_the_options_switch() -> None:

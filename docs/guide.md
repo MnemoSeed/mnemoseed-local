@@ -360,7 +360,7 @@ daemon REST proxy with audit actor `mcp`). Register it in `opencode.json`:
 The running daemon also serves the same gateway over loopback HTTP on
 **`POST /mcp`** (`application/json` only, stateless — no session id, no
 server-side session table). The OpenCode plugin's config hook registers the
-remote entry for you (`oauth: false` plus an explicit 30s timeout; an existing
+remote entry for you (`oauth: false` plus an explicit 30s timeout per bucket (startup, catalog, execution); an existing
 factory stdio entry is shape-migrated, a manual entry wins untouched):
 
 ```json
@@ -373,8 +373,8 @@ factory stdio entry is shape-migrated, a manual entry wins untouched):
     "X-MnemoSeed-Actor": "mcp"
   },
   "oauth": false,
-  "enabled": true,
-  "timeout": 30000
+  "disabled": false,
+  "timeout": {"startup": 30000, "catalog": 30000, "execution": 30000}
 }}}
 ```
 
