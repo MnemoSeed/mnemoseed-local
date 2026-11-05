@@ -14,10 +14,14 @@ report marks the run activation-off.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
+from _ports import RESERVED_PORTS
 
+from mnemoseed_local.config import load_config
 from mnemoseed_local.eval.warm_harness import (
     RigRootNotFresh,
     WarmRig,
@@ -45,6 +49,18 @@ def test_warm_rig_refuses_a_dirty_root(rig_root: Path) -> None:
 
     with pytest.raises(RigRootNotFresh):
         WarmRig(rig_root)
+
+
+def test_warm_rig_boots_off_a_spare_port_and_an_isolated_home(rig_root: Path) -> None:
+    """The rig's daemon identity never names a reserved live port, and the boot
+    home is the rig's own temp root (MNEMOSEED_LOCAL_HOME), handed back to the
+    caller on exit — the suite's test/live isolation contract."""
+    caller_home = os.environ.get("MNEMOSEED_LOCAL_HOME")
+    with WarmRig(rig_root):
+        config = load_config(rig_root / "config.toml")
+        assert urlparse(config.baseurl).port not in RESERVED_PORTS
+        assert Path(os.environ["MNEMOSEED_LOCAL_HOME"]).is_relative_to(rig_root)
+    assert os.environ.get("MNEMOSEED_LOCAL_HOME") == caller_home
 
 
 def test_warm_baseline_point_metric_can_move(rig_root: Path) -> None:

@@ -12,12 +12,15 @@ retrieval changes: the daemon serves as-is and the observation is measured, and
 the result is labelled activation-off (ε=0) — the mechanism it measures does not
 exist yet. Isolation mirrors the T2 recall / rescue rigs: fail-loud
 materialization, per-point roots, strict serial lifecycles, daemon-log handler
-release.
+release, a spare-port daemon identity, and a temp MNEMOSEED_LOCAL_HOME for the
+boot window.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
+import socket
 import time
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -52,10 +55,29 @@ from mnemoseed_local.schema.stamp import (
 )
 from mnemoseed_local.storage.ports import StoredProfile
 
+_LOOPBACK_HOST = "127.0.0.1"
 
-def _config_toml(root: Path) -> str:
+
+def _spare_loopback_port() -> int:
+    """An ephemeral loopback port: the kernel hands one out on an explicit bind
+    to port zero, so the rig's daemon identity never names a reserved port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((_LOOPBACK_HOST, 0))
+        return int(probe.getsockname()[1])
+
+
+def _restore_home_env(previous: str | None) -> None:
+    """Hand MNEMOSEED_LOCAL_HOME back to the caller after the rig's boot window."""
+    if previous is None:
+        os.environ.pop("MNEMOSEED_LOCAL_HOME", None)
+    else:
+        os.environ["MNEMOSEED_LOCAL_HOME"] = previous
+
+
+def _config_toml(root: Path, base_url: str) -> str:
     stores = root / "stores"
     return (
+        f'baseurl = "{base_url}"\n'
         'preset = "embedded"\n'
         f'[storage.vector]\nuri = "{(stores / "chunks.lance").as_posix()}"\ndimensions = 64\n'
         f'[storage.graph]\npath = "{(stores / "cortex.db").as_posix()}"\n'
@@ -82,7 +104,8 @@ class WarmRig:
         self.root = root
         self.profile_id = profile_id
         self.activation_enabled = activation_enabled
-        (root / "config.toml").write_text(_config_toml(root), encoding="utf-8")
+        base_url = f"http://{_LOOPBACK_HOST}:{_spare_loopback_port()}"
+        (root / "config.toml").write_text(_config_toml(root, base_url), encoding="utf-8")
         self._stack: ExitStack | None = None
         self._client: TestClient | None = None
 
@@ -100,6 +123,11 @@ class WarmRig:
     def __enter__(self) -> WarmRig:
         stack = ExitStack()
         try:
+            # the boot window's home: env-resolved paths land under the rig's
+            # own temp root, matching the patched config globals
+            previous_home = os.environ.get("MNEMOSEED_LOCAL_HOME")
+            os.environ["MNEMOSEED_LOCAL_HOME"] = str(self.root)
+            stack.callback(_restore_home_env, previous_home)
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
             self._client = stack.enter_context(rig_client())
             if self.activation_enabled:
