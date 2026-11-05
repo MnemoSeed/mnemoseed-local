@@ -53,6 +53,8 @@ STALE_REVISION = "stale_revision"
 PROTECTED_ENDPOINT = "protected_endpoint"
 RECIPE_KINDS: tuple[str, ...] = (STALE_REVISION, PROTECTED_ENDPOINT)
 
+SECONDS_PER_DAY = 86_400.0
+
 DOWNWEIGHT_FACTOR = 0.9
 
 _PROFILE_KEYS: tuple[str, ...] = ("a", "b")
@@ -117,8 +119,20 @@ class _SeedRequest:
     kind: str
 
 
-def build_daily_cohort_fixture(paths: InstrumentPaths, *, seed_clock_epoch: float) -> FixtureHandle:
-    """Seed the daily cohort pair of one home with both deterministic recipes."""
+def build_daily_cohort_fixture(
+    paths: InstrumentPaths,
+    *,
+    seed_clock_epoch: float,
+    staggered_age_anchor_epoch: float | None = None,
+    staggered_age_days: tuple[int, ...] | None = None,
+) -> FixtureHandle:
+    """Seed the daily cohort pair of one home with both deterministic recipes.
+
+    Without the staggered age recipe the pair carries exactly the two epoch
+    receipts. With it, one receipt per declared age is added, anchored at the
+    caller-supplied seed-time clock, and the epoch receipts stay as the
+    stable-expired control rows of the same pair.
+    """
     epoch = _require_epoch(seed_clock_epoch, field="seed_clock_epoch")
     requests = [
         _SeedRequest(
@@ -129,6 +143,7 @@ def build_daily_cohort_fixture(paths: InstrumentPaths, *, seed_clock_epoch: floa
         )
         for index, kind in enumerate(RECIPE_KINDS)
     ]
+    requests.extend(_staggered_requests(staggered_age_anchor_epoch, staggered_age_days))
     return _seed_pair(
         paths.cohort_graph_db,
         paths.cohort_meta_db,
@@ -140,6 +155,24 @@ def build_daily_cohort_fixture(paths: InstrumentPaths, *, seed_clock_epoch: floa
         fixture_seed_clock_raw=None,
         requests=requests,
     )
+
+
+def _staggered_requests(anchor_epoch: float | None, age_days: tuple[int, ...] | None) -> list[_SeedRequest]:
+    """The staggered age recipe: one receipt per declared age, anchored at the seed-time clock."""
+    if (anchor_epoch is None) != (age_days is None):
+        raise BindingIncompleteError({"field": "staggered_age_recipe"})
+    if anchor_epoch is None or age_days is None:
+        return []
+    anchor = _require_epoch(anchor_epoch, field="staggered_age_anchor_epoch")
+    return [
+        _SeedRequest(
+            nomination_id=f"nom-fixture-staggered-{age:02d}",
+            profile_index=0,
+            applied_at_epoch=anchor - age * SECONDS_PER_DAY,
+            kind=RECIPE_KINDS[position % len(RECIPE_KINDS)],
+        )
+        for position, age in enumerate(_require_age_days(age_days))
+    ]
 
 
 def build_repair_control_fixture(
@@ -304,6 +337,18 @@ def _require_repair_limit(value: object) -> int:
     """The repair cap of the control fixture; the frozen allowlist is the only one."""
     if isinstance(value, bool) or not isinstance(value, int) or value not in ALLOWED_REPAIR_LIMITS:
         raise BindingIncompleteError({"field": "repair_limit"})
+    return value
+
+
+def _require_age_days(value: tuple[int, ...]) -> tuple[int, ...]:
+    """The declared synthetic ages in whole days: distinct and non-negative."""
+    if (
+        not isinstance(value, tuple)
+        or not value
+        or len(set(value)) != len(value)
+        or any(isinstance(age, bool) or not isinstance(age, int) or age < 0 for age in value)
+    ):
+        raise BindingIncompleteError({"field": "staggered_age_days"})
     return value
 
 

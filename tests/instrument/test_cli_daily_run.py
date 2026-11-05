@@ -56,6 +56,9 @@ INIT_REPORT_KEYS = {
     "config_hash",
     "source_hash",
     "manifest_path",
+    "daily_age_recipe",
+    "staggered_age_anchor_raw",
+    "staggered_age_days",
 }
 COLLECT_REPORT_KEYS = {
     "run_id",
