@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,8 @@ from mnemoseed_local.storage.ports import (
     EvidencePointer,
     NominationRequest,
     Page,
+    ReconciliationApplication,
+    StorageError,
 )
 
 # Mechanism input only; this value has no product meaning.
@@ -161,6 +165,69 @@ def _attempts(meta, nomination_id: str):
 
 def _deferred_audits(meta):
     return meta.audit_query(AuditFilter(action="reconcile_deferred"), Page(offset=0, limit=50))
+
+
+def _corrupt_receipt(db_path: Path, nomination_id: str, column: str, value: object) -> None:
+    """Damage one stored receipt column directly, bypassing the append-only
+    trigger on the isolated copy."""
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("DROP TRIGGER IF EXISTS trg_reconciliation_receipts_no_update")
+        conn.execute(
+            f"UPDATE reconciliation_receipts SET {column} = ? WHERE nomination_id = ?",
+            (value, nomination_id),
+        )
+    finally:
+        conn.close()
+
+
+def _mint_unresolved_receipt(graph: SqliteGraphDriver, carrier) -> None:
+    """Write the unresolved receipt the consumer's exhausted path would write,
+    so a receipt row exists before any consumer pass runs."""
+    graph.apply_reconciliation(
+        ReconciliationApplication(
+            nomination_id=carrier.nomination_id,
+            profile_id=PROFILE,
+            disposition="unresolved",
+            reason_code="retry_exhausted",
+            canonical_kind=carrier.canonical_kind,
+            composite_group_id=carrier.composite_group_id,
+            evidence_event_ids=tuple(carrier.evidence_event_ids),
+            verdict="insufficient",
+            quality="degraded",
+            left_node_id=carrier.lo_node_id,
+            left_version=carrier.lo_version,
+            left_expected_peer_id=carrier.lo_expected_peer,
+            right_node_id=carrier.hi_node_id,
+            right_version=carrier.hi_version,
+            right_expected_peer_id=carrier.hi_expected_peer,
+            winner_node_id=None,
+            loser_node_id=None,
+            loser_prior_version=None,
+            loser_new_version=None,
+            applied_at=1000.0,
+        ),
+        downweight_factor=None,
+    )
+
+
+def _graph_rows(db_path: Path) -> dict[str, tuple[tuple, ...]]:
+    """Every user-table row of the isolated graph database, row-order fixed."""
+    conn = sqlite3.connect(db_path)
+    try:
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            name: tuple(conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall()) for name in names
+        }
+    finally:
+        conn.close()
 
 
 def test_same_profile_jobs_do_not_overlap_consumer_and_merge(tmp_path: Path) -> None:
@@ -759,6 +826,167 @@ def test_receipt_lookup_failure_does_not_guess_absent(tmp_path):
         assert _deferred_audits(meta).items == []
         assert len(_attempts(meta, carrier.nomination_id)) == 1
         assert len(graph.versions("na")) == 1
+    finally:
+        _close(graph, meta)
+
+
+def test_damaged_stored_receipt_skips_nomination_and_loop_continues(tmp_path: Path, caplog) -> None:
+    graph, meta = _stores(tmp_path)
+    try:
+        _seed_pair(graph, "na", "nb")
+        _seed_pair(graph, "nc", "nd")
+        _seed_pair(graph, "ne", "nf")
+        damaged = _nominate(graph, meta, "na", "nb")
+        intact = _nominate(graph, meta, "ne", "nf")
+        now = [1000.0]
+        calls: list = []
+        consumer = _consumer(graph, meta, _policy(lambda: now[0], attempt_limit=1), _timeout_seats(calls))
+        assert consumer.process(PROFILE, dream_run_id="run-1") == 2
+        now[0] = 1200.0
+        assert consumer.process(PROFILE, dream_run_id="run-2") == 2
+        db_path = tmp_path / "graph.db"
+        _corrupt_receipt(db_path, damaged.nomination_id, "applied_at", "not-a-timestamp")
+        healthy = _nominate(graph, meta, "nc", "nd")
+        assert (
+            graph.get_reconciliation_receipt(profile_id=PROFILE, nomination_id=intact.nomination_id)
+            is not None
+        )
+        assert (
+            graph.get_reconciliation_receipt(profile_id=PROFILE, nomination_id=healthy.nomination_id) is None
+        )
+        rows_before = _graph_rows(db_path)
+        damaged_attempts = _attempts(meta, damaged.nomination_id)
+        del calls[:]
+        now[0] = 1300.0
+        with caplog.at_level(logging.WARNING):
+            assert consumer.process(PROFILE, dream_run_id="run-3") == 2
+        assert calls == ["seat"]
+        assert "receipt decode failed for " + damaged.nomination_id in caplog.text
+        assert "applied_at" in caplog.text
+        assert _graph_rows(db_path) == rows_before
+        assert _attempts(meta, damaged.nomination_id) == damaged_attempts
+    finally:
+        _close(graph, meta)
+
+
+def test_apply_boundary_receipt_damage_is_skipped_and_loop_continues(tmp_path: Path, caplog) -> None:
+    graph, meta = _stores(tmp_path)
+    try:
+        _seed_pair(graph, "na", "nb")
+        _seed_pair(graph, "nc", "nd")
+        damaged = _nominate(graph, meta, "na", "nb")
+        healthy = _nominate(graph, meta, "nc", "nd")
+        original_lookup = graph.get_reconciliation_receipt
+        original_apply = graph.apply_reconciliation
+        lookups: list = []
+
+        def lookup(*args, **kwargs):
+            result = original_lookup(*args, **kwargs)
+            lookups.append(result)
+            if len(lookups) == 2:
+                raise ValueError(
+                    "receipt column 'applied_at' is not an ISO8601 UTC timestamp: 'yesterday-ish'"
+                )
+            return result
+
+        def apply(application, *args, **kwargs):
+            if application.nomination_id == damaged.nomination_id:
+                raise RuntimeError("apply boundary")
+            return original_apply(application, *args, **kwargs)
+
+        graph.get_reconciliation_receipt = lookup
+        graph.apply_reconciliation = apply
+        decisions = {
+            damaged.nomination_id: _decision_for(damaged, Verdict.NOT_CONFLICT),
+            healthy.nomination_id: _decision_for(healthy, Verdict.NOT_CONFLICT),
+        }
+
+        def seats(nomination):
+            return (
+                SeatOutcome(status=SeatStatus.COMPLETE, decisions=(decisions[nomination.nomination_id],)),
+            )
+
+        consumer = _consumer(graph, meta, _policy(lambda: 1200.0, attempt_limit=1), seats)
+        with caplog.at_level(logging.WARNING):
+            assert consumer.process(PROFILE, dream_run_id="run") == 1
+        assert "terminal apply failed for " + damaged.nomination_id in caplog.text
+        assert "receipt decode failed for " + damaged.nomination_id in caplog.text
+        assert "applied_at" in caplog.text
+        assert _deferred_audits(meta).items == []
+        assert len(_attempts(meta, damaged.nomination_id)) == 1
+        assert original_lookup(profile_id=PROFILE, nomination_id=damaged.nomination_id) is None
+        assert original_lookup(profile_id=PROFILE, nomination_id=healthy.nomination_id) is not None
+    finally:
+        _close(graph, meta)
+
+
+def test_coordinate_completes_with_damaged_stored_receipt(tmp_path: Path, caplog) -> None:
+    graph, meta = _stores(tmp_path)
+    try:
+        _seed_pair(graph)
+        carrier = _nominate(graph, meta)
+        now = [1000.0]
+        consumer = _consumer(graph, meta, _policy(lambda: now[0], attempt_limit=1), _timeout_seats())
+        assert consumer.process(PROFILE, dream_run_id="run-1") == 1
+        now[0] = 1200.0
+        assert consumer.process(PROFILE, dream_run_id="run-2") == 1
+        _corrupt_receipt(tmp_path / "graph.db", carrier.nomination_id, "applied_at", "not-a-timestamp")
+        with caplog.at_level(logging.WARNING):
+            consumer.coordinate(
+                SimpleNamespace(profile_id=PROFILE, dream_run_id="run-3"),
+                ratified=True,
+                configured=True,
+                ensemble_active=True,
+            )
+        assert "receipt decode failed for " + carrier.nomination_id in caplog.text
+        assert "applied_at" in caplog.text
+    finally:
+        _close(graph, meta)
+
+
+def test_fresh_budget_damaged_receipt_skips_before_reservation(tmp_path: Path, caplog) -> None:
+    graph, meta = _stores(tmp_path)
+    try:
+        _seed_pair(graph, "na", "nb")
+        _seed_pair(graph, "nc", "nd")
+        damaged = _nominate(graph, meta, "na", "nb")
+        healthy = _nominate(graph, meta, "nc", "nd")
+        db_path = tmp_path / "graph.db"
+        _mint_unresolved_receipt(graph, damaged)
+        _corrupt_receipt(db_path, damaged.nomination_id, "applied_at", "not-a-timestamp")
+        seat_calls: list = []
+
+        def seats(nomination):
+            seat_calls.append(nomination.nomination_id)
+            return (SeatOutcome(status=SeatStatus.TIMEOUT),)
+
+        consumer = _consumer(graph, meta, _policy(lambda: 1000.0), seats)
+        with caplog.at_level(logging.WARNING):
+            assert consumer.process(PROFILE, dream_run_id="run-1") == 1
+        assert seat_calls == [healthy.nomination_id]
+        assert not _attempts(meta, damaged.nomination_id)
+        assert "receipt decode failed for " + damaged.nomination_id in caplog.text
+        assert "applied_at" in caplog.text
+    finally:
+        _close(graph, meta)
+
+
+def test_receipt_storage_fault_still_propagates(tmp_path: Path) -> None:
+    graph, meta = _stores(tmp_path)
+    try:
+        _seed_pair(graph)
+        carrier = _nominate(graph, meta)
+        calls: list = []
+
+        def fault(*args, **kwargs):
+            raise StorageError("receipt store unavailable")
+
+        graph.get_reconciliation_receipt = fault
+        consumer = _consumer(graph, meta, _policy(lambda: 1000.0), _timeout_seats(calls))
+        with pytest.raises(StorageError, match="receipt store unavailable"):
+            consumer.process(PROFILE, dream_run_id="run-1")
+        assert not _attempts(meta, carrier.nomination_id)
+        assert calls == []
     finally:
         _close(graph, meta)
 

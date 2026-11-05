@@ -13,9 +13,11 @@ Disabled posture: any unset bound (None) means NO reconciliation work at
 all — process() returns 0 before any store read, and repair() returns 0.
 Unset never means unlimited. Failure handling: seat and application
 infrastructure faults record deferred and the dream still completes;
-malformed carrier construction is loud (a bug, never a seat verdict);
-infrastructure failures roll back their own transaction and propagate
-only as far as the pipeline seam, which always completes the dream.
+an undecodable stored receipt is logged and its nomination is skipped
+for the sweep, never a loop escape; malformed carrier construction is
+loud (a bug, never a seat verdict); infrastructure failures roll back
+their own transaction and propagate only as far as the pipeline seam,
+which always completes the dream.
 
 Cursor discipline: every examined carrier consumes scan budget. Fully
 handled pages advance the per-profile opaque cursor even after skips;
@@ -56,6 +58,7 @@ from mnemoseed_local.storage.ports import (
     MetaStore,
     ReconciliationApplication,
     ReconciliationNominationCarrier,
+    ReconciliationReceipt,
     reconciliation_deferred_dedup_key,
 )
 
@@ -70,6 +73,8 @@ _TERMINAL_ACTIONS = {
 
 _VERIFY_MODE = "verify"
 _VOTE_MODE = "vote"
+
+_DECODE_DAMAGE = (ValueError, TypeError, OverflowError)
 
 
 def consumer_enabled(
@@ -248,6 +253,23 @@ class ReconciliationConsumer:
 
     # ------------------------------------------------------------ one nomination
 
+    def _read_receipt(
+        self, profile_id: str, carrier: ReconciliationNominationCarrier
+    ) -> tuple[ReconciliationReceipt | None, bool]:
+        """The stored receipt plus whether its row was undecodable.
+
+        An undecodable row is logged with the failure vocabulary and
+        reported as damage; it is never treated as an absent receipt.
+        """
+        try:
+            receipt = self._graph.get_reconciliation_receipt(
+                profile_id=profile_id, nomination_id=carrier.nomination_id
+            )
+        except _DECODE_DAMAGE as exc:
+            logger.warning("receipt decode failed for %s: %s", carrier.nomination_id, exc)
+            return None, True
+        return receipt, False
+
     def _process_one(
         self,
         profile_id: str,
@@ -260,9 +282,9 @@ class ReconciliationConsumer:
         now = policy.clock()
         assert policy.attempt_limit is not None
         assert policy.retry_backoff_seconds is not None
-        receipt = self._graph.get_reconciliation_receipt(
-            profile_id=profile_id, nomination_id=carrier.nomination_id
-        )
+        receipt, damaged = self._read_receipt(profile_id, carrier)
+        if damaged:
+            return False
         if receipt is not None:
             return True
         attempts = self._meta.list_reconciliation_attempts(
@@ -383,10 +405,9 @@ class ReconciliationConsumer:
             self._graph.apply_reconciliation(application, downweight_factor=factor)
         except Exception as exc:
             logger.warning("terminal apply failed for %s: %s", carrier.nomination_id, exc)
-            receipt = self._graph.get_reconciliation_receipt(
-                profile_id=application.profile_id,
-                nomination_id=carrier.nomination_id,
-            )
+            receipt, damaged = self._read_receipt(application.profile_id, carrier)
+            if damaged:
+                return False
             if receipt is None:
                 return self._record_deferred(
                     application.profile_id,
