@@ -111,6 +111,11 @@ CONTROL_PENDING_COUNT = 105
 
 SEED_CLOCK_EPOCH = 1_700_000_000.0
 
+EPOCH_PAIR_RECIPE = "epoch_pair"
+STAGGERED_BOUNDARY_RECIPE = "staggered_boundary"
+DAILY_AGE_RECIPES = (EPOCH_PAIR_RECIPE, STAGGERED_BOUNDARY_RECIPE)
+STAGGERED_BOUNDARY_AGE_DAYS: tuple[int, ...] = (0, 5, 25, 29, 30, 35)
+
 _STORE_SUFFIXES = ("-wal", "-shm")
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _ROLLBACK_HEADER_PAIR = b"\x01\x01"
@@ -359,6 +364,9 @@ class _InitSeedPlan:
     daily: FixtureHandle | None
     control: FixtureHandle
     store_paths: tuple[Path, ...]
+    daily_age_recipe: str | None = None
+    staggered_age_anchor_raw: str | None = None
+    staggered_age_days: tuple[int, ...] = ()
 
 
 def _run_init(args: argparse.Namespace) -> int:
@@ -370,9 +378,22 @@ def _run_init(args: argparse.Namespace) -> int:
     if not args.source_commit:
         raise CohortIdentityMismatchError({"reason": "source_commit_empty"})
     cap = CONTROL_FIXTURE_CAPS[args.control_fixture]
+    if args.kind != DAILY_KIND and args.daily_age_recipe != EPOCH_PAIR_RECIPE:
+        raise BindingIncompleteError(
+            {
+                "reason": "daily_age_recipe_requires_daily_cohort",
+                "kind": args.kind,
+                "daily_age_recipe": args.daily_age_recipe,
+            }
+        )
     builder: Callable[[InstrumentPaths], _InitSeedPlan]
     if args.kind == DAILY_KIND:
-        builder = functools.partial(_seed_daily_home, control_id=args.control_id, cap=cap)
+        builder = functools.partial(
+            _seed_daily_home,
+            control_id=args.control_id,
+            cap=cap,
+            daily_age_recipe=args.daily_age_recipe,
+        )
     else:
         builder = functools.partial(_seed_control_home, control_id=args.control_id, cap=cap)
     fresh = FreshInit(paths)
@@ -408,12 +429,17 @@ def _run_init(args: argparse.Namespace) -> int:
         "config_hash": primary.config_hash,
         "source_hash": primary.source_hash,
         "manifest_path": str(manifest_path),
+        "daily_age_recipe": plan.daily_age_recipe,
+        "staggered_age_anchor_raw": plan.staggered_age_anchor_raw,
+        "staggered_age_days": list(plan.staggered_age_days) if plan.daily_age_recipe is not None else None,
     }
     _emit_report(report)
     return 0
 
 
-def _seed_daily_home(paths: InstrumentPaths, *, control_id: str, cap: int) -> _InitSeedPlan:
+def _seed_daily_home(
+    paths: InstrumentPaths, *, control_id: str, cap: int, daily_age_recipe: str
+) -> _InitSeedPlan:
     """Seed the daily pair and the matched control pair of one home."""
     control = build_repair_control_fixture(
         paths,
@@ -422,7 +448,14 @@ def _seed_daily_home(paths: InstrumentPaths, *, control_id: str, cap: int) -> _I
         repair_limit=cap,
         seed_clock_epoch=SEED_CLOCK_EPOCH,
     )
-    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_CLOCK_EPOCH)
+    staggered = daily_age_recipe == STAGGERED_BOUNDARY_RECIPE
+    anchor_raw = float.hex(time.time()) if staggered else None
+    daily = build_daily_cohort_fixture(
+        paths,
+        seed_clock_epoch=SEED_CLOCK_EPOCH,
+        staggered_age_anchor_epoch=float.fromhex(anchor_raw) if anchor_raw is not None else None,
+        staggered_age_days=STAGGERED_BOUNDARY_AGE_DAYS if staggered else None,
+    )
     return _InitSeedPlan(
         fixtures=(daily, control),
         daily=daily,
@@ -433,6 +466,9 @@ def _seed_daily_home(paths: InstrumentPaths, *, control_id: str, cap: int) -> _I
             paths.control_graph_db,
             paths.control_meta_db,
         ),
+        daily_age_recipe=daily_age_recipe,
+        staggered_age_anchor_raw=anchor_raw,
+        staggered_age_days=STAGGERED_BOUNDARY_AGE_DAYS if staggered else (),
     )
 
 
@@ -1334,6 +1370,7 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--control-fixture", required=True, choices=CONTROL_FIXTURE_CHOICES)
     init.add_argument("--source-commit", required=True)
     init.add_argument("--source-manifest", required=True)
+    init.add_argument("--daily-age-recipe", choices=DAILY_AGE_RECIPES, default=EPOCH_PAIR_RECIPE)
 
     collect = commands.add_parser("collect", help="record one observation run")
     collect.add_argument("--home", required=True)
