@@ -1,9 +1,10 @@
 """Damaged-evidence behavior of the instrument's read-only surface.
 
 Every case works on a copied store under a temporary home: an unreadable
-protected-node payload and a missing receipt timestamp must surface as the
-instrument's typed binding_incomplete failure, and a failing evidence read
-must leave the inspected store byte-identical.
+protected-node payload, a missing receipt timestamp, a damaged outbox row,
+and a damaged version-chain row must surface as the instrument's typed
+binding_incomplete failure, and a failing evidence read must leave the
+inspected store byte-identical.
 """
 
 from __future__ import annotations
@@ -24,10 +25,19 @@ from mnemoseed_local.instrument.fixtures import (
     build_daily_cohort_fixture,
     build_repair_control_fixture,
 )
-from mnemoseed_local.instrument.ledger import BindingIncompleteError, InstrumentPaths, resolve_paths
+from mnemoseed_local.instrument.ledger import (
+    BindingIncompleteError,
+    InstrumentPaths,
+    canonical_json,
+    resolve_paths,
+    sha256_hex,
+)
 from mnemoseed_local.instrument.sql_readonly import (
+    NODE_VERSION_COLUMNS,
     assert_node_integrity,
     capture_node_integrity,
+    read_node_versions,
+    read_outbox_rows,
     read_unresolved_receipts,
     readonly_connection,
 )
@@ -37,6 +47,7 @@ SEED_EPOCH = 1_700_000_000.0
 CONTROL_ID = "ctrl-105"
 REPAIR_LIMIT = 100
 DAMAGED_PAYLOAD = "{damaged-node-payload"
+DAMAGED_NUMBER_TEXT = "not-a-number"
 
 
 @pytest.fixture
@@ -83,6 +94,55 @@ def _profile_node_ids(graph: SqliteGraphDriver, node_ids: Sequence[str], profile
 def _close_fixture(fixture: FixtureHandle) -> None:
     asyncio.run(fixture.graph.close())
     asyncio.run(fixture.meta.close())
+
+
+@contextmanager
+def _writer(db_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(db_path)
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _recreate_with_unsupported_shape(
+    writer: sqlite3.Connection, *, table: str, columns_ddl: str, copy_sql: str
+) -> None:
+    """Rebuild one table without its constraints, carrying the original rows through copy_sql."""
+    writer.execute(f"ALTER TABLE {table} RENAME TO {table}_damaged_shape")
+    writer.execute(f"CREATE TABLE {table} ({columns_ddl})")
+    writer.execute(copy_sql)
+    writer.execute(f"DROP TABLE {table}_damaged_shape")
+
+
+def _store_version_node_ids(db_path: Path, profile_id: str) -> tuple[str, ...]:
+    with _rows(db_path) as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT node_id FROM node_versions WHERE profile_id = ? ORDER BY node_id",
+            (profile_id,),
+        ).fetchall()
+    assert rows
+    return tuple(str(row[0]) for row in rows)
+
+
+def _first_version_row(db_path: Path, profile_id: str) -> tuple[str, int]:
+    with _rows(db_path) as connection:
+        row = connection.execute(
+            "SELECT node_id, version FROM node_versions WHERE profile_id = ? ORDER BY node_id, version",
+            (profile_id,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0]), int(row[1])
+
+
+def _expected_version_row_hash(raw: Sequence[Any]) -> str:
+    """The documented row-hash contract: an absent cell stays absent, every other cell keeps its text."""
+    payload = {
+        name: None if value is None else str(value)
+        for name, value in zip(NODE_VERSION_COLUMNS, tuple(raw), strict=True)
+    }
+    return sha256_hex(canonical_json(payload).encode("utf-8"))
 
 
 @pytest.mark.parametrize(
@@ -218,3 +278,234 @@ def test_healthy_copied_stores_keep_the_existing_receipt_and_integrity_reads(
             asyncio.run(copy_graph.close())
     finally:
         _close_fixture(control)
+
+
+@pytest.mark.parametrize(
+    ("id_expression", "created_at_expression", "expected_reason", "expected_column", "expected_cause"),
+    [
+        pytest.param("NULL", "created_at", "outbox_row_missing", "id", None, id="null_id"),
+        pytest.param("id", "NULL", "outbox_row_missing", "created_at", None, id="null_created_at"),
+        pytest.param(
+            f"'{DAMAGED_NUMBER_TEXT}'",
+            "created_at",
+            "outbox_row_decode_error",
+            "id",
+            ValueError,
+            id="text_id",
+        ),
+    ],
+)
+def test_a_damaged_outbox_row_fails_typed_without_writes(
+    paths: InstrumentPaths,
+    tmp_path: Path,
+    id_expression: str,
+    created_at_expression: str,
+    expected_reason: str,
+    expected_column: str,
+    expected_cause: type[BaseException] | None,
+) -> None:
+    """A copied store whose outbox row loses a required column or carries an undecodable id fails typed."""
+    control = build_repair_control_fixture(
+        paths,
+        control_id=CONTROL_ID,
+        pending_count=2,
+        repair_limit=REPAIR_LIMIT,
+        seed_clock_epoch=SEED_EPOCH,
+    )
+    _close_fixture(control)
+    copy_path = tmp_path / "outbox-copy.db"
+    _backup(paths.control_graph_db, copy_path)
+    with _writer(copy_path) as writer:
+        _recreate_with_unsupported_shape(
+            writer,
+            table="reconciliation_audit_outbox",
+            columns_ddl=(
+                "id INTEGER, nomination_id TEXT, profile_id TEXT, action TEXT, "
+                "created_at TEXT, delivered_at TEXT"
+            ),
+            copy_sql=(
+                "INSERT INTO reconciliation_audit_outbox "
+                "(id, nomination_id, profile_id, action, created_at) "
+                f"SELECT {id_expression}, nomination_id, profile_id, action, {created_at_expression} "
+                "FROM reconciliation_audit_outbox_damaged_shape"
+            ),
+        )
+
+    intact_hash = _file_sha256(copy_path)
+    with _rows(copy_path) as connection:
+        with pytest.raises(BindingIncompleteError) as caught:
+            read_outbox_rows(connection)
+    assert caught.value.diag_code == "binding_incomplete"
+    assert caught.value.detail["reason"] == expected_reason
+    assert caught.value.detail["column"] == expected_column
+    assert "None" not in json.dumps(caught.value.detail)
+    if expected_cause is None:
+        assert caught.value.__cause__ is None
+    else:
+        assert isinstance(caught.value.__cause__, expected_cause)
+    assert _file_sha256(copy_path) == intact_hash
+
+
+def test_an_undecodable_version_number_fails_typed_without_writes(
+    paths: InstrumentPaths, tmp_path: Path
+) -> None:
+    """A copied store whose version number is stored as undecodable text fails typed, never raw."""
+    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_EPOCH)
+    try:
+        profile_id = daily.profile_ids[0]
+        node_ids = _store_version_node_ids(paths.cohort_graph_db, profile_id)
+        copy_path = tmp_path / "versions-copy.db"
+        _backup(paths.cohort_graph_db, copy_path)
+        target = _first_version_row(copy_path, profile_id)
+        with _writer(copy_path) as writer:
+            writer.execute(
+                "UPDATE node_versions SET version = ? WHERE node_id = ? AND version = ?",
+                (DAMAGED_NUMBER_TEXT, target[0], target[1]),
+            )
+
+        intact_hash = _file_sha256(copy_path)
+        with _rows(copy_path) as connection:
+            with pytest.raises(BindingIncompleteError) as caught:
+                read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+        assert caught.value.diag_code == "binding_incomplete"
+        assert caught.value.detail["reason"] == "node_version_row_decode_error"
+        assert caught.value.detail["column"] == "version"
+        assert caught.value.detail["node_id"] == target[0]
+        assert isinstance(caught.value.__cause__, ValueError)
+        assert _file_sha256(copy_path) == intact_hash
+    finally:
+        _close_fixture(daily)
+
+
+@pytest.mark.parametrize("damaged_column", ["version", "changed_at"])
+def test_an_absent_required_version_column_fails_typed_without_writes(
+    paths: InstrumentPaths, tmp_path: Path, damaged_column: str
+) -> None:
+    """A copied store whose version row loses a required column reports missing evidence, never text None."""
+    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_EPOCH)
+    try:
+        profile_id = daily.profile_ids[0]
+        node_ids = _store_version_node_ids(paths.cohort_graph_db, profile_id)
+        copy_path = tmp_path / "versions-copy.db"
+        _backup(paths.cohort_graph_db, copy_path)
+        select_expressions = ["NULL" if name == damaged_column else name for name in NODE_VERSION_COLUMNS]
+        with _writer(copy_path) as writer:
+            _recreate_with_unsupported_shape(
+                writer,
+                table="node_versions",
+                columns_ddl=(
+                    "node_id TEXT, version INTEGER, profile_id TEXT, valid_from TEXT, valid_to TEXT, "
+                    "superseded_by INTEGER, changed_at TEXT, payload TEXT"
+                ),
+                copy_sql=(
+                    f"INSERT INTO node_versions ({', '.join(NODE_VERSION_COLUMNS)}) "
+                    f"SELECT {', '.join(select_expressions)} FROM node_versions_damaged_shape"
+                ),
+            )
+
+        intact_hash = _file_sha256(copy_path)
+        with _rows(copy_path) as connection:
+            with pytest.raises(BindingIncompleteError) as caught:
+                read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+        assert caught.value.diag_code == "binding_incomplete"
+        assert caught.value.detail["reason"] == "node_version_row_missing"
+        assert caught.value.detail["column"] == damaged_column
+        assert "None" not in json.dumps(caught.value.detail)
+        assert _file_sha256(copy_path) == intact_hash
+    finally:
+        _close_fixture(daily)
+
+
+def test_the_version_row_hash_preserves_an_absent_cell_as_absent(paths: InstrumentPaths) -> None:
+    """The row hash renders an absent nullable cell as JSON null, never as the text None."""
+    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_EPOCH)
+    try:
+        profile_id = daily.profile_ids[0]
+        node_ids = _store_version_node_ids(paths.cohort_graph_db, profile_id)
+        with _rows(paths.cohort_graph_db) as connection:
+            raw = connection.execute(
+                "SELECT node_id, version, profile_id, valid_from, valid_to, superseded_by, "
+                "changed_at, payload FROM node_versions WHERE profile_id = ? ORDER BY node_id, version",
+                (profile_id,),
+            ).fetchall()
+            snapshots = read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+        assert any(item[4] is None or item[5] is None for item in raw)
+        expected = {f"{str(item[0])}:{int(item[1])}": _expected_version_row_hash(tuple(item)) for item in raw}
+        assert {f"{item.node_id}:{item.version}": item.row_hash for item in snapshots} == expected
+    finally:
+        _close_fixture(daily)
+
+
+def test_a_damaged_version_payload_stays_verbatim_evidence(paths: InstrumentPaths, tmp_path: Path) -> None:
+    """The typed version read never decodes a payload: damaged content is hashed verbatim, never repaired."""
+    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_EPOCH)
+    try:
+        profile_id = daily.profile_ids[0]
+        node_ids = _store_version_node_ids(paths.cohort_graph_db, profile_id)
+        copy_path = tmp_path / "payload-copy.db"
+        _backup(paths.cohort_graph_db, copy_path)
+        target = _first_version_row(copy_path, profile_id)
+        with _writer(copy_path) as writer:
+            writer.execute(
+                "UPDATE node_versions SET payload = ? WHERE node_id = ? AND version = ?",
+                (DAMAGED_PAYLOAD, target[0], target[1]),
+            )
+
+        intact_hash = _file_sha256(copy_path)
+        with _rows(copy_path) as connection:
+            snapshots = read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+            raw = connection.execute(
+                "SELECT node_id, version, profile_id, valid_from, valid_to, superseded_by, "
+                "changed_at, payload FROM node_versions WHERE node_id = ? AND version = ?",
+                target,
+            ).fetchone()
+        assert raw is not None
+        damaged = next(item for item in snapshots if item.node_id == target[0] and item.version == target[1])
+        assert damaged.row_hash == _expected_version_row_hash(tuple(raw))
+        assert _file_sha256(copy_path) == intact_hash
+    finally:
+        _close_fixture(daily)
+
+
+def test_healthy_outbox_rows_keep_the_persisted_stamps(paths: InstrumentPaths) -> None:
+    """A healthy store keeps the outbox identifiers and raw stamps verbatim."""
+    control = build_repair_control_fixture(
+        paths,
+        control_id=CONTROL_ID,
+        pending_count=2,
+        repair_limit=REPAIR_LIMIT,
+        seed_clock_epoch=SEED_EPOCH,
+    )
+    _close_fixture(control)
+    with _rows(paths.control_graph_db) as connection:
+        rows = read_outbox_rows(connection)
+        raw_rows = connection.execute(
+            "SELECT id, nomination_id, profile_id, action, created_at, delivered_at "
+            "FROM reconciliation_audit_outbox ORDER BY id"
+        ).fetchall()
+    assert len(rows) == len(raw_rows) > 0
+    assert [row.outbox_id for row in rows] == [int(item[0]) for item in raw_rows]
+    assert [row.created_at_raw for row in rows] == [str(item[4]) for item in raw_rows]
+    assert all(
+        row.delivered_at_raw == (None if item[5] is None else str(item[5]))
+        for row, item in zip(rows, raw_rows, strict=True)
+    )
+
+
+def test_healthy_version_chain_reads_stay_stable(paths: InstrumentPaths) -> None:
+    """A healthy store keeps the version-chain identities and stable row hashes."""
+    daily = build_daily_cohort_fixture(paths, seed_clock_epoch=SEED_EPOCH)
+    try:
+        profile_id = daily.profile_ids[0]
+        node_ids = _store_version_node_ids(paths.cohort_graph_db, profile_id)
+        with _rows(paths.cohort_graph_db) as connection:
+            first = read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+            second = read_node_versions(connection, profile_id=profile_id, node_ids=node_ids)
+            raw = connection.execute(
+                "SELECT node_id, version FROM node_versions WHERE profile_id = ? ORDER BY node_id, version",
+                (profile_id,),
+            ).fetchall()
+        assert first == second
+        assert [(item.node_id, item.version) for item in first] == [(str(row[0]), int(row[1])) for row in raw]
+    finally:
+        _close_fixture(daily)
