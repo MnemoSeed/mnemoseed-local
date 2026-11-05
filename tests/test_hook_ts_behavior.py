@@ -14,8 +14,10 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import auth_support
 import pytest
@@ -86,13 +88,13 @@ def _bundle(tmp_path: Path) -> Path:
     return out
 
 
-def _run(
+def _run_driver(
     bundle: Path,
     scenario: str,
     *,
     debug: str | None = "1",
     extra_env: dict[str, str] | None = None,
-) -> dict:
+) -> subprocess.CompletedProcess[str]:
     # Scenarios that pin the debug sink need the opt-in lane ARMED — it is
     # read from the env at plugin load, so pass it explicitly instead of
     # inheriting whatever the invoking shell carries. debug=None runs the
@@ -112,6 +114,17 @@ def _run(
         env=env,
     )
     assert result.returncode == 0, f"driver failed: {result.stderr}"
+    return result
+
+
+def _run(
+    bundle: Path,
+    scenario: str,
+    *,
+    debug: str | None = "1",
+    extra_env: dict[str, str] | None = None,
+) -> dict:
+    result = _run_driver(bundle, scenario, debug=debug, extra_env=extra_env)
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
@@ -279,11 +292,39 @@ def _daemon_config_toml(home: Path) -> str:
     )
 
 
+#: The driven session lands exactly one hook ingest (a fresh session
+#: reconciles nothing and one prompt posts once), so the expected counter
+#: value is known without reading the driver's racy stdout recording.
+EXPECTED_DRIVEN_INGESTS = 1
+
+#: The driver's ingest POSTs are fire-and-forget: no fixed wait can pin their
+#: completion, so the counter is polled until it moves or the deadline turns
+#: the miss into a visible failure.
+COUNTER_POLL_SECONDS = 10.0
+
+
+def _wait_for_driven_ingest(client: DaemonClient) -> dict[str, Any]:
+    """Poll /api/v1/observability until the driven session's ingest is counted;
+    an expired deadline raises (a visible failure), never a pass."""
+    deadline = time.monotonic() + COUNTER_POLL_SECONDS
+    body: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        body = client.get("/api/v1/observability")
+        if body["capture_ingest_count"] >= EXPECTED_DRIVEN_INGESTS:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(
+        f"the driven session produced no daemon ingest within {COUNTER_POLL_SECONDS}s: {body}"
+    )
+
+
 def test_driven_session_moves_the_daemon_capture_ingest_counter(tmp_path: Path) -> None:
-    """End to end on a real daemon: one driven opencode session lands its
-    ingest (202) AND the daemon's capture_ingest_count counts it — the hook
-    actor header is what the counter keys on, so a session without it reads 0
-    while the daemon accepted every POST."""
+    """End to end on a real daemon: one driven opencode session moves the
+    daemon's capture_ingest_count — the hook actor header is what the counter
+    keys on, so a session without it reads 0 while the daemon accepted every
+    POST. The driver's POSTs are fire-and-forget, so the counter is read
+    through a bounded poll instead of a fixed wait; the poll's timeout is a
+    failure, never a pass."""
     bundle = _bundle(tmp_path)
     home = tmp_path / "daemon-home"
     home.mkdir(parents=True, exist_ok=True)
@@ -292,7 +333,7 @@ def test_driven_session_moves_the_daemon_capture_ingest_counter(tmp_path: Path) 
         credential = auth_support.seed_credential(home)
         app = create_app()
         with auth_support.live_server(app, unused_loopback_port()) as base_url:
-            transcript = _run(
+            driver = _run_driver(
                 bundle,
                 "daemon-e2e",
                 extra_env={
@@ -300,15 +341,13 @@ def test_driven_session_moves_the_daemon_capture_ingest_counter(tmp_path: Path) 
                     "MNEMOSEED_E2E_CREDENTIAL": credential,
                 },
             )
-            ingests = transcript["ingests"]
-            assert ingests, "the driven session produced no daemon ingest"
-            for ingest in ingests:
-                assert ingest["status"] == 202, ingest
-                assert ingest["actor"] == "hook", ingest
             client = DaemonClient(base_url=base_url, token=credential)
-            body = client.get("/api/v1/observability")
-            assert body["capture_ingest_count"] == len(ingests), body
-            assert body["authenticated_actor_counts"]["hook"] == len(ingests), body
+            body = _wait_for_driven_ingest(client)
+            assert body["capture_ingest_count"] == EXPECTED_DRIVEN_INGESTS, (body, driver.stdout)
+            assert body["authenticated_actor_counts"]["hook"] == EXPECTED_DRIVEN_INGESTS, (
+                body,
+                driver.stdout,
+            )
 
 
 def test_inject_once_injects_a_fenced_recall_block_and_is_attempt_once(tmp_path: Path) -> None:
