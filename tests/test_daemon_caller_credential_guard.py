@@ -17,9 +17,10 @@ the scan its shape:
    key the daemon reads — an ``Authorization`` or cookie key, a header set the
    acquisition seam or a module-local producer builds, a bearer literal, or an
    unpack the scan cannot read — a call that never dials presents it anywhere in
-   its own arguments, and a text caller presents it on the statement it dials
-   with. A call site that carries a protected path and presents nothing is
-   reported by its callee.
+   its own arguments, and a text caller presents it in an actual header argument
+   of the statement it dials with, under a key the daemon reads or as an argument
+   the scan cannot read. A call site that carries a protected path and presents
+   nothing is reported by its callee.
 2. **URL-shaped text.** The text scan reads the paths a caller dials from the
    daemon's own authority — a loopback URL, or a variable that declares one — and
    judges each of them against the open set, so an interpolated
@@ -41,9 +42,10 @@ the scan its shape:
 Two shapes are limits the scan records rather than holes. An opaque helper that
 hands its argument straight back (``def passthrough(value): return value``) is a
 call whose return value the scan cannot type-check, so a header position it fills
-counts as presenting the credential. A mention inside a comment is not read at all,
-whatever comment syntax the caller's language has, which is what keeps prose out of
-the scan.
+counts as presenting the credential. Comment text never presents a credential,
+whatever comment syntax the caller's language has, which is what keeps prose out
+of the presentation proof — while a route a comment names is still reported by
+the conservative route scan, which reads the raw source.
 
 A registry pins the known-good classification of every scanned file, so the scan
 has teeth in both directions: a caller that stops presenting the credential, a
@@ -54,7 +56,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -135,8 +137,13 @@ DIALING_CALLEES = frozenset(
 #: The keyword arguments that carry a request's header set.
 HEADER_KEYWORDS = frozenset({"headers"})
 
-#: Header-shaped flags a text consumer passes on the statement it dials with.
-HEADER_FLAGS = re.compile(r"-{1,2}[Hh]eaders?\b|-H\b")
+#: The header flags the daemon's own tools read a header from, exact tokens only:
+#: curl's ``-H``/``--header`` — with the value a ``--header=`` spelling attaches —
+#: and wget's ``--header`` alone, wget's ``-H`` being its span-hosts switch. The
+#: set stays closed with the value-flag tables below: a bundled short flag and an
+#: unseen header channel open no header position.
+_CURL_HEADER_FLAG = re.compile(r"-H|--header(?:=(?P<value>.*))?")
+_WGET_HEADER_FLAG = re.compile(r"--header(?:=(?P<value>.*))?")
 
 #: Comment syntax of the text suffixes that carry one: the line marker, and the
 #: block markers when the language has them. A marker inside a quoted value is not
@@ -231,6 +238,9 @@ _LITERAL_URL = re.compile(r"https?://[^\s'\"`]+")
 #: included.
 _VARIABLE = re.compile(r"\$(?:(?:env|global|local|private|script):)?(?P<name>\w+)")
 
+#: A header value that is a bare variable reference: a value the scan cannot read.
+_UNREADABLE_VALUE = re.compile(r"\$(?:\w+:)?\{?\w+\}?")
+
 #: Variable assignments and parameter declarations used to resolve target values.
 _SHELL_BINDING = re.compile(r"^\s*(?:export\s+)?(?P<name>\w+)=(?P<value>.*)$", re.M)
 _SIGIL_BINDING = re.compile(r"\$(?P<name>\w+)\s*=(?!=)(?P<value>[^\n]*)")
@@ -245,6 +255,11 @@ _PS_DIAL = re.compile(r"\b(?:Invoke-RestMethod|Invoke-WebRequest)\b", re.I)
 _PS_TARGET = re.compile(r"(?:^|\s)-Uri\b", re.I)
 _FETCH_CALL = re.compile(r"\bfetch\s*\(", re.I)
 
+#: The header parameter of a PowerShell dial cmdlet, and the ``headers`` key of a
+#: fetch call's object: the other two header positions the daemon's tools read.
+_PS_HEADER_PARAMETER = re.compile(r"(?:^|\s)-[Hh]eaders?\b")
+_FETCH_HEADER_KEY = re.compile(r"\bheaders\b\s*:", re.I)
+
 #: The shell commands that dial, and the probes that only ask whether one exists.
 _SHELL_DIAL_WORD = re.compile(r"\bcurl(?:\.exe)?\b|\bwget\b", re.I)
 _AVAILABILITY_PROBE = re.compile(
@@ -252,6 +267,10 @@ _AVAILABILITY_PROBE = re.compile(
     r"\s*$",
     re.I,
 )
+
+#: What a command position may end with when the dial word is not the statement's
+#: first word: a call operator, or the environment assignments a dial is prefixed by.
+_COMMAND_POSITION = re.compile(r"(?:^|[\s&!])(?:&|!|command|exec|\w+=\S*)$")
 
 #: The curl and wget flags whose value is never the target. The table is closed:
 #: an unseen long flag fails the target closed, an unseen short one is a switch.
@@ -868,17 +887,173 @@ def _dialing_statements(source: str, suffix: str) -> tuple[str, ...]:
 
 
 def _presents_in_statement(statement: str) -> bool:
-    """Whether one text statement presents the credential: a header flag, or a
-    marker it carries."""
-    return HEADER_FLAGS.search(statement) is not None or any(
-        marker in statement for marker in ACQUISITION_MARKERS
+    """Whether one text statement presents the credential: an actual header argument
+    keyed the way the daemon reads it, or a header argument the scan cannot read."""
+    return any(_presents_in_header_argument(argument) for argument in _header_arguments(statement))
+
+
+def _header_arguments(statement: str) -> tuple[str, ...]:
+    """The header arguments one dialing statement carries, each occurrence on its
+    own: the closed table of the positions the daemon's tools read — curl's
+    ``-H``/``--header``, wget's ``--header``, a PowerShell dial cmdlet's
+    ``-Headers``, and a fetch call's ``headers`` key."""
+    arguments: list[str] = []
+    command = _shell_dial(statement)
+    if command is not None:
+        arguments.extend(_shell_header_arguments(statement, command))
+    masked = _mask_quoted(statement)
+    if _PS_DIAL.search(masked) is not None:
+        arguments.extend(_powershell_header_arguments(masked, statement))
+    arguments.extend(_fetch_header_arguments(masked, statement))
+    return tuple(arguments)
+
+
+def _shell_header_arguments(statement: str, command: re.Match[str]) -> tuple[str, ...]:
+    """The header arguments one curl or wget invocation carries: the flag that takes
+    the next word as its argument, or the value a ``--header=`` spelling attaches."""
+    flag = _CURL_HEADER_FLAG if command.group().lower().startswith("curl") else _WGET_HEADER_FLAG
+    arguments: list[str] = []
+    base = command.end()
+    words = _word_spans(statement[base:])
+    index = 0
+    while index < len(words):
+        start, end = words[index]
+        word = statement[base + start : base + end]
+        index += 1
+        match = flag.fullmatch(word)
+        if match is None:
+            continue
+        if match.group("value") is not None:
+            arguments.append(match.group("value"))
+        elif index < len(words):
+            start, end = words[index]
+            arguments.append(statement[base + start : base + end])
+            index += 1
+        else:
+            arguments.append("")
+    return tuple(arguments)
+
+
+def _powershell_header_arguments(masked: str, statement: str) -> tuple[str, ...]:
+    """The header arguments the PowerShell dial cmdlets in one statement carry: the
+    next whole word after each ``-Headers`` parameter, a parenthesized expression
+    read whole."""
+    arguments: list[str] = []
+    for parameter in _PS_HEADER_PARAMETER.finditer(masked):
+        words = _word_spans(statement[parameter.end() :])
+        if words:
+            start, end = words[0]
+            arguments.append(statement[parameter.end() + start : parameter.end() + end])
+        else:
+            arguments.append("")
+    return tuple(arguments)
+
+
+def _fetch_header_arguments(masked: str, statement: str) -> tuple[str, ...]:
+    """The header arguments the fetch calls in one statement carry: the value of
+    each ``headers`` key inside the call's own arguments, and nowhere else."""
+    arguments: list[str] = []
+    for call in _FETCH_CALL.finditer(masked):
+        close = _closing_bracket(statement, call.end())
+        for key in _FETCH_HEADER_KEY.finditer(masked[call.end() : close]):
+            value = _first_argument(statement, call.end() + key.end())
+            if value is not None:
+                arguments.append(value)
+    return tuple(arguments)
+
+
+def _unquoted_index(text: str, char: str) -> int | None:
+    """The first position of ``char`` outside quotes, None when quotes hide it."""
+    quote = ""
+    for index, item in enumerate(text):
+        if quote:
+            if item == quote:
+                quote = ""
+        elif item in "'\"`":
+            quote = item
+        elif item == char:
+            return index
+    return None
+
+
+def _bare(text: str) -> str:
+    """The text one quoted span carries: a matched pair of surrounding quotes
+    removed."""
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "'\"`":
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def _entry(entry: str, separator: str) -> tuple[str, str | None]:
+    """One header entry as its key and value, the value None when no separator
+    makes it readable."""
+    index = _unquoted_index(entry, separator)
+    if index is None:
+        return (entry.strip(), None)
+    return (entry[:index].strip(), entry[index + 1 :])
+
+
+def _object_entries(text: str) -> tuple[tuple[str, str | None], ...]:
+    """The entries of a header object literal, a JavaScript object or a PowerShell
+    hashtable; an entry the scan cannot split carries no value."""
+    delimiter, separator = (";", "=") if text.startswith("@{") else (",", ":")
+    return tuple(
+        _entry(entry, separator) for entry in _arguments(text, text.index("{") + 1, delimiter) if entry
+    )
+
+
+def _colon_entry(text: str) -> tuple[tuple[str, str | None], ...] | None:
+    """The one entry a colon-separated header text carries, None when it has no
+    separator."""
+    index = _unquoted_index(text, ":")
+    if index is None:
+        return None
+    return ((text[:index].strip(), text[index + 1 :]),)
+
+
+def _header_argument_entries(argument: str) -> tuple[tuple[str, str | None], ...] | None:
+    """The readable entries of one header argument — a colon-separated header text,
+    a JavaScript header object, or a PowerShell hashtable — None when the whole
+    argument is a word the scan cannot read."""
+    stripped = _bare(argument)
+    if (stripped.startswith("{") or stripped.startswith("@{")) and stripped.endswith("}"):
+        return _object_entries(stripped)
+    return _colon_entry(stripped)
+
+
+def _carries_a_marker(value: str | None) -> bool:
+    """Whether a header value's own text carries an acquisition marker."""
+    return value is not None and any(marker in value for marker in ACQUISITION_MARKERS)
+
+
+def _value_unreadable(value: str | None) -> bool:
+    """Whether a header value is one the scan cannot read: empty, or a bare
+    variable reference whose expansion it cannot follow."""
+    if value is None:
+        return True
+    bare = _bare(value)
+    return bare == "" or _UNREADABLE_VALUE.fullmatch(bare) is not None
+
+
+def _presents_in_header_argument(argument: str) -> bool:
+    """Whether one header argument presents the credential: an entry keyed the way
+    the daemon reads carries a marker in its value part or a value the scan cannot
+    read, or the whole argument is a word the scan cannot read."""
+    entries = _header_argument_entries(argument)
+    if entries is None:
+        return True
+    return any(
+        CREDENTIAL_KEYS.fullmatch(_bare(key)) is not None
+        and (_carries_a_marker(value) or _value_unreadable(value))
+        for key, value in entries
     )
 
 
 def _dials_a_surface(statement: str) -> bool:
     """Whether one statement reaches a daemon surface: a dialing command at a command
-    position, or a URL from the daemon's own authority. An availability probe or a
-    quoted mention names no dial."""
+    position, or a URL from the daemon's own authority. An availability probe, a
+    quoted mention, and a mention outside a command position name no dial."""
     masked = _mask_quoted(statement)
     if _PS_DIAL.search(masked) is not None:
         return True
@@ -970,12 +1145,13 @@ def _word_spans(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
-def _first_argument(text: str, start: int) -> str | None:
-    """The first argument of a call that opens at ``start``: the text up to the
-    comma or closing bracket that ends it, nested groups included."""
+def _arguments(text: str, start: int, delimiter: str = ",") -> Iterator[str]:
+    """The arguments one call carries from ``start``, each ending at a top-level
+    delimiter or the bracket that closes the call, nested groups included."""
     depth = 0
     quote = ""
     index = start
+    first = start
     while index < len(text):
         char = text[index]
         if quote:
@@ -992,20 +1168,62 @@ def _first_argument(text: str, start: int) -> str | None:
             depth += 1
         elif char in ")]}":
             if depth == 0:
-                return text[start:index].strip() or None
+                yield text[first:index].strip()
+                return
             depth -= 1
-        elif char == "," and depth == 0:
-            return text[start:index].strip() or None
+        elif char == delimiter and depth == 0:
+            yield text[first:index].strip()
+            first = index + 1
         index += 1
-    return None
+
+
+def _first_argument(text: str, start: int) -> str | None:
+    """The first argument of a call that opens at ``start``: the text up to the
+    comma or closing bracket that ends it, nested groups included."""
+    return next(_arguments(text, start), None)
+
+
+def _closing_bracket(text: str, start: int) -> int:
+    """The index of the bracket that closes the call opened just before ``start``,
+    the text's end when the statement never closes it."""
+    depth = 1
+    quote = ""
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char in "'\"`":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(text)
+
+
+def _at_a_command_position(masked: str, start: int) -> bool:
+    """Whether the word at ``start`` is the statement's command: its first word, or
+    one an environment assignment or a call operator introduces."""
+    prefix = masked[:start].rstrip()
+    return not prefix or _COMMAND_POSITION.search(prefix) is not None
 
 
 def _shell_dial(statement: str) -> re.Match[str] | None:
-    """The curl or wget invocation in one statement, if it dials rather than asks
-    whether the command exists."""
+    """The curl or wget invocation in one statement, if it dials: the dial word
+    stands at a command position, and no availability probe reads it. A dial word
+    an output verb merely names is a mention, not a dial."""
     masked = _mask_quoted(statement)
     for match in _SHELL_DIAL_WORD.finditer(masked):
-        if _AVAILABILITY_PROBE.search(masked[: match.start()]) is None:
+        prefix = masked[: match.start()]
+        if _AVAILABILITY_PROBE.search(prefix) is None and _at_a_command_position(masked, match.start()):
             return match
     return None
 
@@ -1856,6 +2074,152 @@ def test_a_text_marker_counts_only_on_the_statement_that_dials(
     """A marker a caller only names in a comment — of any comment syntax its
     language has — or in another statement of the same line is not a presentation.
     A separator inside a quoted URL is not a separator."""
+    caller = _caller_file(tmp_path, filename, source)
+
+    assert _classify(_scan(caller)) == expected
+
+
+# ---------------------------------------------------------------- text header arguments
+
+#: Text header arguments on the statement a caller dials with: the header positions
+#: the daemon's own tools read, and the body channels and look-alike keys that reach
+#: it unauthenticated.
+_TEXT_HEADER_ARGUMENT_SHAPES = (
+    (
+        "wget-header.sh",
+        "wget --header='Authorization: Bearer x' http://127.0.0.1:7788/memory/remember\n",
+        CREDENTIALED,
+    ),
+    (
+        "mixed-case-key.sh",
+        "curl -H 'aUtHoRiZaTiOn: Bearer x' http://127.0.0.1:7788/memory/remember\n",
+        CREDENTIALED,
+    ),
+    (
+        "unreadable-header-value.sh",
+        "curl -H 'Authorization: $CREDENTIAL' http://127.0.0.1:7788/memory/remember\n",
+        CREDENTIALED,
+    ),
+    (
+        "body-flag.sh",
+        "curl -d 'Authorization: Bearer x' http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "body-flag-after-target.sh",
+        "curl http://127.0.0.1:7788/memory/remember -d 'Authorization: Bearer x'\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "body-data-raw.sh",
+        'curl --data-raw \'{"Authorization":"Bearer x"}\' http://127.0.0.1:7788/memory/remember\n',
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "body-json.sh",
+        'curl --json \'{"Authorization":"Bearer x"}\' http://127.0.0.1:7788/memory/remember\n',
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "body-parameter.ps1",
+        "Invoke-RestMethod -Uri \"$DaemonUrl/memory/remember\" -Body 'Authorization: Bearer x'\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "body-key.js",
+        'fetch("http://127.0.0.1:7788/memory/remember", '
+        '{method: "POST", body: "Authorization: Bearer x"});\n',
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "credential-free-header.sh",
+        "curl http://127.0.0.1:7788/memory/remember -H 'X-Track: x'\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "wget-span-hosts.sh",
+        "wget -H http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "wget-span-hosts-credential.sh",
+        "wget -H 'Authorization: Bearer x' http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "look-alike-key.sh",
+        "curl http://127.0.0.1:7788/memory/remember -H 'X-Authorization: Bearer x'\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+)
+
+
+@pytest.mark.parametrize(("filename", "source", "expected"), _TEXT_HEADER_ARGUMENT_SHAPES)
+def test_a_text_header_argument_presents_the_credential_only_for_the_daemons_key(
+    filename: str, source: str, expected: str, tmp_path: Path
+) -> None:
+    """A text caller presents the credential in an actual header argument, keyed the
+    way the daemon reads it with the marker in the value part: a body parameter, a
+    header whose key the daemon does not read, and a span-hosts switch present
+    nothing."""
+    caller = _caller_file(tmp_path, filename, source)
+
+    assert _classify(_scan(caller)) == expected
+
+
+#: A route a comment carries: the comment cannot present a credential, while the
+#: conservative route scan still reports the route against the raw source.
+_COMMENT_ROUTE_SHAPES = (("comment-route.sh", "# see /memory/remember docs\n"),)
+
+
+@pytest.mark.parametrize(("filename", "source"), _COMMENT_ROUTE_SHAPES)
+def test_a_route_a_comment_names_is_reported_but_presents_nothing(
+    filename: str, source: str, tmp_path: Path
+) -> None:
+    """Comment text cannot present a credential, and the route a comment names is
+    still reported by the conservative route scan."""
+    caller = _caller_file(tmp_path, filename, source)
+
+    scan = _scan(caller)
+
+    assert scan.hits == ("/memory/remember",)
+    assert _classify(scan) == PROTECTED_WITHOUT_CREDENTIAL
+
+
+#: The positions a shell dial word counts from: a mention an output verb carries is
+#: no dial, while a dial after an environment assignment or a call operator is one.
+_COMMAND_POSITION_SHAPES = (
+    ("mention.sh", "echo curl is installed\n", OPEN_SET),
+    (
+        "env-prefixed.sh",
+        "MNEMOSEED_HOME=/tmp curl http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "exec-prefixed.sh",
+        "exec curl http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "command-prefixed.sh",
+        "command curl http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+    (
+        "negated.sh",
+        "! curl http://127.0.0.1:7788/memory/remember\n",
+        PROTECTED_WITHOUT_CREDENTIAL,
+    ),
+)
+
+
+@pytest.mark.parametrize(("filename", "source", "expected"), _COMMAND_POSITION_SHAPES)
+def test_a_shell_dial_word_counts_only_from_a_command_position(
+    filename: str, source: str, expected: str, tmp_path: Path
+) -> None:
+    """A shell dial word is a call at a command position — the statement's first
+    word, or after an environment assignment or a call operator — and a mention an
+    output verb carries names no dial."""
     caller = _caller_file(tmp_path, filename, source)
 
     assert _classify(_scan(caller)) == expected
