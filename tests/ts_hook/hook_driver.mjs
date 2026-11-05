@@ -636,7 +636,10 @@ async function main() {
         messageID: "m_e2e_1",
         prompt: { text: "端到端归因轮" },
       })
-      await delay(300)
+      // The ingest POSTs are fire-and-forget (the prompt hook only enqueues
+      // them), so the transcript prints before they settle; node keeps the
+      // process alive until they do, and pytest takes acceptance from the
+      // daemon's counter (bounded poll), never from this recording.
       console.log(
         JSON.stringify({
           ingests: posts
