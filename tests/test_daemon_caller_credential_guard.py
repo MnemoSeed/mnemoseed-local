@@ -444,6 +444,7 @@ KNOWN_CALLERS: dict[str, str] = {
     "scripts/windows-install-helpers.ps1": OPEN_SET,
     "scripts/windows-logon-task.ps1": OPEN_SET,
     "scripts/windows-logon.ps1": OPEN_SET,
+    "scripts/writer_claim.py": OPEN_SET,
 }
 
 

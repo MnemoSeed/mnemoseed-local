@@ -98,6 +98,15 @@ listing captured earlier in the session.
   with verified disjoint file surfaces. After merge, clean up leftovers via
   `git worktree list` (remove stale task worktrees) and `git branch --merged main`
   (delete merged batch branches).
+- **Single-writer branch claim**: before `git worktree add`, claim the target
+  branch (`uv run python scripts/writer_claim.py claim --repo mnemoseed-local
+  --branch <branch> --seat <seat> --worktree <worktree-path>`) and release it
+  at closeout cleanup, after merge + worktree removal
+  (`uv run python scripts/writer_claim.py release --repo mnemoseed-local
+  --branch <branch> --seat <seat>`). The claim is advisory bookkeeping: it
+  refuses a double claim at the claim file and records the collision in the
+  ledger; nothing else is gated. A stale claim is freed only by an explicit
+  `release --main --reason "<stated reason>"`.
 
 ## Org pointer
 
