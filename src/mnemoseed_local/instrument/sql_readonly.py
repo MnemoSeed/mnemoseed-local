@@ -124,6 +124,31 @@ NODE_VERSION_COLUMNS: tuple[str, ...] = (
     "payload",
 )
 
+#: The outbox read projection with the columns whose absence is missing evidence
+#: and the columns that identify a row in a typed failure detail.
+OUTBOX_ROW_COLUMNS: tuple[str, ...] = (
+    "id",
+    "nomination_id",
+    "profile_id",
+    "action",
+    "created_at",
+    "delivered_at",
+)
+OUTBOX_REQUIRED_COLUMNS: tuple[str, ...] = ("id", "nomination_id", "profile_id", "action", "created_at")
+OUTBOX_IDENTIFIER_COLUMNS: tuple[str, ...] = ("nomination_id", "profile_id", "action")
+
+#: The version-chain columns whose absence is missing evidence; the nullable
+#: valid_to and superseded_by stay outside this set.
+NODE_VERSION_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "node_id",
+    "version",
+    "profile_id",
+    "valid_from",
+    "changed_at",
+    "payload",
+)
+NODE_VERSION_IDENTIFIER_COLUMNS: tuple[str, ...] = ("node_id",)
+
 
 @dataclass(frozen=True)
 class OutboxRowSnapshot:
@@ -217,19 +242,35 @@ def query_hash_for(template: str, placeholder_count: int) -> str:
 
 
 def read_outbox_rows(conn: sqlite3.Connection) -> list[OutboxRowSnapshot]:
-    """Read the persisted audit outbox rows with their raw stamps."""
+    """Read the persisted audit outbox rows with their raw stamps.
+
+    A copied or unsupported table shape that loses a required column fails
+    typed with its identifying cells, and an id the row cannot supply never
+    leaks a raw conversion error.
+    """
     rows = _fetch_rows(conn, OUTBOX_ROWS_QUERY)
-    return [
-        OutboxRowSnapshot(
-            outbox_id=int(row[0]),
-            nomination_id=str(row[1]),
-            profile_id=str(row[2]),
-            action=str(row[3]),
-            created_at_raw=str(row[4]),
-            delivered_at_raw=None if row[5] is None else str(row[5]),
+    snapshots: list[OutboxRowSnapshot] = []
+    for row in rows:
+        values = _row_cells(row, OUTBOX_ROW_COLUMNS)
+        identifiers = _cell_evidence(values, OUTBOX_IDENTIFIER_COLUMNS)
+        _require_row_columns(values, OUTBOX_REQUIRED_COLUMNS, "outbox_row_missing", identifiers)
+        try:
+            outbox_id = int(row[0])
+        except (TypeError, ValueError) as exc:
+            raise BindingIncompleteError(
+                _read_detail("outbox_row_decode_error", exc, column="id", **identifiers)
+            ) from exc
+        snapshots.append(
+            OutboxRowSnapshot(
+                outbox_id=outbox_id,
+                nomination_id=str(row[1]),
+                profile_id=str(row[2]),
+                action=str(row[3]),
+                created_at_raw=str(row[4]),
+                delivered_at_raw=values["delivered_at"],
+            )
         )
-        for row in rows
-    ]
+    return snapshots
 
 
 def read_unresolved_receipts(conn: sqlite3.Connection) -> list[ProjectionReceiptSnapshot]:
@@ -351,21 +392,39 @@ def read_node_versions(
     profile_id: str,
     node_ids: Sequence[str],
 ) -> list[NodeVersionSnapshot]:
-    """Read the version-chain rows of one profile with the hash of each row."""
+    """Read the version-chain rows of one profile with the hash of each row.
+
+    A damaged version row fails typed with its node identity instead of
+    leaking a raw conversion error, and the row hash keeps an absent nullable
+    cell absent.
+    """
     identifiers = tuple(node_ids)
     if not identifiers:
         return []
     placeholders = ", ".join(["?"] * len(identifiers))
     query = NODE_VERSIONS_QUERY_TEMPLATE.format(placeholders=placeholders)
     rows = _fetch_rows(conn, query, (profile_id, *identifiers))
-    return [
-        NodeVersionSnapshot(
-            node_id=str(row[0]),
-            version=int(row[1]),
-            row_hash=_version_row_hash(row),
+    snapshots: list[NodeVersionSnapshot] = []
+    for row in rows:
+        values = _row_cells(row, NODE_VERSION_COLUMNS)
+        row_identifiers = _cell_evidence(values, NODE_VERSION_IDENTIFIER_COLUMNS)
+        _require_row_columns(
+            values, NODE_VERSION_REQUIRED_COLUMNS, "node_version_row_missing", row_identifiers
         )
-        for row in rows
-    ]
+        try:
+            version = int(row[1])
+        except (TypeError, ValueError) as exc:
+            raise BindingIncompleteError(
+                _read_detail("node_version_row_decode_error", exc, column="version", **row_identifiers)
+            ) from exc
+        snapshots.append(
+            NodeVersionSnapshot(
+                node_id=str(row[0]),
+                version=version,
+                row_hash=_version_row_hash(values),
+            )
+        )
+    return snapshots
 
 
 def capture_node_integrity(
@@ -538,12 +597,12 @@ def _read_product_receipt(
     try:
         return graph.get_reconciliation_receipt(profile_id=profile_id, nomination_id=nomination_id)
     except sqlite3.Error as exc:
-        detail = _product_read_detail(
+        detail = _read_detail(
             "product_receipt_query_error", exc, profile_id=profile_id, nomination_id=nomination_id
         )
         raise BindingIncompleteError(detail) from exc
     except (ValueError, TypeError, OverflowError) as exc:
-        detail = _product_read_detail(
+        detail = _read_detail(
             "product_receipt_decode_error", exc, profile_id=profile_id, nomination_id=nomination_id
         )
         raise BindingIncompleteError(detail) from exc
@@ -559,21 +618,48 @@ def _read_product_node(graph: SqliteGraphDriver, *, node_id: str) -> GraphNode |
     try:
         return graph.get_node(node_id)
     except sqlite3.Error as exc:
-        detail = _product_read_detail("product_node_query_error", exc, node_id=node_id)
+        detail = _read_detail("product_node_query_error", exc, node_id=node_id)
         raise BindingIncompleteError(detail) from exc
     except (ValueError, TypeError, OverflowError) as exc:
-        detail = _product_read_detail("product_node_decode_error", exc, node_id=node_id)
+        detail = _read_detail("product_node_decode_error", exc, node_id=node_id)
         raise BindingIncompleteError(detail) from exc
 
 
-def _product_read_detail(reason: str, error: BaseException, **identifiers: str) -> dict[str, Any]:
-    """The typed failure detail of one product read."""
-    return {"reason": reason, **identifiers, "error": str(error)}
+def _read_detail(reason: str, error: BaseException | None = None, **fields: Any) -> dict[str, Any]:
+    """The typed failure detail of one bounded read."""
+    detail: dict[str, Any] = {"reason": reason, **fields}
+    if error is not None:
+        detail["error"] = str(error)
+    return detail
+
+
+def _cell_text(value: Any) -> str | None:
+    """The text of one non-null cell, keeping an absent cell absent."""
+    return None if value is None else str(value)
+
+
+def _row_cells(row: Sequence[Any], columns: Sequence[str]) -> dict[str, Any]:
+    """The projected cells of one read row by column name, absent cells kept absent."""
+    return {name: _cell_text(value) for name, value in zip(columns, row, strict=True)}
+
+
+def _cell_evidence(values: dict[str, Any], names: Sequence[str]) -> dict[str, Any]:
+    """The identifying cells of one read row for a typed failure detail."""
+    return {name: values[name] for name in names}
+
+
+def _require_row_columns(
+    values: dict[str, Any], required: Sequence[str], reason: str, identifiers: dict[str, Any]
+) -> None:
+    """Fail typed when a required column of one read row is absent."""
+    for name in required:
+        if values[name] is None:
+            raise BindingIncompleteError(_read_detail(reason, column=name, **identifiers))
 
 
 def _row_values(rows: Sequence[Sequence[Any]]) -> list[list[Any]]:
     """The row values of a result set, with the text of every non-null value."""
-    return [[None if value is None else str(value) for value in row] for row in rows]
+    return [[_cell_text(value) for value in row] for row in rows]
 
 
 def _column_types(conn: sqlite3.Connection, table: str) -> dict[str, str]:
@@ -582,10 +668,13 @@ def _column_types(conn: sqlite3.Connection, table: str) -> dict[str, str]:
     return {str(row[1]): str(row[2]) for row in rows}
 
 
-def _version_row_hash(row: Sequence[Any]) -> str:
-    """The hash of the selected columns of one version-chain row."""
-    payload = {name: str(value) for name, value in zip(NODE_VERSION_COLUMNS, row, strict=True)}
-    return sha256_hex(canonical_json(payload).encode("utf-8"))
+def _version_row_hash(values: dict[str, Any]) -> str:
+    """The hash of the selected columns of one version-chain row.
+
+    The payload keeps an absent nullable cell absent, so a stored NULL and the
+    literal text None never hash identically.
+    """
+    return sha256_hex(canonical_json(values).encode("utf-8"))
 
 
 def _current_node_hash(graph: SqliteGraphDriver, node_id: str) -> str:
