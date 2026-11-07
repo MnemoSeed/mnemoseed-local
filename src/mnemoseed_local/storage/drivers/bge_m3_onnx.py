@@ -52,6 +52,9 @@ _ENCODER_MODEL = "onnx/model_quantized.onnx"
 _ENCODER_TOKENIZER = "tokenizer.json"
 _SPARSE_PROJECTION = "sparse_linear.pt"
 _DEFAULT_DIMENSION = 1024
+# Input cap: attention memory grows quadratically with sequence length, so the
+# default bounds the transient a single pathological long input can demand.
+_DEFAULT_MAX_LENGTH = 1024
 _CHUNK_BYTES = 1 << 20
 
 ProgressCallback = Callable[[int, int], None]
@@ -69,6 +72,18 @@ class ModelDownloadError(RuntimeError):
 def _model_url(repo: str, filename: str) -> str:
     """Hugging Face resolve URL for one model-file artifact."""
     return f"https://huggingface.co/{repo}/resolve/main/{filename}"
+
+
+def _session_options() -> Any:
+    """CPU EP session options: two intra-op threads; the BFC arena is disabled
+    so transient inference allocations return to the OS instead of being
+    retained at the run's high-water mark."""
+    from onnxruntime import SessionOptions
+
+    options = SessionOptions()
+    options.intra_op_num_threads = 2
+    options.enable_cpu_mem_arena = False
+    return options
 
 
 # torch storage classes -> numpy dtypes (torch-free state-dict reading)
@@ -103,7 +118,7 @@ class BgeM3OnnxEmbedder:
         sparse_repo: str = _SPARSE_REPO,
         sparse_filename: str = _SPARSE_PROJECTION,
         dimension: int = _DEFAULT_DIMENSION,
-        max_length: int = 8192,
+        max_length: int = _DEFAULT_MAX_LENGTH,
         progress: ProgressCallback | None = None,
         **kwargs: Any,
     ) -> None:
@@ -228,12 +243,10 @@ class BgeM3OnnxEmbedder:
                 return
             self.ensure_downloaded()
 
-            from onnxruntime import InferenceSession, SessionOptions
+            from onnxruntime import InferenceSession
 
-            options = SessionOptions()
-            options.intra_op_num_threads = 2
             session = InferenceSession(
-                str(self._model_file), sess_options=options, providers=["CPUExecutionProvider"]
+                str(self._model_file), sess_options=_session_options(), providers=["CPUExecutionProvider"]
             )
             inputs = {i.name for i in session.get_inputs()}
             if "input_ids" not in inputs or "attention_mask" not in inputs:

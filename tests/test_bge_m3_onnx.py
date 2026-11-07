@@ -109,6 +109,62 @@ def test_embed_batch_matches_single_embeds():
             assert abs(batch_value - solo_value) <= max(3e-2, 0.4 * scale)
 
 
+def test_default_input_cap_is_1024(tmp_path):
+    """The default embedder input cap is 1024 tokens: a single pathological
+    long input must not be able to ratchet the inference memory envelope."""
+    embedder = BgeM3OnnxEmbedder(model_dir=tmp_path / "models")
+    assert embedder.max_length == 1024
+
+
+def test_session_options_disable_cpu_mem_arena():
+    """The ORT session disables the CPU BFC arena: transient inference
+    allocations return to the OS instead of being retained at the run's
+    high-water mark."""
+    options = bge_m3_onnx._session_options()
+    assert options.enable_cpu_mem_arena is False
+    assert options.intra_op_num_threads == 2
+
+
+_NEEDLE_FACT = "The nightly backup retention window moved to 03:30 and now keeps 14 rotations."
+_RIVAL_FACT = "The staging cluster syncs its mirror at 04:15 and prunes snapshots older than 7 days."
+_SHORT_DISTRACTORS = [
+    "The design review for the onboarding flow is scheduled for Tuesday.",
+    "The lighthouse score for the landing page improved to 98.",
+]
+_FILLER = (
+    "The workshop notes were archived after the meeting wrapped up. "
+    "A courier delivered the annual catalog to the reception desk. "
+    "The garden project resumed once the weather settled. "
+) * 30
+
+
+def test_long_input_truncates_at_the_default_cap_and_needle_ranks_first():
+    """A >cap-token text still embeds at the default cap (head kept, tail not
+    embedded) and the needle fact still ranks #1 for its own query against
+    short distractors and a rival long pin."""
+    embedder = _make_embedder()
+    if not embedder.model_path.exists():
+        pytest.skip("bge-m3 model absent locally (skipping real-inference truncation test)")
+    embedder._load()
+
+    long_needle = _NEEDLE_FACT + " " + _FILLER
+    long_rival = _RIVAL_FACT + " " + _FILLER
+    texts = [long_needle, long_rival, *_SHORT_DISTRACTORS]
+
+    raw_ids = embedder._tokenizer.encode(long_needle, add_special_tokens=True).ids
+    assert len(raw_ids) > embedder.max_length, "premise: the needle exceeds the cap"
+    capped_ids, _mask = embedder._tokenize([long_needle])
+    assert capped_ids.shape[1] == embedder.max_length
+
+    for text in texts:
+        result = embedder.embed(text)
+        assert len(result.dense) == _MODEL_DIMENSION
+
+    query = embedder.embed("When does the nightly backup retention window start?").dense
+    ranked = sorted(texts, key=lambda text: -_cosine(query, embedder.embed(text).dense))
+    assert ranked[0] == long_needle, f"needle must rank #1 at the cap, got {ranked[0][:40]!r}"
+
+
 # ------------------------------------------------------------ model bootstrap (PRD-06 FR-6.2)
 #
 # First-run model bootstrap is pinned against a local HTTP server with RFC 7233

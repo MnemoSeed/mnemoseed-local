@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from mnemoseed_local.config import RoleLLMConfig
 from mnemoseed_local.dream.readiness import DreamRouteReadiness
 from mnemoseed_local.rest_client import DEFAULT_PROFILE_ID
+from mnemoseed_local.util.process_memory import process_commit_mb
 
 logger = logging.getLogger("mnemoseed_local.daemon.observability")
 
@@ -88,6 +89,7 @@ class Observability:
                 "recall_injection_count": self._recall_injection_count,
                 "recall_injection_chars_total": self._recall_injection_chars_total,
                 "recall_pending_served_count": self._recall_injection_count,
+                "process_commit_mb": process_commit_mb(),
             }
 
 
