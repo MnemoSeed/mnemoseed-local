@@ -53,6 +53,7 @@ from mnemoseed_local.hosts.common.fence import (
 from mnemoseed_local.hosts.common.recall import T1_SIGNAL
 from mnemoseed_local.hosts.cursor import events
 from mnemoseed_local.hosts.cursor import install as cur_install
+from mnemoseed_local.hosts.install import DETECTION_PROBE_BASE
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 from mnemoseed_local.schema.turn import FlushRequest, HostId, IngestEvent, IngestEventType, SessionEndRequest
 from mnemoseed_local.storage.drivers import (
@@ -1125,8 +1126,12 @@ def test_utf8_foreign_content_survives_the_roundtrip(cur_home: Path, stable_comm
 
 
 def test_host_cli_lifecycle_wiring(
-    cur_home: Path, stable_command: tuple[str, str], capsys: pytest.CaptureFixture[str]
+    cur_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", DETECTION_PROBE_BASE)
     assert main(["host", "install", "--host", "cursor"]) == 0
     assert "applied" in capsys.readouterr().out
     assert (cur_home / "hooks.json").is_file()

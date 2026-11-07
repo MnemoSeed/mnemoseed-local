@@ -42,6 +42,7 @@ from mnemoseed_local.capture.stamper import StampWriter, WriteContext, WriteOutc
 from mnemoseed_local.cli import main
 from mnemoseed_local.hosts.codex_cli import events, transcript
 from mnemoseed_local.hosts.codex_cli import install as cx_install
+from mnemoseed_local.hosts.install import DETECTION_PROBE_BASE
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 from mnemoseed_local.schema.turn import (
     HostId,
@@ -1471,6 +1472,7 @@ def test_status_reports_a_complete_install_as_trust_unverified(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", DETECTION_PROBE_BASE)
     cx_install.install()
     config = cx_home / "config.toml"
     assert "[hooks.state" not in config.read_text(encoding="utf-8"), "install never writes a trust record"
@@ -1711,6 +1713,7 @@ def test_host_cli_lifecycle_wiring(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", DETECTION_PROBE_BASE)
     assert main(["host", "install", "--host", "codex_cli"]) == 0
     assert "applied" in capsys.readouterr().out
     hooks = json.loads((cx_home / "hooks.json").read_text(encoding="utf-8"))

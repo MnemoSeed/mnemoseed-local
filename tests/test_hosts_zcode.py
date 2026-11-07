@@ -28,6 +28,7 @@ import pytest
 
 from mnemoseed_local.cli import main
 from mnemoseed_local.hosts.claude_code import events as cc_events
+from mnemoseed_local.hosts.install import DETECTION_PROBE_BASE
 from mnemoseed_local.hosts.zcode import events
 from mnemoseed_local.hosts.zcode import install as zc_install
 from mnemoseed_local.rest_client import (
@@ -1147,8 +1148,12 @@ def test_installed_mcp_entry_spawns_a_working_gateway(
 
 
 def test_host_cli_lifecycle_wiring(
-    zc_home: Path, stable_command: tuple[str, tuple[str, ...]], capsys: pytest.CaptureFixture[str]
+    zc_home: Path,
+    stable_command: tuple[str, tuple[str, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", DETECTION_PROBE_BASE)
     assert main(["host", "install", "--host", "zcode"]) == 0
     assert "applied" in capsys.readouterr().out
     assert (zc_home / "cli" / "config.json").is_file()

@@ -32,6 +32,14 @@ from mnemoseed_local.config import (
     default_config_toml,
     load_config,
 )
+from mnemoseed_local.daemon.observability import (
+    CAPTURE_EVIDENCE_NONE,
+    CaptureEvidenceStatus,
+    SinceBootObservation,
+    capture_evidence_status,
+    since_boot_observation,
+    unreadable_capture_evidence,
+)
 from mnemoseed_local.dream.readiness import models_contain
 from mnemoseed_local.hosts.install import (
     ADAPTER_MODULES,
@@ -782,16 +790,21 @@ def _stale_stdio_mcp_warning(path: Path) -> tuple[str, str] | None:
     )
 
 
+def _observability_counters(client: DaemonClient) -> dict[str, Any] | None:
+    """The daemon's since-boot observability counters; None when unobservable
+    (any transport failure means unknown, never zero)."""
+    try:
+        return client.get("/api/v1/observability")
+    except Exception:  # noqa: BLE001 - any transport failure means "unknown"
+        return None
+
+
 def _daemon_activity(config: Config) -> dict[str, Any] | None:
     """The daemon's since-boot observability counters; None when unreachable
     (a down daemon says nothing about MCP injection)."""
     from mnemoseed_local.credential import read_credential_or_none
 
-    try:
-        client = DaemonClient(base_url=config.baseurl, token=read_credential_or_none())
-        return client.get("/api/v1/observability")
-    except Exception:  # noqa: BLE001 - any transport failure means "unknown"
-        return None
+    return _observability_counters(DaemonClient(base_url=config.baseurl, token=read_credential_or_none()))
 
 
 def _unregistered_profile_ids(stores: Any) -> list[str]:
@@ -1868,13 +1881,183 @@ def cmd_host(args: argparse.Namespace) -> int:
         return 1
     result = entry()
     if args.host_command == "status":
+        observations = _host_status_observations(args.host, result)
+        if args.json:
+            return _emit_json(
+                {
+                    "host": args.host,
+                    "profile_id": observations.profile_id,
+                    "structure": {
+                        "state": result.state,
+                        "path": str(result.path),
+                        "daemon_reachable": result.daemon_reachable,
+                        "base_url": result.base_url,
+                    },
+                    "ingest_ack": {
+                        "state": observations.ingest_ack.state,
+                        "count": observations.ingest_ack.count,
+                        "detail": observations.ingest_ack.detail,
+                    },
+                    "capture_evidence": {
+                        "state": observations.capture.state,
+                        "last_persisted_at": observations.capture.last_persisted_at,
+                        "window_s": observations.capture.window_s,
+                        "detail": observations.capture.detail,
+                    },
+                    "replay_evidence": {
+                        "state": observations.replay.state,
+                        "count": observations.replay.count,
+                        "detail": observations.replay.detail,
+                    },
+                    "trust": {"state": observations.trust.state, "detail": observations.trust.detail},
+                }
+            )
         print(f"host: {result.state}")
         print(f"path: {result.path}")
         print(f"daemon: {'reachable' if result.daemon_reachable else 'unreachable'} ({result.base_url})")
-    else:
-        path, applied = result
-        print(f"{args.host_command}: {path} ({'applied' if applied else 'no change'})")
+        for line in observations.lines():
+            print(line)
+        return 0
+    path, applied = result
+    print(f"{args.host_command}: {path} ({'applied' if applied else 'no change'})")
     return 0
+
+
+#: The manual-trust vocabulary of the host status surface: a known manual
+#: step whose verification the tool never performs, a host whose install
+#: design asks no manual trust step, and a structure the trust state cannot
+#: be assessed from. Never guessed, never automated.
+TRUST_UNVERIFIED = "unverified"
+TRUST_NOT_REQUIRED = "not_required"
+TRUST_UNKNOWN = "unknown"
+
+#: The structural state no trust requirement can attach to: nothing of ours
+#: is registered for the host to trust.
+_STRUCTURE_NOT_INSTALLED = "not-installed"
+
+
+@dataclass(frozen=True)
+class TrustStatus:
+    """One computed manual-trust state for the host status surface."""
+
+    state: str
+    detail: str
+
+    def line(self) -> str:
+        return f"trust: {self.state} ({self.detail})"
+
+
+def _trust_status(host: str, structure_state: str) -> TrustStatus:
+    """The manual-trust observation: a known requirement with its standing
+    state, or an honest unknown. An adapter declares its manual step with
+    ``MANUAL_TRUST_STATE`` / ``MANUAL_TRUST_STEP``; a partial or unreadable
+    structure stays unknown rather than guessing a verdict."""
+    if structure_state == _STRUCTURE_NOT_INSTALLED:
+        return TrustStatus(TRUST_NOT_REQUIRED, "no mnemoseed hooks registered for this host")
+    module = importlib.import_module(HOOK_HOSTS[host].install)
+    pending = getattr(module, "MANUAL_TRUST_STATE", None)
+    if pending is None:
+        return TrustStatus(TRUST_NOT_REQUIRED, "no manual trust step in this host's install flow")
+    if structure_state == pending:
+        return TrustStatus(TRUST_UNVERIFIED, str(getattr(module, "MANUAL_TRUST_STEP", pending)))
+    return TrustStatus(
+        TRUST_UNKNOWN,
+        f"the install structure is {structure_state!r}; the trust state cannot be assessed",
+    )
+
+
+@dataclass(frozen=True)
+class HostStatusObservations:
+    """The status observations beyond structure, gathered once for the human
+    lines and the JSON payload. None of them alone proves another: a written
+    hook config is not an acknowledged ingest, an acknowledged ingest is not
+    a persisted capture, and a persisted capture is not a replay."""
+
+    profile_id: str
+    ingest_ack: SinceBootObservation
+    capture: CaptureEvidenceStatus
+    replay: SinceBootObservation
+    trust: TrustStatus
+
+    def lines(self) -> list[str]:
+        return [self.ingest_ack.line(), self.capture.line(), self.replay.line(), self.trust.line()]
+
+
+def _counter(activity: dict[str, Any] | None, key: str) -> int | None:
+    """One since-boot counter as an int, or None when unobservable."""
+    if not isinstance(activity, dict):
+        return None
+    value = activity.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _capture_window() -> float:
+    """The capture freshness window: the daemon's own idle-flush threshold,
+    falling back to its default when the config is unreadable."""
+    from mnemoseed_local.config import DEFAULT_CAPTURE_IDLE_FLUSH_SEC
+
+    try:
+        return load_config().capture.idle_flush_sec
+    except (ConfigError, ValueError):
+        return DEFAULT_CAPTURE_IDLE_FLUSH_SEC
+
+
+def _capture_evidence(client: DaemonClient, host: str, window_s: float) -> CaptureEvidenceStatus:
+    """The persisted-capture observation for one host+profile: the daemon
+    reads its own store, and every failure mode lands on the honest unknown."""
+    try:
+        reply = client.post("/api/v1/host/capture-evidence", {"profile_id": client.profile_id, "host": host})
+    except Exception as exc:  # noqa: BLE001 - any transport failure means "unknown"
+        return unreadable_capture_evidence(f"the persisted-capture read failed: {exc}", window_s=window_s)
+    if not isinstance(reply, dict):
+        return unreadable_capture_evidence("the persisted-capture reply was unreadable", window_s=window_s)
+    last = reply.get("last_persisted_at")
+    if last is not None and (not isinstance(last, (float, int)) or isinstance(last, bool)):
+        return unreadable_capture_evidence("the persisted-capture reply was unreadable", window_s=window_s)
+    evidence = capture_evidence_status(
+        last_persisted_at=float(last) if last is not None else None, window_s=window_s
+    )
+    profile_last = reply.get("profile_last_persisted_at")
+    if evidence.state == CAPTURE_EVIDENCE_NONE and isinstance(profile_last, (float, int)):
+        evidence = replace(
+            evidence, detail=f"{evidence.detail}; the profile holds captures from other sources"
+        )
+    return evidence
+
+
+def _host_status_observations(host: str, result: Any) -> HostStatusObservations:
+    """Gather the status observations once: structure is already in hand; the
+    since-boot counters and the persisted-capture read come from the daemon
+    the host's hooks post to, each degrading to an honest unknown."""
+    from mnemoseed_local.rest_client import resolve_client
+
+    client = resolve_client(argparse.Namespace(baseurl=result.base_url))
+    activity = _observability_counters(client)
+    window_s = _capture_window()
+
+    ack_count = _counter(activity, "capture_ingest_count")
+    ingest_ack = since_boot_observation(
+        label="ingest ack",
+        count=ack_count,
+        observed=f"{ack_count} hook ingests acknowledged since boot",
+        not_observed="no hook ingest acknowledged since boot",
+        unknown="the since-boot counters were unreadable",
+    )
+    replay_count = _counter(activity, "recall_injection_count")
+    replay = since_boot_observation(
+        label="replay",
+        count=replay_count,
+        observed=f"{replay_count} replay serves observed since boot (not attributed to this host)",
+        not_observed="no replay serve observed since boot",
+        unknown="the since-boot counters were unreadable",
+    )
+    return HostStatusObservations(
+        profile_id=client.profile_id,
+        ingest_ack=ingest_ack,
+        capture=_capture_evidence(client, host, window_s),
+        replay=replay,
+        trust=_trust_status(host, result.state),
+    )
 
 
 # ------------------------------------------------------------ MCP gateway (A3 T3)
@@ -2086,7 +2269,15 @@ def build_parser() -> argparse.ArgumentParser:
     host_verbs = p_host.add_subparsers(dest="host_command", required=True)
     host_verbs.add_parser("install", parents=[host_common], help="install the host adapter's hook")
     host_verbs.add_parser("uninstall", parents=[host_common], help="remove the host adapter's hook")
-    host_verbs.add_parser("status", parents=[host_common], help="report the host adapter's install state")
+    p_host_status = host_verbs.add_parser(
+        "status", parents=[host_common], help="report the host adapter's install state"
+    )
+    p_host_status.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the full status payload as JSON (structure, capture "
+        "evidence observations and the manual trust step)",
+    )
 
     p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")
     p_mcp.add_argument("--baseurl", default=None, help="daemon base URL override")

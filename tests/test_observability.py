@@ -294,3 +294,90 @@ def test_request_logging_on_emits_method_path_status_without_bodies(config_path:
     assert any("GET /healthz" in m for m in messages), messages
     assert any("POST /ingest" in m for m in messages), messages
     assert not any(SECRET_BODY_TEXT in m for m in messages), "request bodies must never reach the log"
+
+
+# ---------------------------------------------------------------- capture evidence states (host status)
+
+
+def test_capture_evidence_states_from_explicit_values() -> None:
+    """The persisted-capture state maps explicit evidence onto the honest
+    vocabulary: absence, in-window presence, out-of-window presence."""
+    from mnemoseed_local.daemon.observability import (
+        CAPTURE_EVIDENCE_NONE,
+        CAPTURE_EVIDENCE_RECENT,
+        CAPTURE_EVIDENCE_STALE,
+        capture_evidence_status,
+    )
+
+    window = 600.0
+    now = 1_000_000.0
+
+    absent = capture_evidence_status(last_persisted_at=None, window_s=window, now=now)
+    assert absent.state == CAPTURE_EVIDENCE_NONE
+    assert absent.last_persisted_at is None
+    assert absent.window_s == window
+
+    recent = capture_evidence_status(last_persisted_at=now - 30.0, window_s=window, now=now)
+    assert recent.state == CAPTURE_EVIDENCE_RECENT
+
+    boundary = capture_evidence_status(last_persisted_at=now - window, window_s=window, now=now)
+    assert boundary.state == CAPTURE_EVIDENCE_RECENT
+
+    stale = capture_evidence_status(last_persisted_at=now - window - 1.0, window_s=window, now=now)
+    assert stale.state == CAPTURE_EVIDENCE_STALE
+    assert stale.last_persisted_at == now - window - 1.0
+
+    future = capture_evidence_status(last_persisted_at=now + 5.0, window_s=window, now=now)
+    assert future.state == CAPTURE_EVIDENCE_RECENT
+
+
+def test_capture_evidence_line_is_one_computed_line() -> None:
+    from mnemoseed_local.daemon.observability import capture_evidence_status
+
+    line = capture_evidence_status(last_persisted_at=None, window_s=600.0, now=1.0).line()
+    assert line.startswith("capture: none (")
+    assert line.endswith(")")
+
+
+def test_since_boot_counter_maps_onto_observed_not_observed_unknown() -> None:
+    """A counter that moved, one that has not, and one that could not be read
+    (None — unknown, never zero)."""
+    from mnemoseed_local.daemon.observability import (
+        OBSERVATION_NOT_OBSERVED,
+        OBSERVATION_OBSERVED,
+        OBSERVATION_UNKNOWN,
+        since_boot_observation,
+    )
+
+    observed = since_boot_observation(
+        label="ingest ack",
+        count=3,
+        observed="3 hook ingests acknowledged since boot",
+        not_observed="no hook ingest acknowledged since boot",
+        unknown="the since-boot counters were unreadable",
+    )
+    assert observed.state == OBSERVATION_OBSERVED
+    assert observed.count == 3
+
+    clear = since_boot_observation(
+        label="ingest ack",
+        count=0,
+        observed="observed",
+        not_observed="no hook ingest acknowledged since boot",
+        unknown="unreadable",
+    )
+    assert clear.state == OBSERVATION_NOT_OBSERVED
+    assert clear.count == 0
+
+    unknown = since_boot_observation(
+        label="ingest ack",
+        count=None,
+        observed="observed",
+        not_observed="clear",
+        unknown="the since-boot counters were unreadable",
+    )
+    assert unknown.state == OBSERVATION_UNKNOWN
+    assert unknown.count is None
+
+    assert observed.line().startswith("ingest ack: observed (")
+    assert clear.line().startswith("ingest ack: not_observed (")
