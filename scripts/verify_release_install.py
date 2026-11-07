@@ -32,6 +32,8 @@ import tempfile
 import threading
 import time
 import tomllib
+import urllib.request
+import uuid
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -51,6 +53,47 @@ HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
 MCP_REQUIRED_TOOLS = ("recall", "remember", "dream_once", "recent_sessions", "session_windows")
 FORBIDDEN_PORTS = (7788, 4096)
 
+MANIFEST_SCHEMA = "mnemoseed-release-manifest/1"
+MANIFEST_SCHEMA_VERSION = 1
+ROUTE_INDEX = "index"
+ROUTE_SOURCE = "source"
+ROUTE_INDEX_BLOCKED = "BLOCKED_OPERATOR"
+ROUTE_INDEX_AVAILABLE = "available"
+INSTALLERS = ("install.sh", "install.ps1")
+HELPER_SOURCES = (
+    "scripts/windows-install-helpers.ps1",
+    "scripts/windows-logon.ps1",
+    "scripts/windows-logon-task.ps1",
+)
+EXPECTED_CLI_CAPABILITIES = (
+    "init",
+    "up",
+    "on",
+    "off",
+    "status",
+    "doctor",
+    "recall",
+    "remember",
+    "dream",
+    "forget",
+    "config",
+    "credential",
+    "profile",
+    "project",
+    "uninstall",
+    "hook",
+    "host",
+    "mcp",
+)
+PROFILE_ENV_VAR = "MNEMOSEED_LOCAL_PROFILE_ID"
+
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_HELPER_URI_DECLARATION = re.compile(r"\$HelperBaseUri\s*=\s*'(?P<uri>[^']+)'")
+_IMMUTABLE_HELPER_URI = re.compile(
+    r"^https://raw\.githubusercontent\.com/MnemoSeed/mnemoseed-local/(?P<revision>[0-9a-f]{40})/scripts/$"
+)
+_PIN_SPEC = re.compile(r"mnemoseed-local\[codex\]==(?P<version>[0-9A-Za-z][A-Za-z0-9._+-]*)")
+
 BUILD_TIMEOUT_S = 600.0
 INSTALL_TIMEOUT_S = 900.0
 CLI_TIMEOUT_S = 120.0
@@ -60,12 +103,16 @@ HOOK_TIMEOUT_S = 120.0
 COVERAGE = (
     "wheel and sdist built from this checkout with `uv build`",
     "wheel METADATA and sdist PKG-INFO checked for name, version, console script and the codex extra",
+    "the release manifest is generated and coherence-verified against the checkout: package version, source "
+    "revision, installer bytes, helper bytes, installer pin, artifact hashes and routes",
     "wheel installed with its codex extra into an isolated `uv tool` directory and bin dir",
     "installed CLI --version equals the artifact version",
     "`import zstandard` and package metadata resolved from the installed tool environment",
     "MCP initialize + tools/list over newline-delimited JSON-RPC on stdio (no tools/call sent)",
     "fresh `init` defaults dream.auto_trigger and capture.auto_recall ON, loaded from the installed wheel",
     "an existing explicit-false config keeps byte-identical content, is not overwritten, and loads as false",
+    "a real daemon boots on a spare port in an isolated home and the installed CLI runs one config set, one "
+    "remember/recall round and one project bind/run handoff against it",
     "Codex hook install/status/uninstall in a sandboxed CODEX_HOME: nested hooks schema, trust-unverified "
     "install state (host trust unknown), the generated command executed through the host shell, and config "
     "bytes restored on uninstall",
@@ -73,6 +120,8 @@ COVERAGE = (
 
 LIMITATIONS = (
     "no model inference: no Ollama model was pulled, loaded or called",
+    "the capture-recall round uses the synthetic embedder and a stub dream model: no real embedding model "
+    "is downloaded or run",
     "no real Codex host trust: the run observes the trust-unverified state only, "
     "so host trust stays unknown; "
     "the one-time /hooks trust step stays user-side and was not performed",
@@ -147,6 +196,41 @@ auto_trigger = false
 
 [capture]
 auto_recall = false
+"""
+
+# A bootable embedded config whose every store lands inside the isolated home
+# and whose embedder is synthetic: the proof daemon runs without any model
+# download, keeping the round bounded and offline.
+_SYNTHETIC_BOOT_CONFIG = """\
+baseurl = "{baseurl}"
+preset = "embedded"
+
+[dream]
+auto_trigger = false
+
+[capture]
+auto_recall = true
+
+[storage.vector]
+uri = "{home}/chunks.lance"
+dimensions = 64
+
+[storage.graph]
+path = "{home}/cortex.db"
+
+[storage.graph.instances.isolated]
+path = "{home}/isolated.db"
+
+[storage.meta]
+path = "{home}/meta.db"
+
+[storage.embed]
+driver = "synthetic"
+dimension = 64
+
+[dream.llm.dream]
+driver = "stub"
+model = "stub"
 """
 
 _CODEX_FOREIGN_CONFIG = """\
@@ -313,6 +397,7 @@ class Verifier:
 
     def __init__(self, report_path: Path) -> None:
         self.report_path = report_path
+        self.manifest_path: Path | None = None
         self.steps: list[dict[str, Any]] = []
         self.report: dict[str, Any] = {
             "schema": SCHEMA,
@@ -609,6 +694,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_sha256(path: Path) -> str:
+    """Line-ending normalized digest: a checkout's autocrlf must not fake or
+    break the source revision binding."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _normcase(path: object) -> str:
     return os.path.normcase(str(path))
 
@@ -659,6 +750,273 @@ def project_version(repo_root: Path) -> tuple[str, str]:
         return str(project["name"]), str(project["version"])
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise Failure(f"cannot read the project version from pyproject.toml: {exc}") from exc
+
+
+# --- release manifest --------------------------------------------------------
+#
+# The manifest binds one release: package version, source revision, installer
+# bytes, helper bytes, installer pin and artifact hashes must all match before
+# the install proofs report setup complete.
+
+
+def _installer_code_text(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".ps1":
+        text = re.sub(r"<#.*?#>", "", text, flags=re.S)
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _installer_pin(repo_root: Path) -> str:
+    pins: set[str] = set()
+    for name in INSTALLERS:
+        found = {
+            f"{PROJECT}[{CODEX_EXTRA}]=={match.group('version')}"
+            for match in _PIN_SPEC.finditer(_installer_code_text(repo_root / name))
+        }
+        if not found:
+            raise Failure(f"{name} declares no exact {PROJECT}[{CODEX_EXTRA}]==<version> pin")
+        pins |= found
+    if len(pins) != 1:
+        raise Failure(f"the installers disagree on the exact pin: {sorted(pins)}")
+    return pins.pop()
+
+
+def _helper_fetch(repo_root: Path) -> str:
+    uris = [
+        match.group("uri")
+        for match in _HELPER_URI_DECLARATION.finditer(_installer_code_text(repo_root / "install.ps1"))
+    ]
+    if len(uris) != 1:
+        raise Failure(f"expected exactly one helper base URI declaration in install.ps1, found {len(uris)}")
+    match = _IMMUTABLE_HELPER_URI.match(uris[0])
+    if match is None:
+        raise Failure(
+            f"install.ps1 must fetch helpers from one pinned full-40-hex source revision, got {uris[0]!r}"
+        )
+    return match.group("revision")
+
+
+def _git_text(repo_root: Path, *argv: str, timeout_s: float = 60.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *argv],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        check=False,
+    )
+
+
+def git_source_commit(repo_root: Path) -> str:
+    completed = _git_text(repo_root, "rev-parse", "HEAD")
+    if completed.returncode != 0:
+        raise Failure(f"git rev-parse HEAD failed: {completed.stderr.strip()}")
+    commit = completed.stdout.strip().lower()
+    if _FULL_SHA.fullmatch(commit) is None:
+        raise Failure(f"git rev-parse HEAD did not return a full 40-hex commit: {commit!r}")
+    return commit
+
+
+def _helper_sha_at(repo_root: Path, revision: str, rel_path: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"{revision}:{rel_path}"],
+        capture_output=True,
+        timeout=60.0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise Failure(f"{rel_path} is not readable at source revision {revision}: {detail}")
+    blob = completed.stdout.replace(b"\r\n", b"\n")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _ancestor_revision(repo_root: Path, revision: str, source_commit: str) -> bool:
+    completed = _git_text(repo_root, "merge-base", "--is-ancestor", revision, source_commit)
+    return completed.returncode == 0
+
+
+def _artifact_record(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise Failure(f"the built artifact is missing: {path}")
+    return {"name": path.name, "size_bytes": path.stat().st_size, "sha256": _sha256(path)}
+
+
+def generate_release_manifest(
+    repo_root: Path, *, wheel: Path, sdist: Path, source_commit: str
+) -> dict[str, Any]:
+    name, version = project_version(repo_root)
+    if name != PROJECT:
+        raise Failure(f"the checkout declares project {name!r}, expected {PROJECT!r}")
+    if _FULL_SHA.fullmatch(source_commit) is None:
+        raise Failure(f"the source revision must be a full 40-hex commit, got {source_commit!r}")
+    pin = _installer_pin(repo_root)
+    expected_pin = f"{PROJECT}[{CODEX_EXTRA}]=={version}"
+    if pin != expected_pin:
+        raise Failure(f"the installer pin {pin!r} does not match the project version pin {expected_pin!r}")
+    fetch_revision = _helper_fetch(repo_root)
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "schema": MANIFEST_SCHEMA,
+        "package_version": version,
+        "source_commit": source_commit,
+        "installer_revision": {installer: _source_sha256(repo_root / installer) for installer in INSTALLERS},
+        "helper_source_revision": {
+            "fetch_revision": fetch_revision,
+            "helpers": {helper: _source_sha256(repo_root / helper) for helper in HELPER_SOURCES},
+        },
+        "installer_pin": pin,
+        "artifacts": {
+            "wheel": _artifact_record(wheel),
+            "sdist": _artifact_record(sdist),
+            "built_from": {"repo_root": str(repo_root), "source_commit": source_commit},
+        },
+        "expected_cli_capabilities": list(EXPECTED_CLI_CAPABILITIES),
+        "routes": {
+            ROUTE_INDEX: {
+                "status": ROUTE_INDEX_BLOCKED,
+                "installer_pin": expected_pin,
+                "note": (
+                    "publication is a separately authorized slice; this route stays blocked and never "
+                    "falls back to the source route silently"
+                ),
+            },
+            ROUTE_SOURCE: {
+                "status": "available",
+                "requirement": (
+                    f"{PROJECT}[{CODEX_EXTRA}] @ "
+                    f"git+https://github.com/MnemoSeed/mnemoseed-local.git@{source_commit}"
+                ),
+                "note": (
+                    "full-40-hex revision only; the installer flags for this route are a separately "
+                    "implemented surface"
+                ),
+            },
+        },
+    }
+
+
+def verify_release_manifest(
+    verifier: Verifier,
+    manifest: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    wheel: Path,
+    sdist: Path,
+    source_commit: str,
+) -> None:
+    _name, version = project_version(repo_root)
+    verifier.check(
+        "the manifest carries the release schema",
+        manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
+        and manifest.get("schema") == MANIFEST_SCHEMA,
+        json.dumps({key: manifest.get(key) for key in ("schema_version", "schema")}),
+    )
+    verifier.check(
+        "the manifest package version matches the checkout",
+        manifest.get("package_version") == version,
+        f"{manifest.get('package_version')!r} vs {version!r}",
+    )
+    recorded_commit = manifest.get("source_commit")
+    verifier.check(
+        "the manifest pins a full 40-hex source revision",
+        isinstance(recorded_commit, str) and _FULL_SHA.fullmatch(recorded_commit) is not None,
+        str(recorded_commit),
+    )
+    verifier.check(
+        "the manifest source revision is the frozen source",
+        recorded_commit == source_commit,
+        f"{recorded_commit!r} vs {source_commit!r}",
+    )
+    live_installers = {installer: _source_sha256(repo_root / installer) for installer in INSTALLERS}
+    verifier.check(
+        "the installer revision matches the checkout installers",
+        manifest.get("installer_revision") == live_installers,
+        _json_text({"manifest": manifest.get("installer_revision"), "actual": live_installers}, 900),
+    )
+    expected_pin = f"{PROJECT}[{CODEX_EXTRA}]=={version}"
+    verifier.check(
+        "the manifest installer pin matches the project version",
+        manifest.get("installer_pin") == expected_pin,
+        f"{manifest.get('installer_pin')!r} vs {expected_pin!r}",
+    )
+    verifier.check(
+        "the checkout installers pin the manifest version",
+        _installer_pin(repo_root) == manifest.get("installer_pin"),
+        _installer_pin(repo_root),
+    )
+    helper_revision = manifest.get("helper_source_revision") or {}
+    fetch_revision = helper_revision.get("fetch_revision")
+    verifier.check(
+        "the helper fetch revision is a full 40-hex commit",
+        isinstance(fetch_revision, str) and _FULL_SHA.fullmatch(fetch_revision) is not None,
+        str(fetch_revision),
+    )
+    live_helpers = {helper: _source_sha256(repo_root / helper) for helper in HELPER_SOURCES}
+    verifier.check(
+        "the recorded helper revision matches the checkout helpers",
+        helper_revision.get("helpers") == live_helpers,
+        _json_text({"manifest": helper_revision.get("helpers"), "actual": live_helpers}, 900),
+    )
+    at_revision = {helper: _helper_sha_at(repo_root, fetch_revision, helper) for helper in HELPER_SOURCES}
+    verifier.check(
+        "the helper bytes at the fetch revision match the recorded helpers",
+        at_revision == live_helpers,
+        _json_text({"at_revision": at_revision, "actual": live_helpers}, 900),
+    )
+    verifier.check(
+        "the helper fetch revision sits inside the frozen source history",
+        _ancestor_revision(repo_root, fetch_revision, source_commit),
+        f"{fetch_revision} vs {source_commit}",
+    )
+    for label, path in (("wheel", wheel), ("sdist", sdist)):
+        recorded = (manifest.get("artifacts") or {}).get(label) or {}
+        actual = _artifact_record(path)
+        verifier.check(
+            f"the recorded {label} matches the built artifact",
+            recorded == actual,
+            _json_text({"manifest": recorded, "actual": actual}, 900),
+        )
+    routes = manifest.get("routes") or {}
+    index_status = (routes.get(ROUTE_INDEX) or {}).get("status")
+    verifier.check(
+        "the manifest records a known index-route status",
+        index_status in (ROUTE_INDEX_BLOCKED, ROUTE_INDEX_AVAILABLE),
+        str(index_status),
+    )
+    source_requirement = str((routes.get(ROUTE_SOURCE) or {}).get("requirement", ""))
+    verifier.check(
+        "the source route requirement pins the frozen source revision",
+        str(recorded_commit) in source_requirement,
+        source_requirement,
+    )
+    capabilities = manifest.get("expected_cli_capabilities")
+    verifier.check(
+        "the manifest lists the expected CLI capabilities",
+        isinstance(capabilities, list)
+        and bool(capabilities)
+        and all(isinstance(item, str) and item for item in capabilities),
+        _json_text(capabilities, 300),
+    )
+
+
+def select_install_route(manifest: Mapping[str, Any], requested: str) -> str:
+    routes = manifest.get("routes") or {}
+    if requested == ROUTE_INDEX:
+        status = (routes.get(ROUTE_INDEX) or {}).get("status")
+        if status != ROUTE_INDEX_AVAILABLE:
+            raise Failure(
+                f"index route is {status!r}: publication is a separately authorized slice; "
+                "no silent source fallback"
+            )
+        return ROUTE_INDEX
+    if requested == ROUTE_SOURCE:
+        requirement = str((routes.get(ROUTE_SOURCE) or {}).get("requirement", ""))
+        if str(manifest.get("source_commit")) not in requirement:
+            raise Failure("the source route requirement does not pin the manifest source revision")
+        return ROUTE_SOURCE
+    raise Failure(f"unknown install route: {requested!r} (expected {ROUTE_INDEX!r} or {ROUTE_SOURCE!r})")
 
 
 def _artifact_version(name: str, suffix: str) -> str:
@@ -1119,6 +1477,225 @@ def proof_config_explicit_false(verifier: Verifier, context: Context) -> None:
     verifier.note("config bytes before the run", hashlib.sha256(before).hexdigest())
 
 
+def proof_release_manifest(verifier: Verifier, context: Context) -> None:
+    source_commit = git_source_commit(context.repo_root)
+    manifest = generate_release_manifest(
+        context.repo_root, wheel=context.wheel, sdist=context.sdist, source_commit=source_commit
+    )
+    verify_release_manifest(
+        verifier,
+        manifest,
+        repo_root=context.repo_root,
+        wheel=context.wheel,
+        sdist=context.sdist,
+        source_commit=source_commit,
+    )
+    verifier.report["release_manifest"] = manifest
+    verifier.note(
+        "release manifest",
+        f"package {manifest['package_version']} at source revision {manifest['source_commit']}",
+    )
+
+
+def proof_cli_capabilities(verifier: Verifier, context: Context) -> None:
+    session = _session(verifier, context, "cli-capabilities")
+    help_run = session.cli("--help", name="the installed CLI answers --help")
+    manifest = verifier.report.get("release_manifest") or {}
+    expected = manifest.get("expected_cli_capabilities") or list(EXPECTED_CLI_CAPABILITIES)
+    missing = [item for item in expected if not re.search(rf"\b{re.escape(str(item))}\b", help_run.stdout)]
+    verifier.check(
+        "the installed CLI exposes every expected capability",
+        not missing,
+        f"missing: {missing}",
+    )
+
+
+CAPTURE_RECALL_BOOT_TIMEOUT_S = 120.0
+CAPTURE_RECALL_TEARDOWN_TIMEOUT_S = 30.0
+PROOF_PROFILE_ID = "release-proof"
+
+
+def _wait_for_healthz(baseurl: str, timeout_s: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{baseurl}/healthz", timeout=2.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return payload
+            last = "non-object health payload"
+        except (OSError, ValueError) as exc:
+            last = str(exc)
+        time.sleep(1.0)
+    raise Failure(f"the proof daemon did not answer /healthz within {timeout_s:.0f}s: {last}")
+
+
+def _wait_healthz_gone(baseurl: str, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{baseurl}/healthz", timeout=1.0) as response:
+                response.read()
+        except OSError:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def proof_capture_recall_round(verifier: Verifier, context: Context) -> None:
+    """The installed CLI end to end: the setup mode, a real daemon on a spare
+    port inside the isolated home, one config set, one remember/recall round
+    and one project bind/run handoff."""
+    session = _session(verifier, context, "capture-recall")
+    session.cli(
+        "init",
+        "--mode",
+        "capture-recall",
+        name="the capture-recall setup mode succeeds on the installed CLI",
+    )
+    config_file = session.home / ".mnemoseed-local" / "config.toml"
+    verifier.check("the setup mode wrote the config file", config_file.is_file(), str(config_file))
+    try:
+        posture = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Failure(f"the setup-mode config is not readable TOML: {exc}") from exc
+    verifier.check(
+        "the capture-recall setup holds dream.auto_trigger false",
+        posture.get("dream", {}).get("auto_trigger") is False,
+        _json_text(posture.get("dream"), 200),
+    )
+    verifier.check(
+        "the capture-recall setup holds capture.auto_recall true",
+        posture.get("capture", {}).get("auto_recall") is True,
+        _json_text(posture.get("capture"), 200),
+    )
+
+    port = _spare_port()
+    baseurl = f"http://127.0.0.1:{port}"
+    verifier.check("the proof daemon listens on a spare port", port not in FORBIDDEN_PORTS, f"port {port}")
+    config_file.write_text(
+        _SYNTHETIC_BOOT_CONFIG.format(baseurl=baseurl, home=session.home.as_posix()),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    daemon_log = session.home / "daemon.log"
+    daemon: subprocess.Popen[bytes] | None = None
+    try:
+        with daemon_log.open("wb") as log_handle:
+            daemon = subprocess.Popen(
+                [str(context.installed_cli), "up", "--host", "127.0.0.1", "--port", str(port)],
+                cwd=str(session.cwd),
+                env=session.env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=log_handle,
+            )
+            health = _wait_for_healthz(baseurl, CAPTURE_RECALL_BOOT_TIMEOUT_S)
+        verifier.check(
+            "the proof daemon boots healthy",
+            health.get("status") == "ok",
+            _json_text(health, 400),
+        )
+
+        session.cli(
+            "config",
+            "set",
+            "capture.idle_flush_sec",
+            "20",
+            "--baseurl",
+            baseurl,
+            name="config set applies through the installed CLI",
+        )
+        get_run = session.cli(
+            "config",
+            "get",
+            "capture.idle_flush_sec",
+            "--baseurl",
+            baseurl,
+            "--json",
+            name="config get reads the applied key back",
+        )
+        verifier.contains(get_run, "20", "the applied config value reads back")
+
+        needle = f"r310 install proof pin {uuid.uuid4().hex}"
+        session.cli(
+            "remember",
+            needle,
+            "--baseurl",
+            baseurl,
+            name="remember pins a fact through the installed CLI",
+        )
+        recall_run = session.cli(
+            "recall",
+            needle,
+            "--baseurl",
+            baseurl,
+            "--json",
+            name="recall returns the pinned fact",
+        )
+        verifier.contains(recall_run, needle, "the recall round returns the remembered fact")
+
+        session.env.pop(PROFILE_ENV_VAR, None)
+        session.cli(
+            "profile",
+            "create",
+            PROOF_PROFILE_ID,
+            "--baseurl",
+            baseurl,
+            name="the proof profile registers",
+        )
+        bound_root = session.cwd / "bound-project"
+        bound_root.mkdir(parents=True, exist_ok=True)
+        session.cli(
+            "project",
+            "bind",
+            "--root",
+            str(bound_root),
+            "--profile",
+            PROOF_PROFILE_ID,
+            "--baseurl",
+            baseurl,
+            name="project bind registers the bound root",
+        )
+        child_probe = f'import os; print(os.environ.get("{PROFILE_ENV_VAR}", ""))'
+        run = session.cli(
+            "project",
+            "run",
+            "--root",
+            str(bound_root),
+            "--",
+            str(context.installed_python),
+            "-I",
+            "-c",
+            child_probe,
+            name="project run hands the bound profile to the child",
+        )
+        verifier.check(
+            "the bound profile reaches the launched child",
+            run.stdout.strip() == PROOF_PROFILE_ID,
+            _tail(run.stdout, 200),
+        )
+
+        session.cli("off", "--baseurl", baseurl, name="off stops the proof daemon through the installed CLI")
+        verifier.check(
+            "the proof daemon is gone after off",
+            _wait_healthz_gone(baseurl, CAPTURE_RECALL_TEARDOWN_TIMEOUT_S),
+            baseurl,
+        )
+    finally:
+        if daemon is not None:
+            if daemon.poll() is None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait(timeout=15)
+            verifier.note("proof daemon exit code", str(daemon.returncode))
+
+
 def _load_hooks_document(hooks_file: Path) -> dict[str, Any]:
     try:
         document = json.loads(hooks_file.read_text(encoding="utf-8"))
@@ -1372,11 +1949,14 @@ def proof_codex_sandbox(verifier: Verifier, context: Context) -> None:
 
 
 PROOFS: tuple[tuple[str, Callable[[Verifier, Context], None]], ...] = (
+    ("release-manifest", proof_release_manifest),
     ("install-artifact", install_artifact),
     ("installed-cli-and-codex-extra", proof_installed_surface),
+    ("installed-cli-capabilities", proof_cli_capabilities),
     ("mcp-handshake", proof_mcp_handshake),
     ("config-defaults", proof_config_defaults),
     ("config-explicit-false", proof_config_explicit_false),
+    ("capture-recall-round", proof_capture_recall_round),
     ("codex-hook-sandbox", proof_codex_sandbox),
 )
 
@@ -1390,6 +1970,25 @@ def _run_all(verifier: Verifier, repo_root: Path, work_root: Path) -> None:
             proof(verifier, context)
 
 
+def _write_release_manifest(verifier: Verifier) -> None:
+    manifest = verifier.report.get("release_manifest")
+    if manifest is None:
+        raise Failure("the release manifest was not generated")
+    if verifier.manifest_path is None:
+        raise Failure("the release manifest path was not configured")
+    payload = dict(manifest)
+    payload["proofs"] = {
+        "report": verifier.report_path.name,
+        "installed_cli": (verifier.report.get("installed") or {}).get("cli", ""),
+        "installed_version": payload["package_version"],
+        "steps": {step["step"]: step["status"] for step in verifier.steps},
+    }
+    verifier.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    verifier.manifest_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
 def _print_summary(verifier: Verifier, exit_code: int) -> None:
     for step in verifier.steps:
         print(f"[{step['status']:>6}] {step['step']} ({step.get('duration_s', 0)}s)")
@@ -1398,6 +1997,8 @@ def _print_summary(verifier: Verifier, exit_code: int) -> None:
     print(f"artifact: {wheel.get('name', '?')} sha256={wheel.get('sha256', '?')}")
     print(f"status: {'PASS' if exit_code == 0 else 'FAIL'}")
     print(f"report: {verifier.report_path}")
+    if verifier.manifest_path is not None:
+        print(f"manifest: {verifier.manifest_path}")
     print("limits: no model inference, no host trust (unknown), no end-to-end installer run")
 
 
@@ -1407,6 +2008,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--report",
         default="release-proof/verify-release-install.json",
         help="path of the structured proof report (default: release-proof/verify-release-install.json)",
+    )
+    parser.add_argument(
+        "--manifest",
+        default="release-proof/release-install-manifest.json",
+        help="path of the generated release manifest (default: release-proof/release-install-manifest.json)",
     )
     parser.add_argument(
         "--workdir",
@@ -1427,6 +2033,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_path = Path(args.report)
     if not report_path.is_absolute():
         report_path = Path.cwd() / report_path
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_absolute():
+        manifest_path = Path.cwd() / manifest_path
     work_root = (
         Path(args.workdir).resolve()
         if args.workdir
@@ -1434,6 +2043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     work_root.mkdir(parents=True, exist_ok=True)
     verifier = Verifier(report_path)
+    verifier.manifest_path = manifest_path
     verifier.report["repo_root"] = str(repo_root)
     verifier.report["work_dir"] = str(work_root)
     verifier.flush()
@@ -1441,6 +2051,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     exit_code = 1
     try:
         _run_all(verifier, repo_root, work_root)
+        _write_release_manifest(verifier)
         status = "pass"
         exit_code = 0
     except Failure as exc:

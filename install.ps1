@@ -99,11 +99,11 @@ $MnemoSeedTaskName = 'MnemoSeedLocalDaemon'
 $MnemoSeedBootstrapSource = $null
 $MnemoSeedTaskRegistration = $null
 $MnemoSeedHelperStaging = $null
-$HelperBaseUri = 'https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/main/scripts/'
+$HelperBaseUri = 'https://raw.githubusercontent.com/MnemoSeed/mnemoseed-local/cbe029cdff87eb019753c402e3dc0bfc885c012d/scripts/'
 $DefaultModel = 'qwen3.5:9b'
 # The exact wheel spec: a floating `latest` would silently track main. Keep in
 # lockstep with pyproject.toml (tests/test_version_single_source.py enforces it).
-$CliPin = 'mnemoseed-local[codex]==0.2.0'
+$CliPin = 'mnemoseed-local[codex]==0.3.0'
 
 # --- helpers ---------------------------------------------------------------
 
