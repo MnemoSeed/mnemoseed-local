@@ -384,7 +384,7 @@ present it as the bearer header, carry `X-MnemoSeed-Profile`, and POST the
 JSON-RPC body to `/mcp`.
 
 Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `supersede(superseded_node_id, successor_node_id)`,
-`dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?)`,
+`dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?, caller_cwd?)`,
 `session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
 connectivity error.
 

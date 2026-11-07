@@ -138,6 +138,8 @@ def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     assert recent["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
     assert recent["inputSchema"]["properties"]["n_per_session"]["type"] == "integer"
     assert recent["inputSchema"]["properties"]["resume_query"]["type"] == "string"
+    # the caller's workspace directory rides as its own optional input
+    assert recent["inputSchema"]["properties"]["caller_cwd"]["type"] == "string"
     # the session time-window surface takes no required arguments
     windows = next(tool for tool in tools if tool["name"] == "session_windows")
     assert "required" not in windows["inputSchema"]
@@ -274,6 +276,52 @@ def test_call_recent_sessions_maps_arguments_to_the_daemon_endpoint() -> None:
             },
         )
     ]
+
+
+def test_call_recent_sessions_forwards_caller_cwd() -> None:
+    """#321: the caller's workspace directory is forwarded verbatim as its own
+    input — the daemon's recovery contract decides with it, the gateway never
+    derives or rewrites it."""
+    payload = {"profile_id": "default", "sessions": [], "selection": "matched"}
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [
+            _request(
+                9,
+                "tools/call",
+                {
+                    "name": "recent_sessions",
+                    "arguments": {
+                        "resume_query": "continue",
+                        "caller_cwd": "G:/dev/some-project",
+                    },
+                },
+            )
+        ],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert client.calls == [
+        (
+            "/session/recent",
+            {
+                "profile_id": "default",
+                "resume_query": "continue",
+                "caller_cwd": "G:/dev/some-project",
+            },
+        )
+    ]
+
+
+def test_call_recent_sessions_omits_caller_cwd_when_absent() -> None:
+    """A caller that sends no workspace keeps the legacy body exactly."""
+    client = StubClient(payload={"profile_id": "default", "sessions": []})
+    _, responses = run_gateway(
+        [_request(9, "tools/call", {"name": "recent_sessions", "arguments": {"resume_query": "continue"}})],
+        client,
+    )
+    assert responses[0]["result"]["isError"] is False
+    assert client.calls == [("/session/recent", {"profile_id": "default", "resume_query": "continue"})]
 
 
 def test_call_recent_sessions_missing_resume_query_is_rejected() -> None:

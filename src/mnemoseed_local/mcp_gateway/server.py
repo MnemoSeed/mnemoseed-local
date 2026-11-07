@@ -133,7 +133,11 @@ TOOLS: list[dict[str, Any]] = [
         "The response's guidance field restates this. "
         "When resume_query is provided, the daemon extracts anchor identifiers from the "
         "raw user prompt and returns only sessions whose USER content matches; "
-        "use self_parent_id=None for root callers (filters child sessions out).",
+        "use self_parent_id=None for root callers (filters child sessions out). "
+        "Pass caller_cwd (the current workspace directory) for project-context recovery: "
+        "the daemon verifies the project binding first and serves only the bound project's "
+        "root conversation — selection=unresolved with a reason means nothing was recovered, "
+        "never search other workspaces or chats on your own.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -152,6 +156,11 @@ TOOLS: list[dict[str, Any]] = [
                 "self_parent_id": {
                     "type": "string",
                     "description": "the calling session's own parent id (None=root caller, string=child)",
+                },
+                "caller_cwd": {
+                    "type": "string",
+                    "description": "the current workspace directory; enables project-context recovery "
+                    "verified against the project binding registry",
                 },
             },
             "required": ["resume_query"],
@@ -236,6 +245,8 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             recent_body["resume_query"] = resume_query
             if "self_parent_id" in arguments:
                 recent_body["self_parent_id"] = arguments["self_parent_id"]
+            if arguments.get("caller_cwd") is not None:
+                recent_body["caller_cwd"] = arguments["caller_cwd"]
             payload = client.post("/session/recent", recent_body)
         elif name == "session_windows":
             windows_body: dict[str, Any] = {"profile_id": client.profile_id}

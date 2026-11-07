@@ -17,6 +17,7 @@ from mnemoseed_local.hosts.common.project_binding import (
     PROFILE_ENV_VAR,
     BindingError,
     bindings_path,
+    contains_root,
     load_bindings,
     resolve_profile,
     roots_for_profile,
@@ -83,9 +84,7 @@ class BindingDecision:
 def _under(root: Path, directory: Path) -> bool:
     """Component-boundary containment of ``directory`` under ``root``
     (case-folded where the platform folds paths)."""
-    base = os.path.normcase(str(root))
-    child = os.path.normcase(str(directory))
-    return child == base or child.startswith(base + os.sep)
+    return contains_root(root, directory)
 
 
 def _rejection(profile: str, roots: tuple[Path, ...], reason: str) -> BindingDecision:
