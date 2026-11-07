@@ -18,23 +18,29 @@
 #      prepended to the current process PATH)
 #   3. install / upgrade the CLI (uv tool install | uv tool upgrade, both pinned
 #      to the exact mnemoseed-local[codex]==<version> spec; never a floating latest)
-#   4. mnemoseed-local init --mode <mode>   (skipped when ~/.mnemoseed-local/config.toml exists)
-#   5. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
+#   4. register the login autostart (Linux: systemd user unit under
+#      ~/.config/systemd/user; macOS: LaunchAgent plist under
+#      ~/Library/LaunchAgents; registration only - the daemon starts with the
+#      next login, never during the install; an existing file is rewritten only
+#      when it carries the identity marker, otherwise the step refuses; no
+#      systemd user session degrades to a note and the install continues)
+#   5. mnemoseed-local init --mode <mode>   (skipped when ~/.mnemoseed-local/config.toml exists)
+#   6. mnemoseed-local doctor    (verbatim) + hardware-tier hint; hint-only,
 #      the script never changes config keys itself
-#   6. ollama pull <dream model> (skipped in capture-recall mode and by
+#   7. ollama pull <dream model> (skipped in capture-recall mode and by
 #      --skip-ollama: the legacy auto dream stays off there; otherwise the
 #      dream route's model from config.toml [dream.llm.dream] `model`, else
 #      the built-in default qwen3.5:9b; runs only after an explicit [y/N]
 #      confirmation; --yes skips the prompt; a model is NEVER pulled without
 #      that confirmation)
-#   7. host adapter wiring (ONLY the hosts named in --hosts <csv>, or the
+#   8. host adapter wiring (ONLY the hosts named in --hosts <csv>, or the
 #      hosts picked from an interactive offer of the detected ones: a host
 #      counts as installed when its CLI is on PATH or its adapter config
 #      directory exists; the offer runs only when stdin is a terminal, a
 #      non-interactive run without --hosts wires NOTHING and reports what it
 #      detected next to the exact per-host commands in the next steps; an
 #      unknown --hosts value refuses before anything is written)
-#   8. final mnemoseed-local doctor re-check + next steps
+#   9. final mnemoseed-local doctor re-check + next steps
 #      (mnemoseed-local up; the selected hosts are wired, or the per-host
 #      commands are printed when none were selected)
 #
@@ -78,6 +84,7 @@ SKIP_OLLAMA=0
 TIER=""
 MODE='capture-recall'
 HOSTS=''
+AUTOSTART_POINTER=''
 
 die() {
     printf '%s\n' "install.sh: error: $*" >&2
@@ -115,7 +122,7 @@ options:
                    explicitly)
   -h, --help       show this help
 
-orchestration: ollama -> uv -> uv tool -> init -> doctor -> confirm+pull -> hosts -> doctor
+orchestration: ollama -> uv -> uv tool -> autostart -> init -> doctor -> confirm+pull -> hosts -> doctor
 EOF
 }
 
@@ -501,6 +508,234 @@ install_ollama() {
     esac
 }
 
+# --- unix autostart: shared generation and registration seam (extracted by tests and CI) ---
+
+# The identity marker proves an autostart file is ours before it is rewritten
+# or removed; a same-path file without it is foreign and is never touched.
+AUTOSTART_MARKER='mnemoseed-local:autostart:unix-daemon:v1'
+LAUNCHAGENT_LABEL='mnemoseed-local-daemon'
+LAUNCHAGENT_PLIST_FILENAME='mnemoseed-local-daemon.plist'
+
+# file_contains PATH TOKEN -> success when the file carries TOKEN.
+file_contains() {
+    [ -f "$1" ] || return 1
+    case "$(cat "$1")" in
+        *"$2"*) return 0 ;;
+    esac
+    return 1
+}
+
+# plist_escape TEXT -> TEXT with the XML element-content specials escaped
+# (& first, so the replacements are not re-escaped).
+plist_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# emit_systemd_unit CLI_PATH -> the user unit on stdout. The daemon.off gate
+# (and, when the data home is overridden at install time, the Environment
+# line) is baked here, because the user manager does not inherit shell rc
+# environment.
+emit_systemd_unit() {
+    _gate='ConditionPathExists=!%h/.mnemoseed-local/daemon.off'
+    _env=""
+    if [ -n "${MNEMOSEED_LOCAL_HOME:-}" ]; then
+        _gate="ConditionPathExists=!$MNEMOSEED_LOCAL_HOME/daemon.off"
+        _env="Environment=MNEMOSEED_LOCAL_HOME=$MNEMOSEED_LOCAL_HOME"
+    fi
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=MnemoSeed Local memory daemon (user session)' \
+        "# $AUTOSTART_MARKER" \
+        "$_gate" \
+        '' \
+        '[Service]'
+    if [ -n "$_env" ]; then
+        printf '%s\n' "$_env"
+    fi
+    printf '%s\n' \
+        "ExecStart=$1 up" \
+        'Restart=no' \
+        '' \
+        '[Install]' \
+        'WantedBy=default.target'
+}
+
+# emit_launchagent_plist CLI_PATH -> the LaunchAgent plist on stdout. The
+# daemon.off gate is an inline sh string evaluated by launchd at load time;
+# the log paths bake the data home, and an install-time MNEMOSEED_LOCAL_HOME
+# is baked into the EnvironmentVariables dict.
+emit_launchagent_plist() {
+    _cli="$(plist_escape "$1")"
+    _data="${MNEMOSEED_LOCAL_HOME:-$HOME/.mnemoseed-local}"
+    _data="$(plist_escape "$_data")"
+    _gate="if [ -f \"\${MNEMOSEED_LOCAL_HOME:-\$HOME/.mnemoseed-local}/daemon.off\" ]; then exit 0; fi; exec '${_cli}' up"
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0">' \
+        "<!-- $AUTOSTART_MARKER -->" \
+        '<dict>'
+    if [ -n "${MNEMOSEED_LOCAL_HOME:-}" ]; then
+        _env_value="$(plist_escape "$MNEMOSEED_LOCAL_HOME")"
+        printf '%s\n' \
+            '    <key>EnvironmentVariables</key>' \
+            '    <dict>' \
+            '        <key>MNEMOSEED_LOCAL_HOME</key>' \
+            "        <string>${_env_value}</string>" \
+            '    </dict>'
+    fi
+    printf '%s\n' \
+        '    <key>Label</key>' \
+        "    <string>${LAUNCHAGENT_LABEL}</string>" \
+        '    <key>ProgramArguments</key>' \
+        '    <array>' \
+        '        <string>/bin/sh</string>' \
+        '        <string>-c</string>' \
+        "        <string>${_gate}</string>" \
+        '    </array>' \
+        '    <key>RunAtLoad</key>' \
+        '    <true/>' \
+        '    <key>StandardErrorPath</key>' \
+        "    <string>${_data}/launchd.out.log</string>" \
+        '    <key>StandardOutPath</key>' \
+        "    <string>${_data}/launchd.out.log</string>" \
+        '</dict>' \
+        '</plist>'
+}
+
+# resolve_autostart_cli -> the absolute CLI path for the autostart entries:
+# `command -v` first, then the uv tool shim dir. launchd's ProgramArguments
+# and the systemd user manager resolve no PATH of their own, so the registered
+# path is always absolute; a path carrying a single quote or whitespace is
+# refused (the single-quoted sh exec string and the systemd argv parser are
+# the shared boundary).
+resolve_autostart_cli() {
+    _cli=""
+    if have mnemoseed-local; then
+        _cli="$(command -v mnemoseed-local)"
+    elif [ -x "$HOME/.local/bin/mnemoseed-local" ]; then
+        _cli="$HOME/.local/bin/mnemoseed-local"
+    fi
+    if [ -z "$_cli" ]; then
+        die "cannot resolve the mnemoseed-local CLI path for login autostart; re-run install.sh once 'mnemoseed-local' is available"
+    fi
+    case "$_cli" in
+        *"'"*|*[[:space:]]*)
+            die "refusing the CLI path '$_cli' for login autostart (a single quote or whitespace would break the registered exec string); install it to a path without those characters and re-run"
+            ;;
+        /*) ;;
+        *) die "the resolved CLI path '$_cli' is not absolute; re-run install.sh with 'mnemoseed-local' reachable on an absolute PATH" ;;
+    esac
+    printf '%s\n' "$_cli"
+}
+
+# systemd_user_manager_present -> the user-manager probe: the query verb
+# first, then the manager's private socket, because the verb's exit codes vary
+# across releases and manager-less sessions (WSL without systemd, containers).
+systemd_user_manager_present() {
+    systemctl --user is-system-running >/dev/null 2>&1 && return 0
+    _xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    [ -e "$_xdg/systemd/private" ]
+}
+
+install_linux_autostart() {
+    _unit_dir="$HOME/.config/systemd/user"
+    _unit="$_unit_dir/mnemoseed-local.service"
+    if [ -f "$_unit" ] && ! file_contains "$_unit" "$AUTOSTART_MARKER"; then
+        die "refusing to touch the existing $_unit (not provably owned by MnemoSeed: identity marker missing); inspect it manually and remove or rename it before re-running"
+    fi
+    if ! have systemctl; then
+        printf '%s\n' 'install.sh: note: login autostart needs a systemd user session (systemctl not found); skipped' >&2
+        return 0
+    fi
+    if ! systemd_user_manager_present; then
+        printf '%s\n' 'install.sh: note: login autostart needs a systemd user session (no user manager detected); skipped' >&2
+        return 0
+    fi
+    _cli="$(resolve_autostart_cli)"
+    mkdir -p "$_unit_dir"
+    _tmp="$_unit_dir/.mnemoseed-local.service.$$.tmp"
+    emit_systemd_unit "$_cli" > "$_tmp"
+    mv "$_tmp" "$_unit"
+    if ! systemctl --user daemon-reload; then
+        die "'systemctl --user daemon-reload' failed; run it manually, then re-run install.sh"
+    fi
+    if ! systemctl --user enable mnemoseed-local.service; then
+        die "'systemctl --user enable mnemoseed-local.service' failed; register it manually with that command, then re-run install.sh"
+    fi
+    AUTOSTART_POINTER='systemctl --user status mnemoseed-local'
+    printf '%s\n' "      registered autostart unit $_unit (starts with the next login; not started now)"
+}
+
+install_darwin_autostart() {
+    _plist_dir="$HOME/Library/LaunchAgents"
+    _plist="$_plist_dir/$LAUNCHAGENT_PLIST_FILENAME"
+    if [ -f "$_plist" ] && ! file_contains "$_plist" "$AUTOSTART_MARKER"; then
+        die "refusing to touch the existing $_plist (not provably owned by MnemoSeed: identity marker missing); inspect it manually and remove or rename it before re-running"
+    fi
+    _cli="$(resolve_autostart_cli)"
+    mkdir -p "$_plist_dir"
+    _tmp="$_plist_dir/.mnemoseed-local-daemon.plist.$$.tmp"
+    emit_launchagent_plist "$_cli" > "$_tmp"
+    mv "$_tmp" "$_plist"
+    AUTOSTART_POINTER="launchctl print gui/$(id -u)/$LAUNCHAGENT_LABEL"
+    printf '%s\n' "      registered autostart plist $_plist (loads with the next login; not started now)"
+    if ! launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+        printf '%s\n' 'install.sh: note: the launchd gui domain is not available in this session; the plist still registers at the next login' >&2
+    fi
+}
+
+# install_unix_autostart -> the step-4 body: register the login autostart for
+# the platform (registration only: the daemon starts with the next login,
+# never during the install; the daemon.off gate and `mnemoseed-local up`'s own
+# early refusal stay the runtime controls).
+install_unix_autostart() {
+    case "$OS_NAME" in
+        Linux*) install_linux_autostart ;;
+        Darwin*) install_darwin_autostart ;;
+        *) printf '%s\n' "install.sh: note: login autostart is not available on this platform ($OS_NAME); skipped" >&2 ;;
+    esac
+}
+
+# plan_autostart -> the dry-run text of the step-4 autostart plan. The plan
+# shows what the step writes on a manager-present machine (content is
+# unconditional); the user-manager presence is a runtime execution condition
+# and is never probed here. Every probe is a command-existence check only.
+plan_autostart() {
+    case "$OS_NAME" in
+        Linux*)
+            plan_autostart_cli_probe
+            if have systemctl; then
+                printf '%s\n' "    probe: systemctl FOUND at $(command -v systemctl)"
+            else
+                printf '%s\n' '    probe: systemctl NOT FOUND'
+            fi
+            printf '%s\n' '    plan:  write ~/.config/systemd/user/mnemoseed-local.service (identity marker, daemon.off gate, absolute ExecStart, Restart=no, WantedBy=default.target), then run `systemctl --user daemon-reload` + `systemctl --user enable mnemoseed-local.service`'
+            printf '%s\n' '           (registration for the next login only; the daemon is not started by the install)'
+            if ! have systemctl; then
+                printf '%s\n' '    plan:  without systemctl on PATH this machine would get the skip note instead (a systemd user session is required)'
+            fi
+            ;;
+        Darwin*)
+            plan_autostart_cli_probe
+            printf '%s\n' '    plan:  write ~/Library/LaunchAgents/mnemoseed-local-daemon.plist (identity marker, inline-sh daemon.off gate, RunAtLoad, no KeepAlive); disk presence registers it for the next login (no launchctl bootstrap)'
+            ;;
+        *)
+            printf '%s\n' "    plan:  unsupported platform ($OS_NAME) - would note and skip login autostart"
+            ;;
+    esac
+}
+
+plan_autostart_cli_probe() {
+    if have mnemoseed-local; then
+        printf '%s\n' "    probe: mnemoseed-local FOUND at $(command -v mnemoseed-local)"
+    else
+        printf '%s\n' "    probe: mnemoseed-local NOT FOUND (the autostart step would fall back to $UV_BIN_DIR/mnemoseed-local or exit non-zero)"
+    fi
+}
+
+# --- unix autostart end ---
+
 # --- dry-run plan -----------------------------------------------------------
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -528,15 +763,17 @@ if [ "$DRY_RUN" -eq 1 ]; then
         printf '%s\n' '    probe: mnemoseed-local command NOT FOUND'
         printf '%s\n' "    plan:  would run \`uv tool install --python 3.12 $CLI_PIN\`"
     fi
-    printf '%s\n' '[4] init'
+    printf '%s\n' '[4] login autostart'
+    plan_autostart
+    printf '%s\n' '[5] init'
     printf '%s\n' "    plan:  would run \`mnemoseed-local init --mode $MODE\` when $CONFIG_PATH does not exist; skipped when present"
-    printf '%s\n' '[5] doctor (first pass)'
+    printf '%s\n' '[6] doctor (first pass)'
     printf '%s\n' '    plan:  would run `mnemoseed-local doctor` (output shown verbatim), then compare the hardware-tier detail'
     printf '%s\n' '           (`recommended tier "<tier>"` vs `current tier "<tier>"`; a hint is printed when they differ; config is never changed)'
     if [ -n "$TIER" ]; then
         printf '%s\n' "    plan:  --tier $TIER given - would print the hint-only \`config set dream.hardware_tier $TIER\` instruction"
     fi
-    printf '%s\n' '[6] model pull (requires confirmation)'
+    printf '%s\n' '[7] model pull (requires confirmation)'
     if [ "$MODE" = "capture-recall" ]; then
         printf '%s\n' '    plan:  skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
     elif [ "$SKIP_OLLAMA" -eq 1 ]; then
@@ -545,7 +782,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
         printf '%s\n' "    plan:  would resolve the dream model from $CONFIG_PATH (an ACTIVE [dream.llm.dream] \`model\` key; default $DEFAULT_MODEL),"
         printf '%s\n' '           prompt [y/N] (skipped by --yes), then run `ollama pull <model>` - NEVER without that confirmation'
     fi
-    printf '%s\n' '[7] host adapter wiring (explicit --hosts or an interactive offer; never automatic)'
+    printf '%s\n' '[8] host adapter wiring (explicit --hosts or an interactive offer; never automatic)'
     if [ -z "$HOST_SELECTED" ]; then
         HOST_PROBED="$(detect_installed_hosts)"
         if [ -n "$HOST_PROBED" ]; then
@@ -564,7 +801,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
             esac
         done
     fi
-    printf '%s\n' '[8] final doctor + guidance'
+    printf '%s\n' '[9] final doctor + guidance'
     printf '%s\n' '    plan:  would re-run `mnemoseed-local doctor` verbatim, then print next steps'
     printf '%s\n' '           (mnemoseed-local up; the selected hosts are wired, or the exact per-host'
     printf '%s\n' '           commands are printed when no --hosts value was given)'
@@ -575,12 +812,12 @@ fi
 
 # --- step 1: ollama ---------------------------------------------------------
 
-printf '%s\n' '[1/8] ollama'
+printf '%s\n' '[1/9] ollama'
 install_ollama
 
 # --- step 2: uv -------------------------------------------------------------
 
-printf '%s\n' '[2/8] uv'
+printf '%s\n' '[2/9] uv'
 if have uv; then
     printf '%s\n' '      found - skipping install'
 else
@@ -596,7 +833,7 @@ prepend_path "$UV_BIN_DIR"
 
 # --- step 3: the mnemoseed-local CLI ---------------------------------------
 
-printf '%s\n' '[3/8] mnemoseed-local CLI'
+printf '%s\n' '[3/9] mnemoseed-local CLI'
 if have mnemoseed-local; then
     printf '%s\n' "      found - upgrading via uv tool ($CLI_PIN)..."
     if ! uv tool upgrade --python 3.12 "$CLI_PIN"; then
@@ -610,9 +847,14 @@ else
 fi
 have mnemoseed-local || die "mnemoseed-local was installed but is not on PATH; add $UV_BIN_DIR to PATH and re-run"
 
-# --- step 4: init ------------------------------------------------------------
+# --- step 4: login autostart --------------------------------------------------
 
-printf '%s\n' '[4/8] init'
+printf '%s\n' '[4/9] login autostart'
+install_unix_autostart
+
+# --- step 5: init ------------------------------------------------------------
+
+printf '%s\n' '[5/9] init'
 if [ -f "$CONFIG_PATH" ]; then
     printf '%s\n' "      $CONFIG_PATH already exists - skipping"
     printf '%s\n' "      to inspect or convert its setup mode: mnemoseed-local init --mode $MODE"
@@ -622,18 +864,18 @@ else
     fi
 fi
 
-# --- step 5: doctor (first pass) + hardware-tier hint ------------------------
+# --- step 6: doctor (first pass) + hardware-tier hint ------------------------
 
-printf '%s\n' '[5/8] doctor (first pass)'
+printf '%s\n' '[6/9] doctor (first pass)'
 run_doctor
 if [ "$DOCTOR_RC" -ne 0 ]; then
     printf '%s\n' 'install.sh: note: doctor reported failures (expected before the model pull) - continuing' >&2
 fi
 show_tier_hints "$DOCTOR_OUT"
 
-# --- step 6: confirmation-gated model pull -----------------------------------
+# --- step 7: confirmation-gated model pull -----------------------------------
 
-printf '%s\n' '[6/8] dream model pull'
+printf '%s\n' '[7/9] dream model pull'
 if [ "$MODE" = "capture-recall" ]; then
     printf '%s\n' '      skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)'
     printf '%s\n' '      for manual consolidation later: install Ollama, then `ollama pull <dream model>` (see `mnemoseed-local doctor`)'
@@ -669,9 +911,9 @@ else
     fi
 fi
 
-# --- step 7: host adapter wiring ---------------------------------------------
+# --- step 8: host adapter wiring ---------------------------------------------
 
-printf '%s\n' '[7/8] host adapter wiring'
+printf '%s\n' '[8/9] host adapter wiring'
 if [ -z "$HOST_SELECTED" ]; then
     HOST_DETECTED="$(detect_installed_hosts)"
     # The offer reads its answer from stdin, so it can run only when stdin is
@@ -714,9 +956,9 @@ else
     done
 fi
 
-# --- step 8: final doctor + guidance -----------------------------------------
+# --- step 9: final doctor + guidance -----------------------------------------
 
-printf '%s\n' '[8/8] doctor (final re-check)'
+printf '%s\n' '[9/9] doctor (final re-check)'
 run_doctor
 if [ "$DOCTOR_RC" -ne 0 ]; then
     printf '%s\n' 'install.sh: note: doctor still reports failures; resolve them, then re-run `mnemoseed-local doctor`' >&2
@@ -725,6 +967,9 @@ printf '\n'
 printf '%s\n' "installation complete: $CLI_PIN"
 printf '%s\n' 'next steps:'
 printf '%s\n' '  mnemoseed-local up            # start the daemon'
+if [ -n "$AUTOSTART_POINTER" ]; then
+    printf '%s\n' "  $AUTOSTART_POINTER   # daemon autostart status"
+fi
 if [ -n "$HOST_SELECTED" ]; then
     printf '%s\n' '  (host adapters were wired above; follow the hooks/mcp/trust notes printed per host)'
 else

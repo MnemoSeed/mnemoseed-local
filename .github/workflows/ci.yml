@@ -115,6 +115,44 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: sh -n install.sh && sh install.sh --dry-run
+      - name: Verify the generated systemd unit (syntax)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eu
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "systemd-analyze unavailable; the unit content pins carry the syntax proof"
+            exit 0
+          fi
+          work="$(mktemp -d)"
+          sed -n '/^# --- unix autostart: shared generation/,/^# --- unix autostart end ---/p' install.sh > "$work/span.sh"
+          printf '#!/bin/sh\nexit 0\n' > "$work/mnemoseed-local"
+          chmod +x "$work/mnemoseed-local"
+          sh -c "
+            die() { printf '%s\n' \"install.sh: error: \$*\" >&2; exit 1; }
+            have() { command -v \"\$1\" >/dev/null 2>&1; }
+            . '$work/span.sh'
+            ( MNEMOSEED_LOCAL_HOME=; emit_systemd_unit '$work/mnemoseed-local' ) > '$work/default.service'
+            ( MNEMOSEED_LOCAL_HOME='$work/home'; export MNEMOSEED_LOCAL_HOME; emit_systemd_unit '$work/mnemoseed-local' ) > '$work/override.service'
+          "
+          systemd-analyze verify "$work/default.service" "$work/override.service"
+      - name: Lint the generated LaunchAgent plist (syntax)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          sed -n '/^# --- unix autostart: shared generation/,/^# --- unix autostart end ---/p' install.sh > "$work/span.sh"
+          printf '#!/bin/sh\nexit 0\n' > "$work/mnemoseed-local"
+          chmod +x "$work/mnemoseed-local"
+          sh -c "
+            die() { printf '%s\n' \"install.sh: error: \$*\" >&2; exit 1; }
+            have() { command -v \"\$1\" >/dev/null 2>&1; }
+            . '$work/span.sh'
+            ( HOME='$work/home'; export HOME; MNEMOSEED_LOCAL_HOME=; emit_launchagent_plist '$work/mnemoseed-local' ) > '$work/default.plist'
+            ( HOME='$work/home'; export HOME; MNEMOSEED_LOCAL_HOME='$work/home/data'; export MNEMOSEED_LOCAL_HOME; emit_launchagent_plist '$work/mnemoseed-local' ) > '$work/override.plist'
+          "
+          plutil -lint "$work/default.plist" "$work/override.plist"
       - name: Dry-run install.ps1
         if: runner.os == 'Windows'
         shell: pwsh

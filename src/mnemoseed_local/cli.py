@@ -1264,11 +1264,12 @@ _PURGE_PROMPT = "proceed with the removals listed above? [y/N] "
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Remove the local install: the owned Windows logon task always, then —
-    only with ``--purge``, explicit and confirmed — the detected host adapters
-    and the data home. Without ``--purge`` everything is kept and the exact
-    per-host removal commands are printed as next steps. The package itself is
-    never removed here: its exact command is the printed final step."""
+    """Remove the local install: the owned Windows logon task or Unix autostart
+    registration always, then — only with ``--purge``, explicit and confirmed —
+    the detected host adapters and the data home. Without ``--purge`` everything
+    is kept and the exact per-host removal commands are printed as next steps.
+    The package itself is never removed here: its exact command is the printed
+    final step."""
     import subprocess
 
     if sys.platform == "win32":
@@ -1304,6 +1305,12 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         if result.returncode != 0:
             print(result.stderr.rstrip(), file=sys.stderr)
             return result.returncode
+    elif sys.platform in ("linux", "darwin"):
+        from mnemoseed_local.unix_autostart import remove_unix_autostart
+
+        autostart_rc = remove_unix_autostart()
+        if autostart_rc != 0:
+            return autostart_rc
     detected = detect_installed_hosts()
     if args.purge:
         return _uninstall_purge(args, detected)

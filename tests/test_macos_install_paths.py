@@ -81,7 +81,7 @@ def _controlled_tools_dir(tmp_path: Path) -> str:
     test can reach a real download."""
     tools_bin = tmp_path / "tools-bin"
     tools_bin.mkdir(exist_ok=True)
-    for name in ("sh", "uname", "sed", "awk", "head", "tr", "cat", "chmod"):
+    for name in ("sh", "uname", "sed", "awk", "head", "tr", "cat", "chmod", "mkdir", "mv", "id"):
         source = shutil.which(name)
         if source is None:
             raise RuntimeError(f"controlled tools dir: {name} is not resolvable on this host")
