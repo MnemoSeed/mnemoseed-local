@@ -193,7 +193,7 @@ OS credential store when available, with a restricted local-file fallback.
 ## Package-index installers (currently unavailable)
 
 The checked-in [Windows installer](../install.ps1) and
-[POSIX installer](../install.sh) pin `mnemoseed-local[codex]==0.2.0` from the
+[POSIX installer](../install.sh) pin `mnemoseed-local[codex]==0.3.0` from the
 default package index. They fail at package installation until that package is
 published. Use the source route above; the installer descriptions here explain
 their behavior and existing installations, not a working one-command install.
