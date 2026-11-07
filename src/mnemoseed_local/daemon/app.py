@@ -104,6 +104,7 @@ from mnemoseed_local.storage.ports import (
     StoredProfile,
 )
 from mnemoseed_local.util.daemon_executor import DaemonExecutor
+from mnemoseed_local.util.process_memory import process_commit_mb
 
 logger = logging.getLogger("mnemoseed_local.daemon")
 
@@ -1312,6 +1313,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
                 "hard_missing": snap.hard_missing,
             },
             "dream_route": readiness.status() if readiness is not None else None,
+            "process_commit_mb": process_commit_mb(),
         }
 
     @app.get("/health")
@@ -1341,6 +1343,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
                 "recall_injection_count": 0,
                 "recall_injection_chars_total": 0,
                 "recall_pending_served_count": 0,
+                "process_commit_mb": None,
             }
         return observability.snapshot()
 

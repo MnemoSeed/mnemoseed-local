@@ -7,6 +7,7 @@ first-sighting profile hygiene.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -270,6 +271,24 @@ def test_recall_counters_are_cumulative_across_multiple_serves(recall_config_pat
         assert obs["recall_injection_count"] == 2
         assert obs["recall_injection_chars_total"] == chars_a + chars_b
         assert obs["recall_pending_served_count"] == 2
+
+
+def test_healthz_and_observability_carry_process_commit_mb(config_path: Path) -> None:
+    """Both status surfaces expose the process private-commit figure. Where a
+    probe exists (win32/linux) it must be a real positive reading — a null-only
+    payload is a dead field, the exact failure the surface exists to prevent —
+    and it degrades to None only where no probe exists (darwin)."""
+    with _boot(config_path) as client:
+        healthz = client.get("/healthz").json()
+        obs = client.get("/api/v1/observability").json()
+
+    for payload in (healthz, obs):
+        value = payload["process_commit_mb"]
+        if sys.platform in ("win32", "linux"):
+            assert value is not None
+            assert value > 0
+        else:
+            assert value is None
 
 
 # ---------------------------------------------------------------- request logging toggle
