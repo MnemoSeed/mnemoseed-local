@@ -124,7 +124,7 @@ install.ps1、scripts/windows-logon*.ps1、cli.py 的 win32 分支零改动；RE
 6. **`load`/`unload` 兼容回退分支** vs 单一 bootstrap/bootout：双路径徒增测试面且拖入弃用 API；早于 10.11 直接不声明。冻结维持。
 7. **`ConditionPathExists=!<baked-path>/daemon.off` vs `ExecCondition=`（I-2 改判，冻结：切换到 ConditionPathExists）**：QA 轮指出 ExecCondition 方案的 `$MNEMOSEED_LOCAL_HOME` 分支在运行时是死支——user manager 不继承 shell rc env，覆写 home 只在安装时烘焙后才存在，而烘焙使路径静态可解析，条件指令（无变量展开需求）功能等价；且 Condition 族版本下限远低（~209 量级 vs ~243）、无 shell、无引号转义、无 `$$` 逃逸风险。本版据此把 Linux 主闸门从 ExecCondition 改判为 ConditionPathExists，ExecCondition 方案保留于此作否决记录；plist 侧不受影响（launchd 无条件机制，内联 sh 闸门维持）。
 
-## 批次执行记录（随批追加）
+## 批次执行记录（工程批 C303-UNIX-LIFECYCLE，2026-11-07）：实现按本冻结执行，gate 机制 = ConditionPathExists（v2 改判）；红→绿三轮（span 不存在 / 模块缺失 / [7/8] 锚点重编号），全量 4830 passed / 23 skipped（平台门控 skip 全部带理由并钉死）；QA 变异 5/5 在设计层被杀（Restart 改写、引号路径、外来文件、fail-closed 信封、KeepAlive 注入）；独立 QA CLOSABLE 0B/0I/5N（N1 oracle 分层、N2 probe-then-bootout 等价偏差、N3 手动命令引号、N4 读错误裸栈、N5 本记录回填——均不阻塞）。真实 systemd/launchd 行为验证归 V305（CI 仅语法面）。
 
 - **2026-11-07 设计 QA 修订（v2 re-freeze）**：设计 QA 判定 NOT CLOSABLE（0 BLOCKER / 2 IMPORTANT / 3 NIT），本版逐项落实：I-1 —— 全部 PRD-B2.14 条目号改正并补行号锚（原「第 3 条」→ 第 4 条/B2.14:12、原「第 4 条」→ 第 7 条/B2.14:15、原「第 8 条」→ 第 11 条/B2.14:19；实质主张经 QA 复核全部为真）；I-2 —— Linux 主闸门改判 `ConditionPathExists`，ExecCondition 方案以否决记录保留（备选 7）；N-1 —— 安装后 shell rc 覆写的 home 分裂窗声明入 UNKNOWN 6；N-2 —— manager 存续窗口内 failed 单元不随新登录重试的边界声明入 UNKNOWN 7；N-3 —— Unix 端口诊断弱于 Windows 的差显式声明入手动路径节。
 - （待工程批次填：TDD 红绿记录、门禁数字、QA 判定、收口记录。）

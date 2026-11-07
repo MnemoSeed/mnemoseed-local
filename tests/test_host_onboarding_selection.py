@@ -103,6 +103,13 @@ def _make_sh_installer(
     env["HOME"] = str(tmp_path)
     env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path / "mnemo-home")
     env["SHIM_LOG"] = str(log)
+    # A redirected runtime dir detaches the login-autostart probe from any real
+    # user manager: systemctl cannot connect and no private socket exists, so
+    # the installer takes its designed systemd-less degrade instead of
+    # registering against a manager that cannot see this isolated home.
+    runtime_dir = tmp_path / "xdg-runtime"
+    runtime_dir.mkdir()
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
     if clean_hosts:
         for name in ("CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
@@ -263,8 +270,8 @@ def test_posix_installer_selects_hosts_explicitly_and_refuses_pre_write() -> Non
     validation_call = SH_TEXT.index('HOST_SELECTED="$(validate_host_list "$HOSTS")"')
     assert validation_call < SH_TEXT.index("# --- dry-run plan")
     assert validation_call < SH_TEXT.index("# --- step 1: ollama")
-    assert "[7/8] host adapter wiring" in SH_TEXT
-    assert "[7/8] OpenCode host adapter hook" not in SH_TEXT
+    assert "[8/9] host adapter wiring" in SH_TEXT
+    assert "[8/9] OpenCode host adapter hook" not in SH_TEXT
     assert "for _host in $HOST_SELECTED" in SH_TEXT
 
 
@@ -294,7 +301,7 @@ def test_no_selection_prints_the_exact_per_host_commands_as_next_steps() -> None
 def test_host_selection_stays_orthogonal_to_the_setup_mode() -> None:
     assert "MODE='capture-recall'" in SH_TEXT
     assert "--mode)" in SH_TEXT
-    sh_step = SH_TEXT[SH_TEXT.index("[7/8] host adapter wiring") : SH_TEXT.index("# --- step 8")]
+    sh_step = SH_TEXT[SH_TEXT.index("[8/9] host adapter wiring") : SH_TEXT.index("# --- step 9")]
     assert "MODE" not in sh_step
     assert "[ValidateSet('CaptureRecall', 'Refinement')]" in PS1_TEXT
     ps1_step = PS1_TEXT[PS1_TEXT.index("[9/10] host adapter wiring") : PS1_TEXT.index("# --- step 8")]
@@ -303,7 +310,7 @@ def test_host_selection_stays_orthogonal_to_the_setup_mode() -> None:
 
 
 def test_dry_run_plan_reports_the_host_selection() -> None:
-    assert "[7] host adapter wiring" in SH_TEXT
+    assert "[8] host adapter wiring" in SH_TEXT
     assert "no host adapter wiring (no --hosts value" in SH_TEXT
     assert "'    plan:  would run `mnemoseed-local hook install opencode`'" in SH_TEXT
     assert "mnemoseed-local host install --host $_host" in SH_TEXT
@@ -350,7 +357,7 @@ def test_installers_detect_installed_hosts_via_cli_or_config_dir() -> None:
 
 
 def test_installers_offer_an_interactive_selection_only_from_an_empty_selection() -> None:
-    sh_step = SH_TEXT[SH_TEXT.index("[7/8] host adapter wiring") : SH_TEXT.index("# --- step 8")]
+    sh_step = SH_TEXT[SH_TEXT.index("[8/9] host adapter wiring") : SH_TEXT.index("# --- step 9")]
     sh_empty = sh_step[sh_step.index('if [ -z "$HOST_SELECTED" ]; then') :]
     assert "[ -t 0 ]" in sh_empty
     assert "offer_installed_host_selection" in sh_empty

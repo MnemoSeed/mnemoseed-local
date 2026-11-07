@@ -68,8 +68,9 @@ Memory is stored in plaintext; there is no encryption-at-rest guarantee.
 Dream inference uses a local model by default, but a remote endpoint can be
 configured and receives the data sent to it. Multi-device sync and a hosted
 cloud daemon are outside this edition. Experience learning remains unfinished
-and off; dream currently produces structured facts. Windows logon startup,
-when registered, does not recover the daemon after a crash.
+and off; dream currently produces structured facts. Login autostart (Windows
+logon task, Linux systemd user unit, macOS launchd agent), when registered,
+does not recover the daemon after a crash.
 
 ## Sponsor MnemoSeed
 
