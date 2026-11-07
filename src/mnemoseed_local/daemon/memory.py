@@ -41,23 +41,32 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from mnemoseed_local.capture.stamper import ConsistencyVerdict, NearDuplicateChecker, WriteConfig
-from mnemoseed_local.config import Config
+from mnemoseed_local.config import Config, live_home_dir
 from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
+from mnemoseed_local.hosts.common.project_binding import (
+    BindingError,
+    bindings_path,
+    contains_root,
+    load_bindings,
+    roots_for_profile,
+)
 
 if TYPE_CHECKING:
     from mnemoseed_local.daemon.app import DreamWorker
@@ -119,6 +128,11 @@ _SCAN_PAGE_LIMIT = 50
 # rows. A scan that returns the limit may have missed older rows, so the
 # consumer reports window_truncated (never a page-visible approximation).
 SESSION_WINDOW_SCAN_LIMIT = 2000
+
+# Bounded page for the session-resume walks (scoped matching, recovery): the
+# ingested_at-desc listing is truncated at the same pragmatic guardrail the
+# unscoped replay uses.
+_RECENT_SCAN_LIMIT = 2000
 
 
 class MemoryNotFoundError(Exception):
@@ -233,6 +247,11 @@ class SessionRecentRequest(BaseModel):
         string=child caller). Filters matched candidates to root sessions when
         the caller is a root (self_parent_id is None) so child/subagent sessions
         stay invisible to their orchestrator.
+    caller_cwd: the caller's workspace directory, carried verbatim from the
+        caller (never derived by the daemon). Present = the recovery contract:
+        the project binding registry must verify the workspace (exact root or
+        containment) before any history is selected; an unverified workspace
+        never falls back to a broad replay. Absent = the legacy behaviors.
     """
 
     profile_id: ProfileRef
@@ -242,6 +261,7 @@ class SessionRecentRequest(BaseModel):
     self_session_id: str | None = None
     resume_query: str | None = Field(default=None, max_length=500)
     self_parent_id: str | None = None
+    caller_cwd: str | None = None
 
 
 class SessionWindowsRequest(BaseModel):
@@ -437,6 +457,68 @@ def _window_iso(window: SessionWindow) -> dict[str, str] | None:
     if latest is None or latest <= 0:
         return None
     return {"first": iso8601_utc(first), "latest": iso8601_utc(latest)}
+
+
+def _track_session_root(is_root: dict[str, bool | None], session_id: str, chunk: ChunkStamp) -> None:
+    """One chunk's lineage vote: any parent-bearing chunk marks the session a
+    child; a session with only parentless chunks is a root; an empty-string
+    parent reads as unknown (never asserted either way)."""
+    spid = getattr(chunk, "session_parent_id", None)
+    if session_id not in is_root:
+        is_root[session_id] = True if spid is None else (False if spid else None)
+    elif spid is not None and is_root[session_id] is not False:
+        is_root[session_id] = False
+
+
+def _attach_window_facts(
+    groups: list[dict[str, Any]],
+    *,
+    vector: VectorStore,
+    profile_id: str,
+    active_sessions: frozenset[str],
+) -> None:
+    """Attach each group's exact window, live-capture flag and staleness in
+    place. A session still capturing is ANOTHER conversation in progress —
+    surfacing the flag and staleness explicitly lets a resuming agent tell
+    "someone else's open work" from "a conversation that ended"."""
+    for group in groups:
+        window = _scan_session_window(vector, profile_id=profile_id, session_id=group["session_id"])
+        group["window"] = _window_iso(window)
+        group["window_truncated"] = window.window_truncated
+        group["active"] = group["session_id"] in active_sessions
+        latest = window.latest
+        group["seconds_since_last_activity"] = (
+            max(0.0, time.time() - latest) if latest is not None and latest > 0 else None
+        )
+
+
+def _self_window_payload(
+    vector: VectorStore,
+    *,
+    profile_id: str,
+    self_session_id: str | None,
+    active_sessions: frozenset[str],
+) -> dict[str, Any] | None:
+    """The caller-named session's exact window when it has chunks, else None."""
+    if not self_session_id:
+        return None
+    window = _scan_session_window(vector, profile_id=profile_id, session_id=self_session_id)
+    if window.first is None:
+        return None
+    return {
+        "session_id": self_session_id,
+        "window": _window_iso(window),
+        "chunk_count": window.chunk_count,
+        "active": self_session_id in active_sessions,
+    }
+
+
+def _anchor_named_roots(anchors: Sequence[str], roots: Sequence[Path]) -> list[Path]:
+    """Bound roots whose directory basename an anchor literally names
+    (casefolded) — the explicit-user-scope test: a repository name in the raw
+    prompt selects the project when it matches exactly one bound root."""
+    names = {anchor.casefold() for anchor in anchors}
+    return [root for root in roots if Path(root).name.casefold() in names]
 
 
 def _group_session_tails(
@@ -1019,6 +1101,7 @@ class MemoryService:
         active_sessions: frozenset[str] = frozenset(),
         resume_query: str | None = None,
         self_parent_id: str | None = None,
+        caller_cwd: str | None = None,
     ) -> dict[str, Any]:
         """B2 time-ordered resume: the newest sessions' verbatim chunk tails.
 
@@ -1030,12 +1113,26 @@ class MemoryService:
         Every group carries its exact per-session window; ``self_window`` is
         the caller-named session's window when it has chunks, else null.
 
-        When ``resume_query`` is set, the endpoint performs scoped-resume
-        matching (issue #187): anchors extracted from the query are matched
-        against USER segments of profile chunks, and sessions are filtered
-        to root sessions only (``session_parent_id IS NULL``). Unmatched
-        queries return empty sessions. Without ``resume_query`` the original
-        profile-global recency behavior applies."""
+        With ``caller_cwd`` the recovery contract applies first: the caller's
+        workspace is verified against the project binding registry BEFORE any
+        history is selected, the raw prompt stays the only user-intent input,
+        and every failure is an explicit unresolved result. Without it the
+        pre-recovery behaviors are unchanged: ``resume_query`` runs
+        scoped-resume matching (anchors extracted from the query are matched
+        against USER segments of profile chunks, filtered to root sessions),
+        otherwise the original profile-global recency behavior applies."""
+        if caller_cwd is not None:
+            return self._session_recent_recovery(
+                profile_id=profile_id,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+                resume_query=resume_query,
+                self_parent_id=self_parent_id,
+                caller_cwd=caller_cwd,
+            )
         if resume_query is not None:
             return self._session_recent_scoped(
                 profile_id=profile_id,
@@ -1054,16 +1151,8 @@ class MemoryService:
         # direct diagnostics that carry at most one identity field keep the legacy
         # unscoped behavior below.
         if exclude_session_id is not None and self_session_id is not None:
-            return {
-                "profile_id": profile_id,
-                "sessions": [],
-                "self_window": None,
-                "guidance": _RECENT_SESSIONS_GUIDANCE,
-                "selection": "unresolved",
-                "selection_reason": "automatic-path identity fields without resume_query",
-                "visibility": self._visibility_mode_payload(),
-            }
-        limit = min(2000, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
+            return self._unresolved(profile_id, "automatic-path identity fields without resume_query")
+        limit = min(_RECENT_SCAN_LIMIT, (sessions + (1 if exclude_session_id else 0)) * per_session * 4)
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
         )
@@ -1073,33 +1162,18 @@ class MemoryService:
             sessions=sessions,
             exclude_session_id=exclude_session_id,
         )
-        for group in groups:
-            window = _scan_session_window(
-                self._stores.vector, profile_id=profile_id, session_id=group["session_id"]
-            )
-            group["window"] = _window_iso(window)
-            group["window_truncated"] = window.window_truncated
-            # Cross-session contamination guard: a session still capturing is
-            # ANOTHER conversation in progress. Surface the live-capture flag
-            # and staleness explicitly so a resuming agent can tell "someone
-            # else's open work" from "a conversation that ended".
-            group["active"] = group["session_id"] in active_sessions
-            latest = window.latest
-            group["seconds_since_last_activity"] = (
-                max(0.0, time.time() - latest) if latest is not None and latest > 0 else None
-            )
-        self_window: dict[str, Any] | None = None
-        if self_session_id:
-            window = _scan_session_window(
-                self._stores.vector, profile_id=profile_id, session_id=self_session_id
-            )
-            if window.first is not None:
-                self_window = {
-                    "session_id": self_session_id,
-                    "window": _window_iso(window),
-                    "chunk_count": window.chunk_count,
-                    "active": self_session_id in active_sessions,
-                }
+        _attach_window_facts(
+            groups,
+            vector=self._stores.vector,
+            profile_id=profile_id,
+            active_sessions=active_sessions,
+        )
+        self_window = _self_window_payload(
+            self._stores.vector,
+            profile_id=profile_id,
+            self_session_id=self_session_id,
+            active_sessions=active_sessions,
+        )
         result: dict[str, Any] = {
             "profile_id": profile_id,
             "sessions": groups,
@@ -1151,6 +1225,19 @@ class MemoryService:
             "profile_last_persisted_at": profile_newest,
         }
 
+    def _unresolved(self, profile_id: str, reason: str) -> dict[str, Any]:
+        """The explicit no-context result: zero injectable tails plus the
+        machine-readable reason a recovery consumer needs to react."""
+        return {
+            "profile_id": profile_id,
+            "sessions": [],
+            "self_window": None,
+            "guidance": _RECENT_SESSIONS_GUIDANCE,
+            "selection": "unresolved",
+            "selection_reason": reason,
+            "visibility": self._visibility_mode_payload(),
+        }
+
     def _session_recent_scoped(
         self,
         *,
@@ -1160,26 +1247,17 @@ class MemoryService:
         exclude_session_id: str | None = None,
         self_session_id: str | None = None,
         active_sessions: frozenset[str] = frozenset(),
-        resume_query: str,
+        resume_query: str | None,
         self_parent_id: str | None = None,
     ) -> dict[str, Any]:
         """Scoped-resume matching (issue #187): extract anchors, scan USER
         segments, filter to root sessions, return matched tails."""
         anchors = _extract_resume_anchors(resume_query)
         if not anchors:
-            return {
-                "profile_id": profile_id,
-                "sessions": [],
-                "self_window": None,
-                "guidance": _RECENT_SESSIONS_GUIDANCE,
-                "selection": "unresolved",
-                "selection_reason": "no anchors",
-                "visibility": self._visibility_mode_payload(),
-            }
+            return self._unresolved(profile_id, "no anchors")
         # Scan a bounded page for anchor hits in USER segments only
-        limit = 2000
         page = self._stores.vector.list_chunks(
-            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=limit)
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RECENT_SCAN_LIMIT)
         )
         matched_ids: set[str] = set()
         is_root: dict[str, bool | None] = {}  # True=root, False=child, None=legacy unknown
@@ -1205,13 +1283,7 @@ class MemoryService:
             hit = any(anchor in content_lower for anchor in anchors)
             if hit:
                 matched_ids.add(sid)
-            # Track root status from session_parent_id
-            spid = getattr(chunk, "session_parent_id", None)
-            if sid not in is_root:
-                is_root[sid] = True if spid is None else (False if spid else None)
-            elif spid is not None and is_root[sid] is not False:
-                # If any chunk says parent, the session is a child
-                is_root[sid] = False
+            _track_session_root(is_root, sid, chunk)
         # Filter to root sessions only (True), excluding legacy unknown (None)
         caller_is_root = self_parent_id is None
         filtered: set[str] = set()
@@ -1226,15 +1298,7 @@ class MemoryService:
             # A child caller sees all matched sessions (no over-filtering)
             filtered = matched_ids
         if not filtered:
-            return {
-                "profile_id": profile_id,
-                "sessions": [],
-                "self_window": None,
-                "guidance": _RECENT_SESSIONS_GUIDANCE,
-                "selection": "unresolved",
-                "selection_reason": "no session matched",
-                "visibility": self._visibility_mode_payload(),
-            }
+            return self._unresolved(profile_id, "no session matched")
         # Fetch tails for matched IDs; the grouping walk keeps recency
         # order and applies the session cap to survivors.
         match_chunks = [c for c in page.items if c.provenance.session_id in filtered]
@@ -1243,29 +1307,18 @@ class MemoryService:
             per_session=per_session,
             sessions=sessions,
         )
-        for group in groups:
-            window = _scan_session_window(
-                self._stores.vector, profile_id=profile_id, session_id=group["session_id"]
-            )
-            group["window"] = _window_iso(window)
-            group["window_truncated"] = window.window_truncated
-            group["active"] = group["session_id"] in active_sessions
-            latest = window.latest
-            group["seconds_since_last_activity"] = (
-                max(0.0, time.time() - latest) if latest is not None and latest > 0 else None
-            )
-        self_window: dict[str, Any] | None = None
-        if self_session_id:
-            window = _scan_session_window(
-                self._stores.vector, profile_id=profile_id, session_id=self_session_id
-            )
-            if window.first is not None:
-                self_window = {
-                    "session_id": self_session_id,
-                    "window": _window_iso(window),
-                    "chunk_count": window.chunk_count,
-                    "active": self_session_id in active_sessions,
-                }
+        _attach_window_facts(
+            groups,
+            vector=self._stores.vector,
+            profile_id=profile_id,
+            active_sessions=active_sessions,
+        )
+        self_window = _self_window_payload(
+            self._stores.vector,
+            profile_id=profile_id,
+            self_session_id=self_session_id,
+            active_sessions=active_sessions,
+        )
         return {
             "profile_id": profile_id,
             "sessions": groups,
@@ -1273,6 +1326,200 @@ class MemoryService:
             "guidance": _RECENT_SESSIONS_GUIDANCE,
             "selection": "matched",
             "anchors": anchors,
+            "visibility": self._visibility_mode_payload(),
+        }
+
+    def _session_recent_recovery(
+        self,
+        *,
+        profile_id: str,
+        per_session: int,
+        sessions: int,
+        exclude_session_id: str | None,
+        self_session_id: str | None,
+        active_sessions: frozenset[str],
+        resume_query: str | None,
+        self_parent_id: str | None,
+        caller_cwd: str,
+    ) -> dict[str, Any]:
+        """Project-context recovery: the caller's workspace is verified against
+        the project binding registry BEFORE any history is selected; the raw
+        prompt is the only user-intent input and is never invented here.
+
+        Resolution order: an explicit repository name in the prompt wins over
+        the workspace hint when it names exactly one bound root of a shared
+        profile; a verified exclusive bound root recovers its newest root
+        conversation without needing a name; an unbound workspace keeps the
+        documented anchor path (never a broad profile-global replay); every
+        verification failure (unreadable registry, other profile's root,
+        ambiguous shared workspace) is an explicit unresolved result. The
+        query never leaves the requested profile's namespace."""
+        if not caller_cwd.strip():
+            return self._unresolved(profile_id, "caller workspace carries no directory")
+        try:
+            bindings = load_bindings(bindings_path(live_home_dir()))
+        except BindingError as exc:
+            return self._unresolved(profile_id, f"project binding registry is unreadable ({exc})")
+        directory = Path(os.path.realpath(caller_cwd))
+        bound_profiles = {
+            entry.profile_id for entry in bindings if contains_root(Path(entry.project_root), directory)
+        }
+        if not bound_profiles:
+            # No trusted binding: with a raw prompt the documented anchor path
+            # still applies; without one there is no honest recovery input.
+            if resume_query is None:
+                return self._unresolved(
+                    profile_id, "caller workspace is not a bound project and no resume_query"
+                )
+            return self._anchor_recovery(
+                profile_id=profile_id,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+                resume_query=resume_query,
+                self_parent_id=self_parent_id,
+                reason="anchors from the raw prompt",
+            )
+        if bound_profiles != {profile_id}:
+            shown = ", ".join(sorted(bound_profiles))
+            return self._unresolved(
+                profile_id,
+                f"caller workspace {directory} belongs to project root(s) bound to "
+                f"profile(s) {shown}, not the requested {profile_id!r}",
+            )
+        roots = roots_for_profile(bindings, profile_id)
+        if len(roots) > 1:
+            named = _anchor_named_roots(_extract_resume_anchors(resume_query), roots)
+            if len(named) != 1:
+                return self._unresolved(
+                    profile_id,
+                    f"ambiguous shared workspace: profile {profile_id!r} is bound to "
+                    f"{len(roots)} project roots and the prompt names {len(named)} of them",
+                )
+            return self._anchor_recovery(
+                profile_id=profile_id,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+                resume_query=resume_query,
+                self_parent_id=self_parent_id,
+                reason="user scope named the project root",
+            )
+        anchors = _extract_resume_anchors(resume_query)
+        if anchors:
+            return self._anchor_recovery(
+                profile_id=profile_id,
+                per_session=per_session,
+                sessions=sessions,
+                exclude_session_id=exclude_session_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+                resume_query=resume_query,
+                self_parent_id=self_parent_id,
+                reason="anchors from the raw prompt",
+            )
+        return self._session_recent_bound(
+            profile_id=profile_id,
+            per_session=per_session,
+            exclude_session_id=exclude_session_id,
+            self_session_id=self_session_id,
+            active_sessions=active_sessions,
+        )
+
+    def _anchor_recovery(
+        self,
+        *,
+        profile_id: str,
+        per_session: int,
+        sessions: int,
+        exclude_session_id: str | None,
+        self_session_id: str | None,
+        active_sessions: frozenset[str],
+        resume_query: str | None,
+        self_parent_id: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        """The #187 anchor path under recovery dispatch: matched results carry
+        the resolution reason so a consumer can tell how the project was
+        selected; unresolved results stay explicit."""
+        result = self._session_recent_scoped(
+            profile_id=profile_id,
+            per_session=per_session,
+            sessions=sessions,
+            exclude_session_id=exclude_session_id,
+            self_session_id=self_session_id,
+            active_sessions=active_sessions,
+            resume_query=resume_query,
+            self_parent_id=self_parent_id,
+        )
+        if result["selection"] == "matched":
+            result["selection_reason"] = reason
+        return result
+
+    def _session_recent_bound(
+        self,
+        *,
+        profile_id: str,
+        per_session: int,
+        exclude_session_id: str | None,
+        self_session_id: str | None,
+        active_sessions: frozenset[str],
+    ) -> dict[str, Any]:
+        """Binding-driven recovery: the newest confirmed ROOT session of the
+        exclusively bound profile is the intended root conversation — one
+        group, the recovery stops once the continuation point is served.
+        A child caller recovers the same project conversation: the target is
+        the project's root conversation, not the caller's own lineage."""
+        page = self._stores.vector.list_chunks(
+            ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RECENT_SCAN_LIMIT)
+        )
+        is_root: dict[str, bool | None] = {}
+        for chunk in page.items:
+            sid = chunk.provenance.session_id
+            if not sid:
+                continue
+            if exclude_session_id is not None and sid == exclude_session_id:
+                continue
+            if self_session_id is not None and sid == self_session_id:
+                continue
+            _track_session_root(is_root, sid, chunk)
+        chosen = next(
+            (
+                sid
+                for chunk in page.items
+                if (sid := chunk.provenance.session_id) is not None and is_root.get(sid) is True
+            ),
+            None,
+        )
+        if chosen is None:
+            return self._unresolved(profile_id, "no confirmed root session in the bound project")
+        groups = _group_session_tails(
+            [c for c in page.items if c.provenance.session_id == chosen],
+            per_session=per_session,
+            sessions=1,
+        )
+        _attach_window_facts(
+            groups,
+            vector=self._stores.vector,
+            profile_id=profile_id,
+            active_sessions=active_sessions,
+        )
+        return {
+            "profile_id": profile_id,
+            "sessions": groups,
+            "self_window": _self_window_payload(
+                self._stores.vector,
+                profile_id=profile_id,
+                self_session_id=self_session_id,
+                active_sessions=active_sessions,
+            ),
+            "guidance": _RECENT_SESSIONS_GUIDANCE,
+            "selection": "matched",
+            "selection_reason": "bound project recovery",
             "visibility": self._visibility_mode_payload(),
         }
 
@@ -2575,7 +2822,12 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
     When ``resume_query`` is set, scoped-resume matching (issue #187) replaces
     the profile-global recency — only sessions whose USER segments contain
     extracted anchor identifiers are returned, filtered to root sessions when
-    ``self_parent_id`` is None."""
+    ``self_parent_id`` is None.
+
+    With ``caller_cwd`` the recovery contract applies: the workspace is
+    verified against the project binding registry first, the raw prompt and
+    the caller scope stay separate inputs, and every ambiguity is an explicit
+    unresolved result."""
     service: MemoryService = request.app.state.memory
     sessions = getattr(getattr(request.app.state, "capture", None), "sessions", None)
     active = frozenset(sessions()) if sessions is not None else frozenset()
@@ -2588,6 +2840,7 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
         active_sessions=active,
         resume_query=req.resume_query,
         self_parent_id=req.self_parent_id,
+        caller_cwd=req.caller_cwd,
     )
 
 

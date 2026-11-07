@@ -219,6 +219,16 @@ def resolve_profile(root: Path, bindings: Sequence[Binding]) -> str | None:
     return next((b.profile_id for b in bindings if root_key(Path(b.project_root)) == key), None)
 
 
+def contains_root(root: Path, directory: Path) -> bool:
+    """Component-boundary containment of ``directory`` under ``root``
+    (``os.path.normcase`` semantics: case-insensitive where the platform
+    folds paths). The binding gate's subdirectory rule and the recovery
+    query's workspace verification share this one test."""
+    base = os.path.normcase(str(root))
+    child = os.path.normcase(str(directory))
+    return child == base or child.startswith(base + os.sep)
+
+
 def roots_for_profile(bindings: Sequence[Binding], profile_id: str) -> list[Path]:
     """Every root explicitly bound to a profile — the sharing fact."""
     return [Path(b.project_root) for b in bindings if b.profile_id == profile_id]
