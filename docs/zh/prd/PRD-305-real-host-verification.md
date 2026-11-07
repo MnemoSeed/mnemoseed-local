@@ -1,6 +1,6 @@
 # PRD-305：真实宿主验证（V305-ONE，Windows 11 第一波）
 
-日期：2026-10-31。状态：V305-ONE 执行完毕，待独立 QA 与主控验收；V305-TWO（2026-11-03，第二轮）已追加执行完毕，记录见文末「第二轮（V305-TWO，2026-11-03）」一节；V305-THREE（2026-11-05，第三轮）已追加执行完毕，记录见文末「第三轮（V305-THREE，2026-11-05）」一节。基线：`da6b959e3facf7a506f8ef205bcc32a3591bd22a`（分支 `docs/305-real-host-verification`）。本轮在真实 Windows 11 主机上以「真实宿主 CLI + 合成守护进程 + 隔离宿主目录」的方式执行捕获→回忆注入→MCP 工具调用全链路验证，只新增本文档，不改变产品代码、配置或默认值。
+日期：2026-10-31。状态：V305-ONE 执行完毕，待独立 QA 与主控验收；V305-TWO（2026-11-03，第二轮）已追加执行完毕，记录见文末「第二轮（V305-TWO，2026-11-03）」一节；V305-THREE（2026-11-05，第三轮）已追加执行完毕，记录见文末「第三轮（V305-THREE，2026-11-05）」一节；V305-FOUR（2026-11-07，第四轮）已追加执行完毕，记录见文末「第四轮（V305-FOUR，2026-11-07）」一节。基线：`da6b959e3facf7a506f8ef205bcc32a3591bd22a`（分支 `docs/305-real-host-verification`）。本轮在真实 Windows 11 主机上以「真实宿主 CLI + 合成守护进程 + 隔离宿主目录」的方式执行捕获→回忆注入→MCP 工具调用全链路验证，只新增本文档，不改变产品代码、配置或默认值。
 
 ## 证据与结论边界
 
@@ -365,3 +365,118 @@ PRD-292 记录真实宿主完整流程为 **0/12**（Windows 11、Ubuntu、macOS
 ## 验收记录（第三轮）
 
 文档编写核对的证据分两类，如实分账（QA 修复轮已对账目本身做过一轮勘误，勘误动作随各条标注）：**(a) 证据树内保全件**（`%LOCALAPPDATA%\Temp\w305-v305-r3\`）：`mnemoseed-home\daemon.log`（每请求一行：boot 行 pid=25776 port=27790、`POST /mcp -> 200/202/405`、`/session/recent -> 200`、`/ingest -> 202`、`POST /memory/remember -> 200`、`POST /session/recall-pending -> 200`、`POST /memory/reinforce -> 200`、idle flush 行、`POST /daemon/shutdown -> 200`（03:38:03.947））、`mnemoseed-home\hook-debug.jsonl`（10 行：reconcile / session-start injection（会话 2 groups:1 chars:561）/ assistant step shape（finish tool-calls→stop）/ recall-pending poll（会话 2 chars:272 slotConsumed armCleared））、`mnemoseed-home\config.toml`、`sessions\daemon-pid.txt`（进程台账；QA 修复轮已按 daemon.log 勘误 shutdown 时刻）、`opencode-serve.log/.err`（boot1）、`opencode-serve2.log/.err`（boot2，含插件 console 输出 10 行与 server password 行）、`opencode-data\opencode\log\opencode.log`（隔离服务日志：唯一加载行指向隔离安装路径、`mcp connected tools=6` connectionID）、`opencode-s1-messages.json`（会话转写：reasoning 自述 mnemoseed 工具、`tools.mnemoseed.remember` 调用与 `new_chunk 81e72aec…` 结果、cost 0）、`opencode-s2-messages.json`（答案逐字引用记忆事实）、`session1-create.json`/`session2-id.txt`/`opencode-s1-prompt.json`/`opencode-s2-prompt.json`、`session-recent-check.json`（T1 回放 payload：会话 1 尾逐字 + remember pin）、`serve-config.json`（config 目录清单：隔离家在列）、`openapi.json`/`serve-providers.json`、`r3-install/uninstall-opencode.log`、`r3-install/uninstall-cursor.log`、`r3-install-codex.log`、`codex-r3-nobypass.log`（零 hook 行 + 401）、`codex-r3-capture.log`（hook: SessionStart/UserPromptSubmit + Completed）、`cursor-agent-probe.log`（0 字节——探针无任何输出本身就是产物；GUI 拉起事件由进程台账记录）、`sessions\cursor-hooks-installed-state.json` + `sessions\cursor-mcp-installed-state.json`（QA 修复轮安装态保全：六事件 hooks 形态——含 beforeSubmitPrompt/afterAgentResponse——与 worktree shim mcp 注册的字节捕获；原安装态文件已被当时的卸载覆盖，修复轮重装后立即复制、再卸载恢复，捕获为修复轮后置动作）、`cursor-root\.cursor\hooks.json` 在盘形态 = 卸载后 19 字节 `{"version": 1}`（卸载终态）、`codex-home\{hooks.json,config.toml}`、`mcp_probe_r3.py` + `mcp-probe-r3-cursor.txt`（Cursor 注册命令网关探针：initialize/tools/remember/recall 全行）、`r3-env.sh`/`r3-child-launch.sh`（隔离 env 与 PATH 剥离清单及收紧记录）。**关键否定性证据亦在盘**：`codex-r3-nobypass.log` 的零 hook 行（信任门槛）、卸载后 `hooks.json`/`mcp.json` 残留形态（`{"version": 1}` / `{}`）。**(b) 未以文件留存件**（仅存在于本轮会话记录或为瞬时态）：serve API 鉴权试错的逐次 401 响应；boot1 双加载窗口的 watcher subscribe 行（loading 行已保全）；Cursor GUI 探针的桌面瞬时窗口（无截图，进程台账在案）；各 `host status` 的中间读数（安装/卸载终态输出已保全）；`/api/v1/observability` 读数——OpenCode 阶段读数，最后读取 03:28:38.864、**早于 03:36 codex 窗口**，非全轮终值（`recall_pending_served_count: 1`、`recall_injection_count: 1`、`recall_injection_chars_total: 69`、actor console:15/mcp:10、`capture_ingest_count: 0`——无 payload 保全件，读数仅存于会话记录；V305-FOUR 第 5 条 actor 不对称 observation 的计数面即此）；codex `/session/recent` 读回内容与 `source: "codex_cli-chat"`/`host: "codex_cli"` 字段（正文引用，读回响应未落盘）；opencode 安装件与 shipped `plugin.ts` 的逐字节 `cmp` 结果（"BYTE-IDENTICAL" 回显，未落盘）；Cursor CLI 实测读数（`cursor --version` = 3.24.18 输出、`--help` 的 Subcommands 列表、`cursor agent` 回落主 help 的行为——probe.log 为 0 字节，读数本身未落盘）；Cursor 首次安装解析到已装 shim 的落盘形态（已被重装覆盖，未保全）；`r3-child-launch.sh` 的 SCRUBBED-OK 预检回显（方法论修正 2 与边界事件 2 的前置校验结果，未落盘）；node v20.12.2 复测输出与 `node:sqlite` `ERR_UNKNOWN_BUILTIN_MODULE` 回溯（机器清单与 ZCode 格引用，未落盘）；`%APPDATA%\Cursor\storage.json` 的 mtime 前后快照（边界事件 1 零写入判据，未落盘）；healthz 首探 body 细节（preset embedded、四 store 就绪、migrations 16，未落盘）。独立实现 QA（已出 CLOSABLE 条件判定，本修复轮即其条件的落实）、完整本地 gates、本 PR CI、merge 与最终验收均待主控记录；#337 关闭声明见上节，最终裁定归主控，当前不声明 #305 完成。
+
+---
+
+# 第四轮（V305-FOUR，2026-11-07）
+
+日期：2026-11-07。状态：V305-FOUR 执行完毕，待独立 QA 与主控验收。基线：`7d93e4f`（分支 `docs/305-verification-round-four`，worktree `.mnemoseeding/worktrees/w305d`，= 当前 main；含 PR #356 的 opencode hook actor 标头（`bf7782d`，#350 修复）、PR #344 的 Cursor adapter、PR #369 的 host status 捕获/信任观测面（`db446af`）、PR #370 的版本冻结 0.3.0（`889e430`，merge 于当日 03:17Z））。本轮沿用前三轮的协议、隔离策略、诚实边界规则与第三轮方法论修正（serve 面、PATH 剥离、PRD-345 配方），在同一台真实 Windows 11 主机上聚焦「第三轮以来的变化」执行：OpenCode actor 归因上线验证（#350 收口观测）、Cursor 复查、Codex/ZCode 状态复测。除本文档外零仓库写入；第一至三轮临时树原样保留未触碰。本轮临时树：`%LOCALAPPDATA%\Temp\w305-v305-r4\`。
+
+**与前三轮的根本环境差异**：真实 7788 守护进程（v0.2.0，PID 22260）本轮**全程在场**（owner 常驻）。「never 7788/4096」边界的执行形态相应升级为「verify before/after」：轮前一次已披露的只读 `GET /health` 存活探测（见边界事件 1）+ 轮后 netstat PID 一致与真实家只读元数据核对；此后全程零 HTTP 接触、4096 全程空置。
+
+## 机器与环境清单（第四轮，增量）
+
+| 项 | 值 |
+| --- | --- |
+| 操作系统 | Windows 11 Pro 25H2，build 10.0.26200.8655（与轮一同） |
+| mnemoseed-local | worktree `w305d` @ `7d93e4f`：**0.3.0**（PR #370 冻结；`.venv` 经 `uv sync --frozen` 重建，Python 3.12，uv 0.12.5；`mnemoseed_local.__file__` 打印确认解析 worktree 代码） |
+| 真实已装 CLI | 0.2.0（`~/.local/bin/mnemoseed-local.exe --version` 复测；本轮按简报**未升级**真实环境） |
+| 0.3.0 wheel 工件 | 本机 `dist/` 仅 0.1.0 旧工件，无 0.3.0 wheel 在盘；PR #370 已 merge、main CI success——0.3.0 wheel 为发布流程产物（简报所述 artifact 未在本机追查下载） |
+| 真实 7788 守护进程 | v0.2.0，PID 22260，python.exe——本轮全程在场（owner 常驻），`GET /health` 首探 `preset embedded`、四 driver 就绪（vector lancedb_embedded / graph sqlite_graph / meta sqlite_meta / embed bge_m3_onnx） |
+| codex-cli / Claude Code / OpenCode / Cursor / Node / uv | 0.164.0 / 2.1.310 / v2.0.32 / 3.24.18 / v20.12.2 / 0.12.5（全部未变） |
+| 合成守护进程 | `mnemoseed-local up --host 127.0.0.1 --port 27791`（备用端口；7788/4096/27788/27789/27790/4577/4580/40924/45278/28894 均未占用） |
+| opencode serve | `opencode serve --hostname 127.0.0.1 --port 4580 --print-logs --log-level debug`（boot1 PID 35544 误启动即杀，boot2 PID 14108） |
+| 隔离目录 | `%LOCALAPPDATA%\Temp\w305-v305-r4\`：`mnemoseed-home\`（守护进程家）、`opencode-home\`、`opencode-data\`、`opencode-state\`、`opencode-cache\`、`home-r\`（HOME/USERPROFILE 重定向根，含 `tmp\`）、`cwd-opencode\`、`cursor-root\`、`codex-home\`、`cwd-codex\`、`sessions\`（日志、探针脚本、进程台账） |
+| 进程台账 | 见 `sessions\r4-process-ledger.txt`：合成守护进程 PID 12536（27791，17:22 boot，`/daemon/shutdown` 正常退出，端口释放）；serve boot1 PID 35544（即杀）；serve boot2 PID 14108（卸载后即杀，端口释放）；自举服务 45278 全程未出现（两次 serve 日志零命中）。owner 进程（7788 PID 22260、opencode 桌面服务 PID 460 @28894、GUI 实例 PID 18648/36228/12696/28556）全程零触碰 |
+
+合成守护进程 `config.toml`（mnemoseed-home）与第三轮同构且启动前写定（`preset embedded`、`baseurl http://127.0.0.1:27791`、`[storage.embed] driver = "synthetic"`、`[storage.vector] dimensions = 64`、`[storage.graph.instances.isolated]` 显式临时绝对路径、`[logging] requests = true`、`[capture] idle_flush_sec = 20.0`）；**boot 一次成功**（连续第二轮，配置模板教训已固化）。healthz 首探：四 store 就绪、migrations 16。守护进程 lifespan 签发凭据 `<home>\secrets\daemon.credential.key`（43 字节），插件经 `MNEMOSEED_LOCAL_DATA_DIR` 指向同一 home 读取。
+
+**隔离配方（PRD-345 配方 A+B 并用）**：`HOME`+`USERPROFILE` → `home-r\`，`OPENCODE_CONFIG_DIR`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME` → 临时树各目录，`TMP`/`TEMP` → `home-r\tmp\`（PRD-345 加固项本轮落地）；子进程 PATH 为**白名单形态**（轮二教训的简报重申）：System32/Windows/PowerShell/nodejs/npm 全局/Git usr+mingw64，无 worktree venv、无 uv、无 `~/.local/bin`、无 `~/bin`、无系统 Python。`opencode debug paths` 机械断言（`sessions\r4-debug-paths.txt`）：home/data/cache/config/state/tmp/bin/log/repos/db 十行全部落临时树——`XDG_STATE_HOME` 隔离使 owner 2.2.5 服务发现落空（无 service.json 自举，45278 全程未监听）。剥离预检（`command -v mnemoseed-local` 必须失败 + `command -v opencode` 必须成功）在每次宿主子进程启动前通过。
+
+## 每宿主每检查点证据矩阵（第四轮）
+
+| 宿主 | 安装 | 配置/握手 | 真实捕获 | 回忆注入 | MCP tools/call | 卸载/清理 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Windows 11 / OpenCode | PASS | PASS（单通道装载 + mcp entry 连接） | **PASS（计数面闭合：capture_ingest_count 0→8，hook 归因）** | PASS（T1 + T2 + 模型答案引用，连续第二轮） | PASS（会话内 remember + recall 两次 tools/call） | PASS |
+| Windows 11 / Cursor | PASS（复现） | BLOCKED（无可驱动 headless 会话，同轮三） | BLOCKED | BLOCKED | PASS（仅网关面，注 5 同义） | PASS |
+| Windows 11 / Codex CLI | PASS | PASS + 信任子格 BLOCKED（结构性复测） | 本轮未复跑捕获（焦点格不在本轮清单） | 本轮未测 | 轮一/轮二网关面 PASS 证据维持 | PASS |
+| Windows 11 / ZCode | 轮一 PASS 证据维持 | BLOCKED（node v20.12.2 复测未变） | BLOCKED | BLOCKED | 轮一网关面 PASS 证据维持 | 轮一 PASS 证据维持 |
+
+注 1（bypass 旗标）与注 5（MCP 通路诚实边界）沿用前几轮定义。本轮 OpenCode 格未使用 bypass 旗标（opencode 无信任门槛）；Codex 格本轮未跑带旗标会话（焦点为信任态结构复查，见 Codex 节）。
+
+### OpenCode（PR #356 actor 标头 @ 7d93e4f，2.0.32 serve 面）——#350 收口观测
+
+- **安装 PASS**：`host install --host opencode` 写入 `opencode-home\plugin\mnemoseed-local.ts`，与 worktree `plugin.ts` **逐字节相同**（`cmp` 实测）；文件内 `x-mnemoseed-actor` 出现 2 处（hook 通道 + mcp entry 头）。`host status` = `match` + `daemon: reachable (http://127.0.0.1:27791)`，并呈现 **PR #369 新观测面**：`ingest ack: not_observed`、`capture: none`、`replay: not_observed`、`trust: not_required`（安装态基线）。
+- **配置/握手 PASS**：boot2 服务日志唯一一条插件加载行指向隔离安装路径；紧随 `mcp connected server=mnemoseed tools=6`（connectionID 639613d9-…，directory=cwd-opencode）；守护进程面同刻 `POST /mcp -> 202`、`GET /mcp -> 405`（fail-open）、`POST /mcp -> 200`。boot1 因启动 cwd 误落仓库根即杀重启用 boot2（边界事件 2）；boot1 上仅一次 session create（无 prompt、无插件加载行），全部会话证据产生于 boot2 单通道形态。
+- **真实捕获 PASS（#350 计数面闭合）**：会话 1（`ses_e4aa81e76ffesMtTb6DZram6OX`，serve API `POST /api/session` + `POST /api/session/{id}/prompt`，payload 形态 `{"text": …}`，响应 `delivery: "steer"`）驱动后，守护进程面 `POST /ingest -> 202` 三行（17:31:22、17:31:54 ×2；观测读数后该会话还有第四行 17:32:31 终答 ingest）；**`GET /api/v1/observability` 读数 `capture_ingest_count: 0 -> 3`——三轮来该计数器首次为 opencode 会话移动**（轮三恒 0 的 actor 不对称缺口在 wire 上闭合）；`authenticated_actor_counts: {"cli": 2, "mcp": 6, "hook": 5, "console": 1}`——`hook: 5` 即插件凭据通道请求（`/session/recent` + ingest ×3 + `/session/recall-pending`，逐行闭合），`console: 1` 为本人一次未携 actor 头的 curl 读数（首次 observability 读取，如实归因本人），`cli` 为本人 CLI 探测面。
+- **T1（首会话，如实记空注）**：`hook-debug.jsonl` `session-start injection {"groups":0,"injectedChars":0,"reason":"no injectable recall content"}`——空守护进程上首次会话无可回放，属预期形态；同文件第 2 行 `session-start injection skipped (selection=%s)` 证实**轮三欠账 10 的插件 debug 通道格式化缺陷在本基线原样在**（占位符未替换；本验证批次不修，留待实现批次）。
+- **空闲 flush 读回（verbatim 通道）**：`POST /session/recent`（守护进程面，actor cli）读回会话尾逐字：`user: Note for later: the AnchorLight nightly batch runs use the tidepool-scheduler v2 config.\nassistant: Noted — saved to memory: the AnchorLight nightly batch runs use the **tidepool-scheduler v2** config.`，`source: "opencode-chat"`、`host: "opencode"`；同读回含会话 1 内 remember pin 条目（`source: "memory.remember"`，`chunk_id a2cf61fb…`）。
+- **会话 1 内 tools/call（同轮三证据面）**：托管模型（`opencode/big-pickle`，agent `build`）经 `execute` 真实调用 `tools.mnemoseed.remember`——守护进程面 `POST /memory/remember -> 200` + `POST /mcp -> 200`（17:31:54）；`hook-debug.jsonl` `assistant step shape {finish:"tool-calls"}`。
+- **回忆注入 PASS（T1 + T2，回归确认）**：会话 2（`ses_e4aa3ee58ffexJFc7w31effy75`，提示词含 `tidepool-scheduler` 实体锚）：`hook-debug.jsonl` `session-start injection {"groups":1,"injectedChars":552}`（T1 跨会话回放会话 1 尾）+ `recall-pending poll {"injectedChars":276,"slotConsumed":true,"armCleared":true}`（T2 服务 remember pin）；守护进程面 `POST /session/recent -> 200` ×2 + `POST /ingest -> 202` + `POST /session/recall-pending -> 200`。观测面（会话 2 窗口读数）：`capture_ingest_count: 5`、`hook: 9`、`recall_injection_count: 1`、`recall_injection_chars_total: 73`（被服务 pin 实测 72 字符，守护进程侧每项 `len(text)+1` 分隔符公式，与轮三同式并陈、不折算）。
+- **会话 2 内第二次 tools/call**：模型经 `execute` 调用 `tools.mnemoseed.recall`（transcript 在案：`await tools.mnemoseed.recall({query: "AnchorLight nightly batch tidepool-scheduler configuration", top_k: 5})`）——守护进程面 `POST /memory/recall -> 200` + `POST /mcp -> 200`（17:34:59）。
+- **模型答案引用 PASS（连续第二轮）**：会话 2 助手终文逐字：「I have it in memory, but only one fact: **the AnchorLight nightly batch runs use the `tidepool-scheduler` v2 config.**」；其 reasoning 自述「We have a recalled memory: …」；引用守卫随之 `POST /memory/reinforce -> 200`（17:35:44）。T1/T2 → 模型输入 → 答案引用 → reinforce 的完整链路本轮在 hook 归因开启的状态下再度闭合。
+- **boot 终值观测面**：`capture_ingest_count: 8`（八个 ingest 全部来自本轮 opencode 会话，与 daemon.log 的 `POST /ingest -> 202` 行数逐一相等）、`authenticated_actor_counts: {"cli": 15, "mcp": 10, "hook": 13, "console": 1}`。逐行可指认的归因：`hook: 13` = 插件凭据通道请求 8 ingest + 2 recent + 2 recall-pending + 1 reinforce（引用守卫，17:35:44 行）——恰好 13，逐行闭合；`console: 1` = 本人一次未携 actor 头的 curl 读数（首次 observability 读取）；`cli`/`mcp` 的余量归本人 CLI 探测面（install/status/uninstall/shutdown）与 /mcp 通道 + 网关 REST 面（远端 entry 5 行 + 探针 2 行可指认）——daemon.log 请求行不携带 actor 字段，逐行余量归因超出日志面，如实并陈、不强行折算。三份快照原文在案（`sessions\r4-observability-{s1,s2,final}.json`）。
+- **卸载 PASS + PR #369 表面在真实活动上的工作证据**：`host uninstall` 后 `host status` = `not-installed`，读数升级为 `ingest ack: observed (8 hook ingests acknowledged since boot)`、`capture: recent (last persisted 18s ago (window 20s))`、`replay: observed (1 replay serves observed since boot (not attributed to this host))`（卸载后诚实不归因）、`trust: not_required (no mnemoseed hooks registered for this host)`——捕获/回放证据面与真实 wire 活动逐项对应。
+- **模型回合来源披露（与轮三同型）**：两个会话回合走 opencode 自带托管 provider（`opencode/big-pickle`），隔离数据目录无 auth.json，`cost: 0`、无凭据创建、真实家 `auth.json` 未触碰。
+
+**#350 收口状态（wire 观测，对 issue #350 done-when 的逐项裁定）**：(1) 「ingest path 标识 actor」——PR #356 落地于本基线，插件每条 daemon 请求携 `x-mnemoseed-actor: hook`（代码 + 安装件实测）；(2) 「counter counts opencode capture」——**本轮 wire 实测达成**：`capture_ingest_count` 0→3→5→8 全部来自真实 opencode serve 会话 ingest，`authenticated_actor_counts[hook]` 同步计数同一请求流；(3) 「behavioral test pins the actor field end to end」——PR #356 随带的测试面在仓库，本轮补足的是其在真实宿主链路上的行为证据。#350 的 wire 收口观测达成；最终关闭裁定归主控。
+
+### Cursor（复查；产品 adapter 第二轮实机）
+
+- **宿主清单（只读，未执行 `cursor agent`、未拉起 GUI——轮三边界事件 1 的教训为现行纪律）**：`cursor --version` = 3.24.18（版本行后随 commit hash 与 arch 两行，轮三记录的版本未变）；CLI bundle 形态不变（`cursor`/`cursor.cmd`/`code-tunnel.exe`/`cursor-tunnel.exe`）；独立 `cursor-agent` CLI 仍未安装（PATH 与 npm 全局均无）；真实 `~/.cursor` 七项布局同轮三（无 hooks.json/mcp.json）。**结论：无可驱动 headless 会话入口，与轮三结构判定一致。**
+- **安装 PASS（复现）**：`host install --host cursor`（安装步 `USERPROFILE`/`HOME` 重定向 + worktree shim 前置 PATH——轮三边界事件 3 的教训落地）写入 `cursor-root\.cursor\hooks.json`（六事件，命令为 worktree shim 绝对路径）与 `mcp.json`（worktree shim + `["mcp"]`）；落盘路径全部为 worktree 绝对路径（无已装 shim 解析）。安装态字节即保全：`sessions\r4-cursor-hooks-installed-state.json` + `r4-cursor-mcp-installed-state.json`（轮三 QA 修复轮的方法本轮前置执行）。`host status` = `installed` + `daemon: reachable (http://127.0.0.1:27791)`。
+- **配置/握手 / 真实捕获 / 回忆注入 BLOCKED**：同轮三同因（无 headless 会话面；GUI 驱动需 owner 协作，超边界）。
+- **MCP tools/call PASS（仅网关面，注 5 同义）**：以隔离 `mcp.json` 注册的原样命令驱动 stdio 网关（轮三修正式探针，通知不读响应）：`initialize` 返回 `serverInfo mnemoseed-local **0.3.0**`（PR #370 冻结面在 serverInfo 的实测呈现，轮三为 0.2.0）、`protocolVersion 2024-11-05`；`tools/list` 6 工具；`tools/call remember` 返回 `{"outcome":"new_chunk","chunk_id":"6b6eaedf…"}`；`tools/call recall`（查询 `AnchorLight nightly batch`）命中本轮 opencode 会话 1 尾 chunk（`provenance_source: "opencode-chat"`、`chunk_id 87809314…`）——同一合成守护进程下的跨宿主召回。诚实边界不变：Cursor app 自身从未加载该注册，单向 ≠ 双向。
+- **卸载 PASS**：`host uninstall` 后 `host status` = `not-installed`；`hooks.json` 恢复 19 字节 `{"version": 1}`、`mcp.json` 恢复 `{}`（与轮三终态同形）。
+
+### Codex CLI（信任态结构复查）
+
+- **安装 PASS**：`host install --host codex_cli` 在隔离 `CODEX_HOME` 写入 `hooks.json` + `config.toml`；installer 输出显式声明 `trust: pending - review and approve the hooks in Codex via /hooks (manual, never automated)`。
+- **信任子格 BLOCKED（结构性，复测固化）**：隔离家实测仅 `config.toml` + `hooks.json` 两文件，无任何信任记录；`host status`（PR #369 信任观测面）= `installed, trust unverified`。未伪造任何信任记录。
+- **无旗标会话（负证）**：真实 `codex exec --skip-git-repo-check -s read-only`（隔离家无凭据）：日志零 `hook:` 行，exit 1（api.openai.com 401，轮一同型）；守护进程日志该窗口零请求行（实测 0）。与轮一/轮二/轮三的信任门槛判定一致，BLOCKED 维持。
+- **卸载 PASS**：`host uninstall` 后 `host status` = `not-installed`。
+
+### ZCode（复测）
+
+- Node 复测：系统 Node 仍 v20.12.2；`node -e "require('node:sqlite')"` 复现 `ERR_UNKNOWN_BUILTIN_MODULE`（需 Node ≥ 22.5）。本轮未执行 `zcode.cjs`、未触碰 `~/.zcode` 与桌面 app。整行维持 BLOCKED。
+
+## 覆盖陈述（对 PRD-292 十二格矩阵，第四轮更新）
+
+计数结构与前三轮一致：
+
+- **3/12 具备真实宿主链路证据**：OpenCode 格维持六检查点全 PASS，且本轮把轮三遗留的**计数面缺口**（actor 不对称，`capture_ingest_count` 恒 0）在 wire 上闭合（#350 收口观测），模型答案引用子格连续第二轮 PASS；该格现为四轮中证据面最完整的格（计数 + T1/T2 + 会话内 tools/call ×2 + 引用守卫）。Codex 格本轮信任结构复查（BLOCKED 维持）+ 卸载面复现；Claude 格未复测，轮一全链证据维持。
+- **1/12 仅安装/卸载面**：ZCode 维持（node 复测未变）。
+- **8/12 维持 0**：Ubuntu、macOS 全部八格。Cursor 为矩阵外宿主行：安装/卸载/网关面 PASS 复现，会话面 BLOCKED 维持（同因）。是否改 3×5=15 属 PRD-292 形状决定，维持轮三移交主控的立场。
+- 单向 ≠ 双向、受限子格如实标注：模型答案引用子格仅 OpenCode PASS；codex/claude 维持 BLOCKED；信任子格仅 codex 且 BLOCKED。不补写 PASS。
+
+## 边界事件与偏差（第四轮，全部如实记录）
+
+1. **一次披露的只读探测（真实 7788）**：会话开始时按简报「verify before/after」指令对真实守护进程发出一次 `GET /health`（无凭据、只读存活探测，返回 v0.2.0/preset embedded——与轮一边界事件 3 同型先例，本轮唯一一次 HTTP 接触）；轮后验证以 netstat（PID 22260 与轮前一致）+ 真实家只读元数据核对完成，无第二次 HTTP 接触。4096 全程空置。
+2. **serve boot1 误启动（cwd 漂移，未遂）**：agent 线程 cwd 在 bash 调用间重置，boot1 从仓库根启动，`POST /api/session` 的 directory 解析为仓库根；实测该 boot 零插件加载行（loading 行 0 条）、仅一次 session create（无 prompt、无会话驱动，会话行落隔离 db），即杀（PID 35544，台账在案）并从 `cwd-opencode` 重启 boot2。仓库根 `.opencode` 无 `plugin/` 目录（只读核实），轮三边界事件 4 的双通道加载未复发。**QA closeout 补记（boot2 上的 create 归因 reconciliation）**：boot2 会话（`ses_e4aa81e76ffe…`）的 `time.created` = 09:29:57.908Z（17:29:57.9 local），**早于** boot2 stdout 日志首条带时间戳行（09:30:42.645Z）约 45 秒，且两个日志面（stdout 与隔离数据日志）均无该 create 的服务端请求行——行缺口在日志面上无解释（nohup 重定向下 stdout 块缓冲为候选机制，未证实）。boot2 归因的判据有二：(a) 该 create 响应的 `directory` 字段解析为 boot2 的 cwd（隔离 cwd-opencode），与 boot1 早前 create 解析为仓库根形成直接对照（serve 以自身 cwd 解析、忽略 payload directory——两次实测同规则）；(b) boot1 已被 `taskkill` 确认死亡（SUCCESS 回显）先于 boot2 启动与本 create。归因为 boot2，行缺口如实并陈。
+3. **child-env 预检迭代三次（全部在宿主子进程成功启动前）**：白名单 PATH 首版缺 Git `usr/bin`（`ls`/`timeout` 等 shell 工具失效——PRD-345 边界事件 4 同型）；`C:/...` 形态 PATH 条目对 Git Bash `command -v` 不可见，改 POSIX 形态后 `SCRUBBED-OK`（`command -v mnemoseed-local` 失败 + `command -v opencode` 成功）；codex 启动 PATH 同型缺 Git 工具（npm 包装脚本需 sed/dirname/uname），补齐后重试。无任何宿主子进程在未剥离状态下运行。
+4. **timeout.exe 陷阱复发一次**：codex 首次启动被 Windows `timeout.exe` 语法错误打断（PRD-345 边界事件 4 同型），改 `/usr/bin/timeout` 重试成功；未产生任何会话。
+5. **真实家在场观测差异（非本批动作，如实记录）**：PRD-345 记录的持久残留 `~/.cache/opencode/opencode-service-38088-6fa07392.exe` 本轮 top-level 清单**不在盘**（现存 bin/ + models.json + models.json.tmp）——本轮零删除动作；PRD-345 已记录的同版本死 PID 清道机制与 owner 侧清理为两个备选解释，归因不做。`~/.local/share/opencode/opencode.db`（owner 常驻 2.2.5 服务在写）Nov 7 mtime——本批隔离证明以 `debug paths` 断言承载（全部解析面落临时树），不以共享表面 mtime 归因。
+6. **真实 7788 全程在场的探测纪律**：本轮全部 `mnemoseed-local` CLI 调用（install/status/uninstall/shutdown）均显式携带 `MNEMOSEED_LOCAL_BASEURL=http://127.0.0.1:27791`（轮一边界事件 3 的教训），每次环境变量在校验后生效；真实家 `~/.mnemoseed-local/daemon.log` 仅做 size/mtime 只读元数据核对（mtime 在轮内变化属 owner 常驻服务自身活动，非本批可归因，如实并陈）。
+7. **hosted 模型回合**：opencode serve 两个会话回合走自带托管 provider（`opencode/big-pickle`，agent `build`），`cost: 0`、无凭据创建、隔离数据目录无 auth.json、真实家 auth.json 未触碰；回合内容均为本轮合成锚文本。
+8. **codex 401 出网**：无凭据隔离家连接 api.openai.com 全部 401（含 5 次重连尝试），零真实模型调用、零计费、无密钥创建。
+
+## 理论锚
+
+本批为验证与文档批次，不引入新特性、新记忆机制，无新增借用理论；与前几轮一致，不以上一轮未验证的神经科学类比支持任何安装或接线结论。注入机制的理论锚（T1 会话启动回放 / T2 焦点扫描、budget 语义）已在 design/01 §4.6 与 PRD-B2.1 注册；本轮实测的是 actor 归因修复后同一锚的端到端行为与计数语义。
+
+## V305-FIVE 仍欠
+
+1. **模型答案引用格（codex/claude）**：维持轮三欠账 2（OpenCode 格已连续两轮给出可行证据形态：hosted 模型 cost 0 + 引用守卫 reinforce，可参照设计）。
+2. **Codex `/hooks` 手动信任**：owner 在真实 app 中审阅并信任后复测无旗标触发（四轮实测无信任即零触发；隔离家无信任记录，状态不迁移）。
+3. **Cursor 会话面**：宿主无 headless 会话入口（本轮清单复查同轮三：CLI bundle 仅打开器/隧道包装、独立 `cursor-agent` CLI 未装）——需 owner 决策（授权安装 `cursor-agent` CLI / GUI 会话协作 / 等 Cursor 提供 headless 面）。
+4. **ZCode 实机会话**：Node ≥ 22.5 运行时或桌面 app 内 owner 手动会话（node v20.12.2 第四轮复测未变）。
+5. **opencode `run` 面（#345，open）**：serve 面为现行规定面；run 面验证须先关闭其 env 覆盖缺口。
+6. **真实家插件副本（QA closeout 勘误，替换轮三 carry-forward 的「两份陈旧副本原样在盘」表述——该表述对本轮不实）**：本轮只读清单实测 `~/.config/opencode/plugin/mnemoseed-local.ts` 一份在盘（117,698 字节，owner 侧 mtime Nov 6 00:57，与 worktree shipped `plugin.ts` @ 7d93e4f `cmp` **逐字节相同**——owner 已于 Nov 6 00:57 执行过一次干净重装）；`plugins/`（复数目录）已**空**（同刻 mtime）——轮三记录的第二份副本不再在盘。owner 的该重装动作正与本轮复现的 install/uninstall PASS 同形；「陈旧副本清理」动作项就此关闭，不再欠。
+7. **插件 debug 通道格式化缺陷**：`selection=%s` 字面占位符 + stdout `[object Object]`（轮三欠账 10）在本基线实测原样（`hook-debug.jsonl` 第 2 行）——仍开放，留待实现批次。
+8. **版本落差（新增，移交主控分诊）**：PR #370 已冻结 0.3.0 并 merge（worktree/合成守护进程/self-report 均为 0.3.0），真实环境已装 CLI 仍为 0.2.0（Nov 6 本地安装）；本轮按简报未升级真实环境。未来轮次若需真实环境对齐 0.3.0，属 owner 决策；0.3.0 wheel 本机无在盘工件（repo `dist/` 仅 0.1.0 旧工件），wheel 为发布流程产物。
+9. **其余平台**：Ubuntu、macOS 八格维持 0。
+10. **清理**：`%LOCALAPPDATA%\Temp\w305-v305-r4\`（守护进程家、隔离宿主家、serve 数据目录、会话日志、探针脚本、进程台账）由 owner 按需删除，与前三轮临时树一并处理；本轮按边界未执行任何仓库外删除。
+
+## 验收记录（第四轮）
+
+文档编写核对的证据分两类，如实分账。**(a) 证据树内保全件**（`%LOCALAPPDATA%\Temp\w305-v305-r4\`）：`mnemoseed-home\daemon.log`（每请求一行：boot 行、`POST /mcp -> 202/405/200`、`/session/recent -> 200`、`/ingest -> 202` ×8、`POST /memory/remember -> 200`、`POST /memory/recall -> 200`、`POST /session/recall-pending -> 200`、`POST /memory/reinforce -> 200`、`POST /daemon/shutdown -> 200`）、`mnemoseed-home\hook-debug.jsonl`（11 行：reconcile ×2 / session-start injection ×2（会话 1 groups:0 空注 + 会话 2 groups:1 chars:552）/ `selection=%s` 缺陷行 / assistant step shape ×4（tool-calls→stop 两会话）/ recall-pending poll ×2（会话 2 chars:276 slotConsumed armCleared））、`mnemoseed-home\config.toml`、`mnemoseed-home\secrets\daemon.credential.key`（存在性；值不引用）、`sessions\r4-debug-paths.txt`（十行全部落临时树的机械断言原文）、`sessions\r4-observability-{s1,s2,final}.json`（三份计数快照原文：3/hook5 → 5/hook9 → 8/hook13）、`sessions\r4-session{1,2}-create.json`、`r4-s{1,2}-prompt-resp.json`、`r4-s{1,2}-messages.json`（会话转写：会话 2 reasoning 自述「We have a recalled memory」、`tools.mnemoseed.recall` 调用、终文逐字引用）、`r4-session-recent-s1.json`（verbatim 读回：`source "opencode-chat"` / `host "opencode"` / `memory.remember` pin）、`opencode-serve-r4.log`（boot1）与 `opencode-serve-r4b.log`（boot2：唯一 loading 行 + mcp connected tools=6 + server password 行）、`r4-install/uninstall-{opencode,cursor,codex}.log`、`r4-status-*.log`（含 PR #369 面读数与卸载后 `ingest ack: observed (8 hook ingests)`）、`r4-cursor-hooks-installed-state.json` + `r4-cursor-mcp-installed-state.json`（安装态字节）、`mcp_probe_r4.py` + `r4-mcp-probe-cursor.txt`（网关探针：0.3.0 serverInfo/6 工具/new_chunk/recall 命中原文）、`r4-codex-nobypass.log`（零 hook 行 + 401）、`r4-child-env.sh`（隔离 env 与白名单 PATH 清单）、`r4-process-ledger.txt`（进程台账；**QA closeout 已按 daemon.log 勘误 shutdown 时刻**——原记 17:49 系会话回填之误，daemon.log 第 58 行实为 `POST /daemon/shutdown` 17:42:13.990、teardown 17:42:14.103 完成（第 65 行）；同单 boot1 条目的「zero sessions」一并勘误为「一次 unprompted session create」，勘误后文本在盘，r3 先例同法）。**关键否定性证据亦在盘**：会话 1 的 `groups:0` 空注行（空守护进程 T1 形态）、卸载后 `{"version": 1}` / `{}` 残留形态、`r4-codex-nobypass.log` 零 hook 行、两次 serve 日志中 45278 零命中、codex 窗口守护进程零请求行。**(b) 未以文件留存件**（仅存在于本轮会话记录或为瞬时态）：serve API prompt 的 **400 schema 拒绝试错**（QA closeout 补记，r3 先例同型披露）：首次 prompt 以 `{"parts":[{"type":"text",…}]}` 形态提交，被 serve 以 400 `InvalidRequestError`（`Missing key\n at ["text"]`，kind=Payload）拒绝——隔离服务日志原文在证据树（`opencode-data\opencode\log\opencode.log` 第 34-35 行：`schema rejection` WARN 行 + `POST /api/session/…/prompt http.status=400` 行）；经 `/openapi.json` 实查改 `{"text": …}` 顶层形态后成功，随后的全部 prompt 均为修正形态；轮前 `GET /health` 的完整响应 body（v0.2.0/preset embedded/四 driver 就绪——版本与 preset 已引于文内）；`uv sync --frozen` 的安装清单（`mnemoseed_local.__file__` 与 0.3.0 版本打印为会话回显）；`cmp` 逐字节相同的 "BYTE-IDENTICAL" 回显（结果已记于文内，回显未落盘）；两次 serve boot 的即时 netstat 读数（终态端口释放已记台账）；Cursor 清单的 `npm ls -g` 输出（cursor-agent 未装的负证，结论记于文内）；ZCode `node:sqlite` 复现的完整回溯（错误类型记于文内）；真实家各表面的完整前后快照 diff（本轮以 spot-check 只读元数据核对替代全量快照——真实 7788 守护进程全程在场使 mtime 归因失效，隔离证明由 `debug paths` 断言承载，该方法论选择如实记于边界事件 5/6）。独立实现 QA、完整本地 gates、本 PR CI、merge 与最终验收均待主控记录；#350 的 wire 收口观测已达成、最终裁定归主控；当前不声明 #305 完成。
