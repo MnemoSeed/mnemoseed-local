@@ -481,6 +481,7 @@ def test_external_surface_inventory_equals_frozen_baseline(
         "/health",
         "/api/v1/observability",
         "/api/v1/audit",
+        "/api/v1/host/capture-evidence",
         "/api/v1/profiles",
         "/api/v1/profiles/archive",
         "/api/v1/config",

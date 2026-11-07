@@ -86,9 +86,17 @@ MCP_COMMAND_KEY = "command"
 MCP_ARGS_KEY = "args"
 MCP_GATEWAY_ARGS = ("mcp",)
 
+#: The manual trust step this host's install design asks of the user; the
+#: tool never reads or writes a trust record and never performs it.
+MANUAL_TRUST_STEP = "review and approve the hooks in Codex via /hooks"
+
 #: Structural status of a complete canonical install: the host still asks the
 #: user to approve the hooks once.
-TRUST_UNVERIFIED = "installed, trust unverified (review and approve the hooks in Codex via /hooks)"
+TRUST_UNVERIFIED = f"installed, trust unverified ({MANUAL_TRUST_STEP})"
+
+#: The structural state that means the manual trust step is still the standing
+#: verdict; a status surface reports it as its own trust observation.
+MANUAL_TRUST_STATE = TRUST_UNVERIFIED
 
 
 def codex_home() -> Path:

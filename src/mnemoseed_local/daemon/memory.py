@@ -251,6 +251,17 @@ class SessionWindowsRequest(BaseModel):
     sessions: int = Field(default=3, ge=1, le=10)
 
 
+class HostCaptureEvidenceRequest(BaseModel):
+    """Request body for POST /api/v1/host/capture-evidence (host status).
+
+    ``host`` is the host adapter name the chunk attribution (``cues.host``)
+    carries; the read is profile-scoped and never guesses across namespaces.
+    """
+
+    profile_id: ProfileRef
+    host: str = Field(min_length=1, max_length=64)
+
+
 class RecallPendingRequest(BaseModel):
     """Request body for POST /session/recall-pending (B2.1 T2 mid-session).
 
@@ -1104,6 +1115,41 @@ class MemoryService:
         if rules_budget is not None:
             result["rules_budget"] = rules_budget.model_dump()
         return result
+
+    def host_capture_evidence(self, *, profile_id: str, host: str) -> dict[str, Any]:
+        """The host status evidence read over the existing chunk store.
+
+        Chunks list ingested_at-desc (the vector driver guarantee), so the
+        first host-attributed hit is the newest and the scan only walks to
+        exhaustion when no host-attributed chunk exists. Newer chunks from
+        other sources never hide older evidence for the selected host.
+        ``profile_last_persisted_at`` is the context that separates "this
+        host never captured" from "the profile store is empty". Read-only;
+        failures propagate so the caller reports an honest unknown instead
+        of an empty store.
+        """
+        page_size = 500
+        offset = 0
+        host_newest: float | None = None
+        profile_newest: float | None = None
+        while True:
+            page = self._stores.vector.list_chunks(
+                ChunkFilter(profile_id=profile_id), Page(offset=offset, limit=page_size)
+            )
+            if not page.items:
+                break
+            if profile_newest is None:
+                profile_newest = page.items[0].ingested_at
+            host_newest = next((chunk.ingested_at for chunk in page.items if chunk.cues.host == host), None)
+            if host_newest is not None or offset + page_size >= page.total:
+                break
+            offset += page_size
+        return {
+            "profile_id": profile_id,
+            "host": host,
+            "last_persisted_at": host_newest,
+            "profile_last_persisted_at": profile_newest,
+        }
 
     def _session_recent_scoped(
         self,
@@ -2543,6 +2589,15 @@ def session_recent(req: SessionRecentRequest, request: Request) -> dict[str, Any
         resume_query=req.resume_query,
         self_parent_id=req.self_parent_id,
     )
+
+
+@router.post("/api/v1/host/capture-evidence")
+def host_capture_evidence(req: HostCaptureEvidenceRequest, request: Request) -> dict[str, Any]:
+    """The host status capture read: the newest persisted chunk attributed to
+    the host within the profile's store, plus the profile's newest persisted
+    chunk overall as context. Observational only — it changes nothing."""
+    service: MemoryService = request.app.state.memory
+    return service.host_capture_evidence(profile_id=req.profile_id, host=req.host)
 
 
 @router.post("/session/windows")
