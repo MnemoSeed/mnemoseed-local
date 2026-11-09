@@ -1,6 +1,6 @@
 # MnemoSeed Local guide
 
-[Back to the overview](../README.md) · [Website](https://mnemoseed.my) ·
+[Back to the overview](../README.md) · [Website](https://mnemoseed.tech) ·
 [Report an issue](https://github.com/MnemoSeed/mnemoseed-local/issues)
 
 This guide covers the current single-user edition. Start with source installation,
@@ -338,7 +338,7 @@ Current technical surfaces include:
   Homebrew consent. Coverage varies across host/platform combinations.
 - Windows logon startup, where registered, has no later crash supervision.
 - Multi-session mutual awareness is research. Multi-device sync and a hosted
-  cloud daemon belong to the broader [MnemoSeed direction](https://github.com/MnemoSeed/mnemoseed),
+  cloud daemon belong to the broader [MnemoSeed direction](https://github.com/MnemoSeed),
   not the delivered Local surface.
 - Stored memory has no confidentiality guarantee: no E2EE, no TEE, and no
   encryption at rest. Remote model use is an explicit configuration choice.
@@ -513,7 +513,7 @@ The harness lives at `python -m mnemoseed_local.eval`, run from a source checkou
 
 See [Chinese documentation](zh/README.md),
 [report an issue](https://github.com/MnemoSeed/mnemoseed-local/issues), or contact
-[hello@mnemoseed.my](mailto:hello@mnemoseed.my). Voluntary support is welcome
+[hello@mnemoseed.tech](mailto:hello@mnemoseed.tech). Voluntary support is welcome
 through [GitHub Sponsors](https://github.com/sponsors/MnemoSeed).
 
 MnemoSeed Local is [MIT licensed](../LICENSE).
