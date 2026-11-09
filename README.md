@@ -9,7 +9,7 @@ and Codex CLI. The OpenCode plugin is a V2 plugin definition and requires
 OpenCode 2.x; V1-shape plugin functions do not run on 2.x, and this plugin
 does not run on 1.x.
 
-[Website](https://mnemoseed.my) · [Complete guide](docs/guide.md) ·
+[Website](https://mnemoseed.tech) · [Complete guide](docs/guide.md) ·
 [GitHub Sponsors](https://github.com/sponsors/MnemoSeed)
 
 ## Install
@@ -60,7 +60,7 @@ Host coverage varies by platform. Codex Desktop app-server mode is unverified.
 - [Memory Atlas verification](features/atlas.md).
 - [Chinese documentation](docs/zh/README.md).
 - [Report an issue](https://github.com/MnemoSeed/mnemoseed-local/issues).
-- [Contact](mailto:hello@mnemoseed.my) · [Website](https://mnemoseed.my).
+- [Contact](mailto:hello@mnemoseed.tech) · [Website](https://mnemoseed.tech).
 
 ## What it does NOT do yet
 
