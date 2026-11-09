@@ -136,7 +136,8 @@ IMMUTABLE_HELPER_URI = re.compile(
     r"https://raw\.githubusercontent\.com/MnemoSeed/mnemoseed-local/([0-9a-f]{40})/scripts/"
 )
 PROJECT_HELPER_FETCH = re.compile(r"raw\.githubusercontent\.com/MnemoSeed/mnemoseed-local/\S*/scripts/")
-FIXTURE_VERSION = "0.3.0"
+FIXTURE_VERSION = "0.1.0"
+REFUSED_VERSIONS = ("0.2.0", "0.3.0")
 FIXTURE_PIN = f"mnemoseed-local[codex]=={FIXTURE_VERSION}"
 FIXTURE_HELPERS = (
     "scripts/windows-install-helpers.ps1",
@@ -296,7 +297,7 @@ def test_manifest_verification_accepts_the_coherent_release(
     assert manifest["expected_cli_capabilities"]
 
 
-@pytest.mark.parametrize("old_version", ["0.2.0", "0.0.1"])
+@pytest.mark.parametrize("old_version", REFUSED_VERSIONS)
 def test_manifest_rejects_the_old_package_versions(
     tmp_path: Path, release_route: ReleaseRoute, old_version: str
 ) -> None:
@@ -332,9 +333,12 @@ def test_manifest_rejects_drifted_installer_bytes(tmp_path: Path, release_route:
         _verify(tmp_path, release_route, manifest)
 
 
-def test_manifest_rejects_an_old_installer_pin(tmp_path: Path, release_route: ReleaseRoute) -> None:
+@pytest.mark.parametrize("old_version", REFUSED_VERSIONS)
+def test_manifest_rejects_an_old_installer_pin(
+    tmp_path: Path, release_route: ReleaseRoute, old_version: str
+) -> None:
     manifest = _generate(release_route)
-    manifest["installer_pin"] = "mnemoseed-local[codex]==0.2.0"
+    manifest["installer_pin"] = f"mnemoseed-local[codex]=={old_version}"
     with pytest.raises(release.Failure):
         _verify(tmp_path, release_route, manifest)
 
@@ -342,7 +346,7 @@ def test_manifest_rejects_an_old_installer_pin(tmp_path: Path, release_route: Re
 def test_manifest_generation_rejects_disagreeing_installer_pins(
     tmp_path: Path, release_route: ReleaseRoute
 ) -> None:
-    drift = "CLI_PIN='mnemoseed-local[codex]==0.2.1'\n"
+    drift = f"CLI_PIN='mnemoseed-local[codex]=={REFUSED_VERSIONS[-1]}'\n"
     (release_route.root / "install.sh").write_text(drift, encoding="utf-8")
     with pytest.raises(release.Failure):
         _generate(release_route)
@@ -457,7 +461,7 @@ def _proof_context(tmp_path: Path, version: str) -> Any:
     )
 
 
-@pytest.mark.parametrize("old_version", ["0.2.0", "0.0.1"])
+@pytest.mark.parametrize("old_version", REFUSED_VERSIONS)
 def test_the_installed_surface_rejects_old_release_clis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_version: str
 ) -> None:
