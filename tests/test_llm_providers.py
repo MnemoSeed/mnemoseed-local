@@ -47,6 +47,20 @@ def test_exactly_nine_unique_expected_ids() -> None:
     assert set(ids) == EXPECTED_IDS
 
 
+def test_preset_order_is_prd_table_order() -> None:
+    assert tuple(p.id for p in PROVIDER_PRESETS) == (
+        "openai",
+        "anthropic",
+        "google",
+        "deepseek",
+        "moonshot",
+        "xai",
+        "openrouter",
+        "nvidia",
+        "custom",
+    )
+
+
 @pytest.mark.parametrize("preset_id", sorted(EXPECTED_IDS))
 def test_protocol_and_base_url_pinned(preset_id: str) -> None:
     preset = by_id(preset_id)
