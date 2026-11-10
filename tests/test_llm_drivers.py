@@ -46,6 +46,12 @@ def test_openai_requires_base_url_model_and_token_param() -> None:
         OpenAICompatibleLLM(base_url="http://x/v1", api_key="k", model="m", token_param="")
 
 
+def test_openai_token_param_rejects_reserved_body_keys() -> None:
+    for reserved in ("model", "messages", "stream"):
+        with pytest.raises(ValueError, match="token_param"):
+            OpenAICompatibleLLM(base_url="http://x/v1", api_key="k", model="m", token_param=reserved)
+
+
 def test_openai_chat_sends_chat_completions_request() -> None:
     sent: dict[str, Any] = {}
 
@@ -172,6 +178,18 @@ def test_openai_non_dict_body_degrades_to_empty_text() -> None:
     assert result.usage is None
 
 
+def test_openai_scalar_choices_body_degrades_to_empty_text() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"choices": 5})
+
+    llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
+    llm._client = _client("https://llm.test/v1", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.text == ""
+    assert result.usage is None
+
+
 def test_openai_check_reports_reachable_and_models() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/models"
@@ -182,6 +200,18 @@ def test_openai_check_reports_reachable_and_models() -> None:
     report = llm.check()
     assert report.ok is True
     assert report.detail["models"] == ["m1", "m2"]
+
+
+def test_openai_check_transport_failure_is_typed_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        raise httpx.ConnectError("refused")
+
+    llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
+    llm._client = _client("https://llm.test/v1", handler)
+    report = llm.check()
+    assert report.ok is False
+    assert "refused" in report.detail["error"]
 
 
 def test_openai_check_reports_unreachable_on_http_error() -> None:
@@ -200,6 +230,18 @@ def test_openai_check_never_raises_on_non_object_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request
         return httpx.Response(200, json=["unexpected"])
+
+    llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
+    llm._client = _client("https://llm.test/v1", handler)
+    report = llm.check()
+    assert report.ok is True
+    assert report.detail["models"] == []
+
+
+def test_openai_check_scalar_data_body_degrades() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"data": 5})
 
     llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
     llm._client = _client("https://llm.test/v1", handler)
@@ -341,6 +383,30 @@ def test_ollama_check_never_raises_on_non_object_body() -> None:
     assert report.detail["models"] == []
 
 
+def test_ollama_check_scalar_models_body_degrades() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"models": 5})
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    report = llm.check()
+    assert report.ok is True
+    assert report.detail["models"] == []
+
+
+def test_ollama_check_transport_failure_is_typed_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        raise httpx.ConnectError("refused")
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    report = llm.check()
+    assert report.ok is False
+    assert "refused" in report.detail["error"]
+
+
 def test_ollama_server_error_is_typed_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -361,6 +427,25 @@ def test_ollama_non_dict_body_degrades_to_empty_text() -> None:
     llm._client = _client("http://127.0.0.1:11434", handler)
     result = llm.chat(system="s", user="u")
     assert result.text == ""
+    assert result.usage is None
+
+
+def test_ollama_scalar_usage_counts_degrade_to_none_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "message": {"role": "assistant", "content": "[]"},
+                "prompt_eval_count": {},
+                "eval_count": [],
+            },
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.text == "[]"
     assert result.usage is None
 
 

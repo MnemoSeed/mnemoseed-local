@@ -103,7 +103,8 @@ def _text_from(body: dict[str, Any]) -> str:
     """Reply text from an Anthropic /v1/messages body: the text blocks of
     content[], joined in order; non-text blocks (tool_use, thinking, ...) and
     malformed entries never contribute."""
-    blocks = body.get("content") or []
+    content = body.get("content")
+    blocks = content if isinstance(content, list) else []
     return "\n".join(
         block["text"]
         for block in blocks

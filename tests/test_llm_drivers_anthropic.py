@@ -181,6 +181,40 @@ def test_anthropic_garbage_shape_degrades_to_empty_text(garbage: Any) -> None:
     assert result.usage is None
 
 
+def test_anthropic_scalar_content_body_degrades_to_empty_text() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"content": 5})
+
+    llm = _driver(handler)
+    result = llm.chat(system="s", user="u")
+    assert result.text == ""
+    assert result.usage is None
+
+
+def test_anthropic_malformed_text_blocks_never_contribute() -> None:
+    """Pins _text_from's decode contract: text blocks whose "text" is missing or
+    non-string contribute nothing; only string text blocks reach the reply."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "text"},
+                    {"type": "text", "text": "ok"},
+                    {"type": "text", "text": 5},
+                ]
+            },
+        )
+
+    llm = _driver(handler)
+    result = llm.chat(system="s", user="u")
+    assert result.text == "ok"
+    assert result.usage is None
+
+
 # ---------------------------------------------------------------- typed failures
 
 
@@ -259,6 +293,17 @@ def test_anthropic_check_never_raises_on_non_object_body() -> None:
     assert report.detail["models"] == []
 
 
+def test_anthropic_check_scalar_data_body_degrades() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"data": 5})
+
+    llm = _driver(handler)
+    report = llm.check()
+    assert report.ok is True
+    assert report.detail["models"] == []
+
+
 def test_anthropic_check_reports_unreachable_on_http_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -268,6 +313,17 @@ def test_anthropic_check_reports_unreachable_on_http_error() -> None:
     report = llm.check()
     assert report.ok is False
     assert "503" in report.detail["error"]
+
+
+def test_anthropic_check_transport_failure_is_typed_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        raise httpx.ConnectError("refused")
+
+    llm = _driver(handler)
+    report = llm.check()
+    assert report.ok is False
+    assert "refused" in report.detail["error"]
 
 
 # ---------------------------------------------------------------- registration
