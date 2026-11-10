@@ -429,9 +429,10 @@ def validate_agent_bindings(value: Any) -> dict[str, str]:
 # ensemble verify judging seat (model B, design/01 decision 1) — dormant unless
 # dream.ensemble=verify; "dream_vote" is the B5 vote seat B's independent
 # generator (a distinct model from A) — dormant unless dream.ensemble=vote.
-# "dream_vote" has NO default route: vote falls back to the dream_verifier
-# judging route (still a distinct model from A) when the dedicated route is
-# unconfigured. Any legacy [dream.llm.deep_reflection] / [dream.llm.short_increment]
+# No role has a factory route: every route is bound explicitly, and vote falls
+# back to the dream_verifier judging route (still a distinct model from A)
+# when the dedicated route is unconfigured. Any legacy
+# [dream.llm.deep_reflection] / [dream.llm.short_increment]
 # tables are tolerated on load and ignored with a warning, never applied.
 LLM_ROLES: tuple[str, ...] = ("dream", "dream_verifier", "dream_vote")
 
@@ -462,52 +463,11 @@ class RoleLLMConfig:
     params: dict[str, Any] = field(default_factory=dict)
 
 
-# A2 MVP: ONE dream LLM role named "dream" (no deep_reflection /
-# short_increment split; the role stays a pipeline-internal param). Dream
-# inference runs against a LOCAL model — ollama by default; the
-# openai-compatible driver stays available as the fallback route. API keys are
-# never written here: a cloud fallback references its key by env-var NAME at
-# resolution time.
-DEFAULT_LLM_ROUTES: dict[str, RoleLLMConfig] = {
-    "dream": RoleLLMConfig(
-        role="dream",
-        driver="ollama",
-        model="qwen3.5:9b",
-        params={
-            "base_url": "http://localhost:11434",
-            # Reflect is structured extraction — thinking models would burn the
-            # whole generation budget on internal thinking and return EMPTY
-            # content ("Expecting value: line 1 column 1", D4 live finding on
-            # qwen3.5:9b). The factory default pins thinking OFF for the dream
-            # route; a user-deliberate `think = true` still wins at the file.
-            "think": False,
-            # ollama's lazy default num_ctx is 4096 — silently smaller than any
-            # packed delta (floor 5000), so a dream on real session volume
-            # always starved to empty output (D4 compounding). Ship a working
-            # 16k window by default; the ctx-window doctor check then reports
-            # honestly whether the delta ceiling fits (tier-coherent overrides
-            # live on dream.delta_budget_ceiling_tokens + this key).
-            "num_ctx": 16384,
-        },
-    ),
-    # B1 ensemble verify (design/01 decision 1): the judging seat (model B).
-    # Verification is a cheaper task than generation, so the factory defaults
-    # to the small judge model on the same local track; it stays dormant until
-    # dream.ensemble is flipped to "verify" (off by default, lite tier locked).
-    "dream_verifier": RoleLLMConfig(
-        role="dream_verifier",
-        driver="ollama",
-        model="gemma4:e4b",
-        params={
-            "base_url": "http://localhost:11434",
-            # Judging is structured output too: thinking burns the whole
-            # generation budget on inner thinking and returns EMPTY content
-            # (same D4 failure shape as the dream route).
-            "think": False,
-            "num_ctx": 16384,
-        },
-    ),
-}
+# No factory dream route: dreams defer until a route is bound via the
+# console wizard or `config set`; existing installs keep their routes via
+# the settings-DB overlay at boot. An explicit role table must carry both
+# driver and model; a partial table is a named load error.
+DEFAULT_LLM_ROUTES: dict[str, RoleLLMConfig] = {}
 
 
 @dataclass
@@ -672,7 +632,7 @@ def load_config(path: Path | None = None) -> Config:
             )
 
     dream = DreamConfig()
-    llm_routes = {role: cfg for role, cfg in DEFAULT_LLM_ROUTES.items()}
+    llm_routes: dict[str, RoleLLMConfig] = {}
     dream_raw = raw.get("dream")
     if dream_raw is not None:
         dream_table = _require_table(dream_raw, "dream")
@@ -786,27 +746,25 @@ def load_config(path: Path | None = None) -> Config:
             ),
         )
 
-        # T6 (FR-2.14): [dream.llm.<role>] overrides per role. Only structural
-        # validation happens here (table-ity, known role, non-empty driver/model
-        # strings); semantic failures (unknown driver, bad params) defer to the
-        # RoleRouter when that role is actually resolved — a misconfigured unused
-        # role never breaks boot.
+        # T6 (FR-2.14): [dream.llm.<role>] routes per role. There is no factory
+        # route to fall back to, so a table that appears must carry both
+        # driver and model (the wizard's write contract); only structural
+        # validation happens here (table-ity, known role, non-empty strings) —
+        # semantic failures (unknown driver, bad params) defer to the
+        # RoleRouter when that role is actually resolved, so a misconfigured
+        # unused role never breaks boot.
         llm_raw = dream_table.get("llm")
         if llm_raw is not None:
             llm_table = _require_table(llm_raw, "dream.llm")
             for role in LLM_ROLES:
                 entry = llm_table.get(role)
                 if entry is None:
-                    continue  # unconfigured role keeps its default route
+                    continue  # an unconfigured role carries no route
                 role_path = f"dream.llm.{role}"
                 entry_table = _require_table(entry, role_path)
                 driver = _optional_driver(entry_table.get("driver"), f"{role_path}.driver")
                 model = _optional_driver(entry_table.get("model"), f"{role_path}.model")
-                # A role with no factory default (B5 dream_vote) requires an
-                # explicit driver+model when it appears in the file; a role with
-                # a default falls back to it for any field left unset.
-                base = DEFAULT_LLM_ROUTES.get(role)
-                if base is None and (driver is None or model is None):
+                if driver is None or model is None:
                     raise ConfigError(
                         role_path,
                         "this role has no default route and must set both 'driver' and 'model'",
@@ -814,12 +772,7 @@ def load_config(path: Path | None = None) -> Config:
                 params = {k: v for k, v in entry_table.items() if k not in ("driver", "model")}
                 if "api_key_env" in params:
                     _validate_api_key_ref(role, params["api_key_env"])
-                llm_routes[role] = RoleLLMConfig(
-                    role=role,
-                    driver=driver if driver is not None else base.driver,  # type: ignore[union-attr]
-                    model=model if model is not None else base.model,  # type: ignore[union-attr]
-                    params={**(base.params if base is not None else {}), **params},
-                )
+                llm_routes[role] = RoleLLMConfig(role=role, driver=driver, model=model, params=params)
             unknown = [
                 str(role)
                 for role in llm_table
@@ -1037,24 +990,29 @@ baseurl = "http://localhost:7788"
 driver = "sqlite_graph"
 path = "~/.mnemoseed-local/isolated.db"
 
-# Dream LLM role routing: role "dream" generates (model A); role
-# "dream_verifier" is the ensemble verify judging seat (model B, dormant unless
-# dream.ensemble = "verify"). The local default is ollama (dream inference
-# stays on the machine); the openai-compatible driver is the fallback for a
-# cloud/remote endpoint. API keys are referenced by ENV-VAR NAME or a
-# secrets:mnemoseed/dream/<role> reference — never a literal key here; the
-# router resolves the value from the process environment / the local secret
-# store at materialization time.
-# Other params (base_url, max_tokens, ...) override the role's defaults.
+# Dream LLM role routing ([dream.llm.<role>]): fresh installs ship with NO
+# dream route — dreams defer (honestly) until a model is bound. Roles:
+# "dream" generates; "dream_verifier" is the ensemble verify judging seat
+# (dormant unless dream.ensemble = "verify"); "dream_vote" is the vote seat
+# (dormant unless dream.ensemble = "vote"). Bind a route with the console
+# wizard (http://localhost:7788/#/config) or
+# `mnemoseed-local config set dream.llm.<role>.<field> <value>`; a role table
+# must set both driver and model. Writable fields:
+#   driver      — registered driver (ollama | openai_compatible | anthropic)
+#   model       — the provider's model id/tag
+#   base_url    — endpoint (ollama default http://localhost:11434; required
+#                 for a cloud driver)
+#   api_key_env — ENV-VAR NAME list or a secrets:mnemoseed/dream/<role>
+#                 reference, never a literal key
+#   max_tokens  — generation token cap
+#   think       — ollama only: thinking toggle (keep off for structured
+#                 extraction; a thinking model returns empty content)
+#   num_ctx     — ollama only: context window (the doctor ctx-window check
+#                 reads it)
+#   num_predict — ollama only: generation cap
 # [dream.llm.dream]
-# driver = "ollama"
-# model = "qwen3.5:9b"
-# base_url = "http://localhost:11434"
-#
-# [dream.llm.dream_verifier]
-# driver = "ollama"
-# model = "gemma4:e4b"
-# base_url = "http://localhost:11434"
+# driver = "..."
+# model = "..."
 
 # The deep_reflection / short_increment / local_track roles were trimmed in the
 # A2 local MVP: any legacy [dream.llm.<legacy-role>] table is tolerated on load

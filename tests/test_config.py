@@ -279,48 +279,56 @@ def test_default_config_toml_writes_the_isolated_graph_instance(tmp_path, monkey
     assert "isolated" in cfg.layer_instances("graph")
 
 
-def test_default_config_toml_dream_model_is_qwen3_5_9b() -> None:
-    """AC3: the default dream model aligns on qwen3.5:9b."""
-    assert 'model = "qwen3.5:9b"' in default_config_toml()
+def test_default_config_toml_has_no_active_dream_route() -> None:
+    """Fresh installs ship with NO dream route: the init template carries only
+    a commented field reference for the role tables and points at the console
+    wizard / config set as the write paths — never an active route key, never
+    a baked-in model."""
+    import tomllib
+
+    template = default_config_toml()
+    parsed = tomllib.loads(template)
+    assert "llm" not in parsed.get("dream", {})
+    assert "qwen3.5" not in template
+    assert "gemma4" not in template
+    assert "ollama pull" not in template
+    assert "http://localhost:7788/#/config" in template
 
 
-def test_default_dream_route_pins_think_off(tmp_path, monkeypatch) -> None:
-    """D4 (live reflect finding): the factory dream route pins think=False in
-    its params — a thinking model burns its whole generation budget on inner
-    thinking and returns EMPTY content for structured-extraction prompts
-    (qwen3.5:9b live evidence; every reflect retried then degraded). The pin
-    ships in the default route so every config resolves it, while a deliberate
-    `think = true` in the file still wins."""
+def test_default_config_toml_documents_the_role_fields(tmp_path, monkeypatch) -> None:
+    """The commented field reference documents every writable role field and
+    both seats (dream + verifier) so ensemble opt-ins discover their route."""
+    monkeypatch.delenv("STORAGE_MODE", raising=False)
+    template = default_config_toml()
+    fields = ("driver", "model", "base_url", "api_key_env", "max_tokens", "think", "num_ctx", "num_predict")
+    for field in fields:
+        assert field in template
+    assert "dream_verifier" in template
+    # a load of the template alone yields no routes
+    p = tmp_path / "config.toml"
+    _write(p, template)
+    assert load_config(p).llm == {}
+
+
+def test_no_factory_dream_route_exists(tmp_path, monkeypatch) -> None:
+    """The factory route table is empty: a fresh load resolves no route, and a
+    deliberate explicit route (with both driver and model) still wins."""
     monkeypatch.delenv("STORAGE_MODE", raising=False)
     from mnemoseed_local.config import DEFAULT_LLM_ROUTES
 
-    assert DEFAULT_LLM_ROUTES["dream"].params["think"] is False
+    assert DEFAULT_LLM_ROUTES == {}
     cfg = load_config(tmp_path / "missing-config.toml")
-    assert cfg.llm["dream"].params["think"] is False
+    assert cfg.llm == {}
     p = tmp_path / "config.toml"
-    _write(p, "[dream.llm.dream]\nthink = true\n")
-    assert load_config(p).llm["dream"].params["think"] is True
-
-
-def test_default_dream_route_ships_a_working_num_ctx(tmp_path, monkeypatch) -> None:
-    """D4 compounding: ollama's own num_ctx default of 4096 is smaller than
-    any packed delta floor (5000), so real-volume dreams always squeezed the
-    output to nothing. The factory route must ship a working window; a bigger
-    num_ctx in the file still wins."""
-    monkeypatch.delenv("STORAGE_MODE", raising=False)
-    cfg = load_config(tmp_path / "missing-config.toml")
-    assert cfg.llm["dream"].params["num_ctx"] == 16384
-    p = tmp_path / "config.toml"
-    _write(p, "[dream.llm.dream]\nnum_ctx = 36864\n")
-    assert load_config(p).llm["dream"].params["num_ctx"] == 36864
-
-
-def test_default_config_toml_documents_the_verifier_role() -> None:
-    """B1 T1: the init template shows the verifier role next to the dream role
-    so a user opting into ensemble=verify discovers the route without reading
-    source."""
-    assert "[dream.llm.dream_verifier]" in default_config_toml()
-    assert 'model = "gemma4:e4b"' in default_config_toml()
+    _write(
+        p,
+        '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nthink = true\nnum_ctx = 36864\n',
+    )
+    dream = load_config(p).llm["dream"]
+    assert dream.driver == "ollama"
+    assert dream.model == "qwen3.5:9b"
+    assert dream.params["think"] is True
+    assert dream.params["num_ctx"] == 36864
 
 
 # ---------------------------------------------------------------- [logging] (B2.12)
