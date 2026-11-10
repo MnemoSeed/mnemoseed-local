@@ -161,22 +161,34 @@ Codex trust step where applicable, config-home consistency, and daemon logs.
 
 ## Dream model setup
 
-Ollama is optional for capture-recall setup. For a manual legacy dream pass,
-install [Ollama](https://ollama.com/download), start its local service, and pull
-the configured dream model. The built-in route is `http://localhost:11434`,
-model `qwen3.5:9b`, `think=false`, and `num_ctx=16384`. If you changed
-`[dream.llm.dream]` in `config.toml`, pull that table's `model` instead.
-Hardware capacity and download size depend on the chosen model.
+Dreaming is optional and off until you bind a model: a fresh setup runs
+capture, recall, embeddings, and decay without any dream route, `doctor`
+reports the unbound route as a readiness note, and scheduled dream work stays
+honestly deferred instead of calling a model that is not there. Nothing
+installs, waits for, or pulls Ollama by default.
+
+Bind a model through the local web console's provider catalog at
+`http://localhost:7788/#/config`:
+
+- an OpenAI-compatible preset (OpenAI, Anthropic, Google Gemini, DeepSeek,
+  Moonshot Kimi, xAI Grok, OpenRouter, NVIDIA NIM),
+- a custom provider (your own base URL plus key, OpenAI-compatible), or
+- a locally detected Ollama, which appears automatically when its service is
+  running.
+
+Once a model is bound, a local Ollama route works like this: start the local
+service, and pull the bound dream model if it is not present. Hardware
+capacity and download size depend on the chosen model.
 
 ```sh
-ollama pull qwen3.5:9b
+ollama pull <bound dream model>
 mnemoseed-local doctor
 mnemoseed-local dream --once
 ```
 
 Manual `dream --once` reports `launched: false` with a reason when the route is
 unavailable. In an existing config with legacy auto dream enabled, scheduled
-work remains pending while the local Ollama model is unavailable and retries on
+work remains pending while the bound model is unavailable and retries on
 a later scheduler cycle without a daemon restart. Capture, recall, and other
 memory APIs remain available when their own dependencies are ready.
 
@@ -186,9 +198,8 @@ disables focal recall on prompts. Do not interpret the installer's `refinement`
 mode as a delivered new engine: refinement v2 is a design proposal, and that mode
 does not re-enable the legacy automatic dream pass.
 
-Dream inference defaults to Ollama; an OpenAI-compatible fallback driver can be
-configured. A remote endpoint receives the memory sent to it. API keys use the
-OS credential store when available, with a restricted local-file fallback.
+A bound remote provider endpoint receives the memory sent to it. API keys use
+the OS credential store when available, with a restricted local-file fallback.
 
 ## Package-index installers (currently unavailable)
 
@@ -198,11 +209,14 @@ default package index. They fail at package installation until that package is
 published. Use the source route above; the installer descriptions here explain
 their behavior and existing installations, not a working one-command install.
 
-Their default `capture-recall` mode skips Ollama installation and model pulling,
-installs uv if missing, installs the CLI, and runs `init` and `doctor`. Host wiring
+They never install, wait for, or pull Ollama by default, in any mode: they
+install uv if missing, install the CLI, and run `init` and `doctor`. The
+Ollama install step and the model pull run only behind the explicit
+`--install-ollama` / `-InstallOllama` switch. Host wiring
 requires your selection, as described below. Existing configs are not silently
-rewritten. Model pulling requires confirmation (`--yes` / `-Yes` skips that
-prompt). `--dry-run` / `-DryRun` prints a plan without side effects.
+rewritten. With the switch, model pulling requires confirmation
+(`--yes` / `-Yes` skips that prompt). `--dry-run` / `-DryRun` prints a plan
+without side effects.
 
 ### Host selection
 
@@ -229,18 +243,19 @@ treating overall installation completion as proof of a working host.
 
 ### Ollama options
 
-Outside capture-recall mode, the POSIX installer can install missing Ollama via
-the official Linux script or, on macOS with Homebrew available, offer
-`brew install ollama` behind explicit consent. `--yes` grants the Homebrew consent
-as well as skipping the model-pull prompt. If Homebrew is absent or you decline,
-the script exits non-zero with manual setup commands and the option to retry
-with `--skip-ollama`.
+The Ollama steps are opt-in on both installers via `--install-ollama` (POSIX)
+or `-InstallOllama` (Windows); without the switch nothing installs, waits for,
+or pulls Ollama in any mode. With the switch, the POSIX installer can install
+missing Ollama via the official Linux script or, on macOS with Homebrew
+available, offer `brew install ollama` behind explicit consent. `--yes` grants
+the Homebrew consent as well as skipping the model-pull prompt. If Homebrew is
+absent or you decline, the script exits non-zero with manual setup commands.
 
-The POSIX `--skip-ollama` option avoids an Ollama installation attempt and model
-pull. Installation can continue without that route; if Ollama is missing, the
-dream route is reported unavailable with exact steps to enable it later. Install
-Ollama and pull the configured model, then re-run `mnemoseed-local doctor` before
-trying a manual dream pass. See [dream model setup](#dream-model-setup).
+The switch also enables the confirmation-gated model pull after
+`mnemoseed-local doctor`. Without Ollama or a bound dream model, capture and
+recall still work out of the box and dreaming stays off until a model is
+bound in the console provider catalog. See
+[dream model setup](#dream-model-setup).
 
 ### Windows startup and helpers
 
@@ -250,14 +265,14 @@ module before dot-sourcing it, using a unique temporary directory removed on
 success and failure. A complete local checkout uses sibling scripts instead.
 A helper download or parse failure aborts setup.
 
-It removes only the exact `\OllamaHeadlessServe` task created by the earlier
-installer: current-user AtLogOn shape, `ollama.exe serve` action, and original
-description. Foreign or drifted same-name tasks are refused with manual
-guidance. It never stops Ollama or changes its native tray/startup configuration.
+The installer does not manage Ollama: it registers no Ollama task, removes no
+task, and never stops Ollama or changes its native tray/startup configuration.
+Machines carrying the earlier hidden `\OllamaHeadlessServe` task keep it; this
+software no longer manages that task.
 
-The Windows installer also registers the current-user `MnemoSeedLocalDaemon`
-AtLogOn task. On login, it waits boundedly for Ollama's API, then starts the
-daemon even if Ollama is unavailable. There is no periodic trigger or crash
+The Windows installer registers the current-user `MnemoSeedLocalDaemon`
+AtLogOn task. On login, the daemon starts directly; there is no wait for any
+external service. There is no periodic trigger or crash
 restart policy. See [daemon lifecycle](#daemon-lifecycle) for persistent on/off
 and manual recovery.
 
@@ -335,7 +350,7 @@ Current technical surfaces include:
   Desktop app-server mode is unverified, and Codex CLI hooks require trust review.
 - Windows is the primary tested platform; Linux runs in CI. macOS dream use
   needs Ollama setup, either manually or through the installer's explicit
-  Homebrew consent. Coverage varies across host/platform combinations.
+  `--install-ollama` Homebrew consent. Coverage varies across host/platform combinations.
 - Windows logon startup, where registered, has no later crash supervision.
 - Multi-session mutual awareness is research. Multi-device sync and a hosted
   cloud daemon belong to the broader [MnemoSeed direction](https://github.com/MnemoSeed),

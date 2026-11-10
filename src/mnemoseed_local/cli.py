@@ -26,9 +26,9 @@ from mnemoseed_local import __version__
 from mnemoseed_local.config import (
     CONFIG_DIR,
     CONFIG_PATH,
-    DEFAULT_LLM_ROUTES,
     Config,
     ConfigError,
+    RoleLLMConfig,
     default_config_toml,
     load_config,
 )
@@ -40,7 +40,7 @@ from mnemoseed_local.daemon.observability import (
     since_boot_observation,
     unreadable_capture_evidence,
 )
-from mnemoseed_local.dream.readiness import models_contain
+from mnemoseed_local.dream.readiness import OLLAMA_DEFAULT_BASE_URL, models_contain
 from mnemoseed_local.hosts.install import (
     ADAPTER_MODULES,
     detect_installed_hosts,
@@ -57,6 +57,27 @@ _HTTP_UNAUTHORIZED = 401
 
 #: Default profile at the application boundary (no identity in the local MVP).
 DEFAULT_PROFILE = "default"
+
+#: The console settings page: the write path for a dream route (init next
+#: steps, the up summary and the doctor advisories share the pointer).
+CONSOLE_CONFIG_URL = "http://localhost:7788/#/config"
+
+
+def _absent_route_advisory(role: str, *, dreams_deferred: bool) -> str:
+    """Shared copy for a missing route: every dream surface answers the same
+    way instead of inventing per-command wording."""
+    consequence = "dreams deferred" if dreams_deferred else "check skipped"
+    return f"no {role} route configured; {consequence} — bind a model in the console ({CONSOLE_CONFIG_URL})"
+
+
+def _route_summary_line(route: RoleLLMConfig) -> str:
+    """The one-line route summary for the up banner."""
+    base_url = route.params.get("base_url")
+    if base_url is None and route.driver == "ollama":
+        base_url = OLLAMA_DEFAULT_BASE_URL
+    summary = f"dream route: {route.driver}/{route.model}"
+    return f"{summary} @ {base_url}" if base_url else summary
+
 
 #: Host config the MCP-injection doctor check inspects (B2.12): an
 #: ``mcp.mnemoseed`` entry here means opencode was told about our MCP server.
@@ -126,12 +147,11 @@ def _print_init_done() -> None:
 
 
 def _print_legacy_next_steps() -> None:
-    # Point at self-check and the one-time model pull (design/01 §6 A3 T5);
-    # guidance only — the CLI never pulls a model silently.
-    model = DEFAULT_LLM_ROUTES["dream"].model
+    # Guidance only — the CLI never pulls a model; the wizard is the bind path
+    # (there is no factory dream route to pull for).
     print("next steps:")
     print("  1. mnemoseed-local doctor   (self-check incl. hardware tier)")
-    print(f"  2. ollama pull {model}   (dream model, first time only)")
+    print(f"  2. bind a dream model in the console: {CONSOLE_CONFIG_URL}   (dreams deferred until bound)")
     print("  3. mnemoseed-local up")
 
 
@@ -294,18 +314,31 @@ def _up_locked(args: argparse.Namespace, ready_callback: Any = None) -> int:
     if config.preset == "embedded":
         print("embedded single-process daemon - all drivers in-process, zero external services")
 
-    if config.llm["dream"].driver == "ollama":
-        print(
-            "note: Ollama readiness does not gate the memory daemon; "
-            "dream work defers until the configured model is available"
-        )
-
     try:
         stores = build_stores(config)
-        asyncio.run(stores.close())
     except StorageError as exc:
         print(f"error: storage stack failed to build: {exc}", file=sys.stderr)
         return 1
+    try:
+        from mnemoseed_local.configwrite.service import ConfigWriteService
+
+        # The settings DB is primary: the route summary must describe the
+        # effective config (DB wins over the file), not the pre-reconcile
+        # file view. Idempotent — the daemon's own boot reconciles again.
+        ConfigWriteService(config, getattr(stores, "meta", None)).reconcile_boot()
+    finally:
+        asyncio.run(stores.close())
+
+    dream_route = config.llm.get("dream")
+    if dream_route is None:
+        print("dream route: not configured (dreams deferred)")
+    else:
+        print(_route_summary_line(dream_route))
+        if dream_route.driver == "ollama":
+            print(
+                "note: Ollama readiness does not gate the memory daemon; "
+                "dream work defers until the configured model is available"
+            )
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"daemon on http://{host}:{port}")
@@ -558,7 +591,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     gate_state = "ok" if gate.get("ok") else "FAIL"
     print(f"daemon: mnemoseed-local {__version__} (preset {health.get('preset', '?')}, gate {gate_state})")
     print(f"dream auto_trigger: {config['dream']['auto_trigger']}")
-    print(f"dream llm driver:  {config['dream']['llm']['dream']['driver']}")
+    dream_driver = config.get("dream", {}).get("llm", {}).get("dream", {}).get("driver")
+    print(f"dream llm driver:  {dream_driver if dream_driver else 'not configured'}")
     print(f"profile: {client.profile_id}")
     if refinement is None:
         print("refinement: unknown (the config could not be loaded)")
@@ -626,12 +660,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             pass
 
     router = RoleRouter(routes=config.llm, audit=None)
-    try:
-        llm = router.resolve("dream")
-        report = llm.check()
-        checks.append(("dream llm", report.ok, f"{config.llm['dream'].driver} {report.detail}"))
-    except LLMError as exc:
-        checks.append(("dream llm", False, str(exc)))
+    dream_route = config.llm.get("dream")
+    if dream_route is None:
+        checks.append(("dream llm", True, _absent_route_advisory("dream", dreams_deferred=True)))
+    else:
+        try:
+            llm = router.resolve("dream")
+            report = llm.check()
+            checks.append(("dream llm", report.ok, f"{dream_route.driver} {report.detail}"))
+        except LLMError as exc:
+            checks.append(("dream llm", False, str(exc)))
 
     # A3 T5 model-missing UX: the ollama dream route's model must be pulled.
     model_ok, model_detail = _dream_model_check(config)
@@ -838,15 +876,20 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
     """Design/01 §4.8: the dream route's context window must fit the cached
     prefix, the packed delta ceiling, and the generation margin.
 
-    An unconfigured ``num_ctx`` is only a hint (the default route works without
-    it); a configured one is checked against
-    ``estimate_tokens(cache_prefix) + delta ceiling + margin`` and fails with a
-    fix hint when the window is exceeded.
+    An unconfigured ``num_ctx`` is only a hint; a configured one is checked
+    against ``estimate_tokens(cache_prefix) + delta ceiling + margin`` and
+    fails with a fix hint when the window is exceeded.
     """
     from mnemoseed_local.dream.delta import estimate_tokens
     from mnemoseed_local.dream.prompts import build_cache_prefix
 
-    route = config.llm["dream"]
+    route = config.llm.get("dream")
+    if route is None:
+        return (
+            "dream ctx window",
+            True,
+            _absent_route_advisory("dream", dreams_deferred=True),
+        )
     # AC5 (T3a): the ctx-window check (and its num_ctx / num_predict hints) is
     # ollama-specific — num_ctx is an ollama server knob. A non-ollama route is
     # skipped: the provider's own context window is out of doctor's reach, so a
@@ -900,19 +943,20 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
 
 
 def _role_model_check(config: Config, role: str) -> tuple[bool, str]:
-    """The ollama model-presence check for one LLM role, reused by every seat.
+    """The model check for one LLM role, reused by every seat.
 
-    Compare the configured ``route.model`` against the server's ``GET
-    /api/tags`` inventory (via the driver's ``check()`` probe; name comparison
-    goes through ``models_contain``). A missing model fails with the pull hint
-    and an unreachable server fails with a start-ollama hint — never a silent
-    pull. A non-ollama route skips the check (same precedent as the ctx-window
-    check: the provider's model inventory is out of doctor's reach). Single
-    wording source for the dream-model and ensemble-verifier checks.
+    An ollama route compares the configured ``route.model`` against the
+    server's ``GET /api/tags`` inventory (name comparison through
+    ``models_contain``): a missing model fails with the pull hint and an
+    unreachable server fails with a start-ollama hint — never a silent pull.
+    A cloud route is probed through the driver's ``check()`` (which never
+    raises): ok passes with the route surfaced, a failed probe fails with the
+    provider's error. An absent route reports the advisory without probing.
+    Single wording source for the dream-model and ensemble-verifier checks.
     """
-    route = config.llm[role]
-    if route.driver != "ollama":
-        return True, f"route driver {route.driver!r} is not ollama; model presence check skipped"
+    route = config.llm.get(role)
+    if route is None:
+        return True, _absent_route_advisory(role, dreams_deferred=False)
     from mnemoseed_local.llm import LLMError, RoleRouter
 
     try:
@@ -920,13 +964,18 @@ def _role_model_check(config: Config, role: str) -> tuple[bool, str]:
     except LLMError as exc:
         return False, str(exc)
     report = llm.check()
+    if route.driver == "ollama":
+        if not report.ok:
+            error = report.detail.get("error", "unknown error")
+            return False, f"ollama server unreachable ({error}); start ollama first"
+        models = [str(name) for name in (report.detail.get("models") or []) if isinstance(name, str)]
+        if models_contain(models, route.model):
+            return True, f"model {route.model!r} present"
+        return False, f"model {route.model!r} not pulled; run: ollama pull {route.model}"
     if not report.ok:
         error = report.detail.get("error", "unknown error")
-        return False, f"ollama server unreachable ({error}); start ollama first"
-    models = [str(name) for name in (report.detail.get("models") or []) if isinstance(name, str)]
-    if models_contain(models, route.model):
-        return True, f"model {route.model!r} present"
-    return False, f"model {route.model!r} not pulled; run: ollama pull {route.model}"
+        return False, f"provider probe failed ({error})"
+    return True, f"route driver {route.driver!r} probe ok; model {route.model!r} configured"
 
 
 def _dream_model_check(config: Config) -> tuple[bool, str]:
@@ -957,18 +1006,15 @@ def _ensemble_verifier_check(config: Config) -> tuple[str, bool, str]:
     if config.dream.ensemble == "vote":
         vote_role = "dream_vote" if "dream_vote" in config.llm else "dream_verifier"
         ok, detail = _role_model_check(config, vote_role)
-        if ok:
-            try:
-                vote_model = config.llm[vote_role].model
-                dream_model = config.llm["dream"].model
-                if vote_model == dream_model:
-                    return (
-                        "ensemble verifier",
-                        False,
-                        f"vote seat model {vote_model!r} must be distinct from dream model {dream_model!r}",
-                    )
-            except Exception:
-                pass
+        dream_route = config.llm.get("dream")
+        if ok and vote_role in config.llm and dream_route is not None:
+            vote_model = config.llm[vote_role].model
+            if vote_model == dream_route.model:
+                return (
+                    "ensemble verifier",
+                    False,
+                    f"vote seat model {vote_model!r} must be distinct from dream model {dream_route.model!r}",
+                )
         return ("ensemble verifier", ok, detail)
     ok, detail = _role_model_check(config, "dream_verifier")
     return ("ensemble verifier", ok, detail)
@@ -996,7 +1042,13 @@ def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
         )
     if config.dream.ensemble == "vote":
         vote_role = "dream_vote" if "dream_vote" in config.llm else "dream_verifier"
-        route = config.llm[vote_role]
+        route = config.llm.get(vote_role)
+        if route is None:
+            return (
+                "verifier ctx window",
+                True,
+                _absent_route_advisory(vote_role, dreams_deferred=False),
+            )
         if route.driver != "ollama":
             return (
                 "verifier ctx window",
@@ -1034,7 +1086,13 @@ def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
             f"dream.llm.{vote_role} num_ctx or lower dream.delta_budget_ceiling_tokens "
             "(large extractions otherwise fall back unverified: window_exceeded)",
         )
-    route = config.llm["dream_verifier"]
+    route = config.llm.get("dream_verifier")
+    if route is None:
+        return (
+            "verifier ctx window",
+            True,
+            _absent_route_advisory("dream_verifier", dreams_deferred=False),
+        )
     if route.driver != "ollama":
         return (
             "verifier ctx window",

@@ -113,7 +113,6 @@ def test_think_role_field_roundtrip(tmp_path) -> None:
     """D4: think is writable via the registry, applies live to the route's
     params, mirrors into the file, and rejects non-boolean values."""
     service, path = _service(tmp_path)
-    assert service._config.llm["dream"].params["think"] is False  # factory default (D4)
     result = service.set("dream.llm.dream.think", True, actor="console")
     assert result["ok"] is True
     assert load_config(path).llm["dream"].params["think"] is True
@@ -142,14 +141,17 @@ def test_num_ctx_and_num_predict_are_writable_role_fields(tmp_path) -> None:
 def test_verifier_role_keys_are_writable_and_bump_their_own_generation(tmp_path) -> None:
     """B1 T1: the dream_verifier role rides the same registry surface as the
     dream role — writes hot-apply to the live route and the file, validate
-    through the shared role validators, and bump only its own generation."""
+    through the shared role validators, and bump only its own generation. An
+    unconfigured role gains its route through the wizard's contract: driver
+    and model land together before the file reloads."""
     service, path = _service(tmp_path)
+    assert service.set("dream.llm.dream_verifier.driver", "ollama", actor="console")["ok"] is True
     result = service.set("dream.llm.dream_verifier.model", "gemma4:e4b-alt", actor="console")
     assert result["ok"] is True
     assert load_config(path).llm["dream_verifier"].model == "gemma4:e4b-alt"
     assert service._config.llm["dream_verifier"].model == "gemma4:e4b-alt"
-    assert service.generation == 1
-    assert service.generation_for("dream_verifier") == 1
+    assert service.generation == 2
+    assert service.generation_for("dream_verifier") == 2
     assert service.generation_for("dream") == 0  # the dream route is untouched
     with pytest.raises(ConfigWriteError):
         service.set("dream.llm.dream_verifier.driver", "  ", actor="console")
@@ -572,6 +574,51 @@ def test_reconcile_db_value_wins_over_file_value_at_boot(tmp_path) -> None:
     drift = _audit_entries(meta, "config_mirror_drift")
     assert len(drift) == 1
     assert drift[0].detail["drifted"] is False
+
+
+def test_reconcile_db_overlay_restores_the_legacy_ollama_route_over_an_empty_default(
+    tmp_path,
+) -> None:
+    """Existing-install compatibility: an install whose settings DB holds the
+    old factory ollama role defaults (imported at its first boot) keeps its
+    configured route even though the file carries no [dream.llm] table anymore
+    and the factory route table is empty — the DB is primary and wins at boot."""
+    meta = _meta(tmp_path)
+    # seed the DB exactly as reconcile_boot imported the old factory defaults
+    for key, value in {
+        "dream.llm.dream.driver": "ollama",
+        "dream.llm.dream.model": "qwen3.5:9b",
+        "dream.llm.dream.base_url": "http://localhost:11434",
+        "dream.llm.dream.think": False,
+        "dream.llm.dream.num_ctx": 16384,
+        "dream.llm.dream_verifier.driver": "ollama",
+        "dream.llm.dream_verifier.model": "gemma4:e4b",
+        "dream.llm.dream_verifier.base_url": "http://localhost:11434",
+        "dream.llm.dream_verifier.think": False,
+        "dream.llm.dream_verifier.num_ctx": 16384,
+    }.items():
+        meta.set_config(key, {"value": value})
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'preset = "embedded"\n[storage.graph.instances.isolated]\ndriver = "sqlite_graph"\n',
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.llm == {}  # no factory route, no file route
+    service = ConfigWriteService(config, meta, clock=lambda: 1_700_000_000.0)
+    result = service.reconcile_boot()
+
+    assert result["ok"] is True
+    dream = service._config.llm["dream"]
+    assert dream.driver == "ollama"
+    assert dream.model == "qwen3.5:9b"
+    assert dream.params["base_url"] == "http://localhost:11434"
+    assert dream.params["think"] is False
+    assert dream.params["num_ctx"] == 16384
+    verifier = service._config.llm["dream_verifier"]
+    assert verifier.driver == "ollama"
+    assert verifier.model == "gemma4:e4b"
 
 
 def test_reconcile_boot_scope_keys_stay_file_scoped_and_restart_required(tmp_path) -> None:

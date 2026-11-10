@@ -28,8 +28,13 @@ CAPTURE_RECALL_CONFIG = (
     'preset = "embedded"\n\n[dream]\nauto_trigger = false\n\n[capture]\nauto_recall = true\n'
 )
 
-#: The legacy auto-dream posture: refinement enabled, route must answer.
-ENABLED_CONFIG = 'preset = "embedded"\n\n[dream]\nauto_trigger = true\n'
+#: The legacy auto-dream posture: refinement enabled, with an explicitly bound
+#: ollama route the availability probe can find unreachable.
+ENABLED_CONFIG = (
+    'preset = "embedded"\n\n[dream]\nauto_trigger = true\n'
+    '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\n'
+    'base_url = "http://127.0.0.1:11434"\n'
+)
 
 
 def _dream_routes(base_url: str = "http://127.0.0.1:11434") -> dict[str, RoleLLMConfig]:
@@ -156,9 +161,19 @@ def test_enabled_with_reachable_route_reports_ready(monkeypatch) -> None:
     )
 
 
-def test_non_ollama_route_is_ready_without_a_network_call(monkeypatch) -> None:
+def test_non_ollama_route_is_probed_through_the_driver(monkeypatch) -> None:
+    """A cloud route is gated by a real probe through the driver's check() —
+    no ollama /api/tags call, and no auto-ready shortcut."""
+    from mnemoseed_local.llm.types import HealthReport
+
+    class _Probe:
+        def check(self) -> HealthReport:
+            return HealthReport(ok=True, detail={"models": ["gpt-4o"]})
+
+    monkeypatch.setattr("mnemoseed_local.dream.readiness._probe_driver", lambda route: _Probe())
+
     def _fail(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("a non-Ollama route is not gated by a network probe")
+        raise AssertionError("a cloud route probe never hits the ollama /api/tags endpoint")
 
     monkeypatch.setattr("httpx.get", _fail)
     routes = {
@@ -171,7 +186,9 @@ def test_non_ollama_route_is_ready_without_a_network_call(monkeypatch) -> None:
     }
     status = observability.refinement_status(auto_trigger=True, auto_recall=True, routes=routes)
     assert status.state == "ready"
-    assert status.line() == "refinement: ready (live check: not an Ollama route)"
+    assert status.line() == (
+        "refinement: ready (live check: provider API ready (openai_compatible); model 'gpt-4o' reachable)"
+    )
 
 
 def test_timeout_reaches_the_route_probe(monkeypatch) -> None:
@@ -304,5 +321,7 @@ def test_cli_status_consumes_the_daemon_observability_computation(
     assert main(["status"]) == 0
     assert seen["auto_trigger"] is False
     assert seen["auto_recall"] is True
-    assert "dream" in seen["routes"]
+    # the live routes mapping rides through verbatim: a capture-recall setup
+    # ships route-less (no factory dream route), so the map is empty
+    assert seen["routes"] == {}
     assert "refinement: disabled (capture-recall mode)" in capsys.readouterr().out

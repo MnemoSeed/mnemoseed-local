@@ -176,6 +176,25 @@ class _UnavailableLLM:
         return HealthReport(ok=False, detail={"error": self._reason})
 
 
+#: One honest boot line when no dream route is bound anywhere: capture/recall
+#: and the storage layers are unaffected; dreams wait for a binding.
+DREAM_NOT_CONFIGURED_NOTICE = (
+    "dream not configured; capture/recall unaffected; dreams deferred until a model is bound"
+)
+
+
+def _resolve_boot_llm(router: RoleRouter, role: str, broken_warning: str) -> DreamLLM:
+    """Shared boot-safe role resolution: a configured-but-broken route warns
+    and degrades typed (FR-2.6); an absent route is normal dormancy (no
+    factory route) — the boot notice covers it, so it stays quiet here."""
+    try:
+        return router.resolve(role)
+    except LLMError as exc:
+        if role in router.roles():
+            logger.warning(broken_warning, exc)
+        return _UnavailableLLM(str(exc))
+
+
 def _build_dream_llm(router: RoleRouter) -> DreamLLM:
     """Materialize the dream-pipeline LLM from the configured routes.
 
@@ -185,14 +204,11 @@ def _build_dream_llm(router: RoleRouter) -> DreamLLM:
     crashing boot; the reflect boundary then reports ``llm_unavailable`` and
     the snapshot stays journaled (FR-2.6).
     """
-    try:
-        return router.resolve(_REFLECT_ROLE)
-    except LLMError as exc:
-        logger.warning(
-            "dream route unavailable at boot (%s); dreams degrade to capture-only until the route is fixed",
-            exc,
-        )
-        return _UnavailableLLM(str(exc))
+    return _resolve_boot_llm(
+        router,
+        _REFLECT_ROLE,
+        "dream route unavailable at boot (%s); dreams degrade to capture-only until the route is fixed",
+    )
 
 
 def _build_verifier_llm(router: RoleRouter) -> DreamLLM:
@@ -200,14 +216,11 @@ def _build_verifier_llm(router: RoleRouter) -> DreamLLM:
     boot discipline as the dream route. A broken verifier route never crashes
     boot and never blocks a dream: the verify phase falls back to the
     unverified reflect result with an audit record (design/01 decision 1)."""
-    try:
-        return router.resolve(_VERIFIER_ROLE)
-    except LLMError as exc:
-        logger.warning(
-            "verifier route unavailable at boot (%s); ensemble verify falls back to A's original reflect",
-            exc,
-        )
-        return _UnavailableLLM(str(exc))
+    return _resolve_boot_llm(
+        router,
+        _VERIFIER_ROLE,
+        "verifier route unavailable at boot (%s); ensemble verify falls back to A's original reflect",
+    )
 
 
 def _build_vote_llm(router: RoleRouter) -> DreamLLM:
@@ -215,19 +228,19 @@ def _build_vote_llm(router: RoleRouter) -> DreamLLM:
 
     Vote is a second full generation over the same delta, so seat B needs its
     own route — never A's model and never the cheaper judge model re-used as a
-    generator. The dedicated ``dream_vote`` route has no factory default, so it
-    is commonly unconfigured: fall back to the ``dream_verifier`` judging route
-    (still a distinct model from A) with a warning, so vote degrades to an
-    independent-seat pass rather than a same-model duplicate or a crash. A
-    broken dedicated route degrades the same way.
-    """
+    generator. The dedicated ``dream_vote`` route is commonly unconfigured:
+    fall back to the ``dream_verifier`` judging route (still a distinct model
+    from A), so vote degrades to an independent-seat pass rather than a
+    same-model duplicate or a crash. A broken dedicated route degrades the
+    same way (with a warning)."""
     try:
         return router.resolve(_VOTE_ROLE)
     except LLMError as exc:
-        logger.warning(
-            "vote route unavailable (%s); seat B falls back to the dream_verifier route",
-            exc,
-        )
+        if _VOTE_ROLE in router.roles():
+            logger.warning(
+                "vote route unavailable (%s); seat B falls back to the dream_verifier route",
+                exc,
+            )
         return _build_verifier_llm(router)
 
 
@@ -834,6 +847,8 @@ def _build_capture(
         generation=configwrite.generation_for,
         secrets=None,
     )
+    if not config.llm:
+        logger.info(DREAM_NOT_CONFIGURED_NOTICE)
 
     def _resolve_dream_llm() -> DreamLLM:
         return _build_dream_llm(router)

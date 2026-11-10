@@ -6,10 +6,11 @@ MnemoSeed Local 是 MnemoSeed 的本地单机版：没有账号体系（localhos
 CLI 优先，本机 Web 控制台随 daemon 在根路径提供；记忆按 profile 命名空间隔离——
 开箱即用的是约定命名空间 `default`，可用 `mnemoseed-local profile create` 注册更多
 命名空间，并经配置键 `profiles.agent_bindings` 绑定到具体 agent（design/04 §3.6）。
-核心闭环：**capture → dream → decay → retrieve**，dream 推理走本地模型
-（默认 ollama；保留 openai-compatible 回退驱动），自动做梦与自动回忆出厂默认开启
-（`dream.auto_trigger` / `capture.auto_recall`，各可用一个配置开关回滚；
-`dream --once` 为手动兜底）。
+核心闭环：**capture → dream → decay → retrieve**，capture/recall 开箱即用；
+dream 需显式绑定模型后才工作——安装器绝不默认安装/等待/拉取 Ollama，dreaming
+在控制台 provider 目录（OpenAI 兼容预设、自定义端点或自动检测到的本机
+Ollama）绑定模型前保持关闭（`dream.auto_trigger` / `capture.auto_recall`
+各可用一个配置开关回滚；`dream --once` 为手动兜底）。
 
 ## 为什么需要它
 
@@ -19,9 +20,9 @@ Agent 每次新开会话都会遗忘。Local 版在本机替你保存"值得记�
 
 ## 定位
 
-- **本地优先**：默认零云依赖，dream 走本地模型
+- **本地优先**：默认零云依赖；dream 不绑定任何默认宿主——模型经控制台 provider 目录显式绑定（云 provider 或本机 Ollama）
 - **无账号**：localhost 即信任边界，默认使用约定的 `default` 命名空间（多 profile 管理面见 design/04 §3.6）
-- **CLI 优先**：capture / retrieve / dream / decay / daemon（自动做梦为默认，`dream --once` 为手动兜底）
+- **CLI 优先**：capture / retrieve / dream / decay / daemon（capture/recall 开箱即用；dream 显式绑定后可用，`dream --once` 为手动兜底）
 - **生产血统**：从 mnemoseed 主仓库移植而来，存储层、schema、迁移完全同源
 
 ## 状态
@@ -58,6 +59,7 @@ Phase B 已经 main 落地：
 结构化事实，尚没有类型化 lesson 工件，也**不从错误中学习**；体验学习仍在建设、
 默认关闭、无任何主张；宿主只有 OpenCode 与 Claude Code；**没有任何自动重启**，
 daemon 死亡后手动运行 `mnemoseed-local up`；平台覆盖不均——Windows 为主测试平台，
-Linux 跑 CI，macOS 需手动配置 ollama。多 session 互认知处于 pre-PRD 研究阶段，尚非功能。
+Linux 跑 CI，macOS 的本地 dream 需手动配置 Ollama 或经安装器 `--install-ollama`
+的显式 Homebrew 同意。多 session 互认知处于 pre-PRD 研究阶段，尚非功能。
 
 开发文档见 [MVP.md](MVP.md)（范围冻结）。

@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Bootstrap,
     [Parameter(Mandatory = $true)]
-    [ValidateSet('off-before', 'off-during', 'healthy', 'unknown-healthy', 'unstable-pid', 'ollama-timeout', 'unknown-port', 'mnemoseed-owned-unhealthy', 'foreign-label', 'mismatched-executable', 'launch')]
+    [ValidateSet('off-before', 'healthy', 'unknown-healthy', 'unstable-pid', 'unknown-port', 'mnemoseed-owned-unhealthy', 'foreign-label', 'mismatched-executable', 'launch')]
     [string]$Scenario,
     [Parameter(Mandatory = $true)]
     [string]$Result
@@ -12,7 +12,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $fixtureConfigHome = Join-Path $env:MNEMOSEED_LOCAL_HOME ''
 [IO.Directory]::CreateDirectory($fixtureConfigHome) | Out-Null
-$marked = $false
 $state = @{ portProbeCount = 0 }
 
 $pathProbe = {
@@ -21,17 +20,8 @@ $pathProbe = {
 }
 $healthProbe = {
     param([string]$Url)
-    if ($Scenario -eq 'ollama-timeout') { return $false }
-    if ($Scenario -eq 'off-during' -and $Url -like '*11434*' -and -not $marked) {
-        $marked = $true
-        [IO.File]::WriteAllText((Join-Path $env:MNEMOSEED_LOCAL_HOME 'daemon.off'), 'off')
-        [IO.File]::WriteAllText($Result, 'marked')
-    }
-    if ($Scenario -eq 'healthy') { return $true }
-    if ($Scenario -eq 'unknown-healthy') { return $true }
-    if ($Scenario -in @('unstable-pid', 'foreign-label', 'mismatched-executable') -and $Url -like '*7788*') { return $true }
-    if ($Url -like '*11434*') { return $true }
-    if ($Scenario -eq 'mnemoseed-owned-unhealthy' -or $Scenario -eq 'unknown-port') { return $false }
+    if ($Url -notlike '*7788*') { return $false }
+    if ($Scenario -in @('healthy', 'unknown-healthy', 'unstable-pid', 'foreign-label', 'mismatched-executable')) { return $true }
     return $false
 }
 $portProbe = {
@@ -81,7 +71,6 @@ $launcher = {
     [IO.File]::AppendAllText($Result, "launch`n")
     if ($Scenario -eq 'launch') { Start-Sleep -Milliseconds 1500 }
 }
-$sleeper = { param([int]$Milliseconds) }
 
 $arguments = @{
     HealthProbe = $healthProbe
@@ -91,9 +80,7 @@ $arguments = @{
     CommandProbe = $commandProbe
     Launcher = $launcher
     TaskIdentity = 'urn:mnemoseed-local:task:windows-logon-daemon:v1'
-    Sleeper = $sleeper
 }
-if ($Scenario -eq 'ollama-timeout') { $arguments.OllamaTimeoutSeconds = 0 }
 & $Bootstrap @arguments
 $exitCode = $LASTEXITCODE
 exit $exitCode

@@ -37,9 +37,8 @@ def test_init_writes_a_working_config(cli_home: Path, capsys: pytest.CaptureFixt
     cfg = load_config(config_path)
     assert cfg.preset == "embedded"
     assert cfg.baseurl == "http://localhost:7788"
-    # the ollama dream driver is the default (model aligned on qwen3.5:9b, AC3)
-    assert cfg.llm["dream"].driver == "ollama"
-    assert cfg.llm["dream"].model == "qwen3.5:9b"
+    # fresh installs ship with no dream route: dreams defer until one is bound
+    assert cfg.llm == {}
     # the A2 schedule trigger keys are present
     assert cfg.dream.floor_pool_points == 10.0
     assert cfg.dream.idle_min_sec == 900.0
@@ -214,16 +213,18 @@ def _mock_doctor_backend(cli_home: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 _ISOLATED_BLOCK = '[storage.graph.instances.isolated]\ndriver = "sqlite_graph"\n'
 
 
-def test_doctor_reports_default_delta_ceiling_window_gap_on_factory_num_ctx(
-    cli_home: Path, monkeypatch, capsys
-) -> None:
-    """D4 compounding: the factory route now ships num_ctx=16384, so the
-    ollama 4096 silent-squeeze trap can no longer pass unnoticed; with the
-    32000 delta ceiling still in place the doctor check FAILS honestly with
-    the actionable hint (tier-coherent pairing lives on
+def test_doctor_reports_window_gap_on_a_default_sized_ollama_ctx(cli_home: Path, monkeypatch, capsys) -> None:
+    """D4 honesty: a 16384 window (the size the legacy factory route shipped)
+    does not fit the 32000 delta ceiling, so the doctor check FAILS with the
+    actionable hint (tier-coherent pairing lives on
     dream.delta_budget_ceiling_tokens — never in the driver)."""
     cli_home.mkdir(parents=True, exist_ok=True)
-    (cli_home / "config.toml").write_text('preset = "embedded"\n' + _ISOLATED_BLOCK, encoding="utf-8")
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 16384\n',
+        encoding="utf-8",
+    )
     _mock_doctor_backend(cli_home, monkeypatch)
     assert main(["doctor"]) == 1
     out = capsys.readouterr().out
@@ -235,7 +236,9 @@ def test_doctor_reports_default_delta_ceiling_window_gap_on_factory_num_ctx(
 def test_doctor_reports_small_num_ctx_with_fix_hint(cli_home: Path, monkeypatch, capsys) -> None:
     cli_home.mkdir(parents=True, exist_ok=True)
     (cli_home / "config.toml").write_text(
-        'preset = "embedded"\n' + _ISOLATED_BLOCK + "[dream.llm.dream]\nnum_ctx = 1024\n",
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 1024\n',
         encoding="utf-8",
     )
     _mock_doctor_backend(cli_home, monkeypatch)
@@ -249,7 +252,9 @@ def test_doctor_reports_small_num_ctx_with_fix_hint(cli_home: Path, monkeypatch,
 def test_doctor_ctx_window_passes_when_num_ctx_fits(cli_home: Path, monkeypatch, capsys) -> None:
     cli_home.mkdir(parents=True, exist_ok=True)
     (cli_home / "config.toml").write_text(
-        'preset = "embedded"\n' + _ISOLATED_BLOCK + "[dream.llm.dream]\nnum_ctx = 40000\n",
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 40000\n',
         encoding="utf-8",
     )
     _mock_doctor_backend(cli_home, monkeypatch)
@@ -264,7 +269,8 @@ def test_doctor_rejects_non_integer_num_predict(cli_home: Path, monkeypatch, cap
     (cli_home / "config.toml").write_text(
         'preset = "embedded"\n'
         + _ISOLATED_BLOCK
-        + '[dream.llm.dream]\nnum_ctx = 40000\nnum_predict = "lots"\n',
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\n'
+        'num_ctx = 40000\nnum_predict = "lots"\n',
         encoding="utf-8",
     )
     _mock_doctor_backend(cli_home, monkeypatch)
@@ -283,12 +289,10 @@ def test_doctor_delta_component_follows_config_ceiling(cli_home: Path, monkeypat
     prefix = estimate_tokens(build_cache_prefix())
     margin = 2048  # DREAM_MARGIN_TOKENS_DEFAULT (num_predict unset)
     num_ctx = prefix + 5000 + margin + 16  # fits a 5000 ceiling, NOT the 32000 default
+    route = f'[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = {num_ctx}\n'
     cli_home.mkdir(parents=True, exist_ok=True)
     (cli_home / "config.toml").write_text(
-        'preset = "embedded"\n' + _ISOLATED_BLOCK + "[dream]\n"
-        "delta_budget_ceiling_tokens = 5000\n"
-        "[dream.llm.dream]\n"
-        f"num_ctx = {num_ctx}\n",
+        'preset = "embedded"\n' + _ISOLATED_BLOCK + "[dream]\ndelta_budget_ceiling_tokens = 5000\n" + route,
         encoding="utf-8",
     )
     _mock_doctor_backend(cli_home, monkeypatch)
@@ -298,7 +302,7 @@ def test_doctor_delta_component_follows_config_ceiling(cli_home: Path, monkeypat
 
     # the same window with the 32000 default ceiling fails the check
     (cli_home / "config.toml").write_text(
-        f'preset = "embedded"\n{_ISOLATED_BLOCK}[dream.llm.dream]\nnum_ctx = {num_ctx}\n',
+        f'preset = "embedded"\n{_ISOLATED_BLOCK}{route}',
         encoding="utf-8",
     )
     assert main(["doctor"]) == 1
@@ -313,6 +317,7 @@ def test_doctor_skips_ctx_window_check_for_non_ollama_route(cli_home: Path, monk
     (cli_home / "config.toml").write_text(
         'preset = "embedded"\n' + _ISOLATED_BLOCK + "[dream.llm.dream]\n"
         'driver = "openai_compatible"\n'
+        'model = "deepseek-chat"\n'
         "num_ctx = 1024\n",  # far too small: would fail the ollama check
         encoding="utf-8",
     )
@@ -342,11 +347,11 @@ def test_doctor_reports_missing_isolated_instance_with_fix_hint(cli_home: Path, 
 def _write_doctor_config(cli_home: Path, extra: str = "") -> None:
     cli_home.mkdir(parents=True, exist_ok=True)
     # these tests exercise the model/tier checks, not the ctx window — give
-    # the config a window-coherent num_ctx so the honest D4 default (factory
-    # 16384 vs 32000 delta ceiling) doesn't wash the target check's outcome;
-    # when `extra` opens the role table itself, the key lands inside it
-    # instead of declaring the table twice
-    window = "num_ctx = 40000\n"
+    # the config an explicit window-coherent ollama route (there is no factory
+    # route to inherit anymore) so the window math doesn't wash the target
+    # check's outcome; when `extra` opens the role table itself, the key lands
+    # inside it instead of declaring the table twice
+    window = 'driver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 40000\n'
     if "[dream.llm.dream]" not in extra:
         window = "[dream.llm.dream]\n" + window
     (cli_home / "config.toml").write_text(
@@ -407,18 +412,96 @@ def test_doctor_dream_model_server_unreachable(cli_home: Path, monkeypatch, caps
     assert "ollama pull" not in out
 
 
-def test_doctor_dream_model_skips_non_ollama_route(cli_home: Path, monkeypatch, capsys) -> None:
-    """Non-ollama dream routes skip the check (same precedent as ctx window)."""
-    _write_doctor_config(
-        cli_home,
-        '[dream.llm.dream]\ndriver = "openai_compatible"\nmodel = "gpt-4o-mini"\n',
+def test_doctor_cloud_dream_route_probes_the_provider(cli_home: Path, monkeypatch, capsys) -> None:
+    """A configured cloud route is probed through the driver's check() — the
+    old 'not ollama; check skipped' wording is gone; a healthy provider passes
+    the check honestly."""
+    cli_home.mkdir(parents=True, exist_ok=True)
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream.llm.dream]\ndriver = "openai_compatible"\nmodel = "gpt-4o-mini"\nnum_ctx = 40000\n',
+        encoding="utf-8",
     )
     _mock_doctor_backend(cli_home, monkeypatch)
     assert main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert "dream model" in out
-    assert "not ollama" in out
-    assert "model presence check skipped" in out
+    model_line = next(item for item in out.splitlines() if "dream model" in item)
+    assert "probe ok" in model_line
+    assert "not ollama" not in model_line
+    assert "check skipped" not in model_line
+
+
+def test_doctor_cloud_dream_route_probe_failure_fails_the_check(cli_home: Path, monkeypatch, capsys) -> None:
+    """A cloud provider that fails its probe FAILS the model check with the
+    provider's error surfaced — the same honesty as an unreachable ollama."""
+    cli_home.mkdir(parents=True, exist_ok=True)
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + '[dream.llm.dream]\ndriver = "openai_compatible"\nmodel = "gpt-4o-mini"\nnum_ctx = 40000\n',
+        encoding="utf-8",
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.llm.RoleRouter",
+        _router_class(HealthReport(ok=False, detail={"error": "HTTP 401"})),
+    )
+    assert main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "provider probe failed (HTTP 401)" in out
+    assert "ollama pull" not in out
+
+
+def test_doctor_reports_no_dream_route_with_advisory(cli_home: Path, monkeypatch, capsys) -> None:
+    """Route-optional doctor: a fresh install (no dream route anywhere) passes
+    every dream check with the bind-a-model advisory — never an exception,
+    never a KeyError, never a fake ollama instruction. The ensemble check
+    stays the dormant-mode skip when the ensemble is off."""
+    cli_home.mkdir(parents=True, exist_ok=True)
+    (cli_home / "config.toml").write_text('preset = "embedded"\n' + _ISOLATED_BLOCK, encoding="utf-8")
+    _mock_doctor_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    for check in ("dream llm", "dream model", "dream ctx window"):
+        line = next(item for item in out.splitlines() if item.startswith("[  ok] " + check))
+        assert "no dream route configured" in line
+        assert "http://localhost:7788/#/config" in line
+    assert "ensemble mode 'off'; verifier model check skipped" in out
+    assert "ollama pull" not in out
+    assert "ollama server unreachable" not in out
+
+
+def test_doctor_ensemble_on_with_missing_verifier_route_is_advisory(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    """Ensemble opt-in without a bound verifier seat must not KeyError: the
+    seat checks report the advisory and doctor stays green."""
+    cli_home.mkdir(parents=True, exist_ok=True)
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n' + _ISOLATED_BLOCK + '[dream]\nensemble = "verify"\n',
+        encoding="utf-8",
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "no dream_verifier route configured" in _verify_line(out)
+
+
+def test_doctor_vote_on_with_no_seat_routes_is_advisory(cli_home: Path, monkeypatch, capsys) -> None:
+    """Vote mode with neither dream_vote nor dream_verifier bound: the vote
+    seat check reports the advisory (never a KeyError) and the vote ctx-window
+    check skips."""
+    cli_home.mkdir(parents=True, exist_ok=True)
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n' + _ISOLATED_BLOCK + '[dream]\nensemble = "vote"\n',
+        encoding="utf-8",
+    )
+    _mock_doctor_backend(cli_home, monkeypatch)
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "no dream_verifier route configured" in _verify_line(out)
+    assert "verifier ctx window" in out
 
 
 def test_doctor_report_lists_new_checks_in_order(cli_home: Path, monkeypatch, capsys) -> None:
@@ -475,7 +558,8 @@ def test_doctor_verifier_present_when_verify_on(cli_home: Path, monkeypatch, cap
     # B1.1: belt-and-braces config — the ctx-window check must clear too
     _write_doctor_config(
         cli_home,
-        '[dream]\nensemble = "verify"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
     )
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr(
@@ -495,7 +579,11 @@ def test_doctor_verifier_missing_model_fails_with_pull_hint(cli_home: Path, monk
     """Opted-in verify with a missing judge model is a FAIL with the pull hint
     — never a silent pull (the runtime fallback is the safety net, doctor is
     the honest report)."""
-    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
+    )
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr(
         "mnemoseed_local.llm.RoleRouter",
@@ -514,7 +602,11 @@ def test_doctor_verifier_missing_model_fails_with_pull_hint(cli_home: Path, monk
 def test_doctor_verifier_server_unreachable_fails_without_pull_advice(
     cli_home: Path, monkeypatch, capsys
 ) -> None:
-    _write_doctor_config(cli_home, '[dream]\nensemble = "verify"\n')
+    _write_doctor_config(
+        cli_home,
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
+    )
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr(
         "mnemoseed_local.llm.RoleRouter",
@@ -531,10 +623,9 @@ def test_doctor_verifier_server_unreachable_fails_without_pull_advice(
     assert "ollama pull" not in line
 
 
-def test_doctor_verifier_skips_non_ollama_verifier_route(cli_home: Path, monkeypatch, capsys) -> None:
-    """A non-ollama verifier route skips the inventory check (same precedent
-    as the dream model and ctx-window checks: the provider's model inventory
-    is out of doctor's reach)."""
+def test_doctor_cloud_verifier_route_probes_the_provider(cli_home: Path, monkeypatch, capsys) -> None:
+    """A configured cloud verifier seat is probed through the driver's check()
+    — the old 'not ollama; check skipped' wording is gone."""
     _write_doctor_config(
         cli_home,
         '[dream]\nensemble = "verify"\n'
@@ -543,8 +634,9 @@ def test_doctor_verifier_skips_non_ollama_verifier_route(cli_home: Path, monkeyp
     _mock_doctor_backend(cli_home, monkeypatch)
     assert main(["doctor"]) == 0
     line = _verify_line(capsys.readouterr().out)
-    assert "not ollama" in line
-    assert "skipped" in line
+    assert "probe ok" in line
+    assert "not ollama" not in line
+    assert "skipped" not in line
 
 
 def test_doctor_verifier_present_when_vote_on(cli_home: Path, monkeypatch, capsys) -> None:
@@ -556,7 +648,8 @@ def test_doctor_verifier_present_when_vote_on(cli_home: Path, monkeypatch, capsy
     noticed when the old skip hid the check."""
     _write_doctor_config(
         cli_home,
-        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+        '[dream]\nensemble = "vote"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
     )
     _mock_doctor_backend(cli_home, monkeypatch)
     monkeypatch.setattr(
@@ -580,10 +673,7 @@ def test_doctor_verifier_fallback_distinct_model_for_vote(cli_home: Path, monkey
     to ``dream_verifier`` (daemon ``_build_vote_llm``). The fallback must be a
     distinct model from the dream generator — a same-model vote would degenerate
     to a duplicate pass."""
-    _write_doctor_config(
-        cli_home,
-        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
-    )
+    _write_doctor_config(cli_home)
     _mock_doctor_backend(cli_home, monkeypatch)
     # dream and verifier share the same model — should fail distinct check
     monkeypatch.setattr(
@@ -600,7 +690,8 @@ def test_doctor_verifier_fallback_distinct_model_for_vote(cli_home: Path, monkey
         'preset = "embedded"\n'
         + _ISOLATED_BLOCK
         + '[dream]\nensemble = "vote"\n'
-        + '[dream.llm.dream_verifier]\nmodel = "qwen3.5:9b"\nnum_ctx = 67000\n',
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 40000\n'
+        + '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 67000\n',
         encoding="utf-8",
     )
     assert main(["doctor"]) == 1
@@ -616,7 +707,7 @@ def test_doctor_vote_uses_dedicated_dream_vote_route_when_configured(
     _write_doctor_config(
         cli_home,
         '[dream]\nensemble = "vote"\n'
-        "[dream.llm.dream_verifier]\nnum_ctx = 67000\n"
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n'
         '[dream.llm.dream_vote]\ndriver = "ollama"\nmodel = "qwen3.5:7b"\nnum_ctx = 67000\n',
     )
     _mock_doctor_backend(cli_home, monkeypatch)
@@ -791,6 +882,73 @@ def test_up_skips_model_preflight_for_non_ollama_route(cli_home: Path, monkeypat
     assert main(["up"]) == 0
     assert consulted == []
     assert calls == {"build_stores": 1, "run_server": 1}
+
+
+def test_up_prints_not_configured_route_summary(cli_home: Path, monkeypatch, capsys) -> None:
+    """A fresh install (no dream route) gets the honest not-configured summary,
+    not an ollama-specific readiness note."""
+    _write_up_config(cli_home)
+    _fake_up_runtime(monkeypatch)
+    assert main(["up"]) == 0
+    out = capsys.readouterr().out
+    assert "dream route: not configured (dreams deferred)" in out
+    assert "Ollama readiness" not in out
+
+
+def test_up_prints_ollama_route_summary_and_readiness_note(cli_home: Path, monkeypatch, capsys) -> None:
+    _write_up_config(
+        cli_home,
+        '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\n',
+    )
+    _fake_up_runtime(monkeypatch)
+    assert main(["up"]) == 0
+    out = capsys.readouterr().out
+    assert "dream route: ollama/qwen3.5:9b @ http://localhost:11434" in out
+    assert "Ollama readiness does not gate the memory daemon" in out
+
+
+def test_up_prints_cloud_route_summary_without_ollama_note(cli_home: Path, monkeypatch, capsys) -> None:
+    """The ollama-specific readiness note prints only for ollama routes; a
+    cloud route gets the same summary shape with its own endpoint."""
+    _write_up_config(
+        cli_home,
+        '[dream.llm.dream]\ndriver = "openai_compatible"\n'
+        'model = "deepseek-chat"\nbase_url = "https://api.deepseek.com/v1"\n',
+    )
+    _fake_up_runtime(monkeypatch)
+    assert main(["up"]) == 0
+    out = capsys.readouterr().out
+    assert "dream route: openai_compatible/deepseek-chat @ https://api.deepseek.com/v1" in out
+    assert "Ollama readiness" not in out
+
+
+def test_up_banner_reflects_the_db_primary_overlay(cli_home: Path, monkeypatch, capsys) -> None:
+    """The settings DB is primary: an install whose DB holds the route but
+    whose file lost it gets the restored-route summary — never the
+    'not configured' line the pre-reconcile file view would print."""
+    from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
+
+    _write_up_config(cli_home)
+    meta_store = SqliteMetaDriver(path=str(cli_home / "meta.db"))
+    for key, value in {
+        "dream.llm.dream.driver": "ollama",
+        "dream.llm.dream.model": "qwen3.5:9b",
+        "dream.llm.dream.base_url": "http://localhost:11434",
+    }.items():
+        meta_store.set_config(key, {"value": value})
+    _fake_up_runtime(monkeypatch)
+
+    class _MetaStores:
+        meta = meta_store
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("mnemoseed_local.storage.factory.build_stores", lambda config: _MetaStores())
+    assert main(["up"]) == 0
+    out = capsys.readouterr().out
+    assert "dream route: ollama/qwen3.5:9b @ http://localhost:11434" in out
+    assert "not configured" not in out
 
 
 # ------------------------------------------- B2.12: doctor observability checks
@@ -1136,12 +1294,15 @@ def test_doctor_profile_check_quiet_when_every_id_is_registered(cli_home: Path, 
 
 
 def test_init_prints_next_steps_guidance(cli_home: Path, capsys) -> None:
+    """No factory dream route: the next step is binding one via the console
+    wizard, never an ollama pull."""
     assert main(["init"]) == 0
     out = capsys.readouterr().out
     assert "next steps:" in out
     assert "  1. mnemoseed-local doctor   (self-check incl. hardware tier)" in out
-    assert "  2. ollama pull qwen3.5:9b   (dream model, first time only)" in out
+    assert "  2. bind a dream model in the console: http://localhost:7788/#/config" in out
     assert "  3. mnemoseed-local up" in out
+    assert "ollama pull" not in out
 
 
 # ---------------------------------------------------------------- profiles (#109)

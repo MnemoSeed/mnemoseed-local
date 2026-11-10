@@ -8,7 +8,7 @@
 
 ### 0.1 一句话定位
 
-**MnemoSeed-Local 是主仓 MnemoSeed 的本地单机移植：一个只在本机回环地址上运行的记忆层守护进程**——loopback 隐式信任、无账号体系、profile 固定为 `default`、CLI 与 MCP 优先、dream 巩固走本地模型（ollama 默认）、记忆明文不出本机。
+**MnemoSeed-Local 是主仓 MnemoSeed 的本地单机移植：一个只在本机回环地址上运行的记忆层守护进程**——loopback 隐式信任、无账号体系、profile 固定为 `default`、CLI 与 MCP 优先、dream 巩固走显式绑定的模型（无默认宿主：新装出厂无 dream 路由，B7 起拆除默认 ollama）、记忆明文不出本机。
 
 ### 0.2 与主仓的关系
 
@@ -54,7 +54,7 @@ flowchart LR
 每条原则都在代码或 mvp-design.md 有出处，不列入无出处原则：
 
 1. **verbatim 全量入库契约（"Capture 即拒绝"的演化形态）**：v1.4 起漏斗第一闸的"拒绝优先"演化为"F2 durability 判定只作元数据注解、绝不过滤落库"——每个 turn 原文逐字进 chunk，scorer 的 S 仅供积分池积累（mvp-design.md v1.4 注记、§4.4；`capture/scorer.py` 模块 docstring；`capture/pipeline.py` ScoringStats 文档）。
-2. **本地优先**：仅 loopback 绑定，非回环地址拒绝启动（`daemon/app.py`）；dream 推理默认 ollama（`config.py` DEFAULT_LLM_ROUTES）。
+2. **本地优先**：仅 loopback 绑定，非回环地址拒绝启动（`daemon/app.py`）；dream 推理无默认宿主（B7 起 `config.py` DEFAULT_LLM_ROUTES 为空，模型经 provider 目录/配置显式绑定；存量安装的旧默认已随首次 boot 导入 settings DB 且 DB 覆盖文件，行为不变）。
 3. **完整读、分流写**：dream 的 snapshot 是全量只读场景（100% 完整场景，无上下文断裂），写回按认知分流 core / isolated / salvage 三分流（mvp-design.md §3 dream 行、§5）。
 4. **诚实空 / 自报告覆盖**：检索无合格候选时返回显式"无相关记忆"语义，绝不垫低质替代品；`dropped_count` 与 CoverageReport 自报搜索覆盖（`retrieve/assemble.py` FR-3.13；honest empty 语义见 03）。
 5. **捕获中立**：评分只读内容本身，不读 anima/偏好状态（本仓无 anima 模块，红线形态照常保留，理论出处见 01 §2 与主仓 design/01 §1）。

@@ -58,29 +58,13 @@ function Invoke-MnemoSeedTaskInstallation {
         [Parameter(Mandatory = $true)][string]$BootstrapSource,
         [Parameter(Mandatory = $true)][string]$TaskName,
         [Parameter(Mandatory = $true)][string]$User,
-        [scriptblock]$TaskLookup,
-        [scriptblock]$TaskUnregister,
         [scriptblock]$TaskInvoker
     )
-    $migrationArguments = @{
-        BootstrapSource = $BootstrapSource
-        TaskName = $TaskName
-        User = $User
-        MigrateLegacyOllamaTask = $true
-    }
-    if ($null -ne $TaskLookup) { $migrationArguments.TaskLookup = $TaskLookup }
-    if ($null -ne $TaskUnregister) { $migrationArguments.TaskUnregister = $TaskUnregister }
-    [void](& $TaskScript @migrationArguments)
-    $exitVariable = Get-Variable LASTEXITCODE -ErrorAction SilentlyContinue
-    if ($null -ne $exitVariable -and $exitVariable.Value -ne 0) {
-        throw "legacy task migration failed with exit code $LASTEXITCODE"
-    }
-
     $registrationArguments = @{ BootstrapSource = $BootstrapSource; TaskName = $TaskName; User = $User }
     if ($null -eq $TaskInvoker) {
         [void](& $TaskScript @registrationArguments)
         $exitVariable = Get-Variable LASTEXITCODE -ErrorAction SilentlyContinue
-    if ($null -ne $exitVariable -and $exitVariable.Value -ne 0) {
+        if ($null -ne $exitVariable -and $exitVariable.Value -ne 0) {
             throw "daemon task registration failed with exit code $LASTEXITCODE"
         }
     } else {

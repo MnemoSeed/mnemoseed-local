@@ -4,11 +4,7 @@ param(
     [string]$BootstrapSource,
     [string]$TaskName = 'MnemoSeedLocalDaemon',
     [string]$User = $env:USERNAME,
-    [switch]$Uninstall,
-    [switch]$MigrateLegacyOllamaTask,
-    [scriptblock]$TaskLookup,
-    [scriptblock]$TaskUnregister,
-    [string]$MigrationResult = ''
+    [switch]$Uninstall
 )
 
 Set-StrictMode -Version 2.0
@@ -119,42 +115,6 @@ function Test-TaskContract($Task, [string]$ExpectedBootstrapSource) {
     if ((Get-PropertyValue $settings 'WakeToRun') -ne $false) { return $false }
     if ((Get-PropertyValue $settings 'RunOnlyIfNetworkAvailable') -ne $false) { return $false }
     return $true
-}
-
-function Test-ExactLegacyOllamaTask($Task) {
-    if ($null -eq $Task -or @($Task).Count -ne 1) { return $false }
-    $task = @($Task)[0]
-    if ((Get-PropertyValue $task 'TaskName') -ne 'OllamaHeadlessServe') { return $false }
-    if ((Get-PropertyValue $task 'TaskPath') -ne '\') { return $false }
-    if ((Get-PropertyValue $task 'Description') -ne 'Headless ollama API server (mnemoseed-local dream engine): background-only, no desktop app required.') { return $false }
-    if (-not (Test-CurrentUserTask $task)) { return $false }
-    $triggers = @(Get-PropertyValue $task 'Triggers')
-    if ($triggers.Count -ne 1) { return $false }
-    $trigger = $triggers[0]
-    if ((Get-PropertyValue (Get-PropertyValue $trigger 'CimClass') 'CimClassName') -ne 'MSFT_TaskLogonTrigger') { return $false }
-    $triggerUser = [string](Get-PropertyValue $trigger 'UserId')
-    if (($triggerUser -ne $User) -and ($triggerUser -notmatch "[\\/]$([regex]::Escape($User))$")) { return $false }
-    $actions = @(Get-PropertyValue $task 'Actions')
-    if ($actions.Count -ne 1) { return $false }
-    $expectedPath = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
-    if ((Get-PropertyValue $actions[0] 'Execute') -ne $expectedPath) { return $false }
-    return (Get-PropertyValue $actions[0] 'Arguments') -ceq 'serve'
-}
-
-if ($MigrateLegacyOllamaTask) {
-    $lookup = if ($null -eq $TaskLookup) { { param($Name) Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue } } else { $TaskLookup }
-    $existing = @(& $lookup 'OllamaHeadlessServe')
-    if ($existing.Count -eq 0) {
-        $migration = @{ Present = $false; Unregistered = $false }
-    } elseif (Test-ExactLegacyOllamaTask $existing) {
-        $unregister = if ($null -eq $TaskUnregister) { { param($Definition, $Name) Unregister-ScheduledTask -InputObject $Definition -Confirm:$false } } else { $TaskUnregister }
-        & $unregister $existing[0] 'OllamaHeadlessServe'
-        $migration = @{ Present = $true; Unregistered = $true }
-    } else {
-        throw "scheduled task OllamaHeadlessServe exists but does not match the exact task created by the prior MnemoSeed installer; it was preserved; inspect it manually and remove or rename it before retrying"
-    }
-    if (-not [string]::IsNullOrEmpty($MigrationResult)) { $migration | ConvertTo-Json -Compress | Set-Content -LiteralPath $MigrationResult }
-    return $migration
 }
 
 if (-not (Test-Path -LiteralPath $BootstrapSource -PathType Leaf)) {

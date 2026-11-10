@@ -18,8 +18,6 @@ AUTOSTART_FIXTURE = TESTS / "windows_autostart_fixture.ps1"
 AMBIENT_FIXTURES = (
     (TESTS / "windows_task_fixture.ps1", "USERNAME", "User"),
     (TESTS / "windows_install_bootstrap_fixture.ps1", "USERNAME", "User"),
-    (TESTS / "windows_install_migration_fixture.ps1", "USERNAME", "User"),
-    (TESTS / "windows_install_migration_fixture.ps1", "LOCALAPPDATA", "LocalAppData"),
     (TESTS / "windows_install_operation_fixture.ps1", "USERNAME", "User"),
     (TESTS / "windows_install_operation_fixture.ps1", "LOCALAPPDATA", "LocalAppData"),
 )

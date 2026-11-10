@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemoseed_local.config import Config
+from mnemoseed_local.config import Config, RoleLLMConfig
 from mnemoseed_local.dream import ReflectedTriple, ReflectionResult, Route
 from mnemoseed_local.dream.snapshot import Snapshot, SnapshotChunk
 from mnemoseed_local.dream.verify import StubVerifyLLM, TripleVerifier
@@ -98,15 +98,13 @@ def _core(chunk_id: str) -> ReflectedTriple:
 
 
 def _config_with_verifier_ctx(num_ctx: int | None, *, driver: str = "ollama") -> Config:
+    """An explicit verify-seat route (no factory route exists to inherit)."""
     config = Config()
     config.dream = replace(config.dream, ensemble="verify")
-    route = config.llm["dream_verifier"]
-    params = dict(route.params)
-    if num_ctx is None:
-        params.pop("num_ctx", None)
-    else:
-        params["num_ctx"] = num_ctx
-    config.llm["dream_verifier"] = replace(route, driver=driver, params=params)
+    params: dict[str, object] = {} if num_ctx is None else {"num_ctx": num_ctx}
+    config.llm["dream_verifier"] = RoleLLMConfig(
+        role="dream_verifier", driver=driver, model="judge-model", params=params
+    )
     return config
 
 
@@ -222,7 +220,10 @@ def _mock_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 def _write_doctor_config(home: Path, extra: str) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.toml").write_text(
-        'preset = "embedded"\n' + _ISOLATED_BLOCK + extra + "[dream.llm.dream]\nnum_ctx = 40000\n",
+        'preset = "embedded"\n'
+        + _ISOLATED_BLOCK
+        + extra
+        + '[dream.llm.dream]\ndriver = "ollama"\nmodel = "qwen3.5:9b"\nnum_ctx = 40000\n',
         encoding="utf-8",
     )
 
@@ -243,12 +244,16 @@ def _ctx_line(out: str) -> str:
     return next(line for line in out.splitlines() if "verifier ctx window" in line)
 
 
-def test_doctor_verifier_ctx_window_fails_on_factory_gap(doctor_home: Path, capsys) -> None:
-    """Q7 made visible: verify ON with the factory verifier num_ctx=16384 vs
-    the 32000 delta ceiling is an honest FAIL naming both fix keys."""
+def test_doctor_verifier_ctx_window_fails_on_a_tight_window(doctor_home: Path, capsys) -> None:
+    """Q7 made visible: verify ON with a verifier window too small for the
+    double-ceiling estimate is an honest FAIL naming both fix keys."""
     from mnemoseed_local.cli import main
 
-    _write_doctor_config(doctor_home, '[dream]\nensemble = "verify"\n')
+    _write_doctor_config(
+        doctor_home,
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 16384\n',
+    )
     assert main(["doctor"]) == 1
     line = _ctx_line(capsys.readouterr().out)
     assert "FAIL" in line
@@ -261,7 +266,8 @@ def test_doctor_verifier_ctx_window_passes_when_fitting(doctor_home: Path, capsy
 
     _write_doctor_config(
         doctor_home,
-        '[dream]\nensemble = "verify"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+        '[dream]\nensemble = "verify"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
     )
     assert main(["doctor"]) == 0
     line = _ctx_line(capsys.readouterr().out)
@@ -301,7 +307,8 @@ def test_doctor_verifier_ctx_window_validates_vote_fallback(doctor_home: Path, c
     # a tight fallback window must FAIL, not be skipped
     _write_doctor_config(
         doctor_home,
-        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 5000\n',
+        '[dream]\nensemble = "vote"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 5000\n',
     )
     assert main(["doctor"]) == 1
     line = _ctx_line(capsys.readouterr().out)
@@ -311,7 +318,8 @@ def test_doctor_verifier_ctx_window_validates_vote_fallback(doctor_home: Path, c
     # fitting fallback window passes
     _write_doctor_config(
         doctor_home,
-        '[dream]\nensemble = "vote"\n[dream.llm.dream_verifier]\nnum_ctx = 67000\n',
+        '[dream]\nensemble = "vote"\n'
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n',
     )
     assert main(["doctor"]) == 0
     line = _ctx_line(capsys.readouterr().out)
@@ -326,7 +334,7 @@ def test_doctor_verifier_ctx_window_validates_dedicated_vote_route(doctor_home: 
     _write_doctor_config(
         doctor_home,
         '[dream]\nensemble = "vote"\n'
-        "[dream.llm.dream_verifier]\nnum_ctx = 67000\n"
+        '[dream.llm.dream_verifier]\ndriver = "ollama"\nmodel = "gemma4:e4b"\nnum_ctx = 67000\n'
         '[dream.llm.dream_vote]\ndriver = "ollama"\nmodel = "qwen3.5:7b"\nnum_ctx = 5000\n',
     )
     assert main(["doctor"]) == 1

@@ -186,7 +186,7 @@ flowchart TB
 
 ### 3.5 ensemble verify 校验层（PRD-B1 交付）
 
-- 形态：模型 B（`dream_verifier` 路由，默认 `ollama / gemma4:e4b`，`config.py:292-304`）逐条裁 A 的 **folded core triple**（只送 core，isolated/salvage 在主图外无可保护对象）；单次调用、**不重试**（校验层非关键路径，任何失败 = 整轮回退 A 原样 + 审计）。
+- 形态：模型 B（`dream_verifier` 路由，默认 `ollama / gemma4:e4b`，`config.py:292-304`；边界修订：B7 起 `DEFAULT_LLM_ROUTES` 清空，路由显式绑定——ensemble 开启而 verifier 路由缺席时 doctor skip、永不 KeyError）逐条裁 A 的 **folded core triple**（只送 core，isolated/salvage 在主图外无可保护对象）；单次调用、**不重试**（校验层非关键路径，任何失败 = 整轮回退 A 原样 + 审计）。
 - 拒绝语义：`reject → replace(route=ISOLATED)`（分歧保档，永不投票消灭、永不删除）；`accept → 原样`。
 - 回退全集（`_fallback`）：LLMUnavailable / JSON 解析失败 / 覆盖不齐（缺号/多号/重号/垃圾 verdict 值）→ 返回 A 原结果 + `ensemble_verify_fallback` 审计（reason ∈ `llm_unavailable | malformed_output | coverage_mismatch`；窗口超限另加 `window_exceeded`）。
 - 运行期窗口守卫：`_window_overflow` 对渲染后的判定 prompt 做 `estimate_tokens(system+user) + VERIFY_MARGIN_TOKENS(2048) > num_ctx` 预检，超窗即回退——绝不把会被静默截断的判定交给 B。
