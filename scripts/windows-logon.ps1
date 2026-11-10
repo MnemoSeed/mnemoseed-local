@@ -1,13 +1,11 @@
 #Requires -Version 5.1
 param(
-    [int]$OllamaTimeoutSeconds = 30,
     [scriptblock]$HealthProbe,
     [scriptblock]$PathProbe,
     [scriptblock]$PortProbe,
     [scriptblock]$ProcessProbe,
     [scriptblock]$CommandProbe,
     [scriptblock]$Launcher,
-    [scriptblock]$Sleeper,
     [string]$TaskIdentity
 )
 
@@ -25,7 +23,6 @@ $ConfigHome = if ([string]::IsNullOrEmpty($env:MNEMOSEED_LOCAL_HOME)) {
     $env:MNEMOSEED_LOCAL_HOME
 }
 $DisabledMarker = Join-Path $ConfigHome 'daemon.off'
-$OllamaUrl = 'http://127.0.0.1:11434'
 $DaemonUrl = 'http://127.0.0.1:7788'
 
 function Get-PropertyValue($Object, [string]$Name) {
@@ -52,10 +49,6 @@ function Test-Health([string]$Url) {
     } catch {
         return $false
     }
-}
-
-function Test-OllamaReady {
-    return Test-Health "$OllamaUrl/api/tags"
 }
 
 function Test-DaemonHealthy {
@@ -119,21 +112,8 @@ try {
     if (-not $hasLock) { exit 0 }
     if (Test-DaemonDisabled) { exit 0 }
 
-    if (-not (Test-OllamaReady)) {
-        $deadline = (Get-Date).AddSeconds($OllamaTimeoutSeconds)
-        while ((Get-Date) -lt $deadline -and -not (Test-OllamaReady)) {
-            if ($null -ne $Sleeper) {
-                & $Sleeper 500
-            } else {
-                Start-Sleep -Milliseconds 500
-            }
-        }
-    }
-    if (-not (Test-OllamaReady)) {
-        [Console]::Error.WriteLine(
-            "MnemoSeed logon start: Ollama API is unavailable at $OllamaUrl; starting the MnemoSeed daemon anyway. Dream work will defer until Ollama is ready."
-        )
-    }
+    # The daemon starts directly; dream readiness is its own deferred-
+    # degradation concern, never a startup wait on an external service.
     if (Test-DaemonDisabled) { exit 0 }
     $daemonListener = Get-Listener 7788
     if ($null -ne $daemonListener) {

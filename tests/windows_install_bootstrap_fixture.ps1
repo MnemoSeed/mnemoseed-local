@@ -75,15 +75,8 @@ try {
         param([string]$Path, [hashtable]$Arguments)
         $null = $events.Add("register:$($Arguments.TaskName)")
     }
-    $lookup = {
-        param([string]$Name)
-        $null = $events.Add("lookup:$Name")
-        return
-    }
-    $unregister = { param($Definition, [string]$Name) $null = $events.Add("unregister:$Name") }
     Invoke-MnemoSeedTaskInstallation -TaskScript $resolved.TaskRegistration -BootstrapSource $resolved.BootstrapSource `
-        -TaskName 'MnemoSeedLocalDaemon' -User $User -TaskLookup $lookup -TaskUnregister $unregister `
-        -TaskInvoker $registration
+        -TaskName 'MnemoSeedLocalDaemon' -User $User -TaskInvoker $registration
     $success = $true
 } catch {
     $errorMessage = $_.Exception.Message

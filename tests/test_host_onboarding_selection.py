@@ -52,11 +52,7 @@ needs_pwsh = pytest.mark.skipif(
 
 #: Test double for the Windows task registrar: declares the splatted parameter
 #: contract and performs nothing.
-FAKE_TASK_SCRIPT = (
-    "param(\n"
-    "    [string]$BootstrapSource, [string]$TaskName, [string]$User, [switch]$MigrateLegacyOllamaTask\n"
-    ")\n"
-)
+FAKE_TASK_SCRIPT = "param(\n    [string]$BootstrapSource, [string]$TaskName, [string]$User\n)\n"
 
 
 class _Installer:
@@ -284,8 +280,8 @@ def test_windows_installer_selects_hosts_explicitly_and_refuses_pre_write() -> N
     validation_call = PS1_TEXT.index("$HostSelection = Get-HostSelection $Hosts")
     assert validation_call < PS1_TEXT.index("# --- dry-run plan")
     assert validation_call < PS1_TEXT.index("# --- step 1: ollama")
-    assert "[9/10] host adapter wiring" in PS1_TEXT
-    assert "[9/10] OpenCode host adapter hook" not in PS1_TEXT
+    assert "[8/9] host adapter wiring" in PS1_TEXT
+    assert "[8/9] OpenCode host adapter hook" not in PS1_TEXT
     assert "foreach ($hostKey in $HostSelection)" in PS1_TEXT
     assert "adapter install failed" in PS1_TEXT
     assert "adapter install failed" in SH_TEXT
@@ -304,7 +300,7 @@ def test_host_selection_stays_orthogonal_to_the_setup_mode() -> None:
     sh_step = SH_TEXT[SH_TEXT.index("[8/9] host adapter wiring") : SH_TEXT.index("# --- step 9")]
     assert "MODE" not in sh_step
     assert "[ValidateSet('CaptureRecall', 'Refinement')]" in PS1_TEXT
-    ps1_step = PS1_TEXT[PS1_TEXT.index("[9/10] host adapter wiring") : PS1_TEXT.index("# --- step 8")]
+    ps1_step = PS1_TEXT[PS1_TEXT.index("[8/9] host adapter wiring") : PS1_TEXT.index("# --- step 9")]
     assert "$Mode" not in ps1_step
     assert "$CliMode" not in ps1_step
 
@@ -314,7 +310,7 @@ def test_dry_run_plan_reports_the_host_selection() -> None:
     assert "no host adapter wiring (no --hosts value" in SH_TEXT
     assert "'    plan:  would run `mnemoseed-local hook install opencode`'" in SH_TEXT
     assert "mnemoseed-local host install --host $_host" in SH_TEXT
-    assert "[9] host adapter wiring" in PS1_TEXT
+    assert "[8] host adapter wiring" in PS1_TEXT
     assert "no host adapter wiring (no -Hosts value" in PS1_TEXT
     assert "mnemoseed-local host install --host $hostKey" in PS1_TEXT
 
@@ -361,7 +357,7 @@ def test_installers_offer_an_interactive_selection_only_from_an_empty_selection(
     sh_empty = sh_step[sh_step.index('if [ -z "$HOST_SELECTED" ]; then') :]
     assert "[ -t 0 ]" in sh_empty
     assert "offer_installed_host_selection" in sh_empty
-    ps_step = PS1_TEXT[PS1_TEXT.index("[9/10] host adapter wiring") : PS1_TEXT.index("# --- step 8")]
+    ps_step = PS1_TEXT[PS1_TEXT.index("[8/9] host adapter wiring") : PS1_TEXT.index("# --- step 9")]
     ps_empty = ps_step[ps_step.index("if ($HostSelection.Count -eq 0) {") :]
     assert "Select-HostsInteractively" in ps_empty
     for text in (SH_TEXT, PS1_TEXT):

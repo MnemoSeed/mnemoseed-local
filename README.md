@@ -36,10 +36,14 @@ Start `mnemoseed-local up` in a separate terminal, then follow the
 [host setup and verification steps](docs/guide.md#host-setup). Installation alone
 does not connect your coding agent or configure startup at login.
 
-This setup keeps automatic dream off. Capture and recall can run without Ollama.
-For manual dream consolidation,
-[install Ollama and prepare the configured model](docs/guide.md#dream-model-setup).
-The default dream route uses `qwen3.5:9b`; hardware requirements depend on the model.
+This setup keeps automatic dream off. Capture and recall work out of the box;
+nothing installs, waits for, or pulls Ollama by default. Dreaming stays off
+until you bind a model through the console provider catalog — an
+OpenAI-compatible preset (OpenAI, Anthropic, Google Gemini, DeepSeek, Moonshot
+Kimi, xAI Grok, OpenRouter, NVIDIA NIM), a custom endpoint, or a locally
+detected Ollama. See [dream model setup](docs/guide.md#dream-model-setup).
+The installers offer `--install-ollama` / `-InstallOllama` for the bundled
+Ollama convenience; hardware requirements depend on the bound model.
 
 ## Supported hosts
 
@@ -65,8 +69,9 @@ Host coverage varies by platform. Codex Desktop app-server mode is unverified.
 ## What it does NOT do yet
 
 Memory is stored in plaintext; there is no encryption-at-rest guarantee.
-Dream inference uses a local model by default, but a remote endpoint can be
-configured and receives the data sent to it. Multi-device sync and a hosted
+Dreaming runs only after you bind a model: a locally detected Ollama or a
+remote provider endpoint can be configured, and a remote endpoint receives
+the data sent to it. Multi-device sync and a hosted
 cloud daemon are outside this edition. Experience learning remains unfinished
 and off; dream currently produces structured facts. Login autostart (Windows
 logon task, Linux systemd user unit, macOS launchd agent), when registered,

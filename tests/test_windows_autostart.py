@@ -164,14 +164,6 @@ def test_off_before_start_does_not_probe_or_launch(tmp_path: Path) -> None:
     assert "Ollama" not in completed.stderr
 
 
-def test_off_during_ollama_wait_does_not_launch_daemon(tmp_path: Path) -> None:
-    completed = run_bootstrap(tmp_path, "off-during")
-
-    assert completed.returncode == 0
-    assert result_text(tmp_path) == "marked"
-    assert "launch" not in result_text(tmp_path)
-
-
 def test_healthy_existing_daemon_is_idempotent(tmp_path: Path) -> None:
     completed = run_bootstrap(tmp_path, "healthy")
 
@@ -193,16 +185,6 @@ def test_listener_pid_must_be_stable_around_health(tmp_path: Path) -> None:
     assert completed.returncode == 1
     assert "changed PID" in completed.stderr
     assert "launch" not in result_text(tmp_path)
-
-
-def test_ollama_timeout_diagnoses_and_starts_memory_daemon(tmp_path: Path) -> None:
-    completed = run_bootstrap(tmp_path, "ollama-timeout")
-
-    assert completed.returncode == 0
-    assert "Ollama API" in completed.stderr
-    assert "starting the MnemoSeed daemon anyway" in completed.stderr
-    assert "OllamaTimeoutSeconds = 30" in BOOTSTRAP
-    assert "launch" in result_text(tmp_path)
 
 
 def test_unknown_port_owner_is_rejected(tmp_path: Path) -> None:
@@ -242,8 +224,11 @@ def test_bootstrap_never_starts_ollama_or_pulls_a_model(tmp_path: Path) -> None:
 
     assert completed.returncode == 0
     assert "Start-Process" not in BOOTSTRAP
-    assert "ollama serve" not in BOOTSTRAP.lower()
-    assert "ollama pull" not in BOOTSTRAP.lower()
+    lowered = BOOTSTRAP.lower()
+    # The daemon starts directly; the script references no Ollama at all.
+    assert "ollama" not in lowered
+    assert "11434" not in BOOTSTRAP
+    assert "sleeper" not in lowered
     assert "pull" not in result_text(tmp_path)
 
 
@@ -375,40 +360,34 @@ def test_uninstall_refuses_ambiguous_same_name_task_outside_owned_path(
     assert not (tmp_path / "task-result.json").exists()
 
 
-def test_installer_does_not_manage_ollama_startup() -> None:
-    lowered = (INSTALL + INSTALL_HELPERS.read_text(encoding="utf-8")).lower()
-    assert "migratelegacyollamatask" in lowered
-    assert "register-scheduledtask" not in lowered
-    assert "start-process" not in lowered
-    assert "start-process" not in lowered
-    assert "native" in lowered
-    assert "tray" in lowered
+def test_installer_no_longer_carries_ollama_migration_or_wait() -> None:
+    helpers = INSTALL_HELPERS.read_text(encoding="utf-8")
+    task = TASK_REGISTRAR.read_text(encoding="utf-8")
+    lowered_install = INSTALL.lower()
+    lowered_helpers = helpers.lower()
+    lowered_task = task.lower()
+    lowered_bootstrap = BOOTSTRAP.lower()
+    # No legacy Ollama machinery remains anywhere: the installer no longer
+    # manages Ollama startup, migrates a legacy task, or waits for its API.
+    assert "migratelegacyollamatask" not in lowered_install
+    assert "ollamaheadlessserve" not in lowered_install
+    assert "ollama" not in lowered_helpers
+    assert "ollama" not in lowered_task
+    assert "ollamaheadlessserve" not in lowered_bootstrap
+    # install.ps1 + helpers never register tasks or start processes directly.
+    lowered_install_helpers = lowered_install + lowered_helpers
+    assert "register-scheduledtask" not in lowered_install_helpers
+    assert "start-process" not in lowered_install_helpers
 
 
-def run_legacy_migration(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
-    return run_fixture(
-        [
-            PWSH,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(ROOT / "tests" / "windows_install_migration_fixture.ps1"),
-            "-TaskScript",
-            str(TASK_REGISTRAR),
-            "-Bootstrap",
-            str(ROOT / "scripts" / "windows-logon.ps1"),
-            "-User",
-            TEST_USER,
-            "-LocalAppData",
-            str(tmp_path / "LocalAppData"),
-            "-Scenario",
-            scenario,
-            "-Result",
-            str(tmp_path / "migration-result.json"),
-        ],
-        tmp_path,
-    )
+def test_installer_ollama_step_is_opt_in() -> None:
+    assert "[switch]$InstallOllama" in INSTALL
+    assert "winget install -e --id Ollama.Ollama" in INSTALL
+    assert "skipped (-InstallOllama not given" in INSTALL
+    # The default path prints no Ollama plan lines: the winget text sits only
+    # inside the switch-gated branch of the dry-run plan.
+    dry_run_section = INSTALL[INSTALL.index("# --- dry-run plan") : INSTALL.index("# --- step 1: ollama")]
+    assert "skipped (-InstallOllama not given; MnemoSeed never installs Ollama by default)" in dry_run_section
 
 
 def run_install_operation(tmp_path: Path, scenario: str) -> subprocess.CompletedProcess[str]:
@@ -439,38 +418,14 @@ def run_install_operation(tmp_path: Path, scenario: str) -> subprocess.Completed
     )
 
 
-@pytest.mark.parametrize("scenario", ["owned", "missing"])
-def test_installer_operation_migrates_then_registers_daemon(tmp_path: Path, scenario: str) -> None:
-    completed = run_install_operation(tmp_path, scenario)
+def test_installer_operation_registers_the_daemon_without_legacy_migration(tmp_path: Path) -> None:
+    completed = run_install_operation(tmp_path, "registered")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     events = (tmp_path / "operation-events.json").read_text(encoding="utf-8")
-    assert '"Call":"lookup"' in events
-    assert '"Call":"unregister"' in events if scenario == "owned" else '"Call":"unregister"' not in events
-    assert events.rfind('"Migrate":true') < events.rfind('"Migrate":false')
-
-
-@pytest.mark.parametrize("scenario", ["foreign", "drifted"])
-def test_installer_operation_does_not_register_after_rejected_migration(
-    tmp_path: Path, scenario: str
-) -> None:
-    completed = run_install_operation(tmp_path, scenario)
-    assert completed.returncode != 0
-    assert "preserved" in completed.stdout.lower() + completed.stderr.lower()
-    assert '"Call":"invoke"' not in (tmp_path / "operation-events.json").read_text(encoding="utf-8")
-
-
-def test_installer_removes_only_exact_legacy_ollama_task(tmp_path: Path) -> None:
-    completed = run_legacy_migration(tmp_path, "owned")
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert '"Unregistered":true' in (tmp_path / "migration-result.json").read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize("scenario", ["foreign", "drifted"])
-def test_installer_preserves_foreign_or_drifted_ollama_task(tmp_path: Path, scenario: str) -> None:
-    completed = run_legacy_migration(tmp_path, scenario)
-    assert completed.returncode != 0
-    assert "manual" in completed.stderr.lower()
-    assert not (tmp_path / "migration-result.json").exists()
+    assert '"Call":"invoke"' in events
+    assert '"Call":"lookup"' not in events
+    assert '"Call":"unregister"' not in events
+    assert '"Migrate"' not in events
 
 
 @pytest.mark.parametrize(
@@ -555,8 +510,9 @@ def test_installer_bootstrap_executes_extracted_functions_with_empty_script_root
     assert any(event.endswith("windows-install-helpers.ps1") for event in payload["Events"])
     assert any(event.endswith("windows-logon.ps1") for event in payload["Events"])
     assert any(event.endswith("windows-logon-task.ps1") for event in payload["Events"])
-    assert "lookup:OllamaHeadlessServe" in payload["Events"]
     assert "register:MnemoSeedLocalDaemon" in payload["Events"]
+    assert not any(event.startswith("lookup:") for event in payload["Events"])
+    assert not any(event.startswith("unregister:") for event in payload["Events"])
 
 
 @pytest.mark.parametrize("scenario", ["local-siblings", "module-syntax-failure", "partial-download"])
@@ -598,14 +554,19 @@ def test_installer_bootstrap_precedence_and_failure_cleanup(tmp_path: Path, scen
         assert not any(event.startswith("register:") for event in payload["Events"])
 
 
-def test_install_dry_run_documents_exact_legacy_migration(tmp_path: Path) -> None:
+def test_install_dry_run_documents_the_opt_in_ollama_step(tmp_path: Path) -> None:
     completed = _run_captured(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ROOT / "install.ps1"), "-DryRun"],
         timeout=20,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "remove only the exact root OllamaHeadlessServe task" in completed.stdout
-    assert "preserve and reject a same-name foreign/drifted task" in completed.stdout
+    assert "OllamaHeadlessServe" not in completed.stdout
+    assert (
+        "skipped (-InstallOllama not given; MnemoSeed never installs Ollama by default)" in completed.stdout
+    )
+    assert "skipped (-InstallOllama not given; no dream model is pulled)" in completed.stdout
+    assert "winget install" not in completed.stdout
+    assert "ollama pull" not in completed.stdout
 
 
 def test_daemon_task_contract_is_explicit() -> None:

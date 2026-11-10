@@ -1,15 +1,16 @@
 """macOS install paths for the POSIX orchestrator.
 
-The capture-recall default completes without touching Ollama and marks the
-dream route honestly, the refinement path installs Ollama through Homebrew
-only when Homebrew is present and the run consents, ``--skip-ollama`` finishes
-the install with the dream route explicitly marked unavailable, and every
-refusal names the exact next commands instead of dead-ending. Every test runs
-the installer with a fully controlled PATH (test shims plus wrapper tools,
-nothing inherited), so ollama, curl and wget are absent by construction and
-no test can reach a real download. The CI matrix runs the script smoke and the
-release install proof on a macOS runner, which stays a runner-level proof and
-never a real-host or model proof.
+Ollama is opt-in only: the default path never installs, waits for, pulls, or
+hides Ollama in any mode, and ``--install-ollama`` gates both the Ollama
+install step (Linux official script; macOS Homebrew behind an explicit [y/N]
+consent that only a terminal stdin or /dev/tty can answer) and the
+confirmation-gated model pull. ``--skip-ollama`` is gone - skipping is the
+default. Every refusal names the exact next commands instead of dead-ending.
+Every test runs the installer with a fully controlled PATH (test shims plus
+wrapper tools, nothing inherited), so ollama, curl and wget are absent by
+construction and no test can reach a real download. The CI matrix runs the
+script smoke and the release install proof on a macOS runner, which stays a
+runner-level proof and never a real-host or model proof.
 """
 
 from __future__ import annotations
@@ -52,6 +53,11 @@ def _extract_function(text: str, header: str) -> str:
         return lines[start]
     end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
     return "\n".join(lines[start : end + 1])
+
+
+def _stdout_step(text: str, start_marker: str, end_marker: str) -> str:
+    """One numbered step's output slice, from its header to the next header."""
+    return text[text.index(start_marker) : text.index(end_marker)]
 
 
 def _decode(completed: subprocess.CompletedProcess[bytes]) -> subprocess.CompletedProcess[str]:
@@ -144,10 +150,10 @@ def _msys_path(path: Path) -> str:
     return posix
 
 
-def _ollama_prelude(
-    shim_dir: Path, *, mode: str = "refinement", skip_ollama: bool = False, yes: bool = False
-) -> str:
-    """The step-1 functions plus the globals they read, with a controlled OS."""
+def _ollama_prelude(shim_dir: Path, *, install_ollama: bool = False, yes: bool = False) -> str:
+    """The step-1 functions plus the globals they read, with a controlled OS.
+    The opt-in flag is part of the prelude: without it the step functions are
+    the silent default path."""
     functions = "\n".join(
         _extract_function(SH_TEXT, header)
         for header in (
@@ -161,9 +167,8 @@ def _ollama_prelude(
     )
     return (
         f"{functions}\n"
-        f"MODE='{mode}'\n"
         "OS_NAME='Darwin'\n"
-        f"SKIP_OLLAMA={1 if skip_ollama else 0}\n"
+        f"INSTALL_OLLAMA={1 if install_ollama else 0}\n"
         f"YES={1 if yes else 0}\n"
         "OLLAMA_URL='https://ollama.com/install.sh'\n"
         f"PATH='{_msys_path(shim_dir)}':\"$PATH\"\n"
@@ -246,17 +251,31 @@ def test_child_path_is_fully_controlled(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- string-level
 
 
-def test_installer_declares_the_skip_ollama_flag() -> None:
-    assert "SKIP_OLLAMA=0" in SH_TEXT
-    assert "--skip-ollama) SKIP_OLLAMA=1 ;;" in SH_TEXT
+def test_installer_declares_the_install_ollama_flag_and_never_the_skip_flag() -> None:
+    assert "INSTALL_OLLAMA=0" in SH_TEXT
+    assert "--install-ollama) INSTALL_OLLAMA=1 ;;" in SH_TEXT
+    assert "--skip-ollama" not in SH_TEXT
+    assert "SKIP_OLLAMA" not in SH_TEXT
     usage = SH_TEXT[SH_TEXT.index("cat <<'EOF'") : SH_TEXT.index("\nEOF\n")]
-    assert "--skip-ollama" in usage
-    assert "no install attempt and no model pull" in usage
-    assert "the dream route is marked unavailable" in usage
+    assert "--install-ollama" in usage
+    assert "--skip-ollama" not in usage
 
 
-def test_installer_documents_the_macos_brew_consent_flow() -> None:
+def test_install_ollama_gates_both_the_install_and_pull_steps() -> None:
+    plan_ollama = _extract_function(SH_TEXT, "plan_ollama() {")
+    assert "--install-ollama not given" in plan_ollama
+    install_ollama = _extract_function(SH_TEXT, "install_ollama() {")
+    assert '[ "$INSTALL_OLLAMA" -ne 1 ]' in install_ollama
+    pull_section = SH_TEXT[SH_TEXT.index("# --- step 7") : SH_TEXT.index("# --- step 8")]
+    assert "INSTALL_OLLAMA" in pull_section
+    pull_plan_section = SH_TEXT[SH_TEXT.index("# --- dry-run plan") : SH_TEXT.index("# --- step 1: ollama")]
+    assert "INSTALL_OLLAMA" in pull_plan_section
+
+
+def test_installer_documents_the_opt_in_macos_brew_consent_flow() -> None:
     header = SH_TEXT[: SH_TEXT.index("set -eu")]
+    assert "1. ollama   (opt-in only: runs exclusively behind --install-ollama" in header
+    assert "default path never installs, waits for, or pulls Ollama in any mode" in header
     assert "macOS: `brew install ollama` behind an explicit [y/N]" in header
     assert "confirm() {" in SH_TEXT
     assert "install Ollama now with Homebrew (`brew install ollama`)? [y/N] " in SH_TEXT
@@ -283,94 +302,87 @@ def test_ci_matrix_runs_the_smoke_and_release_jobs_on_macos() -> None:
 
 
 @needs_sh
-def test_default_capture_recall_install_completes_without_ollama_and_marks_the_dream_route(
+def test_default_capture_recall_install_completes_without_touching_ollama(
     tmp_path: Path,
 ) -> None:
     run, env = _make_installer(tmp_path)
     assert env["PATH"].split(os.pathsep) == [str(tmp_path / "shims"), str(tmp_path / "tools-bin")]
     completed = run()
     assert completed.returncode == 0, _failure_report(completed, env)
-    assert (
-        "skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)"
-        in completed.stdout
-    )
-    assert (
-        "to use the dream engine later: install Ollama (https://ollama.com/download),"
-        " then re-run `mnemoseed-local doctor`" in completed.stdout
-    )
     assert "installation complete:" in completed.stdout
-    assert "init --mode capture-recall" in _shim_log_lines(env)
-    assert not any("ollama" in line or line.startswith("brew") for line in _shim_log_lines(env))
-
-
-@needs_sh
-def test_skip_ollama_refinement_install_finishes_and_marks_the_dream_route_unavailable(
-    tmp_path: Path,
-) -> None:
-    run, env = _make_installer(tmp_path)
-    completed = run("--mode", "refinement", "--skip-ollama")
-    assert completed.returncode == 0, _failure_report(completed, env)
-    assert (
-        "skipped (--skip-ollama): ollama is not on PATH and no Ollama install was attempted"
-        in completed.stdout
-    )
-    assert "the dream route is unavailable for this install" in completed.stdout
-    assert "skipped (--skip-ollama): no dream model pull was attempted" in completed.stdout
-    assert "installation complete:" in completed.stdout
+    assert "skipped (mode capture-recall" not in completed.stdout
+    assert "installing Ollama" not in completed.stdout
+    assert "ollama pull" not in completed.stdout
+    ollama_step = _stdout_step(completed.stdout, "[1/9] ollama", "[2/9] uv")
+    assert ollama_step == "[1/9] ollama\n"
+    pull_step = _stdout_step(completed.stdout, "[7/9] dream model pull", "[8/9] host adapter wiring")
+    assert pull_step == "[7/9] dream model pull\n"
     log = _shim_log_lines(env)
-    assert "init --mode refinement" in log
-    assert not any("install ollama" in line or line.startswith("brew") for line in log)
+    assert "init --mode capture-recall" in log
+    assert not any("ollama" in line or line.startswith("brew") for line in log)
 
 
 @needs_sh
-def test_skip_ollama_dry_run_has_zero_side_effects(tmp_path: Path) -> None:
+def test_refinement_mode_default_completes_without_any_ollama_step(tmp_path: Path) -> None:
     run, env = _make_installer(tmp_path)
-    completed = run("--dry-run", "--mode", "refinement", "--skip-ollama")
+    completed = run("--mode", "refinement")
     assert completed.returncode == 0, _failure_report(completed, env)
-    assert "skipped (--skip-ollama): no Ollama install attempt and no model pull;" in completed.stdout
-    assert (
-        "the install finishes and the dream route is marked unavailable when Ollama is absent"
-        in completed.stdout
-    )
-    assert "skipped (--skip-ollama): no dream model pull is attempted" in completed.stdout
-    assert (
-        "dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed"
-        in completed.stdout
-    )
-    assert _shim_log_lines(env) == []
-
-
-@needs_sh
-def test_skip_ollama_with_ollama_present_skips_the_pull_and_keeps_the_route_honest(
-    tmp_path: Path,
-) -> None:
-    run, env = _make_installer(tmp_path, extra_shims=("ollama",))
-    completed = run("--mode", "refinement", "--skip-ollama")
-    assert completed.returncode == 0, _failure_report(completed, env)
-    assert "      found - skipping install" in completed.stdout
-    assert "skipped (--skip-ollama): no dream model pull was attempted" in completed.stdout
-    assert (
-        "ollama is on PATH; pull a dream model later with: ollama pull <dream model>"
-        " (see `mnemoseed-local doctor`)" in completed.stdout
-    )
-    assert "the dream route is unavailable for this install" not in completed.stdout
+    assert "installation complete:" in completed.stdout
+    assert "installing Ollama" not in completed.stdout
+    assert "ollama pull" not in completed.stdout
+    assert "brew" not in completed.stdout
     log = _shim_log_lines(env)
     assert "init --mode refinement" in log
     assert not any("pull" in line for line in log)
 
 
 @needs_sh
-def test_refinement_without_ollama_still_refuses_on_unsupported_platforms(tmp_path: Path) -> None:
+def test_default_install_with_ollama_present_still_installs_nothing_and_pulls_nothing(
+    tmp_path: Path,
+) -> None:
+    run, env = _make_installer(tmp_path, extra_shims=("ollama",))
+    completed = run()
+    assert completed.returncode == 0, _failure_report(completed, env)
+    assert "installation complete:" in completed.stdout
+    ollama_step = _stdout_step(completed.stdout, "[1/9] ollama", "[2/9] uv")
+    assert ollama_step == "[1/9] ollama\n"
+    assert "ollama pull" not in completed.stdout
+    assert not any("pull" in line for line in _shim_log_lines(env))
+
+
+@needs_sh
+def test_default_dry_run_has_zero_side_effects_and_no_ollama_steps(tmp_path: Path) -> None:
     run, env = _make_installer(tmp_path)
-    completed = run("--mode", "refinement")
+    for args in (("--dry-run",), ("--dry-run", "--mode", "refinement")):
+        completed = run(*args)
+        assert completed.returncode == 0, _failure_report(completed, env)
+        assert (
+            "plan:  skipped (--install-ollama not given; MnemoSeed never installs Ollama by default)"
+            in completed.stdout
+        )
+        assert "plan:  skipped (--install-ollama not given; no dream model is pulled)" in completed.stdout
+        assert "brew install ollama" not in completed.stdout
+        assert "install via the official script" not in completed.stdout
+        assert "ollama pull" not in completed.stdout
+        assert (
+            "dry-run complete: no installers ran, no init, no doctor, no pull - nothing changed"
+            in completed.stdout
+        )
+    assert _shim_log_lines(env) == []
+
+
+@needs_sh
+def test_install_ollama_refuses_on_unsupported_platforms(tmp_path: Path) -> None:
+    run, env = _make_installer(tmp_path)
+    completed = run("--mode", "refinement", "--install-ollama")
     assert completed.returncode != 0, _failure_report(completed, env)
     assert "installation complete:" not in completed.stdout
     assert _shim_log_lines(env) == []
     if os.name == "nt":
-        # The local runner OS has no script installer: the refusal offers the
-        # manual download and the --skip-ollama finish.
+        # The local runner OS has no script installer: the opt-in step refuses
+        # with the manual download path.
         assert "install ollama manually from https://ollama.com/download" in completed.stderr
-        assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
+        assert "--skip-ollama" not in completed.stderr
     elif sys.platform == "darwin":
         # The controlled PATH also carries no brew, so the Darwin branch
         # refuses on the missing Homebrew/Ollama pair before any downloader probe.
@@ -385,21 +397,28 @@ def test_refinement_without_ollama_still_refuses_on_unsupported_platforms(tmp_pa
 
 
 @needs_sh
-def test_darwin_capture_recall_skips_ollama_without_a_dead_end(tmp_path: Path) -> None:
+def test_darwin_default_path_skips_ollama_silently(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     assert env["PATH"] == os.pathsep.join([str(shim_dir), str(tmp_path / "tools-bin")])
-    completed = _run_fragment(_ollama_prelude(shim_dir, mode="capture-recall") + "install_ollama\n", env)
+    completed = _run_fragment(_ollama_prelude(shim_dir) + "install_ollama\n", env)
     assert completed.returncode == 0, _failure_report(completed, env)
-    assert (
-        "skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)"
-        in completed.stdout
-    )
-    assert "to use the dream engine later" in completed.stdout
+    assert completed.stdout == ""
+    assert completed.stderr == ""
     assert _shim_log_lines(env) == []
 
 
 @needs_sh
-def test_darwin_refinement_brew_yes_flag_installs_ollama_via_brew(tmp_path: Path) -> None:
+def test_darwin_flag_absent_never_invokes_brew_even_when_brew_exists(tmp_path: Path) -> None:
+    shim_dir, env = _shim_environment(tmp_path, ("brew",))
+    completed = _run_fragment(_ollama_prelude(shim_dir) + "install_ollama\n", env)
+    assert completed.returncode == 0, _failure_report(completed, env)
+    assert completed.stdout == ""
+    assert "brew" not in completed.stdout
+    assert _shim_log_lines(env) == []
+
+
+@needs_sh
+def test_darwin_install_ollama_brew_yes_flag_installs_ollama_via_brew(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(
         shim_dir,
@@ -410,7 +429,9 @@ def test_darwin_refinement_brew_yes_flag_installs_ollama_via_brew(tmp_path: Path
         'chmod +x "$SHIM_DIR/ollama"\n'
         "exit 0\n",
     )
-    completed = _run_fragment(_ollama_prelude(shim_dir, yes=True) + "install_ollama\n", env)
+    completed = _run_fragment(
+        _ollama_prelude(shim_dir, install_ollama=True, yes=True) + "install_ollama\n", env
+    )
     assert completed.returncode == 0, _failure_report(completed, env)
     assert "install ollama" in _shim_log_lines(env)
     assert "installing Ollama via Homebrew..." in completed.stdout
@@ -419,7 +440,7 @@ def test_darwin_refinement_brew_yes_flag_installs_ollama_via_brew(tmp_path: Path
 
 @needs_sh
 @needs_pty
-def test_darwin_refinement_brew_consent_via_terminal_installs_ollama(tmp_path: Path) -> None:
+def test_darwin_install_ollama_brew_consent_via_terminal_installs_ollama(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(
         shim_dir,
@@ -430,7 +451,9 @@ def test_darwin_refinement_brew_consent_via_terminal_installs_ollama(tmp_path: P
         'chmod +x "$SHIM_DIR/ollama"\n'
         "exit 0\n",
     )
-    completed = _run_fragment_on_pty(_ollama_prelude(shim_dir) + "install_ollama\n", env, b"y\n")
+    completed = _run_fragment_on_pty(
+        _ollama_prelude(shim_dir, install_ollama=True) + "install_ollama\n", env, b"y\n"
+    )
     assert completed.returncode == 0, _failure_report(completed, env)
     assert "install Ollama now with Homebrew (`brew install ollama`)? [y/N] " in completed.stdout
     assert "install ollama" in _shim_log_lines(env)
@@ -439,24 +462,30 @@ def test_darwin_refinement_brew_consent_via_terminal_installs_ollama(tmp_path: P
 
 @needs_sh
 @needs_pty
-def test_darwin_refinement_brew_declined_consent_names_the_exact_next_steps(tmp_path: Path) -> None:
+def test_darwin_install_ollama_brew_declined_consent_names_the_exact_next_steps(
+    tmp_path: Path,
+) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(shim_dir, "brew", _logging_shim_body())
-    completed = _run_fragment_on_pty(_ollama_prelude(shim_dir) + "install_ollama\n", env, b"n\n")
+    completed = _run_fragment_on_pty(
+        _ollama_prelude(shim_dir, install_ollama=True) + "install_ollama\n", env, b"n\n"
+    )
     assert completed.returncode != 0, _failure_report(completed, env)
-    assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
-    assert "brew install ollama" in completed.stderr
+    assert "no Ollama install consent" in completed.stderr
+    assert "install Ollama yourself with 'brew install ollama'" in completed.stderr
     assert "https://ollama.com/download/mac" in completed.stderr
     assert _shim_log_lines(env) == []
 
 
 @needs_sh
-def test_darwin_refinement_without_an_answer_source_declines_instead_of_guessing(tmp_path: Path) -> None:
+def test_darwin_install_ollama_without_an_answer_source_declines_instead_of_guessing(
+    tmp_path: Path,
+) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(shim_dir, "brew", _logging_shim_body())
-    completed = _run_fragment(_ollama_prelude(shim_dir) + "install_ollama\n", env)
+    completed = _run_fragment(_ollama_prelude(shim_dir, install_ollama=True) + "install_ollama\n", env)
     assert completed.returncode != 0, _failure_report(completed, env)
-    assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
+    assert "no Ollama install consent" in completed.stderr
     assert _shim_log_lines(env) == []
 
 
@@ -468,44 +497,32 @@ def test_darwin_brew_consent_never_consumes_a_piped_stdin(tmp_path: Path) -> Non
     # must therefore still end in the refusal with no brew invocation.
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(shim_dir, "brew", _logging_shim_body())
-    completed = _run_fragment(_ollama_prelude(shim_dir) + "install_ollama\n", env, stdin_data=b"y\n")
+    completed = _run_fragment(
+        _ollama_prelude(shim_dir, install_ollama=True) + "install_ollama\n", env, stdin_data=b"y\n"
+    )
     assert completed.returncode != 0, _failure_report(completed, env)
-    assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
+    assert "no Ollama install consent" in completed.stderr
     assert _shim_log_lines(env) == []
 
 
 @needs_sh
-def test_darwin_refinement_without_brew_names_homebrew_ollama_and_the_skip_path(tmp_path: Path) -> None:
+def test_darwin_install_ollama_without_brew_names_homebrew_and_ollama(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path)
-    completed = _run_fragment(_ollama_prelude(shim_dir) + "install_ollama\n", env)
+    completed = _run_fragment(_ollama_prelude(shim_dir, install_ollama=True) + "install_ollama\n", env)
     assert completed.returncode != 0, _failure_report(completed, env)
     assert "ollama not found and Homebrew is not installed" in completed.stderr
     assert "https://brew.sh" in completed.stderr
     assert "https://ollama.com/download/mac" in completed.stderr
-    assert "re-run with --skip-ollama to finish the install without the dream route" in completed.stderr
-    assert _shim_log_lines(env) == []
-
-
-@needs_sh
-def test_darwin_skip_ollama_marks_the_dream_route_unavailable_without_invoking_brew(
-    tmp_path: Path,
-) -> None:
-    shim_dir, env = _shim_environment(tmp_path, ("brew",))
-    completed = _run_fragment(_ollama_prelude(shim_dir, skip_ollama=True) + "install_ollama\n", env)
-    assert completed.returncode == 0, _failure_report(completed, env)
-    assert (
-        "skipped (--skip-ollama): ollama is not on PATH and no Ollama install was attempted"
-        in completed.stdout
-    )
-    assert "the dream route is unavailable for this install" in completed.stdout
-    assert "brew install ollama" in completed.stdout
+    assert "--skip-ollama" not in completed.stderr
     assert _shim_log_lines(env) == []
 
 
 @needs_sh
 def test_darwin_brew_failure_reports_the_manual_download(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path, ("brew",), fail_arg="install ollama")
-    completed = _run_fragment(_ollama_prelude(shim_dir, yes=True) + "install_ollama\n", env)
+    completed = _run_fragment(
+        _ollama_prelude(shim_dir, install_ollama=True, yes=True) + "install_ollama\n", env
+    )
     assert completed.returncode != 0, _failure_report(completed, env)
     assert "'brew install ollama' failed" in completed.stderr
     assert "install it manually from https://ollama.com/download/mac" in completed.stderr
@@ -516,9 +533,9 @@ def test_darwin_brew_failure_reports_the_manual_download(tmp_path: Path) -> None
 
 
 @needs_sh
-def test_linux_refinement_with_ollama_present_skips_the_install(tmp_path: Path) -> None:
+def test_linux_install_ollama_with_ollama_present_skips_the_install(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path, ("ollama",))
-    prelude = _ollama_prelude(shim_dir).replace("OS_NAME='Darwin'", "OS_NAME='Linux'")
+    prelude = _ollama_prelude(shim_dir, install_ollama=True).replace("OS_NAME='Darwin'", "OS_NAME='Linux'")
     completed = _run_fragment(prelude + "install_ollama\n", env)
     assert completed.returncode == 0, _failure_report(completed, env)
     # The test's own shim dir is the only PATH entry carrying ollama, so the
@@ -528,7 +545,7 @@ def test_linux_refinement_with_ollama_present_skips_the_install(tmp_path: Path) 
 
 
 @needs_sh
-def test_linux_refinement_installs_ollama_via_the_official_script(tmp_path: Path) -> None:
+def test_linux_install_ollama_installs_via_the_official_script(tmp_path: Path) -> None:
     shim_dir, env = _shim_environment(tmp_path)
     _write_shim(
         shim_dir,
@@ -542,7 +559,7 @@ def test_linux_refinement_installs_ollama_via_the_official_script(tmp_path: Path
         "exit 0\n"
         "INSTALLER\n",
     )
-    prelude = _ollama_prelude(shim_dir).replace("OS_NAME='Darwin'", "OS_NAME='Linux'")
+    prelude = _ollama_prelude(shim_dir, install_ollama=True).replace("OS_NAME='Darwin'", "OS_NAME='Linux'")
     completed = _run_fragment(prelude + "install_ollama\n", env)
     assert completed.returncode == 0, _failure_report(completed, env)
     assert any("https://ollama.com/install.sh" in line for line in _shim_log_lines(env))
@@ -554,18 +571,17 @@ def test_linux_refinement_installs_ollama_via_the_official_script(tmp_path: Path
 
 
 @needs_sh
-def test_dry_run_plan_reports_the_darwin_skip_brew_and_no_brew_paths(tmp_path: Path) -> None:
+def test_dry_run_plan_reports_the_flag_absent_skip_brew_and_no_brew_paths(tmp_path: Path) -> None:
     skipped_dir, skipped_env = _shim_environment(tmp_path / "skipped")
-    skipped = _run_fragment(_ollama_prelude(skipped_dir, skip_ollama=True) + "plan_ollama\n", skipped_env)
+    skipped = _run_fragment(_ollama_prelude(skipped_dir) + "plan_ollama\n", skipped_env)
     assert skipped.returncode == 0, _failure_report(skipped, skipped_env)
-    assert "skipped (--skip-ollama): no Ollama install attempt and no model pull;" in skipped.stdout
     assert (
-        "the install finishes and the dream route is marked unavailable when Ollama is absent"
+        "plan:  skipped (--install-ollama not given; MnemoSeed never installs Ollama by default)"
         in skipped.stdout
     )
 
     brew_dir, brew_env = _shim_environment(tmp_path / "brew", ("brew",))
-    planned = _run_fragment(_ollama_prelude(brew_dir) + "plan_ollama\n", brew_env)
+    planned = _run_fragment(_ollama_prelude(brew_dir, install_ollama=True) + "plan_ollama\n", brew_env)
     assert planned.returncode == 0, _failure_report(planned, brew_env)
     assert "would ask [y/N] consent, then install via `brew install ollama`" in planned.stdout
     assert (
@@ -574,10 +590,7 @@ def test_dry_run_plan_reports_the_darwin_skip_brew_and_no_brew_paths(tmp_path: P
     )
 
     nobrew_dir, nobrew_env = _shim_environment(tmp_path / "nobrew")
-    refused = _run_fragment(_ollama_prelude(nobrew_dir) + "plan_ollama\n", nobrew_env)
+    refused = _run_fragment(_ollama_prelude(nobrew_dir, install_ollama=True) + "plan_ollama\n", nobrew_env)
     assert refused.returncode == 0, _failure_report(refused, nobrew_env)
     assert "would exit non-zero with the exact manual steps: install Homebrew" in refused.stdout
-    assert (
-        "(https://brew.sh) or Ollama (https://ollama.com/download/mac), or re-run with --skip-ollama"
-        in refused.stdout
-    )
+    assert "(https://brew.sh) or Ollama (https://ollama.com/download/mac)" in refused.stdout

@@ -231,7 +231,7 @@ flowchart TB
 
 | 动词 | 子谓词 | 说明 |
 |---|---|---|
-| `init` | — | 写默认配置（`--force` 覆写）+ 三行 next-steps（doctor / `ollama pull` / up）；本地操作 |
+| `init` | — | 写默认配置（`--force` 覆写）+ 三行 next-steps（doctor / dream 模型绑定指引——控制台 provider 目录 / up）；本地操作 |
 | `up` | — | 启动 daemon；第一闸见 `daemon.off` 哨兵 → stderr 字节钉 + rc 1；Ollama route 离线/缺模型不阻断 daemon，dream 工作延后；storage 栈预构建失败 → 单行错误 |
 | `on` | — | 删哨兵；已运行则报 already on 不重启；否则委托 `up` 路径 |
 | `off` | — | marker-first → 最多 30s 协调锁 → best-effort POST `/daemon/shutdown` → 最多 15s 轮询监听消失；仍可能存活时 rc 非零；探针 1s 上限 |
@@ -252,7 +252,7 @@ flowchart TB
 
 ### 3.4 安装与首次体验（`install.ps1` / `install.sh` / `hardware.py`）
 
-**编排序**（两脚本一致，§1.3 图）：1 探测/安装 ollama → 2 探测/安装 uv → 3 `uv tool install`（已装则 `uv tool upgrade`）→ 4 Windows 注册 MnemoSeed 当前用户登录任务（不接管 Ollama）→ 5 `init`（已存在跳过）→ 6 `doctor` 首检 + 硬件档位提示 → 7 **用户确认后** `ollama pull <model>` → 8 doctor 复检 + 下一步。
+**编排序**（两脚本一致，§1.3 图）：1 ollama（**仅显式 opt-in**——`install.sh` 需 `--install-ollama`、`install.ps1` 需 `-InstallOllama`；默认路径不安装、不等待、不拉取 Ollama，任何模式一致）→ 2 探测/安装 uv → 3 `uv tool install`（已装则 `uv tool upgrade`）→ 4 Windows 注册 MnemoSeed 当前用户登录任务（不接管 Ollama）→ 5 `init`（已存在跳过）→ 6 `doctor` 首检 + 硬件档位提示 → 7 `ollama pull <model>`（同样仅 opt-in；**用户确认后**）→ 8 doctor 复检 + 下一步。
 
 - 拉取目标 = 当前配置 ACTIVE `[dream.llm.dream]` 的 `model` 键，缺席回退内置默认 `qwen3.5:9b`——与 doctor/up 的检查目标同源（「拉的就是查的」）；`-Yes`/`--yes` 跳确认；**模型绝不静默拉取**。
 - `--dry-run` / `-DryRun`：打印编号计划 + 命令存在性探测结果，零副作用（CI smoke 唯一可验证形态）。

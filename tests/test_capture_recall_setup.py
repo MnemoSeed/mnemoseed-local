@@ -229,8 +229,8 @@ def test_unknown_mode_is_refused_before_anything_is_written(
     assert not (cli_home / "config.toml").exists()
 
 
-# installer wiring: the flag exists, defaults to capture-recall, and keeps
-# Ollama out of that mode's path
+# installer wiring: the flag exists, defaults to capture-recall, and no mode
+# implies an Ollama step (Ollama is opt-in via the explicit flag)
 
 
 def test_posix_installer_wires_the_mode_flag() -> None:
@@ -240,8 +240,10 @@ def test_posix_installer_wires_the_mode_flag() -> None:
     assert "--mode=*" in text
     assert 'die "unknown mode' in text
     assert 'mnemoseed-local init --mode "$MODE"' in text
-    assert "skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)" in text
-    assert "skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)" in text
+    assert "skipped (mode capture-recall" not in text
+    assert "skipped (mode capture-recall keeps the legacy auto dream off" not in text
+    assert "--install-ollama) INSTALL_OLLAMA=1 ;;" in text
+    assert "--skip-ollama" not in text
 
 
 def test_windows_installer_wires_the_mode_flag() -> None:
@@ -249,5 +251,7 @@ def test_windows_installer_wires_the_mode_flag() -> None:
     assert "[ValidateSet('CaptureRecall', 'Refinement')]" in text
     assert "[string]$Mode = 'CaptureRecall'" in text
     assert "& mnemoseed-local init --mode $CliMode" in text
-    assert "skipped (mode capture-recall runs capture, local embeddings and recall without Ollama)" in text
-    assert "skipped (mode capture-recall keeps the legacy auto dream off; no dream model is pulled)" in text
+    assert "skipped (mode capture-recall" not in text
+    assert "skipped (mode capture-recall keeps the legacy auto dream off" not in text
+    assert "[switch]$InstallOllama" in text
+    assert "OllamaHeadlessServe" not in text

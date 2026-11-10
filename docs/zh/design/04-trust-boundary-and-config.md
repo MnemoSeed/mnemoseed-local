@@ -276,7 +276,7 @@ issuer-swap seam（I6）：`create_app(*, token_verifier=None)`；None = 每请�
 | `capture.auto_recall_focal_floor` | `(0,1]` | `0.4` | focal 扫描 floor（0 会被拒：全 decayed chunk 皆 focal） |
 | `capture.auto_recall_budget_chars` | 正整数 | `1200` | pending 选择预算 |
 
-**dream.llm.`<role>` × {dream, dream_verifier}（2 角色 × 9 字段）**：`driver` / `model` / `base_url` / `api_key_env`（secret 标记）/ `max_tokens` / `provider` / `think` / `num_ctx` / `num_predict`。默认路由 `ollama/qwen3.5:9b` + `ollama/gemma4:e4b`（A2.5 T3 对齐）。
+**dream.llm.`<role>` × {dream, dream_verifier}（2 角色 × 9 字段）**：`driver` / `model` / `base_url` / `api_key_env`（secret 标记）/ `max_tokens` / `provider` / `think` / `num_ctx` / `num_predict`。默认路由 `ollama/qwen3.5:9b` + `ollama/gemma4:e4b`（A2.5 T3 对齐；边界修订：B7 起 `DEFAULT_LLM_ROUTES` 清空——新装出厂无 dream 路由，模型经 provider 目录/配置显式绑定；存量安装的默认已随首次 boot 导入 settings DB 且 DB 覆盖文件，行为不变）。
 
 **注册表边界**：boot-scope 键（`preset` / `storage.*` / `baseurl` / auth）**不在注册表**——文件域、重启生效。`_SLOT_KEYS = sorted(registry)` 决定 version-id 槽位；**加新键会左移既有槽位**——B2.1 D5 已记边界"version_id 解码以注册表快照为域，升级前版本的 rollback 不支持"；B2.5 因此否决注册键（哨兵三锤之一）。DB 行以 `key_path` 为键，不受槽位移影响。
 
