@@ -3,7 +3,7 @@
 The port contract in one file: ``ChatResult`` carries text + provider-reported
 usage + model + driver; ``check()`` returns a ``HealthReport`` that never
 raises; and every failure a driver can surface (transport, auth, missing route,
-unknown driver, oauth-not-built) is a typed ``LLMError`` subclass so callers
+unknown driver) is a typed ``LLMError`` subclass so callers
 degrade for real (FR-2.6) instead of catching strings.
 """
 
@@ -16,7 +16,6 @@ from mnemoseed_local.llm import (
     LLMError,
     LLMRouteError,
     LLMUnavailable,
-    OAuthNotImplemented,
     UnknownLLMDriverError,
     Usage,
 )
@@ -66,7 +65,6 @@ def test_health_report_carries_ok_and_detail() -> None:
 def test_error_hierarchy_supports_typed_degradation() -> None:
     # FR-2.6: every unavailable branch is reachable through one typed base.
     assert issubclass(LLMUnavailable, LLMError)
-    assert issubclass(OAuthNotImplemented, LLMUnavailable)  # stub chats degrade like 401s
     assert issubclass(LLMRouteError, LLMError)
     assert issubclass(UnknownLLMDriverError, LLMError)
 

@@ -9,10 +9,7 @@ widened chat seam (``reflect.ChatLLM``).
 
 Degradation is typed (FR-2.6): any transport or auth failure inside ``chat``
 raises ``LLMUnavailable``, and ``check`` never raises — it returns a
-``HealthReport``. ``OAuthNotImplemented`` is an ``LLMUnavailable`` subclass so
-an OAuth provider with no implementation (e.g. an Anthropic subscription,
-which is deliberately not supported) degrades through the same typed branch
-callers already catch.
+``HealthReport``.
 """
 
 from __future__ import annotations
@@ -98,7 +95,3 @@ class UnknownLLMDriverError(LLMError):
         else:
             message = f"unknown {layer} driver {driver!r} (no {layer} drivers registered)"
         super().__init__(message)
-
-
-class OAuthNotImplemented(LLMUnavailable):
-    """This OAuth provider has no implementation here (only codex/grok are built)."""

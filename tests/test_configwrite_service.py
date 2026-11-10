@@ -37,9 +37,13 @@ import pytest
 
 from mnemoseed_local.config import LLM_ROLES, load_config
 from mnemoseed_local.configwrite.service import (
+    _FROZEN_LEGACY_ORDER,
+    _SLOT_KEYS,
     CONFIG_KEY_REGISTRY,
     ConfigWriteError,
     ConfigWriteService,
+    _compose_slot_keys,
+    _resolve_version_id,
 )
 from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
 from mnemoseed_local.storage.ports import AuditFilter, Page
@@ -828,3 +832,91 @@ def test_http_set_without_if_match_succeeds_backward_compat(tmp_path) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["ok"] is True
+
+
+# ---------------------------------------------------------------- slot-order freeze
+
+
+def test_frozen_legacy_order_matches_pinned_literal() -> None:
+    """The frozen slot prefix is pinned to today's sorted registry keys, verbatim."""
+    assert _FROZEN_LEGACY_ORDER == (
+        "capture.auto_recall",
+        "capture.auto_recall_budget_chars",
+        "capture.auto_recall_focal_floor",
+        "capture.idle_flush_sec",
+        "decay.enabled",
+        "decay.lambda_per_type",
+        "decay.min_apply_delta",
+        "decay.sweep_interval_s",
+        "dream.auto_trigger",
+        "dream.core_confidence_floor",
+        "dream.delta_budget_ceiling_tokens",
+        "dream.ensemble",
+        "dream.experience_channel.enabled",
+        "dream.floor_pool_points",
+        "dream.hard_deadline_sec",
+        "dream.hardware_tier",
+        "dream.idle_min_sec",
+        "dream.llm.dream.api_key_env",
+        "dream.llm.dream.base_url",
+        "dream.llm.dream.driver",
+        "dream.llm.dream.max_tokens",
+        "dream.llm.dream.model",
+        "dream.llm.dream.num_ctx",
+        "dream.llm.dream.num_predict",
+        "dream.llm.dream.provider",
+        "dream.llm.dream.think",
+        "dream.llm.dream_verifier.api_key_env",
+        "dream.llm.dream_verifier.base_url",
+        "dream.llm.dream_verifier.driver",
+        "dream.llm.dream_verifier.max_tokens",
+        "dream.llm.dream_verifier.model",
+        "dream.llm.dream_verifier.num_ctx",
+        "dream.llm.dream_verifier.num_predict",
+        "dream.llm.dream_verifier.provider",
+        "dream.llm.dream_verifier.think",
+        "dream.llm.dream_vote.api_key_env",
+        "dream.llm.dream_vote.base_url",
+        "dream.llm.dream_vote.driver",
+        "dream.llm.dream_vote.max_tokens",
+        "dream.llm.dream_vote.model",
+        "dream.llm.dream_vote.num_ctx",
+        "dream.llm.dream_vote.num_predict",
+        "dream.llm.dream_vote.provider",
+        "dream.llm.dream_vote.think",
+        "dream.pool_forced_cap",
+        "dream.reflect_batch_max_tokens",
+        "profiles.agent_bindings",
+        "visibility.mode",
+    )
+    assert _FROZEN_LEGACY_ORDER == tuple(sorted(CONFIG_KEY_REGISTRY))
+
+
+def test_slot_keys_equal_frozen_order_today() -> None:
+    """No post-freeze registry keys exist yet: the slot map is the frozen tuple."""
+    assert _SLOT_KEYS == _FROZEN_LEGACY_ORDER
+
+
+@pytest.mark.parametrize(
+    ("frozen", "registry_keys", "expected"),
+    [
+        (("a", "c"), ("c", "b", "a", "d"), ("a", "c", "b", "d")),
+        (("a",), ("a",), ("a",)),
+        (("a", "c"), (), ("a", "c")),
+        (("a",), ("b", "a", "b"), ("a", "b")),
+        ((), ("b", "a"), ("a", "b")),
+    ],
+)
+def test_compose_slot_keys_appends_missing_keys_sorted(frozen, registry_keys, expected) -> None:
+    """Missing registry keys append after the frozen prefix in sorted order."""
+    assert _compose_slot_keys(frozen, registry_keys) == expected
+
+
+def test_version_id_round_trip_through_frozen_slots(tmp_path) -> None:
+    """A stored version id decodes back to the key and version it was written for."""
+    meta = _meta(tmp_path)
+    service, _ = _service(tmp_path, meta=meta)
+    first = service.set("dream.auto_trigger", True, actor="console")["version_id"]
+    role = service.set("dream.llm.dream.model", "stub2", actor="console")["version_id"]
+    assert _resolve_version_id(first) == ("dream.auto_trigger", 1)
+    assert _resolve_version_id(role) == ("dream.llm.dream.model", 1)

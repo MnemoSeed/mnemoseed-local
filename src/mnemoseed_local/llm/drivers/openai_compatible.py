@@ -22,6 +22,9 @@ from mnemoseed_local.llm.types import (
     Usage,
 )
 
+#: Payload keys the driver always emits itself; token_param must not shadow them.
+_RESERVED_BODY_KEYS: frozenset[str] = frozenset({"model", "messages", "stream"})
+
 
 @register(LLM_DRIVERS)
 class OpenAICompatibleLLM:
@@ -38,6 +41,7 @@ class OpenAICompatibleLLM:
         api_key: str,
         model: str,
         max_tokens: int = 2048,
+        token_param: str = "max_tokens",
         timeout: float = 30.0,
         **kwargs: Any,
     ) -> None:
@@ -45,10 +49,18 @@ class OpenAICompatibleLLM:
             raise ValueError("openai_compatible requires a non-empty 'base_url'")
         if not model:
             raise ValueError("openai_compatible requires a non-empty 'model'")
+        if not token_param:
+            raise ValueError("openai_compatible requires a non-empty 'token_param'")
+        if token_param in _RESERVED_BODY_KEYS:
+            reserved = ", ".join(sorted(_RESERVED_BODY_KEYS))
+            raise ValueError(
+                f"openai_compatible 'token_param' must not shadow reserved body keys: {reserved}"
+            )
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.max_tokens = int(max_tokens)
+        self.token_param = token_param
         self.timeout = float(timeout)
         self.params: dict[str, Any] = kwargs
         # Auth rides on each request (not the client): tests swap ``_client`` for
@@ -63,7 +75,7 @@ class OpenAICompatibleLLM:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": self.max_tokens,
+            self.token_param: self.max_tokens,
         }
         try:
             response = self._client.post("/chat/completions", json=payload, headers=self._headers)
@@ -73,6 +85,8 @@ class OpenAICompatibleLLM:
             raise LLMUnavailable(f"openai_compatible chat failed: HTTP {exc.response.status_code}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise LLMUnavailable(f"openai_compatible chat failed: {exc}") from exc
+        if not isinstance(body, dict):
+            body = {}
         text = _first_choice_text(body)
         usage = _usage_from(body.get("usage"))
         return ChatResult(text=text, usage=usage, model=self.model, driver="openai_compatible")
@@ -85,7 +99,8 @@ class OpenAICompatibleLLM:
                     ok=False,
                     detail={"error": f"GET /models returned HTTP {response.status_code}"},
                 )
-            models = _id_list(response.json().get("data"))
+            body = response.json()
+            models = _id_list(body.get("data") if isinstance(body, dict) else None)
             return HealthReport(ok=True, detail={"models": models})
         except (httpx.HTTPError, ValueError) as exc:
             return HealthReport(ok=False, detail={"error": str(exc)})
@@ -93,7 +108,8 @@ class OpenAICompatibleLLM:
 
 def _first_choice_text(body: Any) -> str:
     """First assistant message text from an OpenAI-shaped completion body."""
-    for choice in body.get("choices") or []:
+    choices = body.get("choices") if isinstance(body.get("choices"), list) else []
+    for choice in choices:
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
@@ -106,7 +122,9 @@ def _first_choice_text(body: Any) -> str:
 
 def _id_list(data: Any) -> list[Any]:
     """Flatten OpenAI/Anthropic model catalogs to their id fields."""
-    return [m.get("id") for m in data or [] if isinstance(m, dict)]
+    if not isinstance(data, list):
+        return []
+    return [m.get("id") for m in data if isinstance(m, dict)]
 
 
 def _usage_from(data: Any) -> Usage | None:

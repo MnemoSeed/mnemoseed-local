@@ -745,8 +745,67 @@ CONFIG_KEY_REGISTRY: dict[str, ConfigKey] = {
 for _role in LLM_ROLES:
     CONFIG_KEY_REGISTRY.update(_role_key_specs(_role))
 
-#: Sorted registry keys map to stable version-id slots.
-_SLOT_KEYS: tuple[str, ...] = tuple(sorted(CONFIG_KEY_REGISTRY))
+#: Frozen legacy slot order: stored version-ids decode through this tuple, so
+#: registry growth must append (never re-sort) to keep old ids decodable.
+_FROZEN_LEGACY_ORDER: tuple[str, ...] = (
+    "capture.auto_recall",
+    "capture.auto_recall_budget_chars",
+    "capture.auto_recall_focal_floor",
+    "capture.idle_flush_sec",
+    "decay.enabled",
+    "decay.lambda_per_type",
+    "decay.min_apply_delta",
+    "decay.sweep_interval_s",
+    "dream.auto_trigger",
+    "dream.core_confidence_floor",
+    "dream.delta_budget_ceiling_tokens",
+    "dream.ensemble",
+    "dream.experience_channel.enabled",
+    "dream.floor_pool_points",
+    "dream.hard_deadline_sec",
+    "dream.hardware_tier",
+    "dream.idle_min_sec",
+    "dream.llm.dream.api_key_env",
+    "dream.llm.dream.base_url",
+    "dream.llm.dream.driver",
+    "dream.llm.dream.max_tokens",
+    "dream.llm.dream.model",
+    "dream.llm.dream.num_ctx",
+    "dream.llm.dream.num_predict",
+    "dream.llm.dream.provider",
+    "dream.llm.dream.think",
+    "dream.llm.dream_verifier.api_key_env",
+    "dream.llm.dream_verifier.base_url",
+    "dream.llm.dream_verifier.driver",
+    "dream.llm.dream_verifier.max_tokens",
+    "dream.llm.dream_verifier.model",
+    "dream.llm.dream_verifier.num_ctx",
+    "dream.llm.dream_verifier.num_predict",
+    "dream.llm.dream_verifier.provider",
+    "dream.llm.dream_verifier.think",
+    "dream.llm.dream_vote.api_key_env",
+    "dream.llm.dream_vote.base_url",
+    "dream.llm.dream_vote.driver",
+    "dream.llm.dream_vote.max_tokens",
+    "dream.llm.dream_vote.model",
+    "dream.llm.dream_vote.num_ctx",
+    "dream.llm.dream_vote.num_predict",
+    "dream.llm.dream_vote.provider",
+    "dream.llm.dream_vote.think",
+    "dream.pool_forced_cap",
+    "dream.reflect_batch_max_tokens",
+    "profiles.agent_bindings",
+    "visibility.mode",
+)
+
+
+def _compose_slot_keys(frozen: tuple[str, ...], registry_keys: tuple[str, ...]) -> tuple[str, ...]:
+    """Frozen prefix first, then registry keys absent from it in sorted order."""
+    return frozen + tuple(sorted(set(registry_keys) - set(frozen)))
+
+
+#: Decodable slot order: the frozen legacy prefix plus any later registry keys.
+_SLOT_KEYS: tuple[str, ...] = _compose_slot_keys(_FROZEN_LEGACY_ORDER, tuple(CONFIG_KEY_REGISTRY))
 _REGISTRY_SLOTS: dict[str, int] = {key_path: index for index, key_path in enumerate(_SLOT_KEYS)}
 
 

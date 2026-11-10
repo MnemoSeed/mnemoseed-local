@@ -121,6 +121,8 @@ class OllamaLLM:
             raise LLMUnavailable(f"ollama chat failed: HTTP {exc.response.status_code}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise LLMUnavailable(f"ollama chat failed: {exc}") from exc
+        if not isinstance(body, dict):
+            body = {}
         message = body.get("message")
         text = message.get("content", "") if isinstance(message, dict) else ""
         return ChatResult(text=text, usage=_usage_from(body), model=self.model, driver="ollama")
@@ -137,10 +139,22 @@ class OllamaLLM:
                     ok=False,
                     detail={"error": f"GET /api/tags returned HTTP {response.status_code}"},
                 )
-            models = [m.get("name") for m in response.json().get("models") or [] if isinstance(m, dict)]
+            body = response.json()
+            data = body.get("models") if isinstance(body, dict) else None
+            if not isinstance(data, list):
+                data = []
+            models = [m.get("name") for m in data if isinstance(m, dict)]
             return HealthReport(ok=True, detail={"models": models})
         except (httpx.HTTPError, ValueError) as exc:
             return HealthReport(ok=False, detail={"error": str(exc)})
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Coerce a reported count; malformed values degrade to None."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _usage_from(body: Any) -> Usage | None:
@@ -149,13 +163,10 @@ def _usage_from(body: Any) -> Usage | None:
     previous nested-only read silently dropped every provider token (verified
     against live ollama 0.32). A {"usage": {...}} body stays honored for nested
     shapes some middleware emits."""
-    prompt = body.get("prompt_eval_count")
-    completion = body.get("eval_count")
+    prompt = _int_or_none(body.get("prompt_eval_count"))
+    completion = _int_or_none(body.get("eval_count"))
     if prompt is not None or completion is not None:
-        return Usage(
-            prompt_tokens=int(prompt) if prompt is not None else None,
-            completion_tokens=int(completion) if completion is not None else None,
-        )
+        return Usage(prompt_tokens=prompt, completion_tokens=completion)
     data = body.get("usage")
     if not isinstance(data, dict):
         return None
