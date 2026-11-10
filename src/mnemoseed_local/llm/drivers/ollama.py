@@ -121,6 +121,8 @@ class OllamaLLM:
             raise LLMUnavailable(f"ollama chat failed: HTTP {exc.response.status_code}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise LLMUnavailable(f"ollama chat failed: {exc}") from exc
+        if not isinstance(body, dict):
+            body = {}
         message = body.get("message")
         text = message.get("content", "") if isinstance(message, dict) else ""
         return ChatResult(text=text, usage=_usage_from(body), model=self.model, driver="ollama")
@@ -137,7 +139,9 @@ class OllamaLLM:
                     ok=False,
                     detail={"error": f"GET /api/tags returned HTTP {response.status_code}"},
                 )
-            models = [m.get("name") for m in response.json().get("models") or [] if isinstance(m, dict)]
+            body = response.json()
+            data = body.get("models") if isinstance(body, dict) else None
+            models = [m.get("name") for m in data or [] if isinstance(m, dict)]
             return HealthReport(ok=True, detail={"models": models})
         except (httpx.HTTPError, ValueError) as exc:
             return HealthReport(ok=False, detail={"error": str(exc)})

@@ -2,12 +2,11 @@
 
 T6 rounds out the dream engine's cost layer: the DreamLLM port (narrow chat +
 typed health probe + provider-reported usage), an LLM driver registry mirroring
-the storage idiom, four payload drivers (openai_compatible / anthropic /
-ollama / oauth — the last one reuses the host's Codex / Grok login state), the
-[dream.llm] role router, and the ReflectLLM adapter that makes any DreamLLM
-usable where T3 types strictly against str-returning chat. Importing this
-package registers the built-in drivers (import side effect), as the storage
-package does.
+the storage idiom, the payload drivers (openai_compatible / anthropic /
+ollama) plus the offline stubs (stub / stub_verifier), the [dream.llm] role
+router, and the ReflectLLM adapter that makes any DreamLLM usable where T3
+types strictly against str-returning chat. Importing this package registers
+the built-in drivers (import side effect), as the storage package does.
 
 FR-2.14 route defaults follow design/02 §6: deep_reflection -> Kimi K3 via
 Fireworks, short_increment -> DeepSeek V4 Flash via Fireworks. The offline
@@ -29,7 +28,6 @@ from mnemoseed_local.llm.types import (
     LLMError,
     LLMRouteError,
     LLMUnavailable,
-    OAuthNotImplemented,
     UnknownLLMDriverError,
     Usage,
 )
@@ -44,7 +42,6 @@ __all__ = [
     "LLMRegistry",
     "LLMUnavailable",
     "LLM_DRIVERS",
-    "OAuthNotImplemented",
     "ReflectLLMAdapter",
     "RoleRouter",
     "UnknownLLMDriverError",
