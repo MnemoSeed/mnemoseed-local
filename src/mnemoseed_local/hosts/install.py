@@ -72,9 +72,17 @@ def report_onboarding(host: str, hooks: str, mcp: str, trust: str | None = None)
 class HookStatus:
     """Result of the status check.
 
-    ``state`` is one of ``"not-installed"`` / ``"match"`` (installed file is
-    byte-identical to the shipped plugin) / ``"differs"`` (installed but not
-    the shipped bytes) / ``"disabled"`` (renamed to ``*.ts.disabled``).
+    ``state`` is the adapter's own vocabulary. A file-copy adapter (the plugin
+    installs) reports ``"not-installed"`` / ``"match"`` (installed file is
+    byte-identical to the shipped plugin) / ``"differs"`` (installed but not the
+    shipped bytes) / ``"disabled"`` (renamed to ``*.ts.disabled``); a
+    config-surgery adapter reports its own set, such as
+    ``"not-installed"`` / ``"installed"`` / ``"stale"`` / ``"unreadable"``.
+
+    ``differs`` is a COMPARISON against bytes this tool ships: a file that
+    cannot be parsed is never ``differs``. An adapter that cannot decide a
+    surface says ``unreadable`` instead, so one state name never carries two
+    meanings.
     """
 
     root: Path
@@ -241,6 +249,7 @@ def status(root: Path | None = None, base_url: str | None = None) -> HookStatus:
 #: enumerate this registry, so a host registers once.
 ADAPTER_MODULES: dict[str, str] = {
     "claude_code": "mnemoseed_local.hosts.claude_code.install",
+    "claude_desktop": "mnemoseed_local.hosts.claude_desktop.install",
     "codex_cli": "mnemoseed_local.hosts.codex_cli.install",
     "cursor": "mnemoseed_local.hosts.cursor.install",
     "opencode": "mnemoseed_local.hosts.install",

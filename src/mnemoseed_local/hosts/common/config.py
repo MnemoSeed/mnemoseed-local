@@ -32,6 +32,19 @@ def load_object(target: Path) -> dict[str, object]:
     return data
 
 
+def require_object(target: Path, container: dict[str, object], key: str) -> dict[str, object]:
+    """``container[key]`` as an object, created empty when the key is absent. A
+    key that is present but malformed is user data: it refuses, never overwritten."""
+    value = container.get(key)
+    if isinstance(value, dict):
+        return value
+    if key in container:
+        raise ConfigParseError(f"{target}: {key!r} exists but is not an object — fix it manually")
+    empty: dict[str, object] = {}
+    container[key] = empty
+    return empty
+
+
 def serialize(data: Mapping[str, object]) -> bytes:
     """Canonical bytes: UTF-8 regardless of the process locale, non-ASCII kept
     literal, two-space indent, trailing newline."""

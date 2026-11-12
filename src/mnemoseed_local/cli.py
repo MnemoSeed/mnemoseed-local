@@ -4,7 +4,8 @@ Verbs: init / up / on / off / status / doctor / recall / remember / dream
 (--once, status) / forget / profile (create | list | archive | unarchive) /
 config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
 hook (install | uninstall | status) / host (install | uninstall | status) /
-project (bind | run) / mcp (MCP stdio gateway). Local loopback by default;
+project (bind | run) / mcp (MCP stdio gateway) / instructions (--surface).
+Local loopback by default;
 every state-changing verb talks to the daemon REST (FR-7.12); no
 identity/accounts in the local MVP.
 """
@@ -41,11 +42,13 @@ from mnemoseed_local.daemon.observability import (
     unreadable_capture_evidence,
 )
 from mnemoseed_local.dream.readiness import OLLAMA_DEFAULT_BASE_URL, models_contain
+from mnemoseed_local.hosts.common.config import ConfigParseError
 from mnemoseed_local.hosts.install import (
     ADAPTER_MODULES,
     detect_installed_hosts,
     uninstall_command,
 )
+from mnemoseed_local.mcp_gateway import instructions
 from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
 from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
 
@@ -1944,7 +1947,13 @@ def cmd_host(args: argparse.Namespace) -> int:
     except (ModuleNotFoundError, LookupError):
         print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
         return 1
-    result = entry()
+    try:
+        result = entry()
+    except ConfigParseError as exc:
+        # a refused surface is a user-facing error with manual guidance, never a
+        # traceback: the adapter wrote nothing.
+        print(f"mnemoseed-local: {exc}", file=sys.stderr)
+        return 1
     if args.host_command == "status":
         observations = _host_status_observations(args.host, result)
         if args.json:
@@ -2138,6 +2147,16 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     from mnemoseed_local.mcp_gateway import server as mcp_server
 
     return mcp_server.serve(client=mcp_server.build_client(args))
+
+
+def cmd_instructions(args: argparse.Namespace) -> int:
+    """Print the paste-ready memory protocol block for one surface.
+
+    Local text only: the verb never dials the daemon, so it works on a machine
+    where nothing is running yet.
+    """
+    print(instructions.gateway_text(args.surface))
+    return 0
 
 
 # ------------------------------------------------------------ plumbing
@@ -2346,6 +2365,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mcp = sub.add_parser("mcp", help="run the MCP stdio gateway (JSON-RPC over stdin/stdout)")
     p_mcp.add_argument("--baseurl", default=None, help="daemon base URL override")
+
+    p_instructions = sub.add_parser(
+        "instructions",
+        help="print the paste-ready memory protocol block for a surface without a hook",
+    )
+    p_instructions.add_argument(
+        "--surface",
+        required=True,
+        choices=instructions.SURFACES,
+        help="the surface the block is pasted into: claude_chat / chatgpt read it "
+        "from account-level preference fields this tool cannot write, claude_code "
+        "keeps it with the session without one, generic is the block the MCP "
+        "handshake itself serves",
+    )
     return parser
 
 
@@ -2390,6 +2423,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_hook_event(args)
     if args.command == "mcp":
         return cmd_mcp(args)
+    if args.command == "instructions":
+        return cmd_instructions(args)
     parser.print_help(file=sys.stderr)
     return 2
 

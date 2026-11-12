@@ -107,12 +107,13 @@ def test_ping_returns_empty_result() -> None:
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_seven_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
         "recall",
         "remember",
+        "capture",
         "supersede",
         "dream_once",
         "recent_sessions",
@@ -130,6 +131,10 @@ def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     assert recall["inputSchema"]["properties"]["top_k"]["type"] == "integer"
     remember = next(tool for tool in tools if tool["name"] == "remember")
     assert remember["inputSchema"]["required"] == ["text"]
+    # the hook-less write arm: the same one required text, its own verb
+    capture = next(tool for tool in tools if tool["name"] == "capture")
+    assert capture["inputSchema"]["required"] == ["text"]
+    assert capture["inputSchema"]["properties"]["text"]["type"] == "string"
     supersede = next(tool for tool in tools if tool["name"] == "supersede")
     assert supersede["inputSchema"]["required"] == ["superseded_node_id", "successor_node_id"]
     # #187: scoped resume requires the raw current prompt for anchor matching

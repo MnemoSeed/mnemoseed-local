@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from mnemoseed_local.config import Config, load_config
-from mnemoseed_local.daemon.memory import MemoryService
+from mnemoseed_local.daemon.memory import CAPTURED_CHAT_SOURCE, MemoryService
 from mnemoseed_local.schema.stamp import (
     EXPLICIT_PIN_SOURCE,
     ChunkStamp,
@@ -229,6 +229,46 @@ class TestSupersedeInPlace:
         assert stored.provenance.source == "capture.session"
         # never reinforced: the baseline still equals the ingestion fallback
         assert stored.last_reinforced == stored.ingested_at
+
+    def test_captured_write_landing_on_a_pin_never_rewrites_it(self, service) -> None:
+        """The symmetric guard: supersede-in-place is for two explicit pins.
+        A captured write (source ``mcp-chat``) landing near the user's pin
+        becomes its own chunk — the model's transcription never replaces the
+        user's verbatim pin, and the pin keeps its weight and history."""
+        svc, stores, _config = service
+        _seed_chunk(stores, "owned-pin", self.OLD_TEXT, dense=_dense(self.NEW_TEXT))
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result["outcome"] == "new_chunk"
+        assert result["chunk_id"] != "owned-pin"
+        pinned = stores.vector.get_chunk("owned-pin")
+        assert pinned.text == self.OLD_TEXT
+        assert pinned.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in pinned.provenance.history] == ["created"]
+        assert pinned.decay_weight == 1.0
+        assert pinned.last_reinforced == pinned.ingested_at
+        written = stores.vector.get_chunk(result["chunk_id"])
+        assert written.text == self.NEW_TEXT
+        assert written.provenance.source == CAPTURED_CHAT_SOURCE
+
+    def test_captured_write_landing_on_a_captured_chunk_is_also_a_new_chunk(self, service) -> None:
+        """Neither side is a pin, so the supersede-in-place branch stays closed:
+        a captured write never rewrites another capture's verbatim text."""
+        svc, stores, _config = service
+        _seed_chunk(
+            stores,
+            "earlier-capture",
+            self.OLD_TEXT,
+            dense=_dense(self.NEW_TEXT),
+            source=CAPTURED_CHAT_SOURCE,
+        )
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result["outcome"] == "new_chunk"
+        assert result["chunk_id"] != "earlier-capture"
+        assert stores.vector.get_chunk("earlier-capture").text == self.OLD_TEXT
 
     def test_identical_repin_in_weak_band_reports_reinforced(self, service) -> None:
         """Identical wording is the strongest possible consistency evidence: an

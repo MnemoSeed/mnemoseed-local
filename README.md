@@ -5,9 +5,10 @@
 MnemoSeed Local is a single-user memory layer that runs on your machine. It
 captures conversations, retrieves relevant context across sessions, and provides
 a local web console. Adapters are available for OpenCode, Claude Code, ZCode,
-and Codex CLI. The OpenCode plugin is a V2 plugin definition and requires
-OpenCode 2.x; V1-shape plugin functions do not run on 2.x, and this plugin
-does not run on 1.x.
+and Codex CLI; Claude Desktop gets an MCP entry (no hook, so memory there is
+written by the assistant's own tool calls). The OpenCode plugin is a V2 plugin
+definition and requires OpenCode 2.x; V1-shape plugin functions do not run on
+2.x, and this plugin does not run on 1.x.
 
 [Website](https://mnemoseed.tech) · [Complete guide](docs/guide.md) ·
 [GitHub Sponsors](https://github.com/sponsors/MnemoSeed)
@@ -53,6 +54,7 @@ Ollama convenience; hardware requirements depend on the bound model.
 | Claude Code | [Hook setup](docs/guide.md#claude-code) |
 | ZCode | [Host setup](docs/guide.md#zcode) |
 | Codex CLI | [Host setup and trust review](docs/guide.md#codex-cli) |
+| Claude Desktop | [MCP entry and paste-ready instructions](docs/guide.md#surfaces-without-a-capture-hook) |
 
 Connect only the hosts you choose with the [host commands](docs/guide.md#host-setup).
 Host coverage varies by platform. Codex Desktop app-server mode is unverified.

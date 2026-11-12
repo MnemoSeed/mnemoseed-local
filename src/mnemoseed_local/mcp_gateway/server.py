@@ -6,14 +6,16 @@ any diagnostics go to stderr via ``logging``. Zero new dependencies.
 
 Protocol surface (MCP ``2024-11-05`` shape):
 
-- ``initialize`` -> protocolVersion + capabilities + serverInfo (any client
-  protocolVersion is accepted; the gateway always reports its own);
+- ``initialize`` -> protocolVersion + capabilities + serverInfo + instructions
+  (any client protocolVersion is accepted; the gateway always reports its own,
+  and the instruction block is built in ``instructions.py``);
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
-- ``tools/list`` -> the daemon tools (recall / remember / supersede /
+- ``tools/list`` -> the daemon tools (recall / remember / capture / supersede /
   dream_once / recent_sessions / session_windows — recent_sessions is the B2
   time-ordered resume surface, session_windows the B2.4 per-session
-  time-window surface, supersede the deliberate belief-replacement verb);
+  time-window surface, supersede the deliberate belief-replacement verb, and
+  capture the hook-less chat write arm of remember);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -34,6 +36,7 @@ from dataclasses import replace
 from typing import Any, TextIO
 
 from mnemoseed_local import __version__, daemon_state
+from mnemoseed_local.mcp_gateway import instructions
 from mnemoseed_local.mcp_gateway.reliable_client import (
     DAEMON_AUTH_HINT,
     DAEMON_DISABLED_HINT,
@@ -96,6 +99,25 @@ TOOLS: list[dict[str, Any]] = [
                         "required": ["kind", "value"],
                         "additionalProperties": False,
                     },
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "capture",
+        "description": "Record a durable decision, preference, or constraint the user stated, quoted "
+        "in the user's own words verbatim — never paraphrase, and never record your own guesses, "
+        "drafts, or reasoning. A capture is not a pin: it carries no pin marker and never replaces "
+        "an entry the user pinned. Use it in a session that has no injected memory block; use "
+        "'remember' when the user explicitly asks to pin something.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "the user's statement, quoted verbatim",
                 },
             },
             "required": ["text"],
@@ -222,6 +244,14 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             if arguments.get("rules") is not None:
                 remember_body["rules"] = arguments["rules"]
             payload = client.post("/memory/remember", remember_body)
+        elif name == "capture":
+            text = arguments.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return _error_result("capture requires a non-empty text")
+            payload = client.post(
+                "/memory/remember",
+                {"profile_id": client.profile_id, "text": text, "capture": True},
+            )
         elif name == "supersede":
             payload = client.post(
                 "/memory/supersede",
@@ -308,6 +338,7 @@ def handle_message(client: DaemonClient, message: dict[str, Any]) -> dict[str, A
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "mnemoseed-local", "version": __version__},
+            "instructions": instructions.gateway_text(),
         }
     elif method == "ping":
         result = {}
