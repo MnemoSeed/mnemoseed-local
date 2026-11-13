@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,6 +44,13 @@ EXISTING_CONFIG = {
 UNROUTABLE_BASE_URL = "http://127.0.0.1:9"
 
 HERMETIC_ENV_VARS = ("MNEMOSEED_CLAUDE_DESKTOP_CONFIG", "LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME")
+
+
+def _rpc(msg_id: int, method: str, params: dict[str, object] | None = None) -> dict[str, object]:
+    message: dict[str, object] = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+    if params is not None:
+        message["params"] = params
+    return message
 
 
 def _write_config(target: Path, payload: object, *, text: str | None = None) -> str:
@@ -82,10 +90,10 @@ def cd_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def installed_executable(monkeypatch: pytest.MonkeyPatch) -> str:
-    """The executable-resolution seam: the write path under test, with the
+    """The command-resolution seam: the write path under test, with the
     installed-runtime gate answered instead of guessed."""
     resolved = str(Path(sys.executable).resolve())
-    monkeypatch.setattr(cd_install, "resolve_executable", lambda: resolved)
+    monkeypatch.setattr(cd_install, "resolve_command", lambda: (resolved, ["mcp"]))
     return resolved
 
 
@@ -179,6 +187,24 @@ def test_a_malformed_mcp_servers_value_is_refused_not_overwritten(
     assert hashlib.md5(cd_surface.read_bytes()).hexdigest() == digest
 
 
+def test_a_malformed_mnemoseed_entry_is_refused_not_replaced(
+    cd_surface: Path, installed_executable: str
+) -> None:
+    """The entry is the same user data as the container that holds it: a shape
+    this tool does not own refuses with manual guidance instead of being
+    overwritten, exactly as status calls that shape ``unreadable``."""
+    digest = _write_config(
+        cd_surface,
+        {"mcpServers": {"mnemoseed": "not an object", "foreign-server": {"command": "x"}}},
+    )
+
+    with pytest.raises(cd_install.ConfigParseError):
+        cd_install.install()
+
+    assert hashlib.md5(cd_surface.read_bytes()).hexdigest() == digest
+    assert json.loads(cd_surface.read_text(encoding="utf-8"))["mcpServers"]["mnemoseed"] == "not an object"
+
+
 def test_an_empty_config_file_installs_cleanly(cd_surface: Path, installed_executable: str) -> None:
     _write_config(cd_surface, None, text="")
 
@@ -200,6 +226,30 @@ def test_the_cli_reports_a_refusal_instead_of_a_traceback(
     assert "manually" in captured.err
 
 
+def test_a_config_held_open_by_the_running_app_is_reported_with_guidance(
+    cd_surface: Path,
+    installed_executable: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A write the app holds open is a user-facing refusal: exit 1, the OS
+    error, the close-the-app guidance, and no traceback."""
+    _write_config(cd_surface, EXISTING_CONFIG)
+
+    def locked(*args: object, **kwargs: object) -> bool:
+        raise PermissionError("the file is held by another process")
+
+    monkeypatch.setattr(cd_install, "write_atomic", locked)
+
+    assert main(["host", "install", "--host", "claude_desktop"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "held by another process" in captured.err
+    assert "close Claude Desktop first" in captured.err
+    assert json.loads(cd_surface.read_text(encoding="utf-8")) == EXISTING_CONFIG
+
+
 # ---------------------------------------------------------------- the executable resolver
 
 
@@ -215,11 +265,80 @@ def test_a_development_run_refuses_the_install(cd_surface: Path) -> None:
     assert not cd_surface.exists()
 
 
-def test_a_frozen_bundle_is_an_installed_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_frozen_bundle_runs_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "frozen", True, raising=False)
 
     assert cd_install._installed_runtime() is True
-    assert cd_install.resolve_executable() == str(Path(sys.executable).resolve())
+    assert cd_install.resolve_command() == (str(Path(sys.executable).resolve()), ["mcp"])
+
+
+def _fake_installed_interpreter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A controlled interpreter location with the installed-runtime gate
+    answered, so the resolution under test builds the command itself."""
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    interpreter = scripts / "python.exe"
+    interpreter.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    monkeypatch.setattr(cd_install, "_installed_runtime", lambda: True)
+    return interpreter
+
+
+def test_the_installed_command_is_the_console_script_beside_the_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented install route is a tool/venv layout: the app spawns the
+    launcher beside the interpreter, because the interpreter alone would run
+    ``python mcp``, which is not a program."""
+    interpreter = _fake_installed_interpreter(tmp_path, monkeypatch)
+    launcher = interpreter.with_name(cd_install.GATEWAY_SCRIPT_NAME)
+    launcher.write_text("", encoding="utf-8")
+
+    assert cd_install.resolve_command() == (str(launcher), ["mcp"])
+
+
+def test_the_installed_command_falls_back_to_the_module_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An installed layout without a launcher still yields a spawnable command:
+    the interpreter running the CLI module with the gateway verb."""
+    interpreter = _fake_installed_interpreter(tmp_path, monkeypatch)
+
+    assert cd_install.resolve_command() == (
+        str(interpreter),
+        ["-m", "mnemoseed_local.cli", "mcp"],
+    )
+
+
+def test_the_resolved_command_completes_an_mcp_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command this adapter writes is the command the app will spawn: it is
+    run here for real and answers an ``initialize`` handshake. Only the
+    installed-runtime gate is answered — the resolution under test builds the
+    command itself, with no resolver seam patched."""
+    monkeypatch.setattr(cd_install, "_installed_runtime", lambda: True)
+    command, args = cd_install.resolve_command()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        f'baseurl = "{UNROUTABLE_BASE_URL}"\npreset = "embedded"\n', encoding="utf-8"
+    )
+
+    completed = subprocess.run(
+        [command, *args],
+        input=json.dumps(_rpc(1, "initialize")) + "\n",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "MNEMOSEED_LOCAL_HOME": str(home)},
+        timeout=60.0,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    answered = json.loads(completed.stdout.splitlines()[0])
+    assert answered["result"]["serverInfo"]["name"] == "mnemoseed-local"
+    assert answered["result"]["instructions"] == instructions.gateway_text()
 
 
 # ---------------------------------------------------------------- status
@@ -235,6 +354,31 @@ def test_status_tracks_not_installed_installed_and_stale(cd_surface: Path, insta
     written["mcpServers"]["mnemoseed"]["command"] = "C:/gone/away/python.exe"
     _write_config(cd_surface, written)
     assert cd_install.status().state == "stale"
+
+
+def test_status_reports_stale_when_only_the_arguments_differ(
+    cd_surface: Path, installed_executable: str
+) -> None:
+    """The stored entry is the command/argument pair: a matching command with
+    arguments this surface would not write is not the entry it would write."""
+    cd_install.install()
+    written = json.loads(cd_surface.read_text(encoding="utf-8"))
+    written["mcpServers"]["mnemoseed"]["args"] = ["--stdio"]
+    _write_config(cd_surface, written)
+
+    assert cd_install.status().state == "stale"
+
+
+def test_a_development_checkout_reports_installed_when_it_cannot_compare(cd_surface: Path) -> None:
+    """Outside an installed runtime there is no command to compare against, so
+    a non-empty entry honestly reads ``installed`` rather than a state that
+    would pretend to know."""
+    _write_config(
+        cd_surface, {"mcpServers": {"mnemoseed": {"command": "C:/somewhere/cli.exe", "args": ["mcp"]}}}
+    )
+
+    assert cd_install._installed_runtime() is False
+    assert cd_install.status().state == "installed"
 
 
 def test_stale_is_repaired_by_reinstalling(
@@ -389,6 +533,39 @@ def test_the_classic_path_is_the_fallback_when_nothing_exists(
     _, classic = windows_layout
 
     assert cd_install.config_path() == classic / cd_install.CONFIG_FILENAME
+
+
+def test_the_side_that_already_carries_a_config_wins(windows_layout: tuple[Path, Path]) -> None:
+    """A package directory can exist while the app the user actually runs is
+    the classic install: the side that already holds a config file is the live
+    surface, whichever side it is."""
+    msix_root, classic = windows_layout
+    (msix_root / "claude_pkg").mkdir(parents=True)
+    _write_config(classic / cd_install.CONFIG_FILENAME, {"preferences": {"classic": True}})
+
+    assert cd_install.config_path() == classic / cd_install.CONFIG_FILENAME
+
+
+def test_a_config_on_both_sides_refuses_with_guidance(
+    windows_layout: tuple[Path, Path], installed_executable: str
+) -> None:
+    """Two live config files mean the surface cannot be decided: no guess, no
+    write, and an explicit pointer at the override."""
+    msix_root, classic = windows_layout
+    package = msix_root / "claude_pkg"
+    _write_config(package / cd_install.CONFIG_FILENAME, {"preferences": {"msix": True}})
+    _write_config(classic / cd_install.CONFIG_FILENAME, {"preferences": {"classic": True}})
+
+    with pytest.raises(cd_install.ClaudeDesktopConfigError) as refusal:
+        cd_install.install()
+
+    assert cd_install.CONFIG_OVERRIDE_ENV in str(refusal.value)
+    assert json.loads((package / cd_install.CONFIG_FILENAME).read_text(encoding="utf-8")) == {
+        "preferences": {"msix": True}
+    }
+    assert json.loads((classic / cd_install.CONFIG_FILENAME).read_text(encoding="utf-8")) == {
+        "preferences": {"classic": True}
+    }
 
 
 @pytest.mark.parametrize(

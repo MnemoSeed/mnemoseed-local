@@ -446,17 +446,25 @@ mnemoseed-local instructions --surface claude_chat
 ```
 
 `host install --host claude_desktop` merges one `mcpServers.mnemoseed` entry
-(`{"command": "<absolute path>", "args": ["mcp"]}`) into the app's
-`claude_desktop_config.json`, resolved by directory existence: the
-`MNEMOSEED_CLAUDE_DESKTOP_CONFIG` override, then the Windows MSIX package
-directory, then the platform classic path. Every other key in that file is
-preserved, and a file that is not strict JSON is refused untouched. The command
-is written only from an installed runtime — a development checkout refuses,
-because the app cannot spawn a build environment's interpreter. `host status
---host claude_desktop` reports `not-installed` / `installed` / `stale` (the
-configured command is not the one this surface would write now) / `unreadable`
-(the file, or the entry inside it, cannot be parsed). Close Claude Desktop before
-restarting it: a running app can rewrite the file from memory on exit.
+into the app's `claude_desktop_config.json`: `{"command": "<absolute path>",
+"args": ["mcp"]}`, where the command is the installed CLI's console script
+beside its interpreter (falling back to that interpreter with `args: ["-m",
+"mnemoseed_local.cli", "mcp"]` when no launcher was shipped). The file is
+resolved by directory existence: the `MNEMOSEED_CLAUDE_DESKTOP_CONFIG` override,
+then whichever side already carries a config file — the Windows MSIX package
+directory or the platform classic path — and, when neither does, the MSIX
+directory if it exists, else the classic path. Every other key in that file is
+preserved, and a file that is not strict JSON is refused untouched; an existing
+`mcpServers.mnemoseed` entry of the wrong shape refuses too, instead of being
+replaced. One caveat of any rewrite: duplicate JSON keys in the original file
+are silently merged by `json.loads`, which keeps only the last value. The
+command is written only from an installed runtime — a development checkout
+refuses, because the app cannot spawn a build environment's interpreter.
+`host status --host claude_desktop` reports `not-installed` / `installed` /
+`stale` (the configured command and arguments are not the ones this surface
+would write now) / `unreadable` (the file, or the entry inside it, cannot be
+parsed). Close Claude Desktop before restarting it: a running app can rewrite
+the file from memory on exit.
 
 `instructions --surface <surface>` prints the paste-ready block for
 `claude_chat`, `chatgpt`, `claude_code`, or `generic` (the block the MCP

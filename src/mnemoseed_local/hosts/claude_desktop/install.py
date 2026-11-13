@@ -1,27 +1,32 @@
 """Claude Desktop lifecycle: the ``mcpServers.mnemoseed`` entry in
 ``claude_desktop_config.json``.
 
-The app reads that file from a directory resolved by DIRECTORY existence, in
-this order: ``MNEMOSEED_CLAUDE_DESKTOP_CONFIG`` (an explicit file override for
-tests and CI), then the Windows MSIX package directory under
-``%LOCALAPPDATA%\\Claude-Data\\<pkg>\\``, then the platform classic path
+The app reads that file from a directory resolved by DIRECTORY existence:
+``MNEMOSEED_CLAUDE_DESKTOP_CONFIG`` (an explicit file override for tests and CI)
+wins; otherwise the side that already carries a config file wins, whichever side
+that is — the Windows MSIX package directory under
+``%LOCALAPPDATA%\\Claude-Data\\<pkg>\\`` or the platform classic path
 (``%APPDATA%\\Claude\\``, ``~/Library/Application Support/Claude/``,
-``~/.config/Claude/``). File existence would be the wrong test: an installed
-package whose config has not been generated yet is the live surface, and writing
-elsewhere produces a file the app never reads. Several package directories are
-resolved by newest config mtime, and two of them already carrying a config file
-refuse the operation instead of guessing.
+``~/.config/Claude/``). File existence would be the wrong test for the fallback:
+an installed package whose config has not been generated yet is the live
+surface, and writing elsewhere produces a file the app never reads. Several
+package directories are resolved by newest config mtime, a config file on both
+sides refuses the operation, and so do two package directories that each carry
+one.
 
-Merge semantics: strict JSON, only ``mcpServers.mnemoseed`` is written
-(``{"command": <absolute path>, "args": ["mcp"]}``), every other key survives
-untouched, and a file that does not strict-parse or whose ``mcpServers`` is not
-an object refuses with manual-edit guidance and stays byte-for-byte unchanged.
-Rewrites are atomic (``hosts.common.config.write_atomic``).
+Merge semantics: strict JSON, only ``mcpServers.mnemoseed`` is written, every
+other key survives untouched, and a file that does not strict-parse or whose
+``mcpServers`` — or the mnemoseed entry inside it — is not an object refuses
+with manual-edit guidance and stays byte-for-byte unchanged. Rewrites are atomic
+(``hosts.common.config.write_atomic``); a write the running app holds open is
+reported with close-the-app guidance instead of a traceback.
 
-The command is the running interpreter's absolute path, written only from an
-installed runtime: a development checkout refuses, because pointing the app at a
-build environment writes an entry it cannot spawn. Status reuses the shared
-/healthz probe and HookStatus shape; all operations are local filesystem work.
+The written entry is a command the app can spawn: a frozen bundle runs itself
+with the ``mcp`` argument, an installed distribution runs the launcher beside
+its interpreter (else that interpreter running the CLI module), and a
+development checkout refuses, because a build environment's interpreter is not a
+command the app can run. Status reuses the shared /healthz probe and HookStatus
+shape; all operations are local filesystem work.
 
 The app owns account-level personal preferences that live in the cloud, so this
 installer cannot write the chat-side protocol text — it prints the paste-ready
@@ -56,8 +61,14 @@ CLASSIC_DIR_NAME = "Claude"
 MCP_KEY = "mcpServers"
 MCP_SERVER_NAME = "mnemoseed"
 
-#: The stdio gateway verb the app spawns.
+#: The stdio gateway verb an installed launcher takes.
 GATEWAY_ARGS = ("mcp",)
+
+#: The launcher an installed distribution ships beside its interpreter.
+GATEWAY_SCRIPT_NAME = "mnemoseed-local.exe" if os.name == "nt" else "mnemoseed-local"
+
+#: The CLI module form, for an interpreter that shipped no launcher beside it.
+MODULE_ARGS = ("-m", "mnemoseed_local.cli")
 
 #: What the user is told when the surface cannot be decided or written.
 DEV_RUN_GUIDANCE = (
@@ -66,11 +77,17 @@ DEV_RUN_GUIDANCE = (
     "and run this command from that install"
 )
 
+#: What the user is told when the app holds its own config file open.
+FILE_LOCK_HINT = (
+    f"close Claude Desktop first, then retry: a running app can hold {CONFIG_FILENAME} open and "
+    "rewrite it from memory on exit"
+)
+
 
 class ClaudeDesktopConfigError(ConfigParseError):
-    """This adapter refuses to write: the config surface is undecidable (several
-    package directories already carry a config file) or the running interpreter
-    is not an installed runtime. Nothing is written."""
+    """This adapter refuses to write: the config surface is undecidable (both
+    sides, or several package directories, already carry a config file) or the
+    running interpreter is not an installed runtime. Nothing is written."""
 
 
 def _platform() -> str:
@@ -137,11 +154,25 @@ def _select_package_dir(packages: Sequence[Path]) -> Path:
 
 
 def config_dir() -> Path:
-    """The directory the app reads its config from (see the module docstring)."""
+    """The directory the app reads its config from (see the module docstring):
+    the side that already carries a config file, else the package directory when
+    there is one, else the classic path."""
     packages = _msix_package_dirs()
-    if packages:
-        return _select_package_dir(packages)
-    return _classic_dir()
+    package = _select_package_dir(packages) if packages else None
+    classic = _classic_dir()
+    configured = [
+        side for side in (package, classic) if side is not None and (side / CONFIG_FILENAME).is_file()
+    ]
+    if len(configured) > 1:
+        raise ClaudeDesktopConfigError(
+            f"both Claude Desktop layouts already hold {CONFIG_FILENAME} "
+            f"({' and '.join(str(side) for side in configured)}): this tool cannot tell which one "
+            f"the app reads. Point {CONFIG_OVERRIDE_ENV} at the file to use, or remove the "
+            "config the app does not read"
+        )
+    if configured:
+        return configured[0]
+    return package if package is not None else classic
 
 
 def config_path() -> Path:
@@ -162,19 +193,31 @@ def _installed_runtime() -> bool:
     return Path(__file__).resolve().parents[3].name != "src"
 
 
-def resolve_executable() -> str:
-    """The absolute interpreter path a Desktop entry can spawn."""
+def resolve_command() -> tuple[str, list[str]]:
+    """The ``(command, args)`` the app spawns for the stdio gateway.
+
+    A frozen bundle is the command itself. An installed distribution spawns the
+    launcher beside its interpreter — the bare interpreter would run ``python
+    mcp``, which is not a program — and falls back to that interpreter running
+    the CLI module when no launcher was shipped. A development checkout refuses.
+    """
+    interpreter = Path(sys.executable)
+    if getattr(sys, "frozen", False):
+        return str(interpreter.resolve()), list(GATEWAY_ARGS)
     if not _installed_runtime():
         raise ClaudeDesktopConfigError(DEV_RUN_GUIDANCE)
-    return str(Path(sys.executable).resolve())
+    launcher = interpreter.with_name(GATEWAY_SCRIPT_NAME)
+    if launcher.is_file():
+        return str(launcher), list(GATEWAY_ARGS)
+    return str(interpreter), [*MODULE_ARGS, *GATEWAY_ARGS]
 
 
-def mcp_entry(executable: str) -> dict[str, object]:
+def mcp_entry(command: str, args: Sequence[str]) -> dict[str, object]:
     """The one entry this adapter writes."""
-    return {"command": executable, "args": list(GATEWAY_ARGS)}
+    return {"command": command, "args": list(args)}
 
 
-def _report(target: Path, executable: str, changed: bool) -> None:
+def _report(target: Path, command: str, args: Sequence[str], changed: bool) -> None:
     """The install output: what was written, when to restart the app, the
     paste-ready chat protocol, how to verify it, and the boundary that the chat
     surface has no capture hook."""
@@ -184,7 +227,7 @@ def _report(target: Path, executable: str, changed: bool) -> None:
         mcp="applied" if changed else "up to date",
     )
     print(f"host claude_desktop: config: {target}")
-    print(f"host claude_desktop: command: {executable} {' '.join(GATEWAY_ARGS)}")
+    print(f"host claude_desktop: command: {' '.join([command, *args])}")
     print(
         "host claude_desktop: next: close Claude Desktop first, then restart it - a running app "
         "can rewrite this config from memory on exit and drop the new entry"
@@ -205,15 +248,16 @@ def _report(target: Path, executable: str, changed: bool) -> None:
     print(instructions.gateway_text("claude_chat"))
 
 
-def install(path: Path | None = None, *, executable: str | None = None) -> tuple[Path, bool]:
+def install(path: Path | None = None) -> tuple[Path, bool]:
     """Merge the MCP entry into the app's config; returns ``(path, changed)``."""
-    resolved = executable if executable is not None else resolve_executable()
+    command, args = resolve_command()
     target = path or config_path()
     data = load_object(target)
     servers = require_object(target, data, MCP_KEY)
-    servers[MCP_SERVER_NAME] = mcp_entry(resolved)
+    require_object(target, servers, MCP_SERVER_NAME)  # a stored entry is user data: malformed refuses
+    servers[MCP_SERVER_NAME] = mcp_entry(command, args)
     changed = write_atomic(target, data)
-    _report(target, resolved, changed)
+    _report(target, command, args, changed)
     return target, changed
 
 
@@ -240,11 +284,25 @@ def uninstall(path: Path | None = None) -> tuple[Path, bool]:
     return target, True
 
 
-def _current_command() -> str | None:
-    """The command this adapter would write now, or None when the running
-    interpreter is not an installed runtime and cannot be compared against."""
+def _stored_args(entry: dict[str, object]) -> list[object]:
+    """A stored entry's argument list; anything that is not a list reads as none."""
+    args = entry.get("args")
+    return list(args) if isinstance(args, list) else []
+
+
+def _entry_matches(entry: dict[str, object], current: dict[str, object]) -> bool:
+    """Whether a stored entry IS the command and arguments this surface would
+    write now. Extra keys a user added beside them are none of this
+    comparison."""
+    return entry.get("command") == current["command"] and _stored_args(entry) == _stored_args(current)
+
+
+def _current_entry() -> dict[str, object] | None:
+    """The entry this adapter would write now, or None when the running
+    interpreter is not an installed runtime and there is nothing to compare
+    against."""
     try:
-        return resolve_executable()
+        return mcp_entry(*resolve_command())
     except ClaudeDesktopConfigError:
         return None
 
@@ -252,12 +310,17 @@ def _current_command() -> str | None:
 def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     """The entry's state plus the shared /healthz reachability probe.
 
-    States: ``not-installed`` / ``installed`` / ``stale`` (the configured command
-    is not the one this surface would write now, which is how an entry pointing
-    at a removed environment shows up) / ``unreadable`` (the file, or the
-    mnemoseed entry inside it, cannot be parsed into the expected shape). A parse
-    failure is never reported as ``stale`` and a command mismatch never as
+    States: ``not-installed`` / ``installed`` / ``stale`` (the entry is not the
+    command and arguments this surface would write now, which is how an entry
+    pointing at a removed environment shows up) / ``unreadable`` (the file, or
+    the mnemoseed entry inside it, cannot be parsed into the expected shape). A
+    parse failure is never reported as ``stale`` and a command mismatch never as
     ``unreadable``.
+
+    Command comparison needs an installed runtime: outside one there is no
+    command to compare against, so a non-empty entry reports ``installed`` —
+    the entry exists, and whether it still resolves is not knowable from a
+    development checkout.
     """
     target = path or config_path()
     try:
@@ -270,14 +333,17 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
             state = "unreadable"
         else:
             entry = (servers or {}).get(MCP_SERVER_NAME)
-            command = entry.get("command") if isinstance(entry, dict) else None
             if entry is None:
                 state = "not-installed"
-            elif not isinstance(command, str) or not command.strip():
+            elif not isinstance(entry, dict):
                 state = "unreadable"
             else:
-                current = _current_command()
-                state = "stale" if current is not None and command != current else "installed"
+                command = entry.get("command")
+                if not isinstance(command, str) or not command.strip():
+                    state = "unreadable"
+                else:
+                    current = _current_entry()
+                    state = "installed" if current is None or _entry_matches(entry, current) else "stale"
     resolved_base = base_url if base_url is not None else shared.resolve_base_url()
     return HookStatus(
         root=target.parent,

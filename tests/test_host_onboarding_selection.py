@@ -318,13 +318,24 @@ def test_dry_run_plan_reports_the_host_selection() -> None:
 def test_installers_detect_installed_hosts_via_cli_or_config_dir() -> None:
     assert "detect_installed_hosts() {" in SH_TEXT
     assert "host_config_dir" in SH_TEXT
-    for pair in ("claude_code:claude", "codex_cli:codex", "opencode:opencode", "zcode:zcode"):
+    for pair in (
+        "claude_code:claude",
+        "claude_desktop:",
+        "codex_cli:codex",
+        "cursor:cursor",
+        "opencode:opencode",
+        "zcode:zcode",
+    ):
         assert pair in SH_TEXT, pair
     for marker in (
         '"$HOME/.claude"',
         '"$HOME/.codex"',
         '"$HOME/.config/opencode"',
         '"$HOME/.zcode"',
+        '"$HOME/.cursor"',
+        "MNEMOSEED_CLAUDE_DESKTOP_CONFIG",
+        "Claude-Data",
+        '"$HOME/.config/Claude"',
         "CODEX_HOME",
         "OPENCODE_CONFIG_DIR",
         "XDG_CONFIG_HOME",

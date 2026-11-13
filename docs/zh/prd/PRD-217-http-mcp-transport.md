@@ -10,6 +10,7 @@
 - 唯一路径 **`/mcp`**（精确等值，无尾斜杠变体）。`POST /mcp` = JSON-RPC 2.0；`GET`/`DELETE` → 405。不发 `Mcp-Session-Id`，无服务端会话表——**无状态**。
 - 注册：`app.include_router(mcp_router)` 与其余 router 并列，**必须在 console `StaticFiles` 挂载之前**（Starlette 按注册序匹配；次序有测试钉）。
 - 信封层直调既有 `handle_message` / `call_tool` / `TOOLS`（`mcp_gateway/server.py`），**零改动**：工具集、isError 文案、归因字节不变，stdio 契约测试与工具集 pin 继续有效。`initialize` 答既有 `PROTOCOL_VERSION`；协议版本回声协商仅作为 adapter 层的备选缝，本批不启用。
+  **本条已被 #387 有意修订（不静默，PRD-387 §3 第 5 点 + 该批 PR 正文显式声明）**：工具集半边的冻结解除——hook-less 表面新增 `capture` 工具，工具集 pin 升为七工具；isError 文案与归因字节仍不变，stdio/HTTP 两传输仍逐字节一致。
 - stdio 网关原样保留（`serve()`、`handle_line`、UTF-8 线钉不动）。
 
 ### per-request 身份契约（Q2）

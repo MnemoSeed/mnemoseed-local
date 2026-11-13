@@ -207,12 +207,25 @@ host_config_dir() {
         claude_code)
             if [ -d "$HOME/.claude" ]; then return 0; fi
             ;;
+        claude_desktop)
+            if [ -n "${MNEMOSEED_CLAUDE_DESKTOP_CONFIG:-}" ]; then
+                if [ -f "$MNEMOSEED_CLAUDE_DESKTOP_CONFIG" ]; then return 0; fi
+            else
+                if [ -d "$HOME/Library/Application Support/Claude" ]; then return 0; fi
+                if [ -d "$HOME/.config/Claude" ]; then return 0; fi
+                if [ -n "${APPDATA:-}" ] && [ -d "$APPDATA/Claude" ]; then return 0; fi
+                if [ -n "${LOCALAPPDATA:-}" ] && [ -d "$LOCALAPPDATA/Claude-Data" ]; then return 0; fi
+            fi
+            ;;
         codex_cli)
             if [ -n "${CODEX_HOME:-}" ]; then
                 if [ -d "$CODEX_HOME" ]; then return 0; fi
             else
                 if [ -d "$HOME/.codex" ]; then return 0; fi
             fi
+            ;;
+        cursor)
+            if [ -d "$HOME/.cursor" ]; then return 0; fi
             ;;
         opencode)
             if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
@@ -232,13 +245,14 @@ host_config_dir() {
 
 # detect_installed_hosts -> the installed host keys, space-separated on one
 # line in registry order: a host counts as installed when its CLI is on PATH
-# or its adapter config directory exists.
+# or its adapter config directory exists. An empty pair entry has no CLI, so
+# the config directory alone decides it.
 detect_installed_hosts() {
     _detected=""
-    for _pair in claude_code:claude codex_cli:codex opencode:opencode zcode:zcode; do
+    for _pair in claude_code:claude claude_desktop: codex_cli:codex cursor:cursor opencode:opencode zcode:zcode; do
         _key="${_pair%%:*}"
         _cli="${_pair#*:}"
-        if have "$_cli" || host_config_dir "$_key"; then
+        if { [ -n "$_cli" ] && have "$_cli"; } || host_config_dir "$_key"; then
             if [ -n "$_detected" ]; then
                 _detected="$_detected $_key"
             else

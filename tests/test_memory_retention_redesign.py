@@ -205,6 +205,47 @@ class TestSupersedeInPlace:
         assert result == {"outcome": "needs_reconcile", "chunk_id": "conflict"}
         assert stores.vector.get_chunk("conflict").text == old
 
+    def test_a_capture_landing_on_a_conflicting_pin_only_flags_reconcile(self, service) -> None:
+        """A captured transcription that contradicts the user's pin is not a
+        write: the pin's text, source, history and weight all stand and only
+        the adjudication flag goes up — never a new chunk either."""
+        svc, stores, _config = service
+        old = "AtlasDb prefers pnpm for package management"
+        new = "AtlasDb stopped using pnpm and switched to npm for package management"
+        _seed_chunk(stores, "conflict-pin", old, dense=_dense(new))
+
+        result = svc.remember(profile_id=_PROFILE, text=new, capture=True)
+
+        assert result == {"outcome": "needs_reconcile", "chunk_id": "conflict-pin"}
+        stored = stores.vector.get_chunk("conflict-pin")
+        assert stored.text == old
+        assert stored.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in stored.provenance.history] == ["created"]
+        assert stored.decay_weight == 1.0
+        flagged = stores.vector.list_chunks(
+            ChunkFilter(profile_id=_PROFILE, needs_reconcile=True), Page(offset=0, limit=10)
+        )
+        assert [chunk.chunk_id for chunk in flagged.items] == ["conflict-pin"]
+        everything = stores.vector.list_chunks(ChunkFilter(profile_id=_PROFILE), Page(offset=0, limit=100))
+        assert everything.total == 1
+
+    def test_a_capture_identical_to_a_pin_only_reinforces(self, service) -> None:
+        """Identical wording is reinforcement, never a text write: the pin keeps
+        its verbatim text, source and history while its weight rebounds."""
+        svc, stores, _config = service
+        _seed_chunk(stores, "same-pin", self.NEW_TEXT, dense=_dense(self.NEW_TEXT), decay_weight=0.5)
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result == {"outcome": "reinforced", "chunk_id": "same-pin"}
+        stored = stores.vector.get_chunk("same-pin")
+        assert stored.text == self.NEW_TEXT
+        assert stored.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in stored.provenance.history] == ["created"]
+        assert stored.decay_weight == pytest.approx(0.6)
+        everything = stores.vector.list_chunks(ChunkFilter(profile_id=_PROFILE), Page(offset=0, limit=100))
+        assert everything.total == 1
+
     def test_capture_class_band_hit_is_never_superseded(self, service) -> None:
         """The supersede branch is flashbulb-class only: a re-pin landing in
         band over an ordinary CAPTURE chunk must fall through to a fresh chunk

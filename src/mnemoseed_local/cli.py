@@ -1935,12 +1935,21 @@ def _host_lifecycle(host: str, verb: str) -> Callable[[], Any]:
     return entry
 
 
+def _host_write_guidance(host: str) -> str | None:
+    """The adapter's guidance for a config file the running app holds open, or
+    None when the adapter defines none."""
+    module = importlib.import_module(HOOK_HOSTS[host].install)
+    return getattr(module, "FILE_LOCK_HINT", None)
+
+
 def cmd_host(args: argparse.Namespace) -> int:
     """Host adapter lifecycle: install | uninstall | status.
 
     Routes to the adapter module named in HOOK_HOSTS and its convention-named
     zero-arg lifecycle functions. A missing adapter is a user-facing error
-    (fail loud), unlike the hook transformer's fail-open dispatch.
+    (fail loud), unlike the hook transformer's fail-open dispatch. A refused or
+    unwritable surface — a malformed config, or one the running app holds open —
+    is an error line with the adapter's guidance, never a traceback.
     """
     try:
         entry = _host_lifecycle(args.host, args.host_command)
@@ -1949,10 +1958,14 @@ def cmd_host(args: argparse.Namespace) -> int:
         return 1
     try:
         result = entry()
-    except ConfigParseError as exc:
-        # a refused surface is a user-facing error with manual guidance, never a
-        # traceback: the adapter wrote nothing.
+    except (ConfigParseError, OSError) as exc:
+        # a refused or unwritable surface is a user-facing error with manual
+        # guidance, never a traceback: the adapter wrote nothing.
         print(f"mnemoseed-local: {exc}", file=sys.stderr)
+        if isinstance(exc, OSError):
+            guidance = _host_write_guidance(args.host)
+            if guidance:
+                print(f"mnemoseed-local: {guidance}", file=sys.stderr)
         return 1
     if args.host_command == "status":
         observations = _host_status_observations(args.host, result)

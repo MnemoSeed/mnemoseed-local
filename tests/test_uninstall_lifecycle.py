@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -38,6 +39,15 @@ HOME_ENV_VARS = (
     "MNEMOSEED_LOCAL_BASEURL",
     "MNEMOSEED_LOCAL_PROFILE_ID",
 )
+
+#: The path variables that aim host adapters at the real user profile. They are
+#: pointed inside the sandbox home — not merely unset — so a purge can never
+#: resolve a real Claude Desktop config.
+CLAUDE_PATH_ENV = {
+    "LOCALAPPDATA": "Local",
+    "APPDATA": "Roaming",
+    "MNEMOSEED_CLAUDE_DESKTOP_CONFIG": "Claude/claude_desktop_config.json",
+}
 
 PACKAGE_COMMAND = "uv tool uninstall mnemoseed-local"
 
@@ -63,6 +73,8 @@ def lifecycle_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", home / "config.toml")
     for var in HOME_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    for var, relative in CLAUDE_PATH_ENV.items():
+        monkeypatch.setenv(var, str(tmp_path / relative))
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda base_url, timeout=2.0: False)
     return home
 
@@ -185,6 +197,45 @@ def test_purge_removes_detected_adapters_then_data(
     assert not lifecycle_home.exists()
     assert not (tmp_path / ".zcode" / "cli" / "mnemoseed-local.json").exists()
     assert PACKAGE_COMMAND in out
+
+
+def test_a_purge_never_touches_a_path_outside_the_temporary_home(
+    lifecycle_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The purge may only reach paths the fixture owns: the Claude Desktop
+    config resolves inside the temporary home, our entry is removed from that
+    file, and every atomic rewrite lands under the temporary home."""
+    from mnemoseed_local.hosts.claude_desktop import install as cd_install
+
+    target = cd_install.config_path()
+    # Isolation comes first: a resolution that escapes the sandbox home fails
+    # here, before the purge gets the chance to reach anything outside it.
+    assert target.is_relative_to(tmp_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "preferences": {"a": 1},
+                "mcpServers": {"mnemoseed": {"command": "C:/somewhere/cli.exe", "args": ["mcp"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    replaced: list[Path] = []
+    real_replace = os.replace
+
+    def recording_replace(src: object, dst: object) -> None:
+        replaced.append(Path(str(dst)))
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", recording_replace)
+
+    assert main(["uninstall", "--purge", "--yes"]) == 0
+
+    assert "mnemoseed" not in json.loads(target.read_text(encoding="utf-8")).get("mcpServers", {})
+    assert replaced, "the purge performed no atomic rewrite at all"
+    for path in replaced:
+        assert path.is_relative_to(tmp_path), path
 
 
 def test_purge_with_confirmation_removes(lifecycle_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

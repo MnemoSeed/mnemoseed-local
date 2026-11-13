@@ -64,9 +64,15 @@ L1 是主路径：MCP 规范把 `instructions` 定义为"给客户端的可选�
 
 **必须在 `remember()` 加对称守卫**（当前守卫是不对称的）：现有 `memory.py:933` 只保证"pin 不覆盖 captured"，没有保证"captured 不覆盖 pin"。captured 命中既有 `EXPLICIT_PIN_SOURCE` 且非逐字重复时，今天会走到 supersede-in-place，用模型转述替换用户显式 pin 的 verbatim 正文。修正为：
 
-> 只有在 **写入方与命中方都是显式 pin** 时才允许 supersede-in-place；其余一切近重复落 `new_chunk`。
+> 只有在 **写入方与命中方都是显式 pin** 时才允许 supersede-in-place；其余近重复按分支落位：
+>
+> - **逐字相同**（identical wording）→ 只做强化（`decay_weight` 回弹，如 0.5 → 0.6）：不写 text，不追加 history 事件；
+> - **语义冲突**（`CONFLICT`）→ 只置 `needs_reconcile` 裁决标志：pin 的 text / source / history / weight 一律不写；
+> - 其余近重复 → `new_chunk`，不碰既有条目。
+>
+> 前两条都不是 `new_chunk`；supersede-in-place 因此仍是 pin-to-pin 独占。
 
-该修正是本批的语义红线，必须有测试钉住两个方向。
+该修正是本批的语义红线，必须有测试钉住两个方向；上述两个 carve-out 分支各有一条 `capture=True` 测试钉住。
 
 **为什么不走 `/ingest`**：那需要发明 chat 的 `session_id` 与 turn 分段语义，会把节点级持久事实混进 `recent_sessions` / `session_windows` 的时间线。`HostId` 里也没有 chat 表面。
 
@@ -75,26 +81,29 @@ L1 是主路径：MCP 规范把 `instructions` 定义为"给客户端的可选�
 **路径解析（按目录存在性判定，不按文件存在性）**：
 
 1. `MNEMOSEED_CLAUDE_DESKTOP_CONFIG` 显式覆盖（测试与 CI 用）；
-2. 目录候选，按序首命中：
-   - Windows MSIX：`%LOCALAPPDATA%\Claude-Data\<pkg>\`（`<pkg>` 目录存在即命中）；
-   - Windows 经典：`%APPDATA%\Claude\`；
-   - macOS：`~/Library/Application Support/Claude/`；
-   - Linux：`~/.config/Claude/`；
-3. 全部不存在 → 该平台经典路径（创建目录）。
+2. 目录候选：
+   - Windows MSIX：`%LOCALAPPDATA%\Claude-Data\<pkg>\`（`<pkg>` 目录存在即在候选内）；
+   - Windows 经典：`%APPDATA%\Claude\`；macOS：`~/Library/Application Support/Claude/`；Linux：`~/.config/Claude/`；
+3. **已带 `claude_desktop_config.json` 的一侧优先**：MSIX 侧存在但不带配置、经典侧带配置 → 取经典，反向同理；**两侧都带配置 → 拒绝并给人工指引**（指向 `MNEMOSEED_CLAUDE_DESKTOP_CONFIG`），不猜；
+4. 两侧都不带配置 → MSIX 候选存在则取它，否则平台经典路径（创建目录）。
 
 MSIX 目录下若存在**多个** `<pkg>` 目录：取配置文件 mtime 最新者；若其中多于一个已带 `claude_desktop_config.json`，**拒绝并给人工指引**，不猜。
 
 只按文件存在性判定会在本机现有环境下写出一个应用永不读取的死文件（MSIX 包已装、配置文件尚未生成），install 会打印 applied、status 会报 installed，而真实表面永远不生效。
 
-**可执行文件解析器**：
+**可执行文件解析器**（三支，`args` 随支而定）：
 
-- 冻结安装（`sys.frozen` 或 exe 形态）→ 写 `sys.executable` 绝对路径；
-- 非冻结运行（dev-tree `python -m`）→ **拒绝 install** 并指引先用 CLI 安装形态；不得写出 `python.exe mcp` 这种废命令；
+- 冻结安装（`sys.frozen` 或 exe 形态）→ `command` = `sys.executable` 绝对路径，`args = ["mcp"]`；
+- 非冻结但已安装（`uv tool install` / venv 布局）→ `command` = 解释器旁的 console script（Windows `mnemoseed-local.exe`，其它平台 `mnemoseed-local`），`args = ["mcp"]`；该脚本缺席时回退 `command = sys.executable` + `args = ["-m", "mnemoseed_local.cli", "mcp"]`。任何一支都**不得**写出 `python.exe mcp` 这种废命令；
+- 开发树（dev-tree checkout）→ **拒绝 install** 并指引先用 CLI 安装形态；
+- status 以 command + args **整对**与当前解析结果比较：旧的坏条目因此判 `stale`，重跑 install 即修复；开发树里没有可比的 command，非空条目如实报 `installed`（不新增第五种状态）；
 - 含空格路径由 JSON 数组 args 天然承接，无需转义处理。
 
 **合并语义**：
 
-- 只写 `mcpServers.mnemoseed = {"command": <解析结果>, "args": ["mcp"]}`。`preferences` 及其它每个键保持原样。
+- 只写 `mcpServers.mnemoseed = {"command": <解析结果>, "args": <该支的网关参数>}`。`preferences` 及其它每个键保持原样。
+- 已有的 `mcpServers.mnemoseed` 是用户数据：形状异常（非对象）→ **拒绝并给人工指引**，与 `mcpServers` 容器同一 `require_object` 形状、同一 `ConfigParseError` 退出路径，文件逐字节不动（status 对该形状报 `unreadable`，install 不得静默覆盖）。
+- 配置文件被运行中的应用占用（`write_atomic` 抛 `OSError`/`PermissionError`）→ `host` 动词以 exit 1 报错并回显"先关闭 Claude Desktop"的指引，不打印 traceback。
 - 严格 JSON；解析失败或 `mcpServers` / `mcpServers.mnemoseed` 形状异常 → 拒绝并给人工指引，文件逐字节不动（复用 `claude_code` 的 `SettingsParseError` 模式）。
 - 原子写：临时文件 + fsync + `os.replace`（复用 `hosts.common.config.write_atomic`）。
 - install 输出必须提示**先关闭 Claude Desktop**：运行中的应用可能在退出时从内存快照重写配置，丢掉刚写入的条目。

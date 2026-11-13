@@ -179,7 +179,7 @@ flowchart TB
 |---|---|
 | `initialize` | 返回 `protocolVersion`（本网关恒报 `2024-11-05`，接受任意客户端版本）+ `capabilities{tools}` + `serverInfo{mnemoseed-local, 版本}` |
 | `notifications/initialized` 及一切 `notifications/*` | 忽略，不响应（含 `notifications/cancelled`） |
-| `tools/list` | 返回 6 个工具及 JSON Schema inputSchema |
+| `tools/list` | 返回 7 个工具及 JSON Schema inputSchema |
 | `tools/call` | 代理到 daemon REST（actor = `mcp`）；失败/未知工具 → 结构化 `isError`，永不杀死循环 |
 | `ping` | 空结果 |
 | 未知方法（带 id） | 错误 `-32601`；不可解析行 → 能抢救出 id 则 `-32700`，否则丢弃 |
@@ -207,7 +207,7 @@ flowchart TB
 
 ### 3.2.1 HTTP 传输面（`mcp_gateway/http_transport.py`，loopback `/mcp`）
 
-**路由**：唯一精确路径 `POST /mcp`（`app.include_router(mcp_router)` 与其余 router 并列，**必须早于 console `StaticFiles` 挂载**——Starlette 按注册序匹配）。信封层直调既有 `handle_message` / `call_tool` / `TOOLS`，**零改动**：`initialize` 答既有 `PROTOCOL_VERSION`，工具集与 `isError` 文案字节不变。非 POST 方法（`GET`/`DELETE` 等）→ 405 + `Allow: POST`；`/mcp/` 不是本路由（带凭据落到 console mount：GET 404 / POST 405；不带凭据 401）。body 非单个 JSON 对象 → 常量 400（`MALFORMED_MESSAGE_DETAIL`）；notification（无 id / `notifications/*`）→ 202 空体。**无状态**：不发 `Mcp-Session-Id`、无服务端会话表，重启无可失状态。
+**路由**：唯一精确路径 `POST /mcp`（`app.include_router(mcp_router)` 与其余 router 并列，**必须早于 console `StaticFiles` 挂载**——Starlette 按注册序匹配）。信封层直调既有 `handle_message` / `call_tool` / `TOOLS`，路由与信封零改动：`initialize` 答既有 `PROTOCOL_VERSION`，`isError` 文案与 audit actor 字节不变；工具集这一半是 PRD-217 冻结条款的**有意修订**——#387 新增 `capture`（标注见 PRD-217 §传输 Q1，声明见 PRD-387 §3 与该批 PR 正文）。非 POST 方法（`GET`/`DELETE` 等）→ 405 + `Allow: POST`；`/mcp/` 不是本路由（带凭据落到 console mount：GET 404 / POST 405；不带凭据 401）。body 非单个 JSON 对象 → 常量 400（`MALFORMED_MESSAGE_DETAIL`）；notification（无 id / `notifications/*`）→ 202 空体。**无状态**：不发 `Mcp-Session-Id`、无服务端会话表，重启无可失状态。
 
 **per-request 身份契约**（三头，只有 `/mcp` 解释后两个）：
 

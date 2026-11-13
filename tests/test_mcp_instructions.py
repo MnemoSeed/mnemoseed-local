@@ -10,6 +10,7 @@ cannot drift apart.
 from __future__ import annotations
 
 import argparse
+from string import Formatter
 
 import pytest
 
@@ -21,6 +22,37 @@ GATEWAY_TOOL_NAMES = [str(tool["name"]) for tool in TOOLS]
 
 #: The surfaces ``instructions --surface`` answers.
 SURFACES = ("claude_chat", "chatgpt", "claude_code", "generic")
+
+#: AC2's oracle: the handshake block as the contract holds it. The served text
+#: must be exactly this template with its placeholders resolved, so an
+#: identifier that did not come from the placeholder set can never reach it.
+#: The module's constants stay authoritative; this copy is the contract pin and
+#: changes only when the frozen text is deliberately amended.
+CONTRACT_PREAMBLE = "MnemoSeed is this machine's long-term memory for you, shared across sessions and hosts."
+
+CONTRACT_BODY = """\
+The rules below are situations and actions, not suggestions:
+
+1. If a memory block was already injected into this conversation, that block is
+   your memory channel: use it. Do not call {recall} again for the same topic.
+2. If no memory block is present, this surface has no capture hook and you are
+   the memory channel yourself. When the user mentions past work, an earlier
+   decision, or a stated preference, call {recall} first, querying with the
+   user's own words (names, paths, issue numbers, the wording they used); never
+   rewrite the query into your own synonyms. One call per topic is enough.
+3. No memory block, and the user states a durable decision, preference, or
+   constraint: call {capture} with their words quoted verbatim. Never capture
+   your own guesses, drafts, or reasoning.
+4. If the user explicitly asks to remember or pin something, call {remember}.
+   Call {supersede} only when the user asks to replace one specific belief.
+
+An empty result means no relevant memory exists: say so plainly and continue.
+Do not guess, and do not repeat the query.
+
+A pin is an entry the user explicitly asked to keep: provenance_source is
+"memory.remember", or explicit_pin is true. A captured entry is one written
+from a conversation instead, with explicit_pin false.
+"""
 
 #: Phrases the delivery contract requires: the injected-block intention, the
 #: recall wording, the no-speculation rule, the empty-result meaning and the
@@ -75,6 +107,21 @@ def test_every_mentioned_tool_exists_in_the_gateway_surface() -> None:
         absent = [name for name in GATEWAY_TOOL_NAMES if name != missing]
         with pytest.raises(ValueError):
             instructions.render(absent)
+
+
+def test_every_tool_identifier_in_the_rendered_block_comes_from_the_placeholders() -> None:
+    """AC2: the template's references are exactly its placeholders, and the
+    served block is that template round-tripped — the comparison is against the
+    contract template, never a scan of the free prose, so appending a dead tool
+    name anywhere in the text fails here."""
+    resolved = CONTRACT_BODY.format(**{name: name for name in instructions.TOOL_PLACEHOLDERS})
+
+    assert _surfaced("generic") == f"{CONTRACT_PREAMBLE}\n\n{resolved}".rstrip()
+    for surface in ("claude_chat", "chatgpt", "claude_code"):
+        assert _surfaced(surface).endswith(resolved.rstrip()), surface
+
+    fields = {field for _, field, _, _ in Formatter().parse(instructions.BODY) if field is not None}
+    assert fields == set(instructions.TOOL_PLACEHOLDERS)
 
 
 def test_the_block_carries_every_required_phrase() -> None:

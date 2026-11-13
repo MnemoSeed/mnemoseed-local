@@ -27,6 +27,13 @@ def cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_DIR", home)
     monkeypatch.setattr("mnemoseed_local.config.CONFIG_PATH", home / "config.toml")
     monkeypatch.delenv("STORAGE_MODE", raising=False)
+    # Host-adapter path variables aim at the real user profile: they point
+    # inside the sandbox home so no run can reach a real Claude config.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv(
+        "MNEMOSEED_CLAUDE_DESKTOP_CONFIG", str(tmp_path / "Claude" / "claude_desktop_config.json")
+    )
     return home
 
 
