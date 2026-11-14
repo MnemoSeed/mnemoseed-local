@@ -43,7 +43,13 @@ EXISTING_CONFIG = {
 #: never reach a daemon that happens to be running on this machine.
 UNROUTABLE_BASE_URL = "http://127.0.0.1:9"
 
-HERMETIC_ENV_VARS = ("MNEMOSEED_CLAUDE_DESKTOP_CONFIG", "LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME")
+HERMETIC_ENV_VARS = (
+    "MNEMOSEED_LOCAL_BASEURL",
+    "MNEMOSEED_CLAUDE_DESKTOP_CONFIG",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "XDG_CONFIG_HOME",
+)
 
 
 def _rpc(msg_id: int, method: str, params: dict[str, object] | None = None) -> dict[str, object]:
@@ -60,6 +66,13 @@ def _write_config(target: Path, payload: object, *, text: str | None = None) -> 
     return hashlib.md5(target.read_bytes()).hexdigest()
 
 
+def _write_raw_config(target: Path, payload: bytes) -> str:
+    """A config file whose bytes are not decodable as UTF-8."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
+    return hashlib.md5(payload).hexdigest()
+
+
 @pytest.fixture(autouse=True)
 def _no_ambient_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test inherits the config override from the ambient environment."""
@@ -74,6 +87,7 @@ def cd_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     for var in HERMETIC_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", UNROUTABLE_BASE_URL)
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
     local_home = tmp_path / "mnemoseed-home"
     local_home.mkdir()
@@ -226,6 +240,29 @@ def test_the_cli_reports_a_refusal_instead_of_a_traceback(
     assert "manually" in captured.err
 
 
+def test_a_non_utf8_config_is_refused_with_guidance_and_never_a_traceback(
+    cd_surface: Path, installed_executable: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Bytes that are not UTF-8 are a parse failure like any other: the CLI
+    reports the manual guidance, exits 1, and the file stays untouched."""
+    digest = _write_raw_config(cd_surface, '{"preferences": {"note": "caf\xe9"}}\n'.encode("latin-1"))
+
+    assert main(["host", "install", "--host", "claude_desktop"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "is not UTF-8" in captured.err
+    assert "manually" in captured.err
+    assert "Traceback" not in captured.err
+    assert hashlib.md5(cd_surface.read_bytes()).hexdigest() == digest
+
+
+def test_a_non_utf8_config_reports_unreadable(cd_surface: Path) -> None:
+    _write_raw_config(cd_surface, b'{"mcpServers": {"mnemoseed": "caf\xe9"}}\n')
+
+    assert cd_install.status().state == "unreadable"
+
+
 def test_a_config_held_open_by_the_running_app_is_reported_with_guidance(
     cd_surface: Path,
     installed_executable: str,
@@ -341,6 +378,32 @@ def test_the_resolved_command_completes_an_mcp_handshake(
     assert answered["result"]["instructions"] == instructions.gateway_text()
 
 
+def test_the_module_form_completes_an_mcp_handshake(tmp_path: Path) -> None:
+    """The fallback command is spawnable for real, not just a tuple: the CLI
+    module runs the gateway and answers the handshake under a temp home aimed
+    at an unroutable base."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        f'baseurl = "{UNROUTABLE_BASE_URL}"\npreset = "embedded"\n', encoding="utf-8"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, *cd_install.MODULE_ARGS, "mcp"],
+        input=json.dumps(_rpc(1, "initialize")) + "\n",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "MNEMOSEED_LOCAL_HOME": str(home), "MNEMOSEED_LOCAL_BASEURL": UNROUTABLE_BASE_URL},
+        timeout=60.0,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    answered = json.loads(completed.stdout.splitlines()[0])
+    assert answered["result"]["serverInfo"]["name"] == "mnemoseed-local"
+    assert answered["result"]["instructions"] == instructions.gateway_text()
+
+
 # ---------------------------------------------------------------- status
 
 
@@ -416,6 +479,24 @@ def test_unreadable_and_stale_never_cross_report(cd_surface: Path, installed_exe
     assert cd_install.status().state == "unreadable"
 
 
+def test_a_null_mnemoseed_entry_is_unreadable_and_untouched(cd_surface: Path) -> None:
+    """A present key with a null value is the same refusal the write side
+    raises: status reports it ``unreadable`` instead of reading it as absent,
+    so detection sees the host as present."""
+    digest = _write_config(cd_surface, {"mcpServers": {"mnemoseed": None}})
+
+    assert cd_install.status().state == "unreadable"
+    assert shared._adapter_present("claude_desktop") is True
+    assert hashlib.md5(cd_surface.read_bytes()).hexdigest() == digest
+
+
+def test_a_null_mcp_servers_container_is_unreadable_and_untouched(cd_surface: Path) -> None:
+    digest = _write_config(cd_surface, {"mcpServers": None, "preferences": {}})
+
+    assert cd_install.status().state == "unreadable"
+    assert hashlib.md5(cd_surface.read_bytes()).hexdigest() == digest
+
+
 def test_status_keeps_the_shared_probe_and_base_url(
     cd_surface: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -428,7 +509,8 @@ def test_status_keeps_the_shared_probe_and_base_url(
     monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", fake_probe)
     info = cd_install.status()
     assert info.daemon_reachable is True
-    assert seen["base_url"] == "http://localhost:7788"
+    assert info.base_url == UNROUTABLE_BASE_URL
+    assert seen["base_url"] == UNROUTABLE_BASE_URL
     assert info.path == cd_surface
 
 

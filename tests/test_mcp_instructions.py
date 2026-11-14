@@ -35,14 +35,14 @@ The rules below are situations and actions, not suggestions:
 
 1. If a memory block was already injected into this conversation, that block is
    your memory channel: use it. Do not call {recall} again for the same topic.
-2. If no memory block is present, this surface has no capture hook and you are
+2. If no memory block was injected and this client has no capture hook, you are
    the memory channel yourself. When the user mentions past work, an earlier
    decision, or a stated preference, call {recall} first, querying with the
    user's own words (names, paths, issue numbers, the wording they used); never
    rewrite the query into your own synonyms. One call per topic is enough.
-3. No memory block, and the user states a durable decision, preference, or
-   constraint: call {capture} with their words quoted verbatim. Never capture
-   your own guesses, drafts, or reasoning.
+3. No memory block, this client has no capture hook, and the user states a
+   durable decision, preference, or constraint: call {capture} with their words
+   quoted verbatim. Never capture your own guesses, drafts, or reasoning.
 4. If the user explicitly asks to remember or pin something, call {remember}.
    Call {supersede} only when the user asks to replace one specific belief.
 
@@ -152,6 +152,16 @@ def test_the_block_claims_no_activation() -> None:
     lowered = _flatten(_surfaced("generic")).lower()
     for forbidden in ("memory active", "is active", "activated", "will call"):
         assert forbidden not in lowered, forbidden
+
+
+def test_the_handshake_block_states_the_hookless_premise_only_as_a_condition() -> None:
+    """``initialize.instructions`` reaches hook-capable clients too, so the
+    handshake block may never assert that the surface has no capture hook: the
+    premise appears only inside the conditional rules."""
+    text = _flatten(_surfaced("generic"))
+    assert "this surface has no capture hook" not in text
+    assert "no memory block was injected and this client has no capture hook" in text
+    assert "this client has no capture hook, and the user states" in text
 
 
 def test_the_block_carries_no_markup_or_machine_specific_path() -> None:

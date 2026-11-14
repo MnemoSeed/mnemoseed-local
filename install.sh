@@ -116,7 +116,7 @@ options:
                      to `mnemoseed-local init --mode <mode>`; an existing config is
                      never rewritten
   --hosts <csv>      comma-separated host adapters to wire, from:
-                     claude_code | codex_cli | opencode | zcode
+                     claude_code | claude_desktop | codex_cli | cursor | opencode | zcode
                      (default: none - an interactive session is offered a
                      selection of the detected hosts, a non-interactive run
                      wires nothing and prints the exact per-host commands under
@@ -146,7 +146,7 @@ while [ $# -gt 0 ]; do
             ;;
         --mode=*) MODE="${1#--mode=}" ;;
         --hosts)
-            [ $# -ge 2 ] || die "--hosts requires a value (claude_code|codex_cli|opencode|zcode)"
+            [ $# -ge 2 ] || die "--hosts requires a value (claude_code|claude_desktop|codex_cli|cursor|opencode|zcode)"
             HOSTS="$2"
             shift
             ;;
@@ -175,8 +175,8 @@ validate_host_list() {
         _key="${_rest%%,*}"
         _rest="${_rest#*,}"
         case "$_key" in
-            claude_code|codex_cli|opencode|zcode) ;;
-            *) die "unknown host '$_key' (expected claude_code|codex_cli|opencode|zcode; 'all' is not accepted - name the hosts explicitly)" ;;
+            claude_code|claude_desktop|codex_cli|cursor|opencode|zcode) ;;
+            *) die "unknown host '$_key' (expected claude_code|claude_desktop|codex_cli|cursor|opencode|zcode; 'all' is not accepted - name the hosts explicitly)" ;;
         esac
         case "$_seen" in
             *"|$_key|"*) continue ;;
@@ -208,14 +208,13 @@ host_config_dir() {
             if [ -d "$HOME/.claude" ]; then return 0; fi
             ;;
         claude_desktop)
-            if [ -n "${MNEMOSEED_CLAUDE_DESKTOP_CONFIG:-}" ]; then
-                if [ -f "$MNEMOSEED_CLAUDE_DESKTOP_CONFIG" ]; then return 0; fi
-            else
-                if [ -d "$HOME/Library/Application Support/Claude" ]; then return 0; fi
-                if [ -d "$HOME/.config/Claude" ]; then return 0; fi
-                if [ -n "${APPDATA:-}" ] && [ -d "$APPDATA/Claude" ]; then return 0; fi
-                if [ -n "${LOCALAPPDATA:-}" ] && [ -d "$LOCALAPPDATA/Claude-Data" ]; then return 0; fi
-            fi
+            # An override value points at the file install creates, so it
+            # counts as a candidate even before that file exists.
+            if [ -n "${MNEMOSEED_CLAUDE_DESKTOP_CONFIG:-}" ]; then return 0; fi
+            if [ -d "$HOME/Library/Application Support/Claude" ]; then return 0; fi
+            if [ -d "$HOME/.config/Claude" ]; then return 0; fi
+            if [ -n "${APPDATA:-}" ] && [ -d "$APPDATA/Claude" ]; then return 0; fi
+            if [ -n "${LOCALAPPDATA:-}" ] && [ -d "$LOCALAPPDATA/Claude-Data" ]; then return 0; fi
             ;;
         codex_cli)
             if [ -n "${CODEX_HOME:-}" ]; then
@@ -971,7 +970,9 @@ else
     printf '%s\n' '  no host adapter was wired; to wire hosts, run the exact command for each host:'
     printf '%s\n' '    mnemoseed-local hook install opencode'
     printf '%s\n' '    mnemoseed-local host install --host claude_code'
+    printf '%s\n' '    mnemoseed-local host install --host claude_desktop'
     printf '%s\n' '    mnemoseed-local host install --host codex_cli'
+    printf '%s\n' '    mnemoseed-local host install --host cursor'
     printf '%s\n' '    mnemoseed-local host install --host zcode'
 fi
 exit 0

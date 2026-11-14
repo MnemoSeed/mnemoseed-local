@@ -315,7 +315,10 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     pointing at a removed environment shows up) / ``unreadable`` (the file, or
     the mnemoseed entry inside it, cannot be parsed into the expected shape). A
     parse failure is never reported as ``stale`` and a command mismatch never as
-    ``unreadable``.
+    ``unreadable``. Shape is judged by key presence: a ``mcpServers`` or
+    ``mcpServers.mnemoseed`` key that exists with a non-object value is user
+    data and reads ``unreadable``, the same refusal the write side raises, so
+    ``not-installed`` means the key is genuinely absent.
 
     Command comparison needs an installed runtime: outside one there is no
     command to compare against, so a non-empty entry reports ``installed`` —
@@ -329,21 +332,20 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
         state = "unreadable"
     else:
         servers = data.get(MCP_KEY)
-        if servers is not None and not isinstance(servers, dict):
+        if MCP_KEY in data and not isinstance(servers, dict):
+            state = "unreadable"
+        elif not isinstance(servers, dict) or MCP_SERVER_NAME not in servers:
+            state = "not-installed"
+        elif not isinstance(servers[MCP_SERVER_NAME], dict):
             state = "unreadable"
         else:
-            entry = (servers or {}).get(MCP_SERVER_NAME)
-            if entry is None:
-                state = "not-installed"
-            elif not isinstance(entry, dict):
+            entry = servers[MCP_SERVER_NAME]
+            command = entry.get("command")
+            if not isinstance(command, str) or not command.strip():
                 state = "unreadable"
             else:
-                command = entry.get("command")
-                if not isinstance(command, str) or not command.strip():
-                    state = "unreadable"
-                else:
-                    current = _current_entry()
-                    state = "installed" if current is None or _entry_matches(entry, current) else "stale"
+                current = _current_entry()
+                state = "installed" if current is None or _entry_matches(entry, current) else "stale"
     resolved_base = base_url if base_url is not None else shared.resolve_base_url()
     return HookStatus(
         root=target.parent,

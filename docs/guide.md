@@ -222,17 +222,17 @@ without side effects.
 ### Host selection
 
 Pass `--hosts a,b,c` to `install.sh` or `-Hosts a,b,c` to `install.ps1`, using any
-of `claude_code`, `codex_cli`, `opencode`, and `zcode`. Only the named adapters
-are wired; repeated names are deduplicated. Unknown names, including `all`, are
-refused before any installation step writes anything.
+of `claude_code`, `claude_desktop`, `codex_cli`, `cursor`, `opencode`, and `zcode`.
+Only the named adapters are wired; repeated names are deduplicated. Unknown names,
+including `all`, are refused before any installation step writes anything.
 
 Without an explicit list, a terminal session offers a numbered menu of detected
 hosts. Detection checks the host CLI on PATH or its adapter config directory,
-including `CODEX_HOME`, `OPENCODE_CONFIG_DIR`, or `XDG_CONFIG_HOME` overrides where
-applicable. Only valid offered menu numbers select hosts; an empty selection
-wires none. A non-interactive run without a list wires nothing, reports detected
-hosts, and prints the exact per-host commands as next steps. The daemon can be
-used without a host adapter.
+including `MNEMOSEED_CLAUDE_DESKTOP_CONFIG`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR`,
+or `XDG_CONFIG_HOME` overrides where applicable. Only valid offered menu numbers
+select hosts; an empty selection wires none. A non-interactive run without a list
+wires nothing, reports detected hosts, and prints the exact per-host commands as
+next steps. The daemon can be used without a host adapter.
 
 The installers currently invoke the OpenCode `hook install opencode` alias;
 other selected hosts use `host install --host <host>`. The unified `host` group

@@ -20,11 +20,13 @@ def load_object(target: Path) -> dict[str, object]:
     tolerates a BOM-prefixed file (stripped on the next atomic rewrite)."""
     if not target.is_file():
         return {}
-    text = target.read_text(encoding="utf-8-sig")
-    if not text.strip():
-        return {}
     try:
+        text = target.read_text(encoding="utf-8-sig")
+        if not text.strip():
+            return {}
         data = json.loads(text)
+    except UnicodeDecodeError as exc:
+        raise ConfigParseError(f"{target} is not UTF-8 ({exc}); fix it manually, then retry") from exc
     except ValueError as exc:
         raise ConfigParseError(f"{target} is not strict JSON ({exc}); fix it manually, then retry") from exc
     if not isinstance(data, dict):
