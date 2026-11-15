@@ -312,13 +312,14 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
 
     States: ``not-installed`` / ``installed`` / ``stale`` (the entry is not the
     command and arguments this surface would write now, which is how an entry
-    pointing at a removed environment shows up) / ``unreadable`` (the file, or
-    the mnemoseed entry inside it, cannot be parsed into the expected shape). A
-    parse failure is never reported as ``stale`` and a command mismatch never as
-    ``unreadable``. Shape is judged by key presence: a ``mcpServers`` or
-    ``mcpServers.mnemoseed`` key that exists with a non-object value is user
-    data and reads ``unreadable``, the same refusal the write side raises, so
-    ``not-installed`` means the key is genuinely absent.
+    pointing at a removed environment shows up) / ``unreadable`` (the file
+    cannot be read or parsed into the expected shape, or the mnemoseed entry
+    inside it cannot). A parse failure is never reported as ``stale`` and a
+    command mismatch never as ``unreadable``. Shape is judged by key presence:
+    a ``mcpServers`` or ``mcpServers.mnemoseed`` key that exists with a
+    non-object value is user data and reads ``unreadable``, the same refusal
+    the write side raises, so ``not-installed`` means the key is genuinely
+    absent.
 
     Command comparison needs an installed runtime: outside one there is no
     command to compare against, so a non-empty entry reports ``installed`` —
@@ -328,7 +329,7 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     target = path or config_path()
     try:
         data = load_object(target)
-    except ConfigParseError:
+    except (ConfigParseError, OSError):
         state = "unreadable"
     else:
         servers = data.get(MCP_KEY)

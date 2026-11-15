@@ -104,11 +104,12 @@ MSIX 目录下若存在**多个** `<pkg>` 目录：取配置文件 mtime 最新�
 
 - 只写 `mcpServers.mnemoseed = {"command": <解析结果>, "args": <该支的网关参数>}`。`preferences` 及其它每个键保持原样。
 - 已有的 `mcpServers.mnemoseed` 是用户数据：形状异常（非对象）→ **拒绝并给人工指引**，与 `mcpServers` 容器同一 `require_object` 形状、同一 `ConfigParseError` 退出路径，文件逐字节不动（status 对该形状报 `unreadable`，install 不得静默覆盖）。
-- 配置文件被运行中的应用占用（`write_atomic` 抛 `OSError`/`PermissionError`）→ `host` 动词以 exit 1 报错并回显"先关闭 Claude Desktop"的指引，不打印 traceback。
+- `write_atomic` 抛出任何 `OSError`/`PermissionError` → `host` 动词以 exit 1 干净失败、不打印 traceback；"先关闭 Claude Desktop"的指引仅当错误为落在配置文件路径上的 `PermissionError`（运行中的应用占用该文件）时附加，其余 OS 错误只回显自身那一行错误。
 - 严格 JSON；解析失败或 `mcpServers` / `mcpServers.mnemoseed` 形状异常 → 拒绝并给人工指引，文件逐字节不动（复用 `claude_code` 的 `SettingsParseError` 模式）。
 - 原子写：临时文件 + fsync + `os.replace`（复用 `hosts.common.config.write_atomic`）。
 - install 输出必须提示**先关闭 Claude Desktop**：运行中的应用可能在退出时从内存快照重写配置，丢掉刚写入的条目。
 - `uninstall` 只删 `mcpServers.mnemoseed`；`mcpServers` 因此变空则一并删除该键。
+- `mcpServers.mnemoseed` 为 `null` 这类形状异常的条目 install 拒绝改写而 uninstall 直接删除，评审裁定该不对称可接受：条目本身不携带可保留语义，且容器层已保护其它服务器条目。
 
 **status 四态**：`not-installed` / `installed` / `stale`（已配置但 command 与当前可执行文件不一致）/ `unreadable`（文件不可解析）。
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import sys
 from typing import Any
 
@@ -100,6 +101,39 @@ def test_initialized_notification_emits_nothing() -> None:
     )
     assert len(responses) == 1
     assert responses[0]["id"] == 1
+
+
+def test_initialize_still_answers_when_the_instruction_block_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The instruction block is optional on the wire: when it cannot be built
+    the handshake still answers the id it was asked with, minus that field."""
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise ValueError("over the ceiling")
+
+    monkeypatch.setattr(server.instructions, "gateway_text", boom)
+
+    code, responses = run_gateway([_request(1, "initialize")], StubClient())
+
+    assert code == 0
+    assert len(responses) == 1
+    response = responses[0]
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    result = response["result"]
+    assert result["protocolVersion"] == server.PROTOCOL_VERSION
+    assert "tools" in result["capabilities"]
+    assert result["serverInfo"] == {"name": "mnemoseed-local", "version": __version__}
+    assert "instructions" not in result
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.name == "mnemoseed_local.mcp_gateway.server" and record.levelno >= logging.ERROR
+    ]
+    assert any("instruction block unavailable" in record.getMessage() for record in failures)
 
 
 def test_ping_returns_empty_result() -> None:

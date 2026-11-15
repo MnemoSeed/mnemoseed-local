@@ -1935,11 +1935,29 @@ def _host_lifecycle(host: str, verb: str) -> Callable[[], Any]:
     return entry
 
 
-def _host_write_guidance(host: str) -> str | None:
+def _host_write_guidance(host: str, exc: OSError | ConfigParseError) -> str | None:
     """The adapter's guidance for a config file the running app holds open, or
-    None when the adapter defines none."""
+    None for any other failure. The hint fits only a permission refusal that
+    carries this adapter's config path; a refusal carrying no path is the
+    config write itself."""
+    if not isinstance(exc, PermissionError):
+        return None
     module = importlib.import_module(HOOK_HOSTS[host].install)
-    return getattr(module, "FILE_LOCK_HINT", None)
+    hint: str | None = getattr(module, "FILE_LOCK_HINT", None)
+    if not hint:
+        return None
+    carried = [value for value in (exc.filename, getattr(exc, "filename2", None)) if value]
+    if not carried:
+        return hint
+    config_path = getattr(module, "config_path", None)
+    if not callable(config_path):
+        return None
+    try:
+        target = config_path().resolve()
+        on_config = any(Path(value).resolve() == target for value in carried)
+    except (OSError, ValueError, ConfigParseError):
+        return None
+    return hint if on_config else None
 
 
 def cmd_host(args: argparse.Namespace) -> int:
@@ -1962,10 +1980,9 @@ def cmd_host(args: argparse.Namespace) -> int:
         # a refused or unwritable surface is a user-facing error with manual
         # guidance, never a traceback: the adapter wrote nothing.
         print(f"mnemoseed-local: {exc}", file=sys.stderr)
-        if isinstance(exc, OSError):
-            guidance = _host_write_guidance(args.host)
-            if guidance:
-                print(f"mnemoseed-local: {guidance}", file=sys.stderr)
+        guidance = _host_write_guidance(args.host, exc)
+        if guidance:
+            print(f"mnemoseed-local: {guidance}", file=sys.stderr)
         return 1
     if args.host_command == "status":
         observations = _host_status_observations(args.host, result)

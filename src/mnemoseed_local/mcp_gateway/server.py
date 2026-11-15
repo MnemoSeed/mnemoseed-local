@@ -8,7 +8,9 @@ Protocol surface (MCP ``2024-11-05`` shape):
 
 - ``initialize`` -> protocolVersion + capabilities + serverInfo + instructions
   (any client protocolVersion is accepted; the gateway always reports its own,
-  and the instruction block is built in ``instructions.py``);
+  and the instruction block is built in ``instructions.py`` — when the block
+  cannot be built the failure is logged and the optional field is left out,
+  never the response);
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
 - ``tools/list`` -> the daemon tools (recall / remember / capture / supersede /
@@ -323,6 +325,17 @@ def _salvage_id(line: str) -> Any:
     return int(token)
 
 
+def _gateway_instructions() -> str | None:
+    """The handshake instruction block, or None when it cannot be built: the
+    field is optional on the wire, and a request carrying an id still owes its
+    one response."""
+    try:
+        return instructions.gateway_text()
+    except Exception:
+        logger.exception("instruction block unavailable; answering without it")
+        return None
+
+
 def handle_message(client: DaemonClient, message: dict[str, Any]) -> dict[str, Any] | None:
     """One parsed JSON-RPC message -> its response, or None when the message
     is a notification (or otherwise not answerable)."""
@@ -338,8 +351,10 @@ def handle_message(client: DaemonClient, message: dict[str, Any]) -> dict[str, A
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "mnemoseed-local", "version": __version__},
-            "instructions": instructions.gateway_text(),
         }
+        block = _gateway_instructions()
+        if block is not None:
+            result["instructions"] = block
     elif method == "ping":
         result = {}
     elif method == "tools/list":

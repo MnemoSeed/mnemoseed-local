@@ -14,11 +14,13 @@ platform layout stands in, so no test can reach a real Claude Desktop config.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -285,6 +287,78 @@ def test_a_config_held_open_by_the_running_app_is_reported_with_guidance(
     assert "held by another process" in captured.err
     assert "close Claude Desktop first" in captured.err
     assert json.loads(cd_surface.read_text(encoding="utf-8")) == EXISTING_CONFIG
+
+
+def test_a_permission_failure_naming_the_config_keeps_the_lock_hint(
+    cd_surface: Path,
+    installed_executable: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The held-open refusal carries the config path it hit: that is the one
+    failure the close-the-app hint speaks about."""
+    _write_config(cd_surface, EXISTING_CONFIG)
+
+    def locked(*args: object, **kwargs: object) -> bool:
+        raise PermissionError(errno.EACCES, "the file is held by another process", str(cd_surface))
+
+    monkeypatch.setattr(cd_install, "write_atomic", locked)
+
+    assert main(["host", "install", "--host", "claude_desktop"]) == 1
+
+    captured = capsys.readouterr()
+    assert "held by another process" in captured.err
+    assert "close Claude Desktop first" in captured.err
+
+
+def _disk_full(surface: Path) -> OSError:
+    return OSError(errno.ENOSPC, "no space left on device", str(surface))
+
+
+def _denied_directory(surface: Path) -> OSError:
+    return PermissionError(errno.EACCES, "access is denied", str(surface.parent))
+
+
+@pytest.mark.parametrize("failure", [_disk_full, _denied_directory], ids=["disk-full", "directory-denied"])
+def test_an_os_failure_off_the_config_file_prints_no_lock_hint(
+    failure: Callable[[Path], OSError],
+    cd_surface: Path,
+    installed_executable: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failure the hint cannot fix gets its own error line and nothing else:
+    no close-the-app instruction the user could act on."""
+    _write_config(cd_surface, EXISTING_CONFIG)
+    error = failure(cd_surface)
+
+    def failing(*args: object, **kwargs: object) -> bool:
+        raise error
+
+    monkeypatch.setattr(cd_install, "write_atomic", failing)
+
+    assert main(["host", "install", "--host", "claude_desktop"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(error) in captured.err
+    assert "close Claude Desktop" not in captured.err
+    assert json.loads(cd_surface.read_text(encoding="utf-8")) == EXISTING_CONFIG
+
+
+def test_a_config_that_cannot_be_read_reports_unreadable(
+    cd_surface: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails at the OS level is the unreadable state, not an
+    error that escapes the status verb."""
+    _write_config(cd_surface, EXISTING_CONFIG)
+
+    def denied(*args: object, **kwargs: object) -> dict[str, object]:
+        raise PermissionError(errno.EACCES, "access is denied", str(cd_surface))
+
+    monkeypatch.setattr(cd_install, "load_object", denied)
+
+    assert cd_install.status().state == "unreadable"
 
 
 # ---------------------------------------------------------------- the executable resolver

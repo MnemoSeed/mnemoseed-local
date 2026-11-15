@@ -8,12 +8,10 @@ exist" is a structural property of the builder rather than a review of free
 text. The stdio gateway and the loopback ``POST /mcp`` route both answer
 ``initialize`` through ``handle_message``, so they serve the same bytes.
 
-Every rule is written as a situation -> action pair (implementation-intention
-shape, Gollwitzer 1999), and the recall rule asks for the user's own words
-rather than the assistant's synonyms (encoding specificity, Tulving & Thomson
-1973). The block is best-effort delivery: the MCP specification defines
-``InitializeResult.instructions`` as optional and says a client MAY use it, so
-no text here and no surface that prints it may claim the block was ingested.
+Each rule is a situation -> action pair, and the recall rule asks for the
+user's own words rather than synonyms. The block is best-effort delivery: the
+MCP specification defines ``InitializeResult.instructions`` as optional, so no
+text here and no surface that prints it may claim the block was ingested.
 """
 
 from __future__ import annotations

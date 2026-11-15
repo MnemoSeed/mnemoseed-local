@@ -292,6 +292,10 @@ class TestSupersedeInPlace:
         written = stores.vector.get_chunk(result["chunk_id"])
         assert written.text == self.NEW_TEXT
         assert written.provenance.source == CAPTURED_CHAT_SOURCE
+        # the derived flag, not just the source label: the prefilter, the decay
+        # rate and the recall badge all read this one bit
+        assert pinned.metadata_filter_view()["explicit_pin"] is True
+        assert written.metadata_filter_view()["explicit_pin"] is False
 
     def test_captured_write_landing_on_a_captured_chunk_is_also_a_new_chunk(self, service) -> None:
         """Neither side is a pin, so the supersede-in-place branch stays closed:
