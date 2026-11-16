@@ -32,13 +32,15 @@ SH_TEXT = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 PS1_TEXT = (REPO_ROOT / "install.ps1").read_text(encoding="utf-8")
 
 #: The adapter keys an installer may wire, in registry order.
-HOST_KEYS = ("claude_code", "codex_cli", "opencode", "zcode")
+HOST_KEYS = ("claude_code", "claude_desktop", "codex_cli", "cursor", "opencode", "zcode")
 
 #: The exact manual wiring commands a no-selection install prints.
 NEXT_STEP_COMMANDS = (
     "mnemoseed-local hook install opencode",
     "mnemoseed-local host install --host claude_code",
+    "mnemoseed-local host install --host claude_desktop",
     "mnemoseed-local host install --host codex_cli",
+    "mnemoseed-local host install --host cursor",
     "mnemoseed-local host install --host zcode",
 )
 
@@ -107,6 +109,11 @@ def _make_sh_installer(
     runtime_dir.mkdir()
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+    # Detection reads the Claude Desktop override and the platform config roots
+    # from the ambient environment; a real one would leak into the detected list.
+    env.pop("MNEMOSEED_CLAUDE_DESKTOP_CONFIG", None)
+    env.pop("APPDATA", None)
+    env.pop("LOCALAPPDATA", None)
     if clean_hosts:
         for name in ("CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
             env.pop(name, None)
@@ -161,6 +168,11 @@ def _make_pwsh_installer(tmp_path: Path, *, clean_hosts: bool = False) -> _Insta
     env["TEMP"] = str(tmp_path / "temp")
     env["TMP"] = str(tmp_path / "temp")
     env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+    # Detection reads the Claude Desktop override and the platform config roots
+    # from the ambient environment; a real one would leak into the detected list.
+    env.pop("MNEMOSEED_CLAUDE_DESKTOP_CONFIG", None)
+    env["APPDATA"] = str(tmp_path / "Roaming")
+    env["LOCALAPPDATA"] = str(tmp_path / "Local")
     if clean_hosts:
         for name in ("CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
             env.pop(name, None)
@@ -318,13 +330,24 @@ def test_dry_run_plan_reports_the_host_selection() -> None:
 def test_installers_detect_installed_hosts_via_cli_or_config_dir() -> None:
     assert "detect_installed_hosts() {" in SH_TEXT
     assert "host_config_dir" in SH_TEXT
-    for pair in ("claude_code:claude", "codex_cli:codex", "opencode:opencode", "zcode:zcode"):
+    for pair in (
+        "claude_code:claude",
+        "claude_desktop:",
+        "codex_cli:codex",
+        "cursor:cursor",
+        "opencode:opencode",
+        "zcode:zcode",
+    ):
         assert pair in SH_TEXT, pair
     for marker in (
         '"$HOME/.claude"',
         '"$HOME/.codex"',
         '"$HOME/.config/opencode"',
         '"$HOME/.zcode"',
+        '"$HOME/.cursor"',
+        "MNEMOSEED_CLAUDE_DESKTOP_CONFIG",
+        "Claude-Data",
+        '"$HOME/.config/Claude"',
         "CODEX_HOME",
         "OPENCODE_CONFIG_DIR",
         "XDG_CONFIG_HOME",
@@ -350,6 +373,32 @@ def test_installers_detect_installed_hosts_via_cli_or_config_dir() -> None:
         "XDG_CONFIG_HOME",
     ):
         assert marker in PS1_TEXT, marker
+
+
+def test_every_detected_host_is_a_wirable_key() -> None:
+    """Detection and validation must name the same keys, in registry order: a
+    key a detector can report has to survive the accept list when that host is
+    wired, and a wireable host must not be invisible to detection."""
+    sh_loop = next(line for line in SH_TEXT.splitlines() if "for _pair in" in line)
+    sh_keys = [pair.split(":", 1)[0] for pair in sh_loop.split("for _pair in", 1)[1].split(";")[0].split()]
+    ps1_line = next(line for line in PS1_TEXT.splitlines() if "$candidates = [ordered]@{" in line)
+    ps1_keys = [
+        entry.split("=")[0].strip() for entry in ps1_line.split("@{", 1)[1].rsplit("}", 1)[0].split(";")
+    ]
+    assert tuple(sh_keys) == HOST_KEYS
+    assert tuple(ps1_keys) == HOST_KEYS
+
+
+def test_posix_detection_counts_a_set_claude_desktop_override_as_a_candidate() -> None:
+    """``config_path()`` returns the override unconditionally and install
+    creates the file there, so a set-but-missing override still names the live
+    surface and must not read as "not installed"."""
+    source = _extract_function(SH_TEXT, "host_config_dir() {")
+    branch = source.split("        claude_desktop)", 1)[1].split("        codex_cli)", 1)[0]
+    override = '[ -n "${MNEMOSEED_CLAUDE_DESKTOP_CONFIG:-}" ]'
+    assert branch.index(override) < branch.index("return 0")
+    assert "[ -f " not in branch
+    assert "[ -d " in branch
 
 
 def test_installers_offer_an_interactive_selection_only_from_an_empty_selection() -> None:
@@ -407,6 +456,17 @@ def test_posix_install_runs_exactly_the_selected_adapters(sh_install: _Installer
     assert "host codex_cli: running: mnemoseed-local host install --host codex_cli" in completed.stdout
     assert "host zcode: running: mnemoseed-local host install --host zcode" in completed.stdout
     assert "detected installed hosts" not in completed.stdout
+
+
+@needs_sh
+def test_posix_install_wires_every_accepted_host_key(sh_install: _Installer) -> None:
+    """Every key the accept list names wires through the generic adapter line,
+    so a detected host can never be refused as unknown at selection time."""
+    completed = sh_install.run("--hosts", "claude_desktop,cursor")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    lines = sh_install.adapter_lines()
+    assert "host install --host claude_desktop" in lines
+    assert "host install --host cursor" in lines
 
 
 @needs_sh
@@ -635,6 +695,17 @@ def test_windows_install_runs_exactly_the_selected_adapters(ps1_install: _Instal
 
 
 @needs_pwsh
+def test_windows_install_wires_every_accepted_host_key(ps1_install: _Installer) -> None:
+    """Every key the accept list names wires through the generic adapter line,
+    so a detected host can never be refused as unknown at selection time."""
+    completed = ps1_install.run("-Hosts", "claude_desktop,cursor")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    lines = ps1_install.adapter_lines()
+    assert "host install --host claude_desktop" in lines
+    assert "host install --host cursor" in lines
+
+
+@needs_pwsh
 def test_windows_install_refuses_an_unknown_host_before_any_step(ps1_install: _Installer) -> None:
     completed = ps1_install.run_file(REPO_ROOT / "install.ps1", "-Hosts", "codex_cli,bogus")
     assert completed.returncode != 0
@@ -726,6 +797,7 @@ def test_windows_host_detection_functions_report_cli_and_config_dir_hits(tmp_pat
         "h2": (".zcode",),
         "h3": (".claude", ".zcode"),
         "h4": (),
+        "h5": (".cursor",),
     }
     for name, dirs in home_layouts.items():
         home = tmp_path / name
@@ -739,12 +811,20 @@ def test_windows_host_detection_functions_report_cli_and_config_dir_hits(tmp_pat
     opencode_root.mkdir()
     xdg_root = tmp_path / "xdg-root"
     (xdg_root / "opencode").mkdir(parents=True)
+    claude_override = tmp_path / "claude-config.json"
+    claude_root = tmp_path / "claude-local"
+    (claude_root / "Claude-Data").mkdir(parents=True)
+    claude_roaming = tmp_path / "claude-roaming"
+    (claude_roaming / "Claude").mkdir(parents=True)
     lines = [
         functions,
         "",
         "$env:CODEX_HOME = $null",
         "$env:OPENCODE_CONFIG_DIR = $null",
         "$env:XDG_CONFIG_HOME = $null",
+        "$env:MNEMOSEED_CLAUDE_DESKTOP_CONFIG = $null",
+        "$env:LOCALAPPDATA = $null",
+        "$env:APPDATA = $null",
         "",
     ]
     phases: list[tuple[str, Path, Path, list[str]]] = [
@@ -766,6 +846,24 @@ def test_windows_host_detection_functions_report_cli_and_config_dir_hits(tmp_pat
             empty_path,
             ["$env:OPENCODE_CONFIG_DIR = $null", f"$env:XDG_CONFIG_HOME = '{xdg_root}'"],
         ),
+        (
+            "I",
+            homes["h5"],
+            empty_path,
+            ["$env:XDG_CONFIG_HOME = $null", f"$env:MNEMOSEED_CLAUDE_DESKTOP_CONFIG = '{claude_override}'"],
+        ),
+        (
+            "J",
+            homes["h0"],
+            empty_path,
+            ["$env:MNEMOSEED_CLAUDE_DESKTOP_CONFIG = $null", f"$env:LOCALAPPDATA = '{claude_root}'"],
+        ),
+        (
+            "K",
+            homes["h0"],
+            empty_path,
+            ["$env:LOCALAPPDATA = $null", f"$env:APPDATA = '{claude_roaming}'"],
+        ),
     ]
     for label, home, path, setup in phases:
         lines.extend(setup)
@@ -785,6 +883,9 @@ def test_windows_host_detection_functions_report_cli_and_config_dir_hits(tmp_pat
         "PHASE-F:": "codex_cli",
         "PHASE-G:": "opencode",
         "PHASE-H:": "opencode",
+        "PHASE-I:": "claude_desktop,cursor",
+        "PHASE-J:": "claude_desktop",
+        "PHASE-K:": "claude_desktop",
     }
     for prefix, keys in expected.items():
         line = next(row for row in completed.stdout.splitlines() if row.startswith(prefix))

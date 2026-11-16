@@ -446,7 +446,15 @@ def test_dream_status_counting_wrappers_perform_zero_writes_and_no_invocations(
     ("tool_names", "expected_paths"),
     [
         (
-            ["recall", "remember", "supersede", "dream_once", "recent_sessions", "session_windows"],
+            [
+                "recall",
+                "remember",
+                "capture",
+                "supersede",
+                "dream_once",
+                "recent_sessions",
+                "session_windows",
+            ],
             [
                 "/memory/recall",
                 "/memory/remember",

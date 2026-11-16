@@ -13,7 +13,11 @@ every request, never guessed, D5 isolation):
 - POST /memory/remember     - explicit user pin; provenance asserts
                               ``asserted_by="user"`` with source
                               ``EXPLICIT_PIN_SOURCE``; identical re-pins reinforce
-                              the existing chunk instead of duplicating it.
+                              the existing chunk instead of duplicating it. With
+                              ``capture=true`` the same service writes the
+                              hook-less chat arm instead: source
+                              ``CAPTURED_CHAT_SOURCE``, created by the request's
+                              actor, and never superseding a stored pin.
 - POST /memory/audit        - provenance + version chain + relevant audit rows.
 - POST /memory/timeline     - per-node version replay, else profile-wide paging.
 - POST /memory/export       - stable paged JSON dump including provenance.
@@ -134,6 +138,12 @@ SESSION_WINDOW_SCAN_LIMIT = 2000
 # unscoped replay uses.
 _RECENT_SCAN_LIMIT = 2000
 
+#: Provenance source of a hook-less chat capture: the assistant transcribed a
+#: statement the user made, so the entry is a capture and never a pin. Follows
+#: the stamper's ``{host}-chat`` source convention; a chat surface is not a
+#: HostId, so the label identifies the surface that wrote it.
+CAPTURED_CHAT_SOURCE = "mcp-chat"
+
 
 class MemoryNotFoundError(Exception):
     """The requested memory target does not exist for this profile."""
@@ -173,6 +183,9 @@ class RememberRequest(BaseModel):
     profile_id: ProfileRef
     text: NonBlankText
     rules: list[RecallRule] | None = None
+    #: The hook-less chat arm: the same write service, stamped as a capture
+    #: instead of the user's own pin. Absent keeps the pre-existing pin write.
+    capture: bool = False
 
 
 class AuditRequest(BaseModel):
@@ -848,6 +861,7 @@ class MemoryService:
         text: str,
         actor: str = "console",
         rules: Sequence[RecallRule] | None = None,
+        capture: bool = False,
     ) -> dict[str, Any]:
         """Write an explicit user pin, mirroring the StampWriter's dual-branch
         near-duplicate flow with the supersede-in-place revision branch
@@ -856,6 +870,10 @@ class MemoryService:
         revised wording supersedes the stored text on the SAME chunk — never a
         second entry within the bands. Provenance is append-only; the
         explicit-pin source is never rewritten.
+        ``capture`` is the hook-less chat arm of the same service: the entry is
+        stamped as a capture (source ``CAPTURED_CHAT_SOURCE``, created by the
+        request's actor) instead of the user's own pin, and supersede-in-place is
+        closed to it — a transcription never rewrites a verbatim entry.
         B2.7: every branch persists the standing ``rules`` on the chunk
         (``rules_json``) — the driver merges them by identity on a re-upsert, so
         a near-duplicate re-pin never drops rules."""
@@ -875,10 +893,10 @@ class MemoryService:
             provenance=Provenance(
                 asserted_by="user",
                 session_id=None,
-                source=EXPLICIT_PIN_SOURCE,
+                source=CAPTURED_CHAT_SOURCE if capture else EXPLICIT_PIN_SOURCE,
                 confidence=1.0,
                 asserted_at=now,
-                history=[ProvenanceEvent(action="created", actor="user", at=now)],
+                history=[ProvenanceEvent(action="created", actor=actor if capture else "user", at=now)],
             ),
             decay_weight=1.0,
             score=1.0,
@@ -930,10 +948,13 @@ class MemoryService:
                 actor=actor,
             )
             return {"outcome": "reinforced", "chunk_id": hit.chunk_id}
-        if hit.provenance.source != EXPLICIT_PIN_SOURCE:
-            # Supersede is flashbulb-class only: a re-worded pin landing near an
-            # ordinary capture chunk must never rewrite captured verbatim text —
-            # it becomes its own fresh pin chunk instead.
+        if stamp.provenance.source != EXPLICIT_PIN_SOURCE or hit.provenance.source != EXPLICIT_PIN_SOURCE:
+            # Supersede is flashbulb-class only, and symmetric: the branch is
+            # open to an incoming pin hitting a stored pin, and to nothing else.
+            # A re-worded pin landing near an ordinary capture chunk becomes a
+            # fresh chunk rather than rewriting captured verbatim text, and a
+            # captured write landing near a stored pin becomes a fresh chunk
+            # rather than replacing the user's own wording.
             vector.upsert_chunk(stamp, embedded.dense, embedded.sparse)
             self._audit(
                 profile_id, "remember", {"chunk_id": stamp.chunk_id, "profile_id": profile_id}, actor=actor
@@ -2774,6 +2795,7 @@ def memory_remember(req: RememberRequest, request: Request) -> dict[str, Any]:
         text=req.text,
         actor=resolve_actor(request),
         rules=req.rules,
+        capture=req.capture,
     )
 
 

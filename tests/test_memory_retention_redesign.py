@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from mnemoseed_local.config import Config, load_config
-from mnemoseed_local.daemon.memory import MemoryService
+from mnemoseed_local.daemon.memory import CAPTURED_CHAT_SOURCE, MemoryService
 from mnemoseed_local.schema.stamp import (
     EXPLICIT_PIN_SOURCE,
     ChunkStamp,
@@ -205,6 +205,47 @@ class TestSupersedeInPlace:
         assert result == {"outcome": "needs_reconcile", "chunk_id": "conflict"}
         assert stores.vector.get_chunk("conflict").text == old
 
+    def test_a_capture_landing_on_a_conflicting_pin_only_flags_reconcile(self, service) -> None:
+        """A captured transcription that contradicts the user's pin is not a
+        write: the pin's text, source, history and weight all stand and only
+        the adjudication flag goes up — never a new chunk either."""
+        svc, stores, _config = service
+        old = "AtlasDb prefers pnpm for package management"
+        new = "AtlasDb stopped using pnpm and switched to npm for package management"
+        _seed_chunk(stores, "conflict-pin", old, dense=_dense(new))
+
+        result = svc.remember(profile_id=_PROFILE, text=new, capture=True)
+
+        assert result == {"outcome": "needs_reconcile", "chunk_id": "conflict-pin"}
+        stored = stores.vector.get_chunk("conflict-pin")
+        assert stored.text == old
+        assert stored.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in stored.provenance.history] == ["created"]
+        assert stored.decay_weight == 1.0
+        flagged = stores.vector.list_chunks(
+            ChunkFilter(profile_id=_PROFILE, needs_reconcile=True), Page(offset=0, limit=10)
+        )
+        assert [chunk.chunk_id for chunk in flagged.items] == ["conflict-pin"]
+        everything = stores.vector.list_chunks(ChunkFilter(profile_id=_PROFILE), Page(offset=0, limit=100))
+        assert everything.total == 1
+
+    def test_a_capture_identical_to_a_pin_only_reinforces(self, service) -> None:
+        """Identical wording is reinforcement, never a text write: the pin keeps
+        its verbatim text, source and history while its weight rebounds."""
+        svc, stores, _config = service
+        _seed_chunk(stores, "same-pin", self.NEW_TEXT, dense=_dense(self.NEW_TEXT), decay_weight=0.5)
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result == {"outcome": "reinforced", "chunk_id": "same-pin"}
+        stored = stores.vector.get_chunk("same-pin")
+        assert stored.text == self.NEW_TEXT
+        assert stored.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in stored.provenance.history] == ["created"]
+        assert stored.decay_weight == pytest.approx(0.6)
+        everything = stores.vector.list_chunks(ChunkFilter(profile_id=_PROFILE), Page(offset=0, limit=100))
+        assert everything.total == 1
+
     def test_capture_class_band_hit_is_never_superseded(self, service) -> None:
         """The supersede branch is flashbulb-class only: a re-pin landing in
         band over an ordinary CAPTURE chunk must fall through to a fresh chunk
@@ -229,6 +270,50 @@ class TestSupersedeInPlace:
         assert stored.provenance.source == "capture.session"
         # never reinforced: the baseline still equals the ingestion fallback
         assert stored.last_reinforced == stored.ingested_at
+
+    def test_captured_write_landing_on_a_pin_never_rewrites_it(self, service) -> None:
+        """The symmetric guard: supersede-in-place is for two explicit pins.
+        A captured write (source ``mcp-chat``) landing near the user's pin
+        becomes its own chunk — the model's transcription never replaces the
+        user's verbatim pin, and the pin keeps its weight and history."""
+        svc, stores, _config = service
+        _seed_chunk(stores, "owned-pin", self.OLD_TEXT, dense=_dense(self.NEW_TEXT))
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result["outcome"] == "new_chunk"
+        assert result["chunk_id"] != "owned-pin"
+        pinned = stores.vector.get_chunk("owned-pin")
+        assert pinned.text == self.OLD_TEXT
+        assert pinned.provenance.source == EXPLICIT_PIN_SOURCE
+        assert [event.action for event in pinned.provenance.history] == ["created"]
+        assert pinned.decay_weight == 1.0
+        assert pinned.last_reinforced == pinned.ingested_at
+        written = stores.vector.get_chunk(result["chunk_id"])
+        assert written.text == self.NEW_TEXT
+        assert written.provenance.source == CAPTURED_CHAT_SOURCE
+        # the derived flag, not just the source label: the prefilter, the decay
+        # rate and the recall badge all read this one bit
+        assert pinned.metadata_filter_view()["explicit_pin"] is True
+        assert written.metadata_filter_view()["explicit_pin"] is False
+
+    def test_captured_write_landing_on_a_captured_chunk_is_also_a_new_chunk(self, service) -> None:
+        """Neither side is a pin, so the supersede-in-place branch stays closed:
+        a captured write never rewrites another capture's verbatim text."""
+        svc, stores, _config = service
+        _seed_chunk(
+            stores,
+            "earlier-capture",
+            self.OLD_TEXT,
+            dense=_dense(self.NEW_TEXT),
+            source=CAPTURED_CHAT_SOURCE,
+        )
+
+        result = svc.remember(profile_id=_PROFILE, text=self.NEW_TEXT, capture=True)
+
+        assert result["outcome"] == "new_chunk"
+        assert result["chunk_id"] != "earlier-capture"
+        assert stores.vector.get_chunk("earlier-capture").text == self.OLD_TEXT
 
     def test_identical_repin_in_weak_band_reports_reinforced(self, service) -> None:
         """Identical wording is the strongest possible consistency evidence: an

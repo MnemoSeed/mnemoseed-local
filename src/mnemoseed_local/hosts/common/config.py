@@ -20,16 +20,31 @@ def load_object(target: Path) -> dict[str, object]:
     tolerates a BOM-prefixed file (stripped on the next atomic rewrite)."""
     if not target.is_file():
         return {}
-    text = target.read_text(encoding="utf-8-sig")
-    if not text.strip():
-        return {}
     try:
+        text = target.read_text(encoding="utf-8-sig")
+        if not text.strip():
+            return {}
         data = json.loads(text)
+    except UnicodeDecodeError as exc:
+        raise ConfigParseError(f"{target} is not UTF-8 ({exc}); fix it manually, then retry") from exc
     except ValueError as exc:
         raise ConfigParseError(f"{target} is not strict JSON ({exc}); fix it manually, then retry") from exc
     if not isinstance(data, dict):
         raise ConfigParseError(f"{target} does not contain a JSON object")
     return data
+
+
+def require_object(target: Path, container: dict[str, object], key: str) -> dict[str, object]:
+    """``container[key]`` as an object, created empty when the key is absent. A
+    key that is present but malformed is user data: it refuses, never overwritten."""
+    value = container.get(key)
+    if isinstance(value, dict):
+        return value
+    if key in container:
+        raise ConfigParseError(f"{target}: {key!r} exists but is not an object — fix it manually")
+    empty: dict[str, object] = {}
+    container[key] = empty
+    return empty
 
 
 def serialize(data: Mapping[str, object]) -> bytes:

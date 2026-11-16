@@ -254,8 +254,8 @@ function Invoke-Doctor {
 function Get-HostSelection([string]$Csv) {
     $seen = @()
     foreach ($token in $Csv.Split(',')) {
-        if (@('claude_code', 'codex_cli', 'opencode', 'zcode') -cnotcontains $token) {
-            Exit-WithError "unknown host '$token' (expected claude_code|codex_cli|opencode|zcode; 'all' is not accepted - name the hosts explicitly)"
+        if (@('claude_code', 'claude_desktop', 'codex_cli', 'cursor', 'opencode', 'zcode') -cnotcontains $token) {
+            Exit-WithError "unknown host '$token' (expected claude_code|claude_desktop|codex_cli|cursor|opencode|zcode; 'all' is not accepted - name the hosts explicitly)"
         }
         if ($seen -notcontains $token) { $seen += $token }
     }
@@ -278,8 +278,14 @@ function Test-HostConfigDir([string]$Key) {
     $dir = ''
     if ($Key -eq 'claude_code') {
         $dir = Join-Path $env:USERPROFILE '.claude'
+    } elseif ($Key -eq 'claude_desktop') {
+        if ($env:MNEMOSEED_CLAUDE_DESKTOP_CONFIG) { return $true }
+        if ($env:LOCALAPPDATA -and (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Claude-Data') -PathType Container)) { return $true }
+        if ($env:APPDATA -and (Test-Path -LiteralPath (Join-Path $env:APPDATA 'Claude') -PathType Container)) { return $true }
     } elseif ($Key -eq 'codex_cli') {
         $dir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    } elseif ($Key -eq 'cursor') {
+        $dir = Join-Path $env:USERPROFILE '.cursor'
     } elseif ($Key -eq 'opencode') {
         if ($env:OPENCODE_CONFIG_DIR) { $dir = $env:OPENCODE_CONFIG_DIR }
         elseif ($env:XDG_CONFIG_HOME) { $dir = Join-Path $env:XDG_CONFIG_HOME 'opencode' }
@@ -296,9 +302,10 @@ function Test-HostConfigDir([string]$Key) {
 # exists.
 function Get-InstalledHosts {
     $detected = @()
-    $candidates = [ordered]@{ claude_code = 'claude'; codex_cli = 'codex'; opencode = 'opencode'; zcode = 'zcode' }
+    $candidates = [ordered]@{ claude_code = 'claude'; claude_desktop = ''; codex_cli = 'codex'; cursor = 'cursor'; opencode = 'opencode'; zcode = 'zcode' }
     foreach ($candidate in $candidates.GetEnumerator()) {
-        if ((Test-CommandExists $candidate.Value) -or (Test-HostConfigDir $candidate.Key)) {
+        $cliFound = ($candidate.Value -ne '') -and (Test-CommandExists $candidate.Value)
+        if ($cliFound -or (Test-HostConfigDir $candidate.Key)) {
             $detected += $candidate.Key
         }
     }
@@ -640,7 +647,9 @@ if ($HostSelection.Count -gt 0) {
     Write-Host '  no host adapter was wired; to wire hosts, run the exact command for each host:'
     Write-Host '    mnemoseed-local hook install opencode'
     Write-Host '    mnemoseed-local host install --host claude_code'
+    Write-Host '    mnemoseed-local host install --host claude_desktop'
     Write-Host '    mnemoseed-local host install --host codex_cli'
+    Write-Host '    mnemoseed-local host install --host cursor'
     Write-Host '    mnemoseed-local host install --host zcode'
 }
 exit 0

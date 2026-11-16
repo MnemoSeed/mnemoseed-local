@@ -12,10 +12,11 @@ own — these tools are for deliberately querying, pinning, and replacing memory
 
 ## Verbs
 
-Verbs: `recall`, `remember`, `supersede`, `dream_once`, `recent_sessions`, `session_windows`
+Verbs: `recall`, `remember`, `capture`, `supersede`, `dream_once`, `recent_sessions`, `session_windows`
 
 - `recall` — search memory for past decisions, preferences, and prior work on a topic. Required `query`; optional `top_k` caps the result count.
-- `remember` — store one fact verbatim. Call it only when the user explicitly asks to pin that fact.
+- `remember` — store one fact verbatim as a pin. Call it when the user explicitly asks to keep or pin that fact: this verb is the pin path, and a statement the user merely makes is a `capture` instead.
+- `capture` — record a durable decision, preference, or constraint the user stated, quoting their own wording verbatim. Captures are not pins: use it in a surface that has no capture hook, and never record your own guesses, drafts, or reasoning.
 - `supersede` — record that one belief replaces another (`superseded_node_id`, `successor_node_id`). A deliberate act only; never fire it automatically.
 - `dream_once` — launch exactly one dream consolidation cycle and return its launched/state payload.
 - `recent_sessions` — fetch recent sessions' verbatim tails to re-anchor on where the previous conversation ended.
@@ -41,6 +42,16 @@ user asks this session to continue.
 - Before re-deciding an existing topic, recall what was already decided.
 
 Never call recall unconditionally every turn. One recall per topic is enough.
+
+When a memory block is already in context, that block is the memory channel for
+the session: use it rather than recalling the same topic again.
+
+## When to capture
+
+A surface without the capture hook (a chat window, for example) writes nothing
+by itself. There, a durable decision, preference, or constraint the user states
+is worth a `capture` call in the user's own words. One capture per statement is
+enough, and an assistant's own speculation never belongs in memory.
 
 ## Empty results
 

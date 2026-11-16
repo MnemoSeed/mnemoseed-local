@@ -12,6 +12,7 @@ then connect a host and verify capture and recall with a real session.
 - [Uninstall](#uninstall)
 - [Memory behavior and status](#status)
 - [MCP gateway](#mcp-gateway)
+- [Surfaces without a capture hook](#surfaces-without-a-capture-hook)
 - [Daemon credential](#daemon-credential)
 - [Daemon lifecycle](#daemon-lifecycle)
 - [Development](#development) and [evaluation](#evaluation-maintainers)
@@ -221,17 +222,17 @@ without side effects.
 ### Host selection
 
 Pass `--hosts a,b,c` to `install.sh` or `-Hosts a,b,c` to `install.ps1`, using any
-of `claude_code`, `codex_cli`, `opencode`, and `zcode`. Only the named adapters
-are wired; repeated names are deduplicated. Unknown names, including `all`, are
-refused before any installation step writes anything.
+of `claude_code`, `claude_desktop`, `codex_cli`, `cursor`, `opencode`, and `zcode`.
+Only the named adapters are wired; repeated names are deduplicated. Unknown names,
+including `all`, are refused before any installation step writes anything.
 
 Without an explicit list, a terminal session offers a numbered menu of detected
 hosts. Detection checks the host CLI on PATH or its adapter config directory,
-including `CODEX_HOME`, `OPENCODE_CONFIG_DIR`, or `XDG_CONFIG_HOME` overrides where
-applicable. Only valid offered menu numbers select hosts; an empty selection
-wires none. A non-interactive run without a list wires nothing, reports detected
-hosts, and prints the exact per-host commands as next steps. The daemon can be
-used without a host adapter.
+including `MNEMOSEED_CLAUDE_DESKTOP_CONFIG`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR`,
+or `XDG_CONFIG_HOME` overrides where applicable. Only valid offered menu numbers
+select hosts; an empty selection wires none. A non-interactive run without a list
+wires nothing, reports detected hosts, and prints the exact per-host commands as
+next steps. The daemon can be used without a host adapter.
 
 The installers currently invoke the OpenCode `hook install opencode` alias;
 other selected hosts use `host install --host <host>`. The unified `host` group
@@ -398,10 +399,19 @@ the credential from `~/.mnemoseed-local/secrets/daemon.credential.key`,
 present it as the bearer header, carry `X-MnemoSeed-Profile`, and POST the
 JSON-RPC body to `/mcp`.
 
-Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `supersede(superseded_node_id, successor_node_id)`,
+Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `capture(text)`,
+`supersede(superseded_node_id, successor_node_id)`,
 `dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?, caller_cwd?)`,
 `session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
 connectivity error.
+
+The handshake also carries a short instruction block (`initialize.result.instructions`) that states the four
+execution rules — use an injected memory block instead of re-querying, recall before answering about past work,
+`capture` a durable statement the user makes, `remember` when the user asks for a pin. The MCP specification
+defines that field as optional and says a client MAY use it, so it is best-effort delivery: a client that ignores
+it loses nothing, and no surface here claims the block reached a model. `remember` writes a pin; `capture` routes
+to the same write service with a capture stamp (source `mcp-chat`, no pin marker), so the two stay
+distinguishable by `explicit_pin` exactly as the skill describes.
 
 Honest boundaries of the HTTP surface:
 
@@ -423,6 +433,44 @@ Honest boundaries of the HTTP surface:
   host after `mnemoseed-local credential rotate`).
 - `"oauth": false` keeps a first-party entry from opening a browser
   OAuth/DCR loop when the daemon answers 401.
+
+## Surfaces without a capture hook
+
+Claude chat and ChatGPT web cannot install a hook: no hook command exists in
+those products. Memory there works through the MCP tools the assistant calls
+itself, plus a protocol block you paste once.
+
+```sh
+mnemoseed-local host install --host claude_desktop
+mnemoseed-local instructions --surface claude_chat
+```
+
+`host install --host claude_desktop` merges one `mcpServers.mnemoseed` entry
+into the app's `claude_desktop_config.json`: `{"command": "<absolute path>",
+"args": ["mcp"]}`, where the command is the installed CLI's console script
+beside its interpreter (falling back to that interpreter with `args: ["-m",
+"mnemoseed_local.cli", "mcp"]` when no launcher was shipped). The file is
+resolved by directory existence: the `MNEMOSEED_CLAUDE_DESKTOP_CONFIG` override,
+then whichever side already carries a config file — the Windows MSIX package
+directory or the platform classic path — and, when neither does, the MSIX
+directory if it exists, else the classic path. Every other key in that file is
+preserved, and a file that is not strict JSON is refused untouched; an existing
+`mcpServers.mnemoseed` entry of the wrong shape refuses too, instead of being
+replaced. One caveat of any rewrite: duplicate JSON keys in the original file
+are silently merged by `json.loads`, which keeps only the last value. The
+command is written only from an installed runtime — a development checkout
+refuses, because the app cannot spawn a build environment's interpreter.
+`host status --host claude_desktop` reports `not-installed` / `installed` /
+`stale` (the configured command and arguments are not the ones this surface
+would write now) / `unreadable` (the file, or the entry inside it, cannot be
+parsed). Close Claude Desktop before restarting it: a running app can rewrite
+the file from memory on exit.
+
+`instructions --surface <surface>` prints the paste-ready block for
+`claude_chat`, `chatgpt`, `claude_code`, or `generic` (the block the MCP
+handshake itself serves). Claude's personal preferences and ChatGPT's custom
+instructions are account-level and cloud-synced, so no installer can write them:
+pasting is the boundary, not a gap.
 
 ## Agent skill
 

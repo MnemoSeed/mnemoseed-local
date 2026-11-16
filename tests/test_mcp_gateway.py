@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import sys
 from typing import Any
 
@@ -102,17 +103,51 @@ def test_initialized_notification_emits_nothing() -> None:
     assert responses[0]["id"] == 1
 
 
+def test_initialize_still_answers_when_the_instruction_block_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The instruction block is optional on the wire: when it cannot be built
+    the handshake still answers the id it was asked with, minus that field."""
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise ValueError("over the ceiling")
+
+    monkeypatch.setattr(server.instructions, "gateway_text", boom)
+
+    code, responses = run_gateway([_request(1, "initialize")], StubClient())
+
+    assert code == 0
+    assert len(responses) == 1
+    response = responses[0]
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    result = response["result"]
+    assert result["protocolVersion"] == server.PROTOCOL_VERSION
+    assert "tools" in result["capabilities"]
+    assert result["serverInfo"] == {"name": "mnemoseed-local", "version": __version__}
+    assert "instructions" not in result
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.name == "mnemoseed_local.mcp_gateway.server" and record.levelno >= logging.ERROR
+    ]
+    assert any("instruction block unavailable" in record.getMessage() for record in failures)
+
+
 def test_ping_returns_empty_result() -> None:
     _, responses = run_gateway([_request(9, "ping")], StubClient())
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_seven_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
         "recall",
         "remember",
+        "capture",
         "supersede",
         "dream_once",
         "recent_sessions",
@@ -130,6 +165,10 @@ def test_tools_list_has_exactly_the_six_tools_with_valid_schemas() -> None:
     assert recall["inputSchema"]["properties"]["top_k"]["type"] == "integer"
     remember = next(tool for tool in tools if tool["name"] == "remember")
     assert remember["inputSchema"]["required"] == ["text"]
+    # the hook-less write arm: the same one required text, its own verb
+    capture = next(tool for tool in tools if tool["name"] == "capture")
+    assert capture["inputSchema"]["required"] == ["text"]
+    assert capture["inputSchema"]["properties"]["text"]["type"] == "string"
     supersede = next(tool for tool in tools if tool["name"] == "supersede")
     assert supersede["inputSchema"]["required"] == ["superseded_node_id", "successor_node_id"]
     # #187: scoped resume requires the raw current prompt for anchor matching

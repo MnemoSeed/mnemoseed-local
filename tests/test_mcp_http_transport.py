@@ -9,6 +9,7 @@ crosses a real loopback socket.
 
 from __future__ import annotations
 
+import io
 import json
 import threading
 import time
@@ -24,6 +25,7 @@ from _test_daemon import TEST_ACTOR, daemon_for_test
 from mnemoseed_local import __version__
 from mnemoseed_local.credential import read_credential_at
 from mnemoseed_local.daemon.auth import AUTH_DETAIL
+from mnemoseed_local.mcp_gateway import instructions, server
 from mnemoseed_local.mcp_gateway.http_transport import (
     MALFORMED_MESSAGE_DETAIL,
     MCP_PATH,
@@ -33,7 +35,15 @@ from mnemoseed_local.mcp_gateway.http_transport import (
 from mnemoseed_local.mcp_gateway.server import PROTOCOL_VERSION
 from mnemoseed_local.rest_client import ACTOR_HEADER, DaemonClient
 
-TOOL_NAMES = {"recall", "remember", "supersede", "dream_once", "recent_sessions", "session_windows"}
+TOOL_NAMES = {
+    "recall",
+    "remember",
+    "capture",
+    "supersede",
+    "dream_once",
+    "recent_sessions",
+    "session_windows",
+}
 
 #: The tools/call round trip must finish far below the self-call's own 30s
 #: client timeout; an inline (on-loop) dispatch stalls past it.
@@ -142,7 +152,25 @@ def test_initialize_answers_the_gateway_shape(home: Path) -> None:
     assert "tools" in result["capabilities"]
 
 
-def test_tools_list_is_the_six_gateway_tools(home: Path) -> None:
+def test_both_transports_serve_the_same_instruction_block(home: Path) -> None:
+    """One text, one builder: the stdio loop and the loopback route answer
+    ``initialize`` through the same ``handle_message``, so the bytes a client
+    reads cannot differ between the two lanes."""
+    stdin = io.StringIO(json.dumps(_rpc(1, "initialize")) + "\n")
+    stdout = io.StringIO()
+    server.serve(stdin=stdin, stdout=stdout, client=DaemonClient(base_url="http://127.0.0.1:9"))
+    stdio_result = json.loads(stdout.getvalue())["result"]
+
+    with auth_support.boot(home) as client:
+        response = client.post(MCP_PATH, json=_rpc(1, "initialize"), headers={PROFILE_HEADER: "default"})
+    loopback_result = response.json()["result"]
+
+    assert stdio_result["instructions"] == loopback_result["instructions"]
+    assert loopback_result["instructions"] == instructions.gateway_text()
+    assert len(loopback_result["instructions"]) <= instructions.MAX_CHARS
+
+
+def test_tools_list_is_the_seven_gateway_tools(home: Path) -> None:
     with auth_support.boot(home) as client:
         response = client.post(MCP_PATH, json=_rpc(2, "tools/list"), headers={PROFILE_HEADER: "default"})
 
