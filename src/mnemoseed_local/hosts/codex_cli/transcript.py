@@ -60,6 +60,65 @@ def _read_lines(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines()
 
 
+def validate_rollout(path: Any) -> None:
+    """Reject a truncated compressed frame before any of its turns are read.
+
+    ``stream_reader`` returns a partial tail without error, so the importer
+    checks frame completeness separately. Appended frames are walked in order.
+    """
+    file = Path(path).expanduser()
+    if file.suffix != ".zst":
+        return
+    decompressor = require_zstandard().ZstdDecompressor()
+    pending = file.read_bytes()
+    while pending:
+        obj: Any = decompressor.decompressobj()
+        obj.decompress(pending)
+        if not obj.eof:
+            raise ValueError("truncated compressed rollout")
+        pending = obj.unused_data
+
+
+#: Default rollout root the CLI uses when ``--source`` is omitted.
+DEFAULT_SOURCE = "~/.codex/sessions"
+
+
+def iter_rollouts(root: Any) -> list[Path]:
+    """Rollout files under ``root`` (compressed and plain), in stable order."""
+    base = Path(root).expanduser()
+    if not base.is_dir():
+        return []
+    return sorted(
+        path for pattern in ("*.jsonl.zst", "*.jsonl") for path in base.rglob(pattern) if path.is_file()
+    )
+
+
+def read_session_meta(path: Any) -> str | None:
+    """The conversation id from a rollout's ``session_meta`` line, if present."""
+    if not isinstance(path, (str, Path)) or not str(path).strip():
+        return None
+    try:
+        lines = _read_lines(Path(path).expanduser())
+    except OSError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            session_id = payload.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id
+    return None
+
+
 def read_turns(path: Any) -> list[TranscriptTurn]:
     """All user/assistant message turns of a rollout transcript, ascending."""
     if not isinstance(path, str) or not path.strip():

@@ -140,3 +140,24 @@ def test_settle_forwards_the_flag_to_the_drain(config_path: Path) -> None:
         )
         assert settled.status_code == 200, settled.text
         assert seen == [False]
+
+
+def test_settle_response_carries_funnel_and_suppressed_points(config_path: Path) -> None:
+    with auth_support.boot(config_path.parent) as client:
+        _ingest(client)
+        settled = client.post(
+            "/session/end",
+            json={"session_id": SESSION, "profile_id": PROFILE, "credit_pool": False},
+        )
+        assert settled.status_code == 200, settled.text
+        body = settled.json()
+        assert body["pool_points_suppressed"] > 0.0
+        assert body["new_chunk"] + body["reinforced"] + body["needs_reconcile"] == 1
+
+
+def test_settle_response_suppressed_points_are_zero_when_crediting(config_path: Path) -> None:
+    with auth_support.boot(config_path.parent) as client:
+        _ingest(client)
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+        assert settled.json()["pool_points_suppressed"] == 0.0

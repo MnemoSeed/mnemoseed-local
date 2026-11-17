@@ -505,6 +505,11 @@ class WritingPipeline:
         return self._stats
 
     @property
+    def pool_points_suppressed(self) -> float:
+        """S withheld from the score pool by credit_pool=False settles."""
+        return self._inner.stats.pool_points_suppressed
+
+    @property
     def pool(self) -> ScorePool:
         """The inner funnel's score pool (daemon boot restore + observability)."""
         return self._inner.pool

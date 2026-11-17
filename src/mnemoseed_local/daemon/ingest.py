@@ -56,6 +56,17 @@ def _observability(request: Request) -> Observability | None:
     return getattr(request.app.state, "observability", None)
 
 
+def _settle_counts(capture: Any) -> dict[str, float]:
+    """Cumulative funnel counters; injection seams may bind no capture."""
+    stats = getattr(capture, "stats", None)
+    return {
+        "new_chunk": float(getattr(stats, "new_chunks", 0)),
+        "reinforced": float(getattr(stats, "reinforced", 0)),
+        "needs_reconcile": float(getattr(stats, "needs_reconcile", 0)),
+        "pool_points_suppressed": float(getattr(capture, "pool_points_suppressed", 0.0)),
+    }
+
+
 def _effective_ingest_profile(event: IngestEvent, config: Config | None) -> str:
     """Effective profile for capture-side routing (#130).
 
@@ -291,8 +302,10 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     # never blocks the event loop for the whole store write; the response still
     # waits for the drain future (ack = completed-applied). Guarded so injection
     # seams that bind a drain-less pipeline keep working.
+    capture = getattr(request.app.state, "capture", None)
+    before = _settle_counts(capture)
     lane = getattr(request.app.state, "drain_lane", None)
-    drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
+    drain = getattr(capture, "drain", None)
     if drain is not None:
         drain_fn = drain if req.credit_pool else partial(drain, credit_pool=False)
         if lane is not None:
@@ -319,12 +332,19 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     memory = getattr(request.app.state, "memory", None)
     if memory is not None:
         memory.end_session(req.profile_id, req.session_id)
+    after = _settle_counts(capture)
     return {
         "status": "settled",
         "session_id": req.session_id,
         "profile_id": req.profile_id,
         "turns": turn_range.end - turn_range.start + 1,
         "turn_range": turn_range,
+        "new_chunk": int(after["new_chunk"] - before["new_chunk"]),
+        "reinforced": int(after["reinforced"] - before["reinforced"]),
+        "needs_reconcile": int(after["needs_reconcile"] - before["needs_reconcile"]),
+        "pool_points_suppressed": max(
+            0.0, after["pool_points_suppressed"] - before["pool_points_suppressed"]
+        ),
     }
 
 
