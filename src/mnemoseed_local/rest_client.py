@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from mnemoseed_local import endpoint
 from mnemoseed_local.credential import read_credential_or_none
 
 #: Audit-attribution header the daemon trusts (actor cli|console|mcp|hook).
@@ -160,8 +161,9 @@ def client_for(
 def resolve_client(args: Any, *, require_session: bool = False) -> DaemonClient:
     """Build a client from the CLI args + config.
 
-    Base URL order: ``--baseurl``, then the config baseurl. The profile is
-    ``MNEMOSEED_LOCAL_PROFILE_ID`` or the ``default`` profile.
+    Base URL order: ``--baseurl``, then ``MNEMOSEED_LOCAL_BASEURL``, then the
+    config baseurl. The first two skip instance verification with a warning;
+    the config baseurl is verified before any credential is attached.
     """
     from mnemoseed_local.config import ConfigError, load_config
 
@@ -169,8 +171,13 @@ def resolve_client(args: Any, *, require_session: bool = False) -> DaemonClient:
         config_base = load_config().baseurl
     except ConfigError:
         config_base = "http://localhost:7788"
-    base_url = _arg_baseurl(args) or config_base
-    base_url = base_url.rstrip("/")
+    arg_base = _arg_baseurl(args)
+    env_base = (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or "").strip().rstrip("/") or None
+    override = arg_base is not None or env_base is not None
+    base_url = endpoint.resolve(
+        arg_base or env_base or config_base.rstrip("/"),
+        override=override,
+    )
     profile_id = os.environ.get("MNEMOSEED_LOCAL_PROFILE_ID") or DEFAULT_PROFILE_ID
     if require_session and not profile_id:
         raise DaemonUnavailableError("no profile selected: set MNEMOSEED_LOCAL_PROFILE_ID")

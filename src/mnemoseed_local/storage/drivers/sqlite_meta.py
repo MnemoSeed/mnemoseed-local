@@ -18,7 +18,7 @@ import secrets
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from collections.abc import Sequence as CSeq
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +45,9 @@ from mnemoseed_local.storage.ports import (
     ErrorSignalType,
     EvidenceKind,
     EvidencePointer,
+    IngestAppliedEvent,
+    IngestRecord,
+    IngestStream,
     NominationOutcome,
     NominationRejectedError,
     NominationRequest,
@@ -52,6 +55,7 @@ from mnemoseed_local.storage.ports import (
     OwnerConflictError,
     Page,
     PageResult,
+    PoolCreditOp,
     PoolState,
     ReconciliationNominationCarrier,
     ReconciliationNominationPage,
@@ -136,15 +140,7 @@ class SqliteMetaDriver:
 
     def pool_credit(self, profile_id: str, balance: float, turn_range: TurnRange) -> None:
         with _transaction(self._conn):
-            self._conn.execute(
-                "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
-                "watermark_end, last_event_start, last_event_end) "
-                "VALUES (?, ?, ?, ?, 0, 0) "
-                "ON CONFLICT(profile_id) DO UPDATE SET "
-                "balance = excluded.balance, watermark_start = excluded.watermark_start, "
-                "watermark_end = excluded.watermark_end",
-                (profile_id, balance, turn_range.start, turn_range.end),
-            )
+            _pool_credit_conn(self._conn, profile_id, balance, turn_range)
 
     def pool_drain(self, profile_id: str, turn_range: TurnRange) -> float:
         """Move the whole pending gauge into the lifetime ledger atomically.
@@ -154,27 +150,7 @@ class SqliteMetaDriver:
         one of them wins the balance and files it.
         """
         with _transaction(self._conn):
-            row = self._conn.execute(
-                "SELECT balance FROM profile_score_pool WHERE profile_id = ?",
-                (profile_id,),
-            ).fetchone()
-            drained = float(row["balance"]) if row is not None else 0.0
-            self._conn.execute(
-                "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
-                "watermark_end, last_event_start, last_event_end, filed_points_total) "
-                "VALUES (?, 0, 0, 0, ?, ?, ?) "
-                "ON CONFLICT(profile_id) DO UPDATE SET "
-                "balance = 0, last_event_start = excluded.last_event_start, "
-                "last_event_end = excluded.last_event_end, "
-                "filed_points_total = filed_points_total + excluded.filed_points_total",
-                (
-                    profile_id,
-                    turn_range.start,
-                    turn_range.end,
-                    drained,
-                ),
-            )
-            return drained
+            return _pool_drain_conn(self._conn, profile_id, turn_range)
 
     def pool_state(self, profile_id: str) -> PoolState:
         """The profile's pending gauge plus its lifetime filed total."""
@@ -235,6 +211,155 @@ class SqliteMetaDriver:
                 "UPDATE profile_score_pool SET watermark_start = ?, watermark_end = ? WHERE profile_id = ?",
                 (new_start, new_end, profile_id),
             )
+
+    # ------------------------------------------------------------ ingest queue
+
+    def ingest_record(self, record: IngestRecord) -> None:
+        with _transaction(self._conn):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO ingest_events (event_id, profile_id, session_id, "
+                "rollout_id, ordinal, kind, payload, actor, host, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.event_id,
+                    record.profile_id,
+                    record.session_id,
+                    record.rollout_id,
+                    record.ordinal,
+                    record.kind,
+                    record.payload,
+                    record.actor,
+                    record.host,
+                    iso8601_utc(record.received_at),
+                ),
+            )
+            self._raise_seen(self._conn, record.stream, record.ordinal)
+
+    def ingest_seen(self, profile_id: str, session_id: str, rollout_id: str, ordinal: int) -> int:
+        with _transaction(self._conn):
+            return self._raise_seen(self._conn, IngestStream(profile_id, session_id, rollout_id), ordinal)
+
+    @staticmethod
+    def _raise_seen(conn: sqlite3.Connection, stream: IngestStream, ordinal: int) -> int:
+        conn.execute(
+            "INSERT INTO ingest_watermarks "
+            "(profile_id, session_id, rollout_id, seen_ordinal, applied_ordinal) "
+            "VALUES (?, ?, ?, ?, -1) "
+            "ON CONFLICT(profile_id, session_id, rollout_id) DO UPDATE SET "
+            "seen_ordinal = MAX(seen_ordinal, excluded.seen_ordinal)",
+            (stream.profile_id, stream.session_id, stream.rollout_id, ordinal),
+        )
+        row = conn.execute(
+            "SELECT seen_ordinal FROM ingest_watermarks WHERE profile_id = ? AND session_id = ? "
+            "AND rollout_id = ?",
+            (stream.profile_id, stream.session_id, stream.rollout_id),
+        ).fetchone()
+        return int(row["seen_ordinal"]) if row is not None else ordinal
+
+    def ingest_watermarks(self, stream: IngestStream) -> tuple[int, int]:
+        row = self._conn.execute(
+            "SELECT seen_ordinal, applied_ordinal FROM ingest_watermarks "
+            "WHERE profile_id = ? AND session_id = ? AND rollout_id = ?",
+            (stream.profile_id, stream.session_id, stream.rollout_id),
+        ).fetchone()
+        if row is None:
+            return (-1, -1)
+        return (int(row["seen_ordinal"]), int(row["applied_ordinal"]))
+
+    def ingest_pending(
+        self,
+        *,
+        profile_id: str | None = None,
+        session_id: str | None = None,
+    ) -> tuple[IngestRecord, ...]:
+        clauses = [
+            "applied.event_id IS NULL",
+            "(event.ordinal = -1 OR event.ordinal > watermark.applied_ordinal)",
+        ]
+        params: list[Any] = []
+        if profile_id is not None:
+            clauses.append("event.profile_id = ?")
+            params.append(profile_id)
+        if session_id is not None:
+            clauses.append("event.session_id = ?")
+            params.append(session_id)
+        rows = self._conn.execute(
+            "SELECT event.* FROM ingest_events event "
+            "LEFT JOIN ingest_applied applied ON applied.event_id = event.event_id "
+            "JOIN ingest_watermarks watermark ON watermark.profile_id = event.profile_id "
+            "AND watermark.session_id = event.session_id AND watermark.rollout_id = event.rollout_id "
+            "WHERE " + " AND ".join(clauses) + " ORDER BY event.id",
+            params,
+        ).fetchall()
+        return tuple(
+            IngestRecord(
+                event_id=str(row["event_id"]),
+                profile_id=str(row["profile_id"]),
+                session_id=str(row["session_id"]),
+                rollout_id=str(row["rollout_id"]),
+                ordinal=int(row["ordinal"]),
+                kind=str(row["kind"]),
+                payload=str(row["payload"]),
+                actor=str(row["actor"]),
+                host=str(row["host"]),
+                received_at=epoch_from_iso(str(row["received_at"])),
+            )
+            for row in rows
+        )
+
+    def ingest_apply(
+        self,
+        *,
+        stream: IngestStream,
+        applications: Sequence[IngestAppliedEvent],
+        credits: Sequence[PoolCreditOp],
+        at: float,
+    ) -> None:
+        with _transaction(self._conn):
+            for application in applications:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO ingest_applied (event_id, profile_id, session_id, "
+                    "rollout_id, ordinal, points, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        application.event_id,
+                        stream.profile_id,
+                        stream.session_id,
+                        stream.rollout_id,
+                        application.ordinal,
+                        application.points,
+                        iso8601_utc(at),
+                    ),
+                )
+            if applications:
+                applied = max(application.ordinal for application in applications)
+                self._conn.execute(
+                    "INSERT INTO ingest_watermarks "
+                    "(profile_id, session_id, rollout_id, seen_ordinal, applied_ordinal) "
+                    "VALUES (?, ?, ?, -1, ?) "
+                    "ON CONFLICT(profile_id, session_id, rollout_id) DO UPDATE SET "
+                    "applied_ordinal = MAX(applied_ordinal, excluded.applied_ordinal)",
+                    (stream.profile_id, stream.session_id, stream.rollout_id, applied),
+                )
+            for credit in credits:
+                if credit.kind not in ("credit", "drain") or not math.isfinite(credit.balance):
+                    raise ValueError("credit balance must be finite and non-negative")
+                if credit.balance < 0:
+                    raise ValueError("credit balance must be finite and non-negative")
+                if credit.kind == "credit":
+                    _pool_credit_conn(self._conn, credit.profile_id, credit.balance, credit.turn_range)
+                else:
+                    _pool_drain_conn(self._conn, credit.profile_id, credit.turn_range)
+
+    def ingest_prune(self, *, keep: int) -> int:
+        with _transaction(self._conn):
+            cursor = self._conn.execute(
+                "DELETE FROM ingest_events WHERE id IN ("
+                "SELECT event.id FROM ingest_events event JOIN ingest_applied applied "
+                "ON applied.event_id = event.event_id ORDER BY event.id DESC LIMIT -1 OFFSET ?"
+                ")",
+                (keep,),
+            )
+            return int(cursor.rowcount)
 
     # ------------------------------------------------------------ profiles
 
@@ -1000,6 +1125,38 @@ def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _pool_credit_conn(
+    conn: sqlite3.Connection, profile_id: str, balance: float, turn_range: TurnRange
+) -> None:
+    conn.execute(
+        "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
+        "watermark_end, last_event_start, last_event_end) "
+        "VALUES (?, ?, ?, ?, 0, 0) "
+        "ON CONFLICT(profile_id) DO UPDATE SET "
+        "balance = excluded.balance, watermark_start = excluded.watermark_start, "
+        "watermark_end = excluded.watermark_end",
+        (profile_id, balance, turn_range.start, turn_range.end),
+    )
+
+
+def _pool_drain_conn(conn: sqlite3.Connection, profile_id: str, turn_range: TurnRange) -> float:
+    row = conn.execute(
+        "SELECT balance FROM profile_score_pool WHERE profile_id = ?", (profile_id,)
+    ).fetchone()
+    drained = float(row["balance"]) if row is not None else 0.0
+    conn.execute(
+        "INSERT INTO profile_score_pool (profile_id, balance, watermark_start, "
+        "watermark_end, last_event_start, last_event_end, filed_points_total) "
+        "VALUES (?, 0, 0, 0, ?, ?, ?) "
+        "ON CONFLICT(profile_id) DO UPDATE SET "
+        "balance = 0, last_event_start = excluded.last_event_start, "
+        "last_event_end = excluded.last_event_end, "
+        "filed_points_total = filed_points_total + excluded.filed_points_total",
+        (profile_id, turn_range.start, turn_range.end, drained),
+    )
+    return drained
 
 
 def _merge_watermark(current: tuple[int, int], incoming: tuple[int, int]) -> tuple[int, int]:

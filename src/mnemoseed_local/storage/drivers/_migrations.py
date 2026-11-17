@@ -763,6 +763,66 @@ _RECONCILIATION_ATTEMPTS_TABLE = CreateTable(
 )
 
 
+# v17: durable capture intake. The envelope table keeps the raw ingest event and
+# its caller header; the watermark table holds independent seen/applied ordinals
+# per stream; the applied table is the replay-skip marker keyed by the
+# deterministic event id. A rollout id of None is stored as the empty string so
+# the stream key stays NOT NULL and unique on SQLite.
+_INGEST_EVENTS_TABLE = CreateTable(
+    store="meta",
+    name="ingest_events",
+    columns=(
+        Column("id", "INTEGER", primary_key=True),
+        Column("event_id", "TEXT", not_null=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("session_id", "TEXT", not_null=True),
+        Column("rollout_id", "TEXT", not_null=True),
+        Column("ordinal", "INTEGER", not_null=True),
+        Column("kind", "TEXT", not_null=True),
+        Column("payload", "TEXT", not_null=True),
+        Column("actor", "TEXT", not_null=True),
+        Column("host", "TEXT", not_null=True),
+        Column("received_at", "TEXT", not_null=True),
+    ),
+    unique=(("event_id",),),
+)
+
+_INGEST_EVENTS_STREAM_INDEX = CreateIndex(
+    store="meta",
+    name="idx_ingest_events_stream",
+    table="ingest_events",
+    columns=("profile_id", "session_id", "rollout_id", "id"),
+)
+
+_INGEST_WATERMARKS_TABLE = CreateTable(
+    store="meta",
+    name="ingest_watermarks",
+    columns=(
+        Column("profile_id", "TEXT", not_null=True),
+        Column("session_id", "TEXT", not_null=True),
+        Column("rollout_id", "TEXT", not_null=True),
+        Column("seen_ordinal", "INTEGER", not_null=True, default=-1),
+        Column("applied_ordinal", "INTEGER", not_null=True, default=-1),
+    ),
+    unique=(("profile_id", "session_id", "rollout_id"),),
+)
+
+_INGEST_APPLIED_TABLE = CreateTable(
+    store="meta",
+    name="ingest_applied",
+    columns=(
+        Column("event_id", "TEXT", primary_key=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("session_id", "TEXT", not_null=True),
+        Column("rollout_id", "TEXT", not_null=True),
+        Column("ordinal", "INTEGER", not_null=True),
+        Column("points", "REAL", not_null=True, default=0.0),
+        Column("applied_at", "TEXT", not_null=True),
+    ),
+    checks=("points >= 0",),
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -953,6 +1013,20 @@ MIGRATIONS: tuple[Migration, ...] = (
                 table="reconcile_nominations",
                 columns=("profile_id", "nomination_id"),
             ),
+        ),
+    ),
+    Migration(
+        version=17,
+        description=(
+            "durable capture intake: raw ingest envelopes with actor attribution, "
+            "independent seen/applied watermarks per (profile, session, rollout), "
+            "and applied replay-skip markers"
+        ),
+        ops=(
+            _INGEST_EVENTS_TABLE,
+            _INGEST_EVENTS_STREAM_INDEX,
+            _INGEST_WATERMARKS_TABLE,
+            _INGEST_APPLIED_TABLE,
         ),
     ),
 )

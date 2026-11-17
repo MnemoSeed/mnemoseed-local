@@ -48,6 +48,7 @@ from mnemoseed_local.config import (
     DREAM_HARDWARE_TIERS,
     LAMBDA_TARGETS,
     LLM_ROLES,
+    ROLE_ROUTE_REQUIRED_MESSAGE,
     VISIBILITY_MODES,
     CaptureConfig,
     Config,
@@ -248,6 +249,19 @@ def _cross_validate_floor(config: Config, value: float) -> None:
     pool_forced_cap AND a non-zero floor requires the isolated graph instance."""
     _cross_validate_cap_vs_floor(config, value)
     _cross_validate_floor_requires_isolated(config, value)
+
+
+def _cross_validate_role_route(role: str, field: str) -> Callable[[Config, Any], None]:
+    """A driver/model write must leave both parts of the role route set."""
+
+    def check(config: Config, value: Any) -> None:
+        route = config.llm.get(role)
+        driver = value if field == "driver" else (route.driver if route is not None else "")
+        model = value if field == "model" else (route.model if route is not None else "")
+        if not driver or not model:
+            raise ValueError(ROLE_ROUTE_REQUIRED_MESSAGE)
+
+    return check
 
 
 def _validate_lambda_map(value: Any) -> dict[str, float]:
@@ -520,17 +534,17 @@ def _role_applier(role: str, field: str) -> Callable[[Config, Any], None]:
 def _role_key_specs(role: str) -> dict[str, ConfigKey]:
     """The writable fields of one dream role (design/02 section 6; ``think``
     landed with the D4 thinking-output fix)."""
-    fields: dict[str, tuple[str, Callable[[Any], Any], bool]] = {
-        "driver": ("string", _validate_nonempty_str, False),
-        "model": ("string", _validate_nonempty_str, False),
-        "base_url": ("string", _validate_optional_str, False),
-        "api_key_env": ("env-var names or secrets: reference", _validate_env_name_list, True),
-        "max_tokens": ("positive integer", _validate_optional_positive_int, False),
-        "provider": ("string", _validate_optional_str, False),
-        "think": ("boolean", _validate_bool, False),
+    fields: dict[str, tuple[str, Callable[[Any], Any], bool, Callable[[Config, Any], None] | None]] = {
+        "driver": ("string", _validate_nonempty_str, False, _cross_validate_role_route(role, "driver")),
+        "model": ("string", _validate_nonempty_str, False, _cross_validate_role_route(role, "model")),
+        "base_url": ("string", _validate_optional_str, False, None),
+        "api_key_env": ("env-var names or secrets: reference", _validate_env_name_list, True, None),
+        "max_tokens": ("positive integer", _validate_optional_positive_int, False, None),
+        "provider": ("string", _validate_optional_str, False, None),
+        "think": ("boolean", _validate_bool, False, None),
         # ollama context knobs; the doctor ctx-window check hints at these
-        "num_ctx": ("positive integer", _validate_optional_positive_int, False),
-        "num_predict": ("positive integer", _validate_optional_positive_int, False),
+        "num_ctx": ("positive integer", _validate_optional_positive_int, False, None),
+        "num_predict": ("positive integer", _validate_optional_positive_int, False, None),
     }
     return {
         f"dream.llm.{role}.{field}": ConfigKey(
@@ -541,8 +555,9 @@ def _role_key_specs(role: str) -> dict[str, ConfigKey]:
             apply=_role_applier(role, field),
             live_apply=True,
             secret=is_secret,
+            cross_validate=cross_validate,
         )
-        for field, (label, validator, is_secret) in fields.items()
+        for field, (label, validator, is_secret, cross_validate) in fields.items()
     }
 
 

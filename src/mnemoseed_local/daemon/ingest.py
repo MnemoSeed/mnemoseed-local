@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,8 @@ from mnemoseed_local.capture import (
 from mnemoseed_local.capture.stamper import WriteOutcome
 from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
+from mnemoseed_local.daemon.ingest_queue import FLUSH_KIND, SESSION_END_KIND
+from mnemoseed_local.daemon.ingest_recovery import queue_drain_fn
 from mnemoseed_local.daemon.observability import Observability
 from mnemoseed_local.schema.turn import (
     FlushRequest,
@@ -40,6 +43,8 @@ from mnemoseed_local.storage.ports import (
     ErrorSignalType,
     EvidenceKind,
     EvidencePointer,
+    IngestAppliedEvent,
+    IngestStream,
     TurnRange,
 )
 from mnemoseed_local.util.daemon_executor import DaemonExecutor
@@ -64,15 +69,12 @@ class _SettleDrainResult:
     pool_points_suppressed: float
 
 
-def _drain_for_settle(capture: Any, credit_pool: bool) -> Callable[[str], _SettleDrainResult]:
+def _drain_for_settle(capture: Any, drain: Callable[[str], Any]) -> Callable[[str], _SettleDrainResult]:
     """One drain's own outcomes and score suppression, sampled at its entry/exit."""
 
     def settle_drain(session_id: str) -> _SettleDrainResult:
         before = getattr(capture, "pool_points_suppressed", 0.0)
-        if credit_pool:
-            outcomes = capture.drain(session_id)
-        else:
-            outcomes = capture.drain(session_id, credit_pool=False)
+        outcomes = drain(session_id)
         suppressed = max(0.0, getattr(capture, "pool_points_suppressed", 0.0) - before)
         return _SettleDrainResult(list(outcomes or []), suppressed)
 
@@ -201,6 +203,7 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     config = getattr(request.app.state, "config", None)
     effective_profile = _effective_ingest_profile(event, config)
     rollout_id = event.transcript_rollout_id
+    queue = getattr(request.app.state, "ingest_queue", None)
     if observability is not None:
         # B2.12: capture-hook activity (vs other actors) feeds the doctor's
         # registered-but-never-connected check; every sighting feeds the
@@ -211,6 +214,8 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         observability.note_profile_sighting(effective_profile)
     # B1 provider-error nomination path — never falls into focal scan
     if event.event is IngestEventType.PROVIDER_ERROR:
+        if queue is not None:
+            queue.record_non_turn(event, resolve_actor(request))
         _handle_provider_error(event, effective_profile, request)
         return {
             "status": "accepted",
@@ -226,6 +231,20 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     memory = getattr(request.app.state, "memory", None)
     if (
         event.transcript_ordinal is not None
+        and queue is not None
+        and queue.seen(event.profile_id, event.session_id, rollout_id, event.transcript_ordinal)
+    ):
+        seen, _ = queue.watermark(IngestStream(event.profile_id, event.session_id, rollout_id or ""))
+        return {
+            "status": "accepted",
+            "session_id": event.session_id,
+            "profile_id": event.profile_id,
+            "event": event.event.value,
+            "ack_ordinal": seen,
+            "deduped": True,
+        }
+    if (
+        event.transcript_ordinal is not None
         and memory is not None
         and memory.transcript_ordinal_dedupes(
             effective_profile, event.session_id, event.transcript_ordinal, rollout_id
@@ -239,11 +258,17 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
             "ack_ordinal": memory.transcript_watermark(effective_profile, event.session_id, rollout_id),
             "deduped": True,
         }
+    event_id = queue.record(event, resolve_actor(request)) if queue is not None else None
     try:
         segmenter.ingest(event)
-    except ProfileMismatchError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except SessionSettledError as exc:
+    except (ProfileMismatchError, SessionSettledError) as exc:
+        if queue is not None and event_id is not None:
+            queue.apply(
+                IngestStream(event.profile_id, event.session_id, rollout_id or ""),
+                (IngestAppliedEvent(event_id, event.transcript_ordinal or -1, 0.0),),
+                credits=(),
+                at=time.time(),
+            )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     # every accepted capture ingest feeds the per-session visibility
     # latch (first-capture signal; verbose count). Best-effort: the signal
@@ -267,6 +292,11 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
                 logger.warning("transcript watermark bookkeeping failed", exc_info=True)
         if ack_ordinal is None:
             ack_ordinal = event.transcript_ordinal
+        if queue is not None:
+            ack_ordinal = queue.advance_seen(
+                IngestStream(event.profile_id, event.session_id, rollout_id or ""),
+                event.transcript_ordinal,
+            )
     # B2.1 T2 (PRD-B2.1): user prompts run the embedding-free focal scan and
     # park the pending-recall selection BEFORE the 202 answers (ack-implies-
     # ready). The scan is store I/O, so it runs in a worker thread; the
@@ -320,6 +350,9 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
         turn_range = TurnRange(start=0, end=-1)
     except ProfileMismatchError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    queue = getattr(request.app.state, "ingest_queue", None)
+    if queue is not None:
+        queue.record_session_marker(SESSION_END_KIND, req.profile_id, req.session_id)
     # v1 drain trigger: no scheduled drain exists yet, so settlement is the
     # natural off-HTTP-path moment to move buffered turns through the F2-F4
     # funnel. /ingest stays submit-only (the client never waits on writes).
@@ -331,7 +364,17 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     lane = getattr(request.app.state, "drain_lane", None)
     result: _SettleDrainResult | None = None
     if getattr(capture, "drain", None) is not None:
-        drain_fn = _drain_for_settle(capture, req.credit_pool)
+        assert capture is not None
+        if queue is not None:
+            base_drain = queue_drain_fn(queue, capture, credit_pool=req.credit_pool)
+        else:
+
+            def base_drain(session_id: str) -> Any:
+                if req.credit_pool:
+                    return capture.drain(session_id)
+                return capture.drain(session_id, credit_pool=False)
+
+        drain_fn = _drain_for_settle(capture, base_drain)
         if lane is not None:
             result = await lane.drain(drain_fn, req.session_id)
         else:
@@ -406,13 +449,18 @@ async def flush(req: FlushRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ProfileMismatchError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    queue = getattr(request.app.state, "ingest_queue", None)
+    if queue is not None:
+        queue.record_session_marker(FLUSH_KIND, req.profile_id, req.session_id)
     lane = getattr(request.app.state, "drain_lane", None)
-    drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
+    capture = getattr(request.app.state, "capture", None)
+    drain = getattr(capture, "drain", None)
     if drain is not None:
+        base_drain = queue_drain_fn(queue, capture) if queue is not None else drain
         if lane is not None:
-            await lane.drain(drain, req.session_id)
+            await lane.drain(base_drain, req.session_id)
         else:
-            drain(req.session_id)
+            base_drain(req.session_id)
     return {
         "status": "flushed",
         "session_id": req.session_id,

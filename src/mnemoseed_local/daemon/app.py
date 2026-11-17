@@ -25,6 +25,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
@@ -59,6 +60,8 @@ from mnemoseed_local.daemon.auth import (
 )
 from mnemoseed_local.daemon.idle_flush import IdleFlushSweeper
 from mnemoseed_local.daemon.ingest import router as ingest_router
+from mnemoseed_local.daemon.ingest_queue import IngestQueue
+from mnemoseed_local.daemon.ingest_recovery import queue_drain_fn, recover_pending
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
 from mnemoseed_local.daemon.observability import Observability
@@ -79,7 +82,8 @@ from mnemoseed_local.dream import (
     resume_boundary,
 )
 from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
-from mnemoseed_local.dream.readiness import DreamRouteReadiness
+from mnemoseed_local.dream.readiness import NO_ROUTE_DETAIL, DreamRouteReadiness
+from mnemoseed_local.endpoint import EndpointRecord, clear_endpoint, write_endpoint
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -260,6 +264,25 @@ class HealthSnapshot:
     gate_ok: bool
     degradations: list[dict[str, str]]
     hard_missing: list[dict[str, str]]
+
+
+def _capabilities_payload(snap: HealthSnapshot, readiness: DreamRouteReadiness | None) -> dict[str, Any]:
+    """Capability report: core memory is storage-gated, dream is route-gated."""
+    dream = readiness.status() if readiness is not None else None
+    if dream is None:
+        dream = {
+            "ready": False,
+            "driver": None,
+            "model": None,
+            "detail": NO_ROUTE_DETAIL,
+            "checked_at": None,
+        }
+    return {
+        "capture": {"ready": snap.gate_ok},
+        "recall": {"ready": snap.gate_ok},
+        "dream": dream,
+        "storage": {"ok": snap.gate_ok},
+    }
 
 
 def _issue_payload(issue: CapabilityIssue) -> dict[str, str]:
@@ -1123,6 +1146,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.dream_readiness,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
+    app.state.ingest_queue = IngestQueue(stores.meta)
+    app.state.drain = queue_drain_fn(app.state.ingest_queue, app.state.capture)
+    # Durable replay runs before the idle sweeper can observe the restored
+    # segmenter state.
+    recover_pending(app.state.ingest_queue, app.state.segmenter, app.state.drain)
     # B6 (W-C): the drain lane runs WritingPipeline.drain off the event loop on
     # one dedicated daemon thread. Per-lifespan (drains are recoverable-critical,
     # unlike the never-closed scan singleton); teardown stops it before the
@@ -1133,7 +1161,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # semantics, no settle). The segmenter flush runs on the event loop; the
     # store drain rides the shared drain lane.
     app.state.idle_flush = IdleFlushSweeper(
-        app.state.segmenter, app.state.capture, config, lane=app.state.drain_lane
+        app.state.segmenter,
+        app.state.capture,
+        config,
+        lane=app.state.drain_lane,
+        drain_fn=app.state.drain,
     )
     app.state.idle_flush_task = asyncio.create_task(app.state.idle_flush.run_forever())
     # Dream chain thread (T1a): the capture/memory surface never blocks on a
@@ -1190,12 +1222,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         degradations=[_issue_payload(i) for i in stores.report.degradations],
         hard_missing=[_issue_payload(i) for i in stores.report.hard_missing],
     )
+    write_endpoint(
+        EndpointRecord(
+            pid=os.getpid(),
+            instance_id=app.state.instance_id,
+            base_url=config.baseurl.rstrip("/"),
+            started_at=time.time(),
+        )
+    )
     if stores.report.ok:
         logger.info("storage stack ready, all required capabilities present")
     else:
         for deg in stores.report.missing:
             logger.warning("degraded: %s - %s", deg.feature, deg.behavior)
     yield
+    clear_endpoint()
     # Cancel the periodic loops before the stores close (lifecycle order); the
     # idle sweeper stops before the drain lane closes.
     logger.info("teardown: stop background loops")
@@ -1228,7 +1269,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("teardown: drain capture lane")
     segmenter = getattr(app.state, "segmenter", None)
     capture = getattr(app.state, "capture", None)
-    drain = getattr(capture, "drain", None)
+    drain = getattr(app.state, "drain", None)
     lane = getattr(app.state, "drain_lane", None)
     if segmenter is not None and drain is not None and capture is not None:
         segmenter.flush_all()
@@ -1287,6 +1328,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
     have no knowledge of which one is in play.
     """
     app = FastAPI(title="MnemoSeed Local", version=__version__, lifespan=lifespan)
+    app.state.instance_id = str(uuid.uuid4())
     # Capture intake lives per-app state; F1 (StrippingPipeline) drains the
     # same pipeline instance the /ingest router hands turns to, on the
     # consumer side of the seam so the HTTP path stays O(1).
@@ -1318,6 +1360,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
         readiness = getattr(app.state, "dream_readiness", None)
         return {
             "status": "ok",
+            "instance_id": app.state.instance_id,
             "uptime_ms": round(elapsed_ms, 3),
             "preset": snap.preset,
             "stores": snap.stores,
@@ -1328,6 +1371,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
                 "hard_missing": snap.hard_missing,
             },
             "dream_route": readiness.status() if readiness is not None else None,
+            "capabilities": _capabilities_payload(snap, readiness),
             "process_commit_mb": process_commit_mb(),
         }
 

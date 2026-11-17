@@ -14,6 +14,13 @@ if (!bundle || !scenario) {
   process.exit(64)
 }
 
+// Behavior scenarios predate the endpoint handshake and rely on the explicit
+// base-URL override, which skips verification. Endpoint scenarios leave it
+// unset so they exercise the handshake itself.
+if (!scenario.startsWith("endpoint-") && !process.env.MNEMOSEED_LOCAL_BASEURL) {
+  process.env.MNEMOSEED_LOCAL_BASEURL = "http://localhost:7788"
+}
+
 // provider-failure scenarios consume the committed synthetic bus_event
 // fixtures; the runner passes the directory explicitly so nothing depends on
 // cwd or machine paths.
@@ -25,10 +32,14 @@ async function loadFixture(name) {
 // isolation: the plugin roots its artifacts under MNEMOSEED_LOCAL_DATA_DIR
 process.env.MNEMOSEED_LOCAL_DATA_DIR = await mkdtemp(join(tmpdir(), "mnemo-hook-test-"))
 const WATERMARKS = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-watermarks.json")
+const ENDPOINT_PATH = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "endpoint.json")
+const TEST_INSTANCE = "hook-test-instance"
+let servedInstance = TEST_INSTANCE
 
 const posts = []
 const failing = new Set()
 const throwing = new Set()
+const rejectBodyTexts = new Set()
 // daemon-e2e: pass fetches through to the REAL loopback daemon pytest booted;
 // responses are the daemon's own, the recording stays (status included).
 const realFetch = globalThis.fetch.bind(globalThis)
@@ -42,11 +53,19 @@ const CREDENTIAL_PATH = join(
   "daemon.credential.key",
 )
 globalThis.fetch = async (url, init) => {
-  const body = JSON.parse(init.body)
+  const body = init?.body ? JSON.parse(init.body) : null
+  if (url.endsWith("/healthz") && (!init?.method || init.method === "GET")) {
+    posts.push({ url, body, headers: init?.headers ?? null, accepted: true, status: 200 })
+    return { ok: true, status: 200, json: async () => ({ status: "ok", instance_id: servedInstance }) }
+  }
   if (liveDaemon) {
     const response = await realFetch(url, init)
     posts.push({ url, body, headers: init?.headers ?? null, accepted: response.ok, status: response.status })
     return response
+  }
+  if (typeof body?.content?.text === "string" && rejectBodyTexts.has(body.content.text)) {
+    posts.push({ url, body, headers: init?.headers ?? null, accepted: false, status: 422 })
+    return { ok: false, status: 422 }
   }
   const accepted = !failing.has(url)
   posts.push({ url, body, headers: init?.headers ?? null, accepted, status: accepted ? 200 : 503 })
@@ -63,6 +82,49 @@ globalThis.fetch = async (url, init) => {
 }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// D5 outbox scenarios read tagged lines back from the reused debug sink and
+// capture the always-on warning without mutating the recorded daemon posts.
+async function outboxRecords() {
+  const raw = await readFile(join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"), "utf8").catch(
+    () => "",
+  )
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const parsed = JSON.parse(line)
+        return parsed.tag === "hook-outbox" ? [parsed.payload] : []
+      } catch {
+        return []
+      }
+    })
+}
+
+function captureErrors() {
+  const original = console.error
+  const seen = []
+  console.error = (...args) => {
+    seen.push(args.map(String).join(" "))
+  }
+  return { seen, restore: () => { console.error = original } }
+}
+
+async function seedEndpoint(instanceId) {
+  await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+  await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+  await writeFile(
+    ENDPOINT_PATH,
+    JSON.stringify({
+      pid: process.pid,
+      instance_id: instanceId,
+      base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
+      started_at: Date.now() / 1000,
+    }),
+    "utf8",
+  )
+}
 
 const SES = "sess-behavior"
 // outage-hole: after the daemon rejects the live turn, the HOST's own store
@@ -1743,6 +1805,149 @@ async function main() {
       break
     }
 
+    case "mcp-transform-sync": {
+      // The registered mcp.transform callback is synchronous: the host's
+      // transform contract is `(editor) => void` and no async verification is
+      // awaited here. Pins the documented limitation (no false coverage claim).
+      const cb = current.mcpTransforms[0]
+      const map = {}
+      const ret = cb(makeMcpEditor(map))
+      console.log(
+        JSON.stringify({
+          isPromise: ret instanceof Promise,
+          injected: Boolean(map.mnemoseed),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-spool": {
+      // A failed ingest POST spools a tagged line + visible warning (DEBUG off).
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/ingest")
+      const errors = captureErrors()
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_spool",
+        prompt: { text: "down turn" },
+      })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      const ingests = outbox.filter((entry) => entry.endpoint === "/ingest")
+      console.log(
+        JSON.stringify({
+          outboxCount: ingests.length,
+          text: ingests[0]?.body?.content?.text ?? null,
+          warned: errors.seen.some((line) => line.includes("spooled")),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-flush": {
+      // The spooled turn is re-POSTed in order before the next live POST once
+      // the daemon recovers; the sink spool is emptied.
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/ingest")
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_first",
+        prompt: { text: "first down turn" },
+      })
+      await delay(150)
+      failing.delete(base + "/ingest")
+      posts.length = 0
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_second",
+        prompt: { text: "live turn" },
+      })
+      await delay(250)
+      const order = posts
+        .filter((post) => post.url.endsWith("/ingest"))
+        .map((post) => post.body?.content?.text ?? null)
+      console.log(
+        JSON.stringify({
+          order,
+          remaining: (await outboxRecords()).length,
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-4xx": {
+      // A permanent 4xx spool line must be dropped at flush so the next live
+      // turn posts normally, with a single visible drop warning.
+      rejectBodyTexts.add("poison turn")
+      const errors = captureErrors()
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_poison", prompt: { text: "poison turn" } })
+      await delay(200)
+      errors.seen.length = 0
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_live1", prompt: { text: "live turn one" } })
+      await delay(200)
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_live2", prompt: { text: "live turn two" } })
+      await delay(200)
+      errors.restore()
+      const ingests = posts
+        .filter((post) => post.url.endsWith("/ingest"))
+        .map((post) => ({ text: post.body?.content?.text ?? null, status: post.status }))
+      console.log(
+        JSON.stringify({
+          ingests,
+          dropWarnings: errors.seen.filter((line) => line.includes("dropped")).length,
+          repeatWarnings: errors.seen.filter((line) => line.includes("unreachable")).length,
+          remaining: (await outboxRecords()).length,
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-pull-recent": {
+      // An awaited T1 pull failure spools + warns, same as the fire-and-forget lane.
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/session/recent")
+      const errors = captureErrors()
+      const g1 = { system: ["BASE"] }
+      await fire.context({ sessionID: SES, system: g1.system })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      console.log(
+        JSON.stringify({
+          count: outbox.filter((entry) => entry.endpoint === "/session/recent").length,
+          warned: errors.seen.some((line) => line.includes("spooled")),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-pull-pending": {
+      // An awaited T2 pull failure spools + warns (ingest and T1 succeed first).
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/session/recall-pending")
+      recallPayload = RECALL_PAYLOAD
+      await fire.prompt({
+        sessionID: SES,
+        messageID: "m_outbox_t2",
+        prompt: { text: "陈渡桥已接好，查一下" },
+      })
+      await delay(100)
+      const errors = captureErrors()
+      const g1 = { system: ["BASE"] }
+      await fire.context({ sessionID: SES, system: g1.system })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      console.log(
+        JSON.stringify({
+          count: outbox.filter((entry) => entry.endpoint === "/session/recall-pending").length,
+          warned: errors.seen.some((line) => line.includes("spooled")),
+        }),
+      )
+      break
+    }
+
     case "config-inject": {
       // B2.6: the config hook registers cfg.mcp["mnemoseed"] create-if-absent
       // — an empty cfg, a cfg without the mcp map, and a cfg carrying a manual
@@ -3101,6 +3306,73 @@ async function main() {
           agents: posts
             .filter((post) => post.body.event === "user_prompt")
             .map((post) => ({ text: post.body.content?.text, agent: post.body.agent ?? null })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-stale": {
+      await seedEndpoint(TEST_INSTANCE)
+      servedInstance = "forged-instance"
+      await fire.prompt({ sessionID: "sess-stale", messageID: "m_stale_1", prompt: { text: "stale turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-valid": {
+      await seedEndpoint(TEST_INSTANCE)
+      await fire.prompt({ sessionID: "sess-valid", messageID: "m_valid_1", prompt: { text: "fresh turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-rotated": {
+      await seedEndpoint(TEST_INSTANCE)
+      await fire.prompt({ sessionID: "sess-rotated", messageID: "m_rot_1", prompt: { text: "first turn" } })
+      await delay(200)
+      servedInstance = "forged-instance"
+      await fire.prompt({ sessionID: "sess-rotated", messageID: "m_rot_2", prompt: { text: "second turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-record-missing": {
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      await fire.prompt({ sessionID: "sess-no-record", messageID: "m_nr_1", prompt: { text: "no record turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-record-malformed": {
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      await writeFile(ENDPOINT_PATH, "{not-json", "utf8")
+      await fire.prompt({ sessionID: "sess-bad-record", messageID: "m_br_1", prompt: { text: "bad record turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
         }),
       )
       break

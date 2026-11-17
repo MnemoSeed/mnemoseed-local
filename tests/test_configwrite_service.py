@@ -141,10 +141,13 @@ def test_num_ctx_and_num_predict_are_writable_role_fields(tmp_path) -> None:
 def test_verifier_role_keys_are_writable_and_bump_their_own_generation(tmp_path) -> None:
     """B1 T1: the dream_verifier role rides the same registry surface as the
     dream role — writes hot-apply to the live route and the file, validate
-    through the shared role validators, and bump only its own generation. An
-    unconfigured role gains its route through the wizard's contract: driver
-    and model land together before the file reloads."""
-    service, path = _service(tmp_path)
+    through the shared role validators, and bump only its own generation."""
+    path = _config_toml(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8") + '\n[dream.llm.dream_verifier]\ndriver = "stub"\nmodel = "stub"\n',
+        encoding="utf-8",
+    )
+    service = ConfigWriteService(load_config(path), None, clock=lambda: 1_700_000_000.0)
     assert service.set("dream.llm.dream_verifier.driver", "ollama", actor="console")["ok"] is True
     result = service.set("dream.llm.dream_verifier.model", "gemma4:e4b-alt", actor="console")
     assert result["ok"] is True
@@ -310,10 +313,9 @@ def test_set_role_fields_accumulate_no_blank_lines(tmp_path) -> None:
     assert load_config(path).llm["dream"].params["base_url"] == "http://custom.test/v1"
 
 
-def test_set_creates_role_table_cleanly_when_missing(tmp_path) -> None:
-    """A route's first write creates [dream.llm.<role>] after the last table
-    with exactly one blank separator — the mirror is clean and parseable (the
-    first write lands in a config with no role table at all)."""
+def test_set_single_field_first_write_rejected_when_role_table_missing(tmp_path) -> None:
+    """A route's first write cannot set just one half: the cross-field
+    invariant refuses it and the config mirror stays byte-identical."""
     path = _config_toml(tmp_path)
     text = path.read_text(encoding="utf-8")
     text = text.replace(
@@ -321,15 +323,11 @@ def test_set_creates_role_table_cleanly_when_missing(tmp_path) -> None:
         "",
     )
     path.write_text(text, encoding="utf-8")
+    before = path.read_bytes()
     service = ConfigWriteService(load_config(path), None, clock=lambda: 1_700_000_000.0)
-    service.set("dream.llm.dream.driver", "openai_compatible", actor="console")
-    service.set("dream.llm.dream.model", "moonshotai/Kimi-K3", actor="console")
-    blob = path.read_text(encoding="utf-8")
-    table = blob.split("[dream.llm.dream]", 1)[1].split("[", 1)[0]
-    lines = [line for line in table.splitlines() if line.strip()]
-    assert lines == ['driver = "openai_compatible"', 'model = "moonshotai/Kimi-K3"']
-    assert load_config(path).llm["dream"].driver == "openai_compatible"
-    assert load_config(path).llm["dream"].model == "moonshotai/Kimi-K3"
+    with pytest.raises(ConfigWriteError):
+        service.set("dream.llm.dream.driver", "openai_compatible", actor="console")
+    assert path.read_bytes() == before
 
 
 # ---------------------------------------------------------------- typed validation

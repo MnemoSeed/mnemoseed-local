@@ -147,9 +147,9 @@ def test_error_event_has_v12_fields() -> None:
 
 def test_migration_head_is_version_15() -> None:
     """v15 adds reconciliation application receipts, outbox, and audit dedup."""
-    assert latest_version() == 16
+    assert latest_version() == 17
     meta_versions = sorted(m.version for m in MIGRATIONS if m.applies_to("meta"))
-    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16]
+    assert meta_versions == [1, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17]
 
 
 def test_error_events_has_v12_columns(b1_config: Path) -> None:

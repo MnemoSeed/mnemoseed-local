@@ -54,7 +54,8 @@ from mnemoseed_local.hosts.common.daemon import (
     POST_TIMEOUT_SECONDS,
     debug,
     enforce_project_binding,
-    hook_client,
+    hook_client_or_none,
+    post_capture,
     profile_id,
 )
 from mnemoseed_local.hosts.common.recall import (
@@ -260,14 +261,16 @@ def transform_event(raw: str) -> int:
         debug(f"dropped unmapped or identity-less event {event.get('hook_event_name')!r}")
         return 0
     kind, body = action
-    client = hook_client(timeout=POST_TIMEOUT_SECONDS)
+    client = hook_client_or_none(timeout=POST_TIMEOUT_SECONDS)
     try:
         if kind == "t1":
+            if client is None:
+                return 0
             block = session_start_block(pull_session_tails(client, str(body)))
             if block is not None:
                 print(json.dumps(additional_context_payload(block)))
             return 0
-        client.post(ENDPOINTS[kind], body.model_dump(mode="json"))
+        post_capture(client, ENDPOINTS[kind], body.model_dump(mode="json"), host="cursor")
     except Exception as exc:  # noqa: BLE001 - fire-and-forget contract
         debug(f"{kind} failed: {exc}")
     return 0

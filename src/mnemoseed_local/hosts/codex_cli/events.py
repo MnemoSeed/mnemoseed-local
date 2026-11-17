@@ -66,6 +66,12 @@ from mnemoseed_local.hosts.common.daemon import (
     hook_client as hook_client,
 )
 from mnemoseed_local.hosts.common.daemon import (
+    hook_client_or_none as hook_client_or_none,
+)
+from mnemoseed_local.hosts.common.daemon import (
+    post_capture as post_capture,
+)
+from mnemoseed_local.hosts.common.daemon import (
     profile_id as profile_id,
 )
 from mnemoseed_local.hosts.common.fence import (
@@ -163,17 +169,18 @@ def _user_prompt_lane(payload: dict[str, Any], session_id: str) -> None:
         debug("dropped prompt-less UserPromptSubmit")
         return
     turns = _transcript_turns(payload)
-    client = hook_client(timeout=POST_TIMEOUT_SECONDS)
+    client = hook_client_or_none(timeout=POST_TIMEOUT_SECONDS)
     body = _ingest_body(
         IngestEventType.USER_PROMPT, payload, session_id, prompt, anchor_ordinal(turns, prompt)
     )
-    client.post("/ingest", body.model_dump(mode="json"))
+    post_capture(client, "/ingest", body.model_dump(mode="json"), host="codex_cli")
     # only an ACKED user ingest parks the focal slot, so the pull runs
     # strictly after the 2xx; a served selection is the ONE stdout this
     # lane may write
-    block = inject_recall_context(session_id, client)
-    if block is not None:
-        print(json.dumps(additional_context_payload(block, INJECTION_HOOK_EVENT)))
+    if client is not None:
+        block = inject_recall_context(session_id, client)
+        if block is not None:
+            print(json.dumps(additional_context_payload(block, INJECTION_HOOK_EVENT)))
 
 
 def _differential_lane(payload: dict[str, Any], session_id: str, *, settle: bool) -> None:
@@ -184,7 +191,7 @@ def _differential_lane(payload: dict[str, Any], session_id: str, *, settle: bool
             floor = turn.ordinal
     model = payload.get("model")
     model_id = model if isinstance(model, str) and model else None
-    client = hook_client(timeout=POST_TIMEOUT_SECONDS)
+    client = hook_client_or_none(timeout=POST_TIMEOUT_SECONDS)
     ack: int | None = None
     for turn in turns:
         if turn.ordinal <= floor:
@@ -199,15 +206,17 @@ def _differential_lane(payload: dict[str, Any], session_id: str, *, settle: bool
             turn.ordinal,
             model_id=model_id,
         )
-        reply = client.post("/ingest", body.model_dump(mode="json"))
+        reply = post_capture(client, "/ingest", body.model_dump(mode="json"), host="codex_cli")
         if ack is None:
             ack = _ack_ordinal(reply)
     if settle:
-        client.post(
+        post_capture(
+            client,
             "/session/end",
             SessionEndRequest(session_id=session_id, profile_id=profile_id(), ts=time.time()).model_dump(
                 mode="json"
             ),
+            host="codex_cli",
         )
 
 

@@ -74,6 +74,7 @@ def cx_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CODEX_HOME", str(home))
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     return home
 
 
@@ -86,6 +87,7 @@ def captured_posts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
         calls.append((path, body or {}))
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -199,8 +201,10 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def daemon(config_path: Path) -> TestClient:
+def daemon(config_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     with auth_support.boot(config_path.parent) as client:
+        # The booted app is in-process: no socket answers the instance probe.
+        monkeypatch.setattr("mnemoseed_local.endpoint.resolve", lambda url, **kwargs: url)
         yield client
 
 
@@ -289,6 +293,7 @@ def _capture_pull(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tuple[
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -331,6 +336,7 @@ def _capture_recent(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tupl
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -581,6 +587,7 @@ def test_ingest_rejection_never_pulls(
             raise DaemonRestError(409, "already settled")
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     turns = [(0, "user", "按模块梳理召回链路的测试盲区")]
     assert _run(monkeypatch, _payload_with("user_prompt", tmp_path, turns)) == 0
@@ -604,6 +611,7 @@ def test_differential_uses_the_first_ack_as_the_intra_process_floor(
             return {"ack_ordinal": 2}
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert _run(monkeypatch, _payload_with("stop", tmp_path, turns)) == 0
     ordinals = [body["transcript_ordinal"] for path, body in captured_posts if path == "/ingest"]
@@ -689,7 +697,10 @@ def test_watermark_loss_replays_without_duplicates(
     monkeypatch.setattr(DaemonClient, "post", recording)
     assert _run(monkeypatch, _payload_with("stop", tmp_path, turns, session_id=SESSION)) == 0
     ordinals = [body["transcript_ordinal"] for path, body, _ in recovery if path == "/ingest" and body]
-    assert ordinals == [1, 3], "the ack floor (2) skips ordinal 2 without an HTTP send"
+    # D5: the crashed batch's last turn (3) was spooled; the hook outbox flushes
+    # the spool before the next live POST, so 3 precedes the re-sent 1. Ordinal 2
+    # is still skipped by the ack floor (2) — no HTTP send either way.
+    assert ordinals == [3, 1], "the spool flushes before the live turn; ordinal 2 stays skipped"
     stored = [event.transcript_ordinal for event in accepted]
     assert stored == [0, 1, 2, 3], "replay filled the gap, no duplicates"
     settled = daemon.post("/session/end", json={"session_id": SESSION, "profile_id": "default"})

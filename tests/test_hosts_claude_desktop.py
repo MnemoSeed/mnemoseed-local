@@ -442,7 +442,11 @@ def test_the_resolved_command_completes_an_mcp_handshake(
         capture_output=True,
         text=True,
         encoding="utf-8",
-        env={**os.environ, "MNEMOSEED_LOCAL_HOME": str(home)},
+        env={
+            **os.environ,
+            "MNEMOSEED_LOCAL_HOME": str(home),
+            "MNEMOSEED_LOCAL_BASEURL": UNROUTABLE_BASE_URL,
+        },
         timeout=60.0,
     )
 

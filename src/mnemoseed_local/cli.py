@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -23,7 +24,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from mnemoseed_local import __version__
+from mnemoseed_local import __version__, endpoint
 from mnemoseed_local.config import (
     CONFIG_DIR,
     CONFIG_PATH,
@@ -49,8 +50,8 @@ from mnemoseed_local.hosts.install import (
     uninstall_command,
 )
 from mnemoseed_local.mcp_gateway import instructions
-from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
-from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
+from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT, DAEMON_DOWN_HINT
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 
 if TYPE_CHECKING:
     from mnemoseed_local.daemon.observability import RefinementStatus
@@ -572,6 +573,24 @@ def _refinement_state() -> RefinementStatus | None:
     )
 
 
+def _capability_lines(caps: dict[str, Any]) -> list[str]:
+    def is_ready(value: object) -> bool:
+        return isinstance(value, dict) and bool(value.get("ready"))
+
+    dream_value = caps.get("dream")
+    dream: dict[str, Any] = dream_value if isinstance(dream_value, dict) else {}
+    lines = [
+        "capabilities: capture={}, recall={}, dream={}".format(
+            "ready" if is_ready(caps.get("capture")) else "unavailable",
+            "ready" if is_ready(caps.get("recall")) else "unavailable",
+            "ready" if is_ready(dream) else "unavailable",
+        )
+    ]
+    if not is_ready(dream) and dream.get("detail"):
+        lines.append(f"dream unavailable: {dream['detail']}")
+    return lines
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from mnemoseed_local.rest_client import resolve_client
 
@@ -596,6 +615,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"dream auto_trigger: {config['dream']['auto_trigger']}")
     dream_driver = config.get("dream", {}).get("llm", {}).get("dream", {}).get("driver")
     print(f"dream llm driver:  {dream_driver if dream_driver else 'not configured'}")
+    for line in _capability_lines(health.get("capabilities", {})):
+        print(line)
     print(f"profile: {client.profile_id}")
     if refinement is None:
         print("refinement: unknown (the config could not be loaded)")
@@ -729,6 +750,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "'mnemoseed-local profile create <id>'; typo'd ids present as empty memory",
             )
         )
+    storage_ok = next((ok for name, ok, _ in checks if name == "storage"), False)
+    dream_ready, dream_detail = next(
+        ((ok, detail) for name, ok, detail in checks if name == "dream llm"),
+        (False, "not configured"),
+    )
+    for line in _capability_lines(
+        {
+            "capture": {"ready": storage_ok},
+            "recall": {"ready": storage_ok},
+            "dream": {"ready": dream_ready, "detail": dream_detail},
+        }
+    ):
+        print(line)
     return _doctor_report(checks, warnings)
 
 
@@ -2206,9 +2240,17 @@ def _emit_json(payload: Any) -> int:
 
 def _client_error(exc: Exception) -> int:
     """One honest failure line. A refused credential names its real causes
-    instead of being reported as a connectivity problem."""
+    instead of being reported as a connectivity problem; a down daemon carries
+    the start command instead of a bare connection refusal."""
     if isinstance(exc, DaemonRestError) and exc.status == _HTTP_UNAUTHORIZED:
         print(f"error: {DAEMON_AUTH_HINT}", file=sys.stderr)
+        return 1
+    if isinstance(exc, DaemonUnavailableError):
+        base_url = getattr(exc, "base_url", "the daemon")
+        print(f"error: {DAEMON_DOWN_HINT.format(base_url=base_url)} ({exc})", file=sys.stderr)
+        return 1
+    if isinstance(exc, endpoint.StaleEndpointError):
+        print(f"error: {exc}; {DAEMON_DOWN_HINT.format(base_url='the daemon')}", file=sys.stderr)
         return 1
     print(f"error: {exc}", file=sys.stderr)
     return 1
@@ -2233,10 +2275,14 @@ def _print_import_report(report: Any) -> None:
 
 
 def _import_base_url() -> str:
+    override = (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or "").strip().rstrip("/")
+    if override:
+        return endpoint.resolve(override, override=True)
     try:
-        return load_config().baseurl.rstrip("/")
+        config_base = load_config().baseurl.rstrip("/")
     except ValueError, ConfigError:
-        return "http://localhost:7788"
+        config_base = "http://localhost:7788"
+    return endpoint.resolve(config_base)
 
 
 def cmd_import(args: argparse.Namespace) -> int:

@@ -32,7 +32,7 @@ from mnemoseed_local.capture.stripper import (
 )
 from mnemoseed_local.schema.turn import Turn, TurnRole
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
-from mnemoseed_local.storage.ports import Embedder, TurnRange, VectorStore
+from mnemoseed_local.storage.ports import Embedder, PoolCreditOp, TurnRange, VectorStore
 
 
 class CapturePipeline(Protocol):
@@ -292,6 +292,7 @@ class ScoringPipeline:
         *,
         bindings_snapshot: dict[str, str] | None = None,
         credit_pool: bool = True,
+        credit_ops: list[PoolCreditOp] | None = None,
     ) -> list[ScoredTurn]:
         """Process pending turns of one session; returns the newly scored turns.
 
@@ -343,6 +344,7 @@ class ScoringPipeline:
                     effective,
                     scored.importance,
                     TurnRange(turn.turn_index, turn.turn_index),
+                    ops_sink=credit_ops,
                 )
                 self._stats.pool_triggers += len(fired)
             else:
@@ -447,7 +449,13 @@ class WritingPipeline:
     def reload_rules(self, ruleset: RuleSet) -> None:
         self._inner.reload_rules(ruleset)
 
-    def drain(self, session_id: str, *, credit_pool: bool = True) -> list[WriteOutcome]:
+    def drain(
+        self,
+        session_id: str,
+        *,
+        credit_pool: bool = True,
+        credit_ops: list[PoolCreditOp] | None = None,
+    ) -> list[WriteOutcome]:
         """Score pending turns, then write the durable ones to the store.
 
         One drain is atomic: agent_bindings are snapshot at entry so a
@@ -456,6 +464,8 @@ class WritingPipeline:
         # snapshot for atomic drain — mirrors ScoringPipeline snapshot
         bindings_snapshot: dict[str, str] | None = None
         credit_kw: dict[str, Any] = {} if credit_pool else {"credit_pool": False}
+        if credit_ops is not None:
+            credit_kw["credit_ops"] = credit_ops
         if self._config is not None:
             bindings_snapshot = dict(self._config.profiles.agent_bindings)
             scored = self._inner.drain(session_id, bindings_snapshot=bindings_snapshot, **credit_kw)
