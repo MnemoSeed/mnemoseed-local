@@ -2,10 +2,10 @@
 
 Behavioral contract over the real embedded drivers (LanceDB + sqlite-graph +
 synthetic embedder), mirroring the retrieval-sequence-diagram: the vector track
-returns semantic neighbors within the cue-entity overlap and a decay floor; the
-graph track returns the 2-hop entity-subgraph; the fusion rerank produces one
-ranked union with a per-candidate score breakdown. Determinism is contractual:
-no clocks, no randomness, no network.
+returns semantic neighbors above a similarity and decay floor, with entity cues
+contributing only to the beta score; the graph track returns the 2-hop
+entity-subgraph; the fusion rerank produces one ranked union with a per-candidate
+score breakdown. Determinism is contractual: no clocks, no randomness, no network.
 """
 
 from __future__ import annotations
@@ -234,35 +234,48 @@ def _graph_candidates(result: HybridRecall) -> list[Candidate]:
 # ------------------------------------------------------------ vector track
 
 
-def test_vector_track_returns_semantic_neighbors_filtered_by_cue_entities(stack) -> None:
+def test_vector_track_returns_semantic_neighbors_regardless_of_cue_entities(stack) -> None:
     _write(stack, _chunk("c_mem", "the LanceDb loader caches vectors", decay=0.9, entities=("LanceDb",)))
     _write(stack, _chunk("c_other", "the university library at noon", decay=0.9, entities=("University",)))
     result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_mem" in ids
-    assert "c_other" not in ids
+    assert "c_other" in ids
 
 
-def test_entity_filter_blocks_token_overlap_without_cue_entity(stack) -> None:
+def test_entity_mismatch_does_not_block_token_overlap(stack) -> None:
     _write(stack, _chunk("c_ent", "the LanceDb retrieval loader", decay=0.9, entities=("LanceDb",)))
     _write(stack, _chunk("c_noent", "the LanceDb retrieval loader too", decay=0.9, entities=("Cache",)))
     result = _recall(stack, "lancedb retrieval loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_ent" in ids
-    assert "c_noent" not in ids
+    assert "c_noent" in ids
 
 
 def test_vector_track_keeps_chunks_missing_entity_cues(stack) -> None:
-    """D2 (live-drain finding): chunks whose stored entity cues are EMPTY —
-    written before the daemon filled them, or written by paths with nothing to
-    extract — mean 'no entity evidence', never a contradiction. The entity
-    gate must only exclude positive mismatches."""
+    """Chunks with no stored entity cues carry no entity evidence and stay
+    matchable."""
     _write(stack, _chunk("c_untagged", "the LanceDb loader caches vectors", decay=0.9, entities=()))
     _write(stack, _chunk("c_tagged", "the LanceDb retrieval loader", decay=0.9, entities=("LanceDb",)))
     result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_untagged" in ids
     assert "c_tagged" in ids
+
+
+def test_entity_mismatch_does_not_veto_vector_hit_at_floor(stack) -> None:
+    """Stored cues disjoint from the query entities are a soft signal: a chunk
+    whose similarity clears the floor is still served."""
+    _write(stack, _chunk("needle", "lancedb loader", decay=0.9, entities=("Unrelated",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert "needle" in {c.id for c in _chunk_candidates(result)}
+
+
+def test_id_query_without_matching_cue_still_serves_chunk(stack) -> None:
+    text = "PRD-387 hook-less capture remember"
+    _write(stack, _chunk("needle", text, decay=0.9, entities=("Hookless",)))
+    result = _recall_at_floor(stack, text, extract_cues(text))
+    assert "needle" in {c.id for c in _chunk_candidates(result)}
 
 
 def test_vector_track_excludes_decay_below_floor(stack) -> None:
@@ -607,6 +620,16 @@ def test_unbackticked_id_query_seeds_matching_graph_node(stack) -> None:
     text = "PRD-387 hookless surfaces"
     result = _recall(stack, text, extract_cues(text))
     assert "PRD-387" in {c.id for c in _graph_candidates(result)}
+
+
+def test_graph_seeding_uses_extracted_entities(stack) -> None:
+    stack.graph.upsert_node(_node("match", NodeType.DECISION, ("PRD-387",), decay=0.9))
+    stack.graph.upsert_node(_node("other", NodeType.DECISION, ("OTHER-1",), decay=0.9))
+    text = "PRD-387 hook-less capture remember"
+    result = _recall(stack, text, extract_cues(text))
+    ids = {c.id for c in _graph_candidates(result)}
+    assert "match" in ids
+    assert "other" not in ids
 
 
 def test_graph_track_caps_at_config_top_k(stack) -> None:
