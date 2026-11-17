@@ -602,6 +602,13 @@ def test_graph_track_empty_cue_entities_yields_no_candidates(stack) -> None:
     assert _graph_candidates(result) == []
 
 
+def test_unbackticked_id_query_seeds_matching_graph_node(stack) -> None:
+    stack.graph.upsert_node(_node("PRD-387", NodeType.DECISION, ("PRD-387",), decay=0.9))
+    text = "PRD-387 hookless surfaces"
+    result = _recall(stack, text, extract_cues(text))
+    assert "PRD-387" in {c.id for c in _graph_candidates(result)}
+
+
 def test_graph_track_caps_at_config_top_k(stack) -> None:
     stack.graph.upsert_node(_node("hub", NodeType.PREFERENCE, ("LanceDb",), decay=0.9))
     for i in range(24):

@@ -258,6 +258,15 @@ _BACKTICK = re.compile(r"`([^`\n]+)`")
 
 _CAP_TOKEN = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_\-]+[a-z][A-Za-z0-9_\-]*)")
 
+# All-caps identifiers carry a digit or hyphen (PRD-387, B1); a plain caps word
+# such as JSON stays prose.
+_CAP_ID_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?=[A-Z0-9_\-]*[0-9\-])"
+    r"([A-Z][A-Z0-9_\-]*)"
+    r"(?![A-Za-z0-9_])"
+)
+
 # Bare filename tokens with an extension, e.g. "scorer.py".
 _BARE_FILE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})(?![A-Za-z0-9_.-])")
 
@@ -925,11 +934,12 @@ class CueExtractor:
                 if _is_tool_name(tok):
                     tools.append((pos, tok))
 
-        # capitalized ASCII tokens
-        for m in _CAP_TOKEN.finditer(masked):
-            tok = m.group(1)
-            if _is_name_like(tok):
-                entities.append((m.start(), tok))
+        # capitalized ASCII tokens and all-caps ID-shaped tokens
+        for pattern in (_CAP_TOKEN, _CAP_ID_TOKEN):
+            for m in pattern.finditer(masked):
+                tok = m.group(1)
+                if _is_name_like(tok):
+                    entities.append((m.start(), tok))
 
         # CJK noun runs
         for m in _CJK_RUN.finditer(masked):
