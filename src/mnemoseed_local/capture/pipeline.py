@@ -194,6 +194,7 @@ class ScoringStats:
     disposable_flagged: int = 0
     disposable_reasons: dict[str, int] = field(default_factory=dict)
     pool_triggers: int = 0
+    pool_points_suppressed: float = 0.0
     bytes_in: int = 0
     bytes_out: int = 0
     rules_hit: dict[str, int] = field(default_factory=dict)
@@ -285,12 +286,19 @@ class ScoringPipeline:
         """Swap the stripper ruleset; governs turns drained after this call."""
         self._stripper.reload_rules(ruleset)
 
-    def drain(self, session_id: str, *, bindings_snapshot: dict[str, str] | None = None) -> list[ScoredTurn]:
+    def drain(
+        self,
+        session_id: str,
+        *,
+        bindings_snapshot: dict[str, str] | None = None,
+        credit_pool: bool = True,
+    ) -> list[ScoredTurn]:
         """Process pending turns of one session; returns the newly scored turns.
 
-        Verbatim contract: every turn is scored, retained, and its S credited
-        to the pool; the F2 durability verdict only lands as annotation
-        telemetry — nothing is ever dropped here.
+        Verbatim contract: every turn is scored and retained; the F2 durability
+        verdict only lands as annotation telemetry — nothing is ever dropped
+        here. Every turn's S is credited to the pool unless ``credit_pool`` is
+        False, in which case the suppressed total lands in stats instead.
 
         When a config or resolver is bound, the effective profile is snapshot
         at drain entry so one drain is atomic.
@@ -330,12 +338,15 @@ class ScoringPipeline:
                 reason = scored.durability.reasons[0] if scored.durability.reasons else "default-deferral"
                 self._stats.disposable_reasons[reason] = self._stats.disposable_reasons.get(reason, 0) + 1
             self._scored.setdefault(session_id, []).append(scored)
-            fired = self._pool.add_points(
-                effective,
-                scored.importance,
-                TurnRange(turn.turn_index, turn.turn_index),
-            )
-            self._stats.pool_triggers += len(fired)
+            if credit_pool:
+                fired = self._pool.add_points(
+                    effective,
+                    scored.importance,
+                    TurnRange(turn.turn_index, turn.turn_index),
+                )
+                self._stats.pool_triggers += len(fired)
+            else:
+                self._stats.pool_points_suppressed += scored.importance
             results.append(scored)
         return results
 
@@ -436,7 +447,7 @@ class WritingPipeline:
     def reload_rules(self, ruleset: RuleSet) -> None:
         self._inner.reload_rules(ruleset)
 
-    def drain(self, session_id: str) -> list[WriteOutcome]:
+    def drain(self, session_id: str, *, credit_pool: bool = True) -> list[WriteOutcome]:
         """Score pending turns, then write the durable ones to the store.
 
         One drain is atomic: agent_bindings are snapshot at entry so a
@@ -444,11 +455,12 @@ class WritingPipeline:
         """
         # snapshot for atomic drain — mirrors ScoringPipeline snapshot
         bindings_snapshot: dict[str, str] | None = None
+        credit_kw: dict[str, Any] = {} if credit_pool else {"credit_pool": False}
         if self._config is not None:
             bindings_snapshot = dict(self._config.profiles.agent_bindings)
-            scored = self._inner.drain(session_id, bindings_snapshot=bindings_snapshot)
+            scored = self._inner.drain(session_id, bindings_snapshot=bindings_snapshot, **credit_kw)
         else:
-            scored = self._inner.drain(session_id)
+            scored = self._inner.drain(session_id, **credit_kw)
         # contexts are snapshot-consistent — derive effective PURELY from snapshot
         contexts: list[tuple[ScoredTurn, WriteContext]] = []
         for item in scored:

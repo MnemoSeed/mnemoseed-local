@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -292,10 +293,11 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     lane = getattr(request.app.state, "drain_lane", None)
     drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
     if drain is not None:
+        drain_fn = drain if req.credit_pool else partial(drain, credit_pool=False)
         if lane is not None:
-            await lane.drain(drain, req.session_id)
+            await lane.drain(drain_fn, req.session_id)
         else:
-            drain(req.session_id)
+            drain_fn(req.session_id)
     # QA-5: the turns are persisted by the drain, so the settled session can
     # hand its buffers back (same guarded-seam pattern as drain).
     prune = getattr(getattr(request.app.state, "capture", None), "prune_settled", None)

@@ -135,6 +135,8 @@ class SessionEndRequest(BaseModel):
     session_id: str
     profile_id: ProfileRef
     ts: float | None = None  # host-stamped end time; server stamps when absent
+    # Whether this settle credits its turn S to the score pool.
+    credit_pool: bool = True
 
 
 class ProfileCreateRequest(BaseModel):
