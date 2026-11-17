@@ -258,8 +258,7 @@ _BACKTICK = re.compile(r"`([^`\n]+)`")
 
 _CAP_TOKEN = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_\-]+[a-z][A-Za-z0-9_\-]*)")
 
-# All-caps identifiers carry a digit or hyphen (PRD-387, B1); a plain caps word
-# such as JSON stays prose.
+# All-caps identifiers carry a digit or hyphen; a plain caps word stays prose.
 _CAP_ID_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])"
     r"(?=[A-Z0-9_\-]*[0-9\-])"
