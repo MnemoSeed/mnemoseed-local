@@ -106,12 +106,14 @@ class _FakeClient:
         settle_status: int = 200,
         settle_reply: dict[str, Any] | None = None,
         ingest_ack: int | None = None,
+        ingest_reply: dict[str, Any] | None = None,
     ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.active = active
         self.settle_status = settle_status
         self.settle_reply = settle_reply
         self.ingest_ack = ingest_ack
+        self.ingest_reply = ingest_reply
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.calls.append(("GET", path, params))
@@ -131,6 +133,8 @@ class _FakeClient:
                 "needs_reconcile": 0,
                 "pool_points_suppressed": 1.5,
             }
+        if self.ingest_reply is not None:
+            return self.ingest_reply
         reply: dict[str, Any] = {"status": "accepted"}
         if self.ingest_ack is not None:
             reply["ack_ordinal"] = self.ingest_ack
@@ -367,7 +371,7 @@ def test_accounts_for_deduped_turns(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _isolated_home(tmp_path, monkeypatch)
     root = tmp_path / "sessions"
     _write_rollout(_rollout_path(root, RUN_A), turns=((0, "user", "u0"),))
-    client = _FakeClient(ingest_ack=7)
+    client = _FakeClient(ingest_reply={"status": "accepted", "deduped": True, "ack_ordinal": 7})
     report = run_import(
         source=_source(),
         root=root,
@@ -378,6 +382,23 @@ def test_accounts_for_deduped_turns(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
     assert report.turns_ingested == 1
     assert report.turns_deduped == 1
+
+
+def test_dedup_at_equal_watermark_is_counted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolated_home(tmp_path, monkeypatch)
+    root = tmp_path / "sessions"
+    _write_rollout(_rollout_path(root, RUN_A), turns=((0, "user", "u0"), (1, "assistant", "a0")))
+    client = _FakeClient(ingest_reply={"status": "accepted", "deduped": True, "ack_ordinal": 1})
+    report = run_import(
+        source=_source(),
+        root=root,
+        profile_id="default",
+        client=client,
+        ledger=ImportLedger("codex_cli"),
+        progress=_quiet,
+    )
+    assert report.turns_ingested == 2
+    assert report.turns_deduped == 2
 
 
 # ---------------------------------------------------------------- report contract

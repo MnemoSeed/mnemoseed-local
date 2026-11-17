@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from mnemoseed_local.capture.pipeline import ScoringPipeline
 from mnemoseed_local.capture.pool import ScorePool
 from mnemoseed_local.capture.scorer import TurnScorer
+from mnemoseed_local.rest_client import ACTOR_HEADER
 from mnemoseed_local.schema.turn import HostId, SessionEndRequest, Turn, TurnRole, TurnStep
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
 
@@ -161,3 +162,22 @@ def test_settle_response_suppressed_points_are_zero_when_crediting(config_path: 
         settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
         assert settled.status_code == 200, settled.text
         assert settled.json()["pool_points_suppressed"] == 0.0
+
+
+def test_watermark_replay_marks_deduped_at_equal_ordinal(config_path: Path) -> None:
+    body = {
+        "host": HostId.CLAUDE_CODE.value,
+        "event": "user_prompt",
+        "session_id": SESSION,
+        "profile_id": PROFILE,
+        "ts": 1.0,
+        "content": {"text": "a replay with a watermark at the final ordinal"},
+        "transcript_ordinal": 5,
+    }
+    with auth_support.boot(config_path.parent) as client:
+        first = client.post("/ingest", json=body, headers={ACTOR_HEADER: "cli"})
+        assert first.status_code == 202, first.text
+        replay = client.post("/ingest", json=body, headers={ACTOR_HEADER: "cli"})
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["deduped"] is True
+        assert replay.json()["ack_ordinal"] == 5

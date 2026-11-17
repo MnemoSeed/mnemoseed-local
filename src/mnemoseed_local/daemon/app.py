@@ -654,13 +654,13 @@ class DrainLane:
         with self._lock:
             self._pending[session_id] = future
 
-    async def drain(self, fn: Callable[[str], Any], session_id: str) -> None:
+    async def drain(self, fn: Callable[[str], Any], session_id: str) -> Any:
         """Queue one drain and await its completion (the ack = applied)."""
         future = self._executor.submit(fn, session_id)
         with self._lock:
             self._pending[session_id] = future
         try:
-            await asyncio.wrap_future(future)
+            return await asyncio.wrap_future(future)
         finally:
             with self._lock:
                 if self._pending.get(session_id) is future:

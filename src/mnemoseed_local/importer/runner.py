@@ -223,8 +223,7 @@ def run_import(
             )
             reply = client.post("/ingest", body.model_dump(mode="json"))
             report.turns_ingested += 1
-            ack = reply.get("ack_ordinal") if isinstance(reply, dict) else None
-            if isinstance(ack, int) and not isinstance(ack, bool) and ack > ordinal:
+            if isinstance(reply, dict) and reply.get("deduped") is True:
                 report.turns_deduped += 1
             settled_through = max(settled_through, ordinal)
         settle = client.post(
