@@ -13,7 +13,7 @@ Determinism is contractual: identical inputs produce identical packages.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -189,7 +189,8 @@ def _recall(
     cues: ExtractedCues,
     config: HybridConfig | None = None,
 ) -> HybridRecall:
-    return HybridRetriever(config).recall(
+    effective = replace(config if config is not None else HybridConfig(), min_similarity=-1e9)
+    return HybridRetriever(effective).recall(
         text,
         cues,
         profile_id=_PROFILE,

@@ -63,7 +63,7 @@ def test_warm_rig_boots_off_a_spare_port_and_an_isolated_home(rig_root: Path) ->
     assert os.environ.get("MNEMOSEED_LOCAL_HOME") == caller_home
 
 
-def test_warm_baseline_point_metric_can_move(rig_root: Path) -> None:
+def test_warm_baseline_point_metric_can_move(rig_root: Path, no_similarity_floor: None) -> None:
     """One warm-needle point on the REAL daemon surface, with a competing
     same-band decoy seeded alongside the needle. The instrument's metric must
     genuinely move: (a) the needle re-surfaces top on the needle-aligned
@@ -115,7 +115,9 @@ def test_warm_baseline_point_metric_can_move(rig_root: Path) -> None:
     assert result.activation_eps == 0.0
 
 
-def test_warm_harness_can_measure_activation_on_without_changing_materials(rig_root: Path) -> None:
+def test_warm_harness_can_measure_activation_on_without_changing_materials(
+    rig_root: Path, no_similarity_floor: None
+) -> None:
     material = warm_materials()[0]
     result = run_warm_point(material, root=rig_root, sleep=lambda _: None, activation_enabled=True)
     off = run_warm_point(material, root=rig_root, sleep=lambda _: None, activation_enabled=False)

@@ -11,7 +11,7 @@ no clocks, no randomness, no network.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import pytest
@@ -195,7 +195,8 @@ def _recall(
     *,
     now: float | None = None,
 ) -> HybridRecall:
-    return HybridRetriever(config).recall(
+    effective = replace(config if config is not None else HybridConfig(), min_similarity=-1e9)
+    return HybridRetriever(effective).recall(
         text,
         cues,
         profile_id=_PROFILE,
@@ -203,6 +204,22 @@ def _recall(
         graph_store=stack.graph,
         embedder=stack.embed,
         now=now,
+    )
+
+
+def _recall_at_floor(
+    stack: _Stack,
+    text: str,
+    cues: ExtractedCues,
+    config: HybridConfig | None = None,
+) -> HybridRecall:
+    return HybridRetriever(config if config is not None else HybridConfig()).recall(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
     )
 
 
@@ -779,8 +796,63 @@ def test_default_config_documented_defaults() -> None:
     assert config.vector_top_k == 20
     assert config.graph_top_k == 20
     assert config.min_decay == 0.4
+    assert config.min_similarity == 0.45
     assert config.weight_semantic == 1.0
     assert config.weight_cue_overlap == 1.0
     assert config.weight_decay == 0.2
     assert config.weight_centrality == 0.5
     assert config.centrality_saturation == 8
+
+
+# ------------------------------------------------------------ similarity floor
+
+
+def test_similarity_floor_drops_low_hits_and_counts_them(stack) -> None:
+    _write(stack, _chunk("needle", "lancedb loader", entities=("LanceDb",)))
+    for i in range(3):
+        _write(stack, _chunk(f"noise-{i}", f"unrelated topic number {i}", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.floor_dropped == 3
+    assert result.vector_hits == 1
+    assert [c.id for c in _chunk_candidates(result)] == ["needle"]
+
+
+def test_empty_result_when_every_candidate_is_below_floor(stack) -> None:
+    _write(stack, _chunk("noise-a", "unrelated topic number one", entities=("LanceDb",)))
+    _write(stack, _chunk("noise-b", "unrelated topic number two", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.candidates == []
+    assert result.vector_hits == 0
+    assert result.floor_dropped == 2
+
+
+def test_needle_ranks_first_above_surviving_boilerplate(stack) -> None:
+    _write(stack, _chunk("needle", "lancedb loader", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-a", "lancedb loader pipeline", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-b", "lancedb loader loader loader", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-c", "lancedb loader and more", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.floor_dropped == 0
+    assert [c.id for c in _chunk_candidates(result)][0] == "needle"
+
+
+def test_rescued_pin_below_floor_is_still_admitted(stack) -> None:
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    _write(
+        stack,
+        _chunk(
+            "pin", "unrelated topic number one", decay=0.3, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE
+        ),
+    )
+    query_embedding = stack.embed.embed("lancedb loader")
+    raw_hits = stack.vector.search(
+        query_embedding.dense, query_embedding.sparse, ChunkFilter(profile_id=_PROFILE), 20
+    )
+    pin_hit = next(hit for hit in raw_hits if hit.chunk.chunk_id == "pin")
+    assert pin_hit.similarity < config.min_similarity
+
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)), config)
+    pins = [c for c in _chunk_candidates(result) if c.id == "pin"]
+    assert len(pins) == 1
+    assert pins[0].rescued is True
+    assert result.floor_dropped == 0

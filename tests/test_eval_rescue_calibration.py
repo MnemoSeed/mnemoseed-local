@@ -184,7 +184,7 @@ def test_rig_refuses_a_dirty_root(rig_root: Path) -> None:
         RescueRig(rig_root, rescue_floor=0.25, rescue_cue_min=0.30)
 
 
-def test_calibration_point_end_to_end(rig_root: Path) -> None:
+def test_calibration_point_end_to_end(rig_root: Path, no_similarity_floor: None) -> None:
     """One full calibration point over the REAL daemon surface: the eligible
     band pin is served flagged rescued and rebounds; the plain decoy below the
     main floor is never admitted regardless of its perfect cue match; the
@@ -213,7 +213,9 @@ def test_calibration_point_end_to_end(rig_root: Path) -> None:
     assert material.dead_pin_id in residue_ids
 
 
-def test_rank_flip_material_keeps_discipline_when_pin_outscores_healthy(rig_root: Path) -> None:
+def test_rank_flip_material_keeps_discipline_when_pin_outscores_healthy(
+    rig_root: Path, no_similarity_floor: None
+) -> None:
     """The rank_discipline bar must have teeth: on this point the pin's fused
     score BEATS the healthy chunk's end-to-end (asserted from the served
     scores), so 'pin ranks after healthy' can only hold through enforced
@@ -230,7 +232,9 @@ def test_rank_flip_material_keeps_discipline_when_pin_outscores_healthy(rig_root
     assert metrics.rank_after_normal is True
 
 
-def test_calibration_point_keeps_partial_cue_out_at_strict_threshold(rig_root: Path) -> None:
+def test_calibration_point_keeps_partial_cue_out_at_strict_threshold(
+    rig_root: Path, no_similarity_floor: None
+) -> None:
     """The cue axis genuinely discriminates: a partial-overlap pin (β=0.3) is
     gated OUT at cue_min 0.4 and stays out without any noise admission."""
     material = next(m for m in rescue_materials() if m.cue_class == "partial")

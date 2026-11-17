@@ -85,11 +85,12 @@ RETRIEVER_CLOSE_TIMEOUT_S = 2.0
 class HybridConfig:
     """Tunable fusion weights and candidate-pool floors (FR-3.4).
 
-    Defaults: alpha=1.0, beta=1.0, gamma=0.8, delta=0.5; candidate-pool decay
+    Defaults: alpha=1.0, beta=1.0, gamma=0.2, delta=0.5; candidate-pool decay
     floor 0.4 (design item 2: decay_weight < 0.4 never enters the pool);
-    per-track pools capped at 20; graph 1-hop degree centrality saturates at 8
-    neighbors. The rescue band (design/09 §3.5) admits flashbulb pins below
-    the main floor when the cue match is strong enough.
+    store-similarity floor 0.45 on ordinary vector hits (rescued pins bypass
+    it); per-track pools capped at 20; graph 1-hop degree centrality saturates
+    at 8 neighbors. The rescue band (design/09 §3.5) admits flashbulb pins
+    below the main floor when the cue match is strong enough.
     """
 
     weight_semantic: float = 1.0
@@ -97,6 +98,7 @@ class HybridConfig:
     weight_decay: float = 0.2
     weight_centrality: float = 0.5
     min_decay: float = 0.4
+    min_similarity: float = 0.45
     rescue_min_decay: float = DEFAULT_RECALL_RESCUE_FLOOR
     rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
     vector_top_k: int = 20
@@ -316,6 +318,9 @@ class HybridRetriever:
                 if _chunk_cue_overlap(query, chunk) < config.rescue_cue_min:
                     continue
                 rescued = True
+            if not rescued and float(hit.similarity) < config.min_similarity:
+                floor_dropped += 1
+                continue
             # Empty stored entity cues mean "no entity evidence" (e.g. written
             # before the daemon filled them), never a contradiction: the gate
             # only excludes positive mismatches (D2).

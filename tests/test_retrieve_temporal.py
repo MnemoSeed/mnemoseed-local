@@ -20,7 +20,13 @@ import pytest
 
 from mnemoseed_local.retrieve.assemble import AssembleConfig, Assembler
 from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
-from mnemoseed_local.retrieve.hybrid import Candidate, HybridRecall, HybridRetriever, ScoreBreakdown
+from mnemoseed_local.retrieve.hybrid import (
+    Candidate,
+    HybridConfig,
+    HybridRecall,
+    HybridRetriever,
+    ScoreBreakdown,
+)
 from mnemoseed_local.retrieve.temporal import TemporalVerdict, evaluate_temporal
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
@@ -114,7 +120,7 @@ def _query_cues(entities: tuple[str, ...] = ("Ops",)) -> ExtractedCues:
 
 
 def _recall(stack: _Stack, text: str, cues: ExtractedCues) -> HybridRecall:
-    return HybridRetriever().recall(
+    return HybridRetriever(HybridConfig(min_similarity=-1e9)).recall(
         text,
         cues,
         profile_id=_PROFILE,
