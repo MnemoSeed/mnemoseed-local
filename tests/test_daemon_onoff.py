@@ -446,6 +446,26 @@ def test_on_not_running_removes_marker_and_starts(home: Path, monkeypatch, capsy
     assert calls == {"build_stores": 1, "run_server": 1}, "on must run the up start path"
 
 
+def test_on_starts_when_the_endpoint_record_is_stale(home: Path, monkeypatch, capsys) -> None:
+    from mnemoseed_local.endpoint import StaleEndpointError
+
+    set_disabled()
+    (home / "config.toml").write_text('preset = "embedded"\n', encoding="utf-8")
+    calls = _fake_up_runtime(monkeypatch)
+    monkeypatch.setattr(
+        "mnemoseed_local.cli._dream_model_check",
+        lambda config: (True, "model 'qwen3.5:9b' present"),
+    )
+
+    def _stale(args):
+        raise StaleEndpointError("no daemon endpoint record")
+
+    monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", _stale)
+    assert main(["on"]) == 0
+    assert not is_disabled()
+    assert calls == {"build_stores": 1, "run_server": 1}
+
+
 def test_on_already_running_does_not_restart(home: Path, monkeypatch, capsys) -> None:
     set_disabled()
     calls: dict[str, int] = {"run_server": 0}

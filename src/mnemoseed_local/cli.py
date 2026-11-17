@@ -533,8 +533,11 @@ def cmd_on(args: argparse.Namespace) -> int:
         return 1
     try:
         set_enabled()
+        client = None
         try:
             client = resolve_client(args)
+        except endpoint.StaleEndpointError:
+            pass
         except Exception as exc:
             from mnemoseed_local.daemon_state import set_disabled
 
@@ -543,7 +546,7 @@ def cmd_on(args: argparse.Namespace) -> int:
             except OSError:
                 pass
             return _client_error(exc)
-        if _daemon_reachable(client):
+        if client is not None and _daemon_reachable(client):
             print("already on: memory service is running")
             return 0
         result = _up_locked(args, lock.release)
