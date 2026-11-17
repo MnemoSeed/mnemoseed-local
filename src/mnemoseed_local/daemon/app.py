@@ -25,6 +25,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future as ConcurrentFuture
@@ -80,6 +81,7 @@ from mnemoseed_local.dream import (
 )
 from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
 from mnemoseed_local.dream.readiness import NO_ROUTE_DETAIL, DreamRouteReadiness
+from mnemoseed_local.endpoint import EndpointRecord, clear_endpoint, write_endpoint
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -1209,12 +1211,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         degradations=[_issue_payload(i) for i in stores.report.degradations],
         hard_missing=[_issue_payload(i) for i in stores.report.hard_missing],
     )
+    write_endpoint(
+        EndpointRecord(
+            pid=os.getpid(),
+            instance_id=app.state.instance_id,
+            base_url=config.baseurl.rstrip("/"),
+            started_at=time.time(),
+        )
+    )
     if stores.report.ok:
         logger.info("storage stack ready, all required capabilities present")
     else:
         for deg in stores.report.missing:
             logger.warning("degraded: %s - %s", deg.feature, deg.behavior)
     yield
+    clear_endpoint()
     # Cancel the periodic loops before the stores close (lifecycle order); the
     # idle sweeper stops before the drain lane closes.
     logger.info("teardown: stop background loops")
@@ -1306,6 +1317,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
     have no knowledge of which one is in play.
     """
     app = FastAPI(title="MnemoSeed Local", version=__version__, lifespan=lifespan)
+    app.state.instance_id = str(uuid.uuid4())
     # Capture intake lives per-app state; F1 (StrippingPipeline) drains the
     # same pipeline instance the /ingest router hands turns to, on the
     # consumer side of the seam so the HTTP path stays O(1).
@@ -1337,6 +1349,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
         readiness = getattr(app.state, "dream_readiness", None)
         return {
             "status": "ok",
+            "instance_id": app.state.instance_id,
             "uptime_ms": round(elapsed_ms, 3),
             "preset": snap.preset,
             "stores": snap.stores,

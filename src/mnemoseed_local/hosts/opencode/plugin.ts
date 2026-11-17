@@ -65,12 +65,65 @@ import { homedir } from "node:os"
 import { dirname, join, sep } from "node:path"
 
 const HOST_ID = "opencode"
-const BASE_URL: string = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+const BASE_URL_OVERRIDE: string = (process.env.MNEMOSEED_LOCAL_BASEURL || "").trim()
+const BASE_URL: string = BASE_URL_OVERRIDE || "http://localhost:7788"
 const PROFILE_ID: string = process.env.MNEMOSEED_LOCAL_PROFILE_ID || "default"
 const TIMEOUT_MS = 2000
 const FETCH_TIMEOUT_MS = 1500
+const ENDPOINT_TIMEOUT_MS = 1500
 const DEDUP_CAP = 1000
 const MAX_TOOL_OUTPUT_CHARS = 20000
+
+const CONFIG_DIR: string =
+  process.env.MNEMOSEED_LOCAL_HOME ||
+  process.env.MNEMOSEED_LOCAL_DATA_DIR ||
+  join(homedir(), ".mnemoseed-local")
+const ENDPOINT_PATH: string = join(CONFIG_DIR, "endpoint.json")
+const STALE_ENDPOINT_MESSAGE = "mnemoseed-local: daemon endpoint is stale; no credential was sent"
+
+// The daemon's per-start endpoint record gates every bearer-carrying fetch:
+// a cheap PID pre-filter, then the unauthenticated /healthz instance id. The
+// verification request deliberately carries no headers at all.
+let endpointResolution: Promise<string> | null = null
+
+async function verifyEndpoint(): Promise<string> {
+  if (BASE_URL_OVERRIDE) {
+    console.error("mnemoseed-local: MNEMOSEED_LOCAL_BASEURL set; skipping daemon instance verification")
+    return BASE_URL
+  }
+  let raw: string
+  try {
+    raw = await readFile(ENDPOINT_PATH, "utf8")
+  } catch {
+    console.error("mnemoseed-local: no daemon endpoint record; instance verification skipped")
+    return BASE_URL
+  }
+  const record = JSON.parse(raw) as Record<string, unknown>
+  const pid = Number(record.pid)
+  const instanceId = String(record.instance_id ?? "")
+  const base = String(record.base_url ?? "").replace(/\/+$/, "")
+  if (!Number.isInteger(pid) || !instanceId || !base) throw new Error("invalid endpoint record")
+  try {
+    process.kill(pid, 0)
+  } catch {
+    throw new Error("daemon endpoint pid is not running")
+  }
+  const response = await fetch(base + "/healthz", { signal: AbortSignal.timeout(ENDPOINT_TIMEOUT_MS) })
+  if (!response.ok) throw new Error("endpoint health check failed")
+  const body = (await response.json()) as Record<string, unknown>
+  if (body.instance_id !== instanceId) throw new Error("daemon instance mismatch")
+  return base
+}
+
+function effectiveBaseUrl(): Promise<string> {
+  if (endpointResolution === null) {
+    endpointResolution = verifyEndpoint().catch((error: unknown) => {
+      console.error(STALE_ENDPOINT_MESSAGE + ":", error)
+      throw error
+    })
+  }
+  return endpointResolution
+}
 
 // ---- B2.1 T1/T3 session-start recall injection + consumption guard. The
 // whole mechanism is deterministic and model-free: the injected replay is the
@@ -527,30 +580,27 @@ type JsonRecord = { [key: string]: unknown }
 // un-reconcile the session and roll assistant fingerprints back (B2.2 QA
 // re-review — a rejected ingest must schedule recovery, not leapfrog it).
 function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () => void): void {
-  try {
-    void fetch(BASE_URL + endpoint, {
-      method: "POST",
-      headers: daemonHeaders(),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
-      .then((response) => {
-        if (!response.ok) {
-          debugLog("daemon POST rejected", { endpoint, status: response.status })
-          if (nack !== undefined) nack()
-          return
-        }
-        if (ack !== undefined) ack()
+  void (async () => {
+    try {
+      const base = await effectiveBaseUrl()
+      const response = await fetch(base + endpoint, {
+        method: "POST",
+        headers: daemonHeaders(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
       })
-      .catch((error: unknown) => {
-        console.debug("mnemoseed-local: POST", endpoint, "failed:", error)
-        debugLog("daemon POST failed", { endpoint, error: String(error) })
+      if (!response.ok) {
+        debugLog("daemon POST rejected", { endpoint, status: response.status })
         if (nack !== undefined) nack()
-      })
-  } catch (error) {
-    console.debug("mnemoseed-local: POST", endpoint, "aborted:", error)
-    if (nack !== undefined) nack()
-  }
+        return
+      }
+      if (ack !== undefined) ack()
+    } catch (error) {
+      console.debug("mnemoseed-local: POST", endpoint, "failed:", error)
+      debugLog("daemon POST failed", { endpoint, error: String(error) })
+      if (nack !== undefined) nack()
+    }
+  })()
 }
 
 // ---- bounded FIFO dedup (Map preserves insertion order; the oldest key is
@@ -1054,7 +1104,8 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
   const spid = parentIdOfSessionID(sessionParentIds, sessionID)
   if (spid !== null) body.self_parent_id = spid
   try {
-    const response = await fetch(BASE_URL + "/session/recent", {
+    const base = await effectiveBaseUrl()
+    const response = await fetch(base + "/session/recent", {
       method: "POST",
       headers: daemonHeaders(),
       body: JSON.stringify(body),
@@ -1085,7 +1136,8 @@ async function pullPendingRecall(sessionID: string): Promise<any | null> {
   // re-serves a T1 replay. NOT a post() call site — the arity invariants
   // stay untouched.
   try {
-    const response = await fetch(BASE_URL + "/session/recall-pending", {
+    const base = await effectiveBaseUrl()
+    const response = await fetch(base + "/session/recall-pending", {
       method: "POST",
       headers: daemonHeaders(),
       body: JSON.stringify({

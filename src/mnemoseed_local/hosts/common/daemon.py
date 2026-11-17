@@ -12,6 +12,7 @@ from typing import Any
 
 from httpx import Timeout
 
+from mnemoseed_local import endpoint
 from mnemoseed_local.config import live_home_dir
 from mnemoseed_local.hosts.common.project_binding import (
     PROFILE_ENV_VAR,
@@ -43,9 +44,17 @@ RECALL_PULL_MAX_CHARS = 1200
 RECALL_BUDGET_KEY = "budget_chars"
 
 
-def resolve_base_url() -> str:
-    """Daemon base URL the hook posts to (env override, else the default)."""
-    return (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or DEFAULT_BASE_URL).rstrip("/")
+def resolve_base_url(*, verify: bool = False) -> str:
+    """Daemon base URL the hook posts to (env override, else the default).
+
+    With ``verify`` the endpoint record and instance handshake gate the URL.
+    Installers probe reachability without a credential and keep the raw URL.
+    """
+    override = (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or "").strip()
+    raw = (override or DEFAULT_BASE_URL).rstrip("/")
+    if not verify:
+        return raw
+    return endpoint.resolve(raw, override=bool(override), allow_missing=True)
 
 
 def profile_id() -> str:
@@ -183,8 +192,8 @@ def debug(message: str) -> None:
 
 
 def hook_client(timeout: float | Timeout = POST_TIMEOUT_SECONDS) -> DaemonClient:
-    """The hook POST client: env base URL, env profile binding, hook actor."""
-    return client_for(resolve_base_url(), profile_id=profile_id(), actor="hook", timeout=timeout)
+    """The hook POST client: verified base URL, env profile binding, hook actor."""
+    return client_for(resolve_base_url(verify=True), profile_id=profile_id(), actor="hook", timeout=timeout)
 
 
 def pull_pending_recall(session_id: str, client: DaemonClient) -> dict[str, Any] | None:

@@ -199,8 +199,10 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def daemon(config_path: Path) -> TestClient:
+def daemon(config_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     with auth_support.boot(config_path.parent) as client:
+        # The booted app is in-process: no socket answers the instance probe.
+        monkeypatch.setattr("mnemoseed_local.endpoint.resolve", lambda url, **kwargs: url)
         yield client
 
 

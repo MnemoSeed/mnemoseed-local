@@ -25,6 +25,9 @@ async function loadFixture(name) {
 // isolation: the plugin roots its artifacts under MNEMOSEED_LOCAL_DATA_DIR
 process.env.MNEMOSEED_LOCAL_DATA_DIR = await mkdtemp(join(tmpdir(), "mnemo-hook-test-"))
 const WATERMARKS = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-watermarks.json")
+const ENDPOINT_PATH = join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "endpoint.json")
+const TEST_INSTANCE = "hook-test-instance"
+let servedInstance = TEST_INSTANCE
 
 const posts = []
 const failing = new Set()
@@ -42,7 +45,11 @@ const CREDENTIAL_PATH = join(
   "daemon.credential.key",
 )
 globalThis.fetch = async (url, init) => {
-  const body = JSON.parse(init.body)
+  const body = init?.body ? JSON.parse(init.body) : null
+  if (url.endsWith("/healthz") && (!init?.method || init.method === "GET")) {
+    posts.push({ url, body, headers: init?.headers ?? null, accepted: true, status: 200 })
+    return { ok: true, status: 200, json: async () => ({ status: "ok", instance_id: servedInstance }) }
+  }
   if (liveDaemon) {
     const response = await realFetch(url, init)
     posts.push({ url, body, headers: init?.headers ?? null, accepted: response.ok, status: response.status })
@@ -3101,6 +3108,53 @@ async function main() {
           agents: posts
             .filter((post) => post.body.event === "user_prompt")
             .map((post) => ({ text: post.body.content?.text, agent: post.body.agent ?? null })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-stale": {
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      await writeFile(
+        ENDPOINT_PATH,
+        JSON.stringify({
+          pid: process.pid,
+          instance_id: TEST_INSTANCE,
+          base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
+          started_at: Date.now() / 1000,
+        }),
+        "utf8",
+      )
+      servedInstance = "forged-instance"
+      await fire.prompt({ sessionID: "sess-stale", messageID: "m_stale_1", prompt: { text: "stale turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-valid": {
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      await writeFile(
+        ENDPOINT_PATH,
+        JSON.stringify({
+          pid: process.pid,
+          instance_id: TEST_INSTANCE,
+          base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
+          started_at: Date.now() / 1000,
+        }),
+        "utf8",
+      )
+      await fire.prompt({ sessionID: "sess-valid", messageID: "m_valid_1", prompt: { text: "fresh turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
         }),
       )
       break

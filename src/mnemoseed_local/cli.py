@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -23,7 +24,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from mnemoseed_local import __version__
+from mnemoseed_local import __version__, endpoint
 from mnemoseed_local.config import (
     CONFIG_DIR,
     CONFIG_PATH,
@@ -2266,10 +2267,14 @@ def _print_import_report(report: Any) -> None:
 
 
 def _import_base_url() -> str:
+    override = (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or "").strip().rstrip("/")
+    if override:
+        return endpoint.resolve(override, override=True, allow_missing=True)
     try:
-        return load_config().baseurl.rstrip("/")
+        config_base = load_config().baseurl.rstrip("/")
     except ValueError, ConfigError:
-        return "http://localhost:7788"
+        config_base = "http://localhost:7788"
+    return endpoint.resolve(config_base, allow_missing=True)
 
 
 def cmd_import(args: argparse.Namespace) -> int:
