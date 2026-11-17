@@ -392,7 +392,7 @@ def test_session_end_fixture_settles_after_the_differential(
     assert _run(monkeypatch, _payload_with("session_end", tmp_path, turns)) == 0
     assert [path for path, _ in captured_posts] == ["/ingest", "/session/end"]
     settle = captured_posts[1][1]
-    assert set(settle) == {"session_id", "profile_id", "ts"}
+    assert set(settle) == {"session_id", "profile_id", "ts", "credit_pool"}
     assert settle["session_id"] == "cx-sess-01"
     assert settle["profile_id"] == "default"
 

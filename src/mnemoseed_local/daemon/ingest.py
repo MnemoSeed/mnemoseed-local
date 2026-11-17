@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -20,6 +22,7 @@ from mnemoseed_local.capture import (
     SessionUnknownError,
     TurnSegmenter,
 )
+from mnemoseed_local.capture.stamper import WriteOutcome
 from mnemoseed_local.config import Config
 from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.observability import Observability
@@ -28,6 +31,7 @@ from mnemoseed_local.schema.turn import (
     IngestEvent,
     IngestEventType,
     MessageContent,
+    ProfileRef,
     ProviderErrorContent,
     SessionEndRequest,
 )
@@ -52,6 +56,36 @@ scan_executor = DaemonExecutor(max_workers=2, thread_name_prefix="mnemoseed-scan
 
 def _observability(request: Request) -> Observability | None:
     return getattr(request.app.state, "observability", None)
+
+
+@dataclass(frozen=True)
+class _SettleDrainResult:
+    outcomes: list[WriteOutcome]
+    pool_points_suppressed: float
+
+
+def _drain_for_settle(capture: Any, credit_pool: bool) -> Callable[[str], _SettleDrainResult]:
+    """One drain's own outcomes and score suppression, sampled at its entry/exit."""
+
+    def settle_drain(session_id: str) -> _SettleDrainResult:
+        before = getattr(capture, "pool_points_suppressed", 0.0)
+        if credit_pool:
+            outcomes = capture.drain(session_id)
+        else:
+            outcomes = capture.drain(session_id, credit_pool=False)
+        suppressed = max(0.0, getattr(capture, "pool_points_suppressed", 0.0) - before)
+        return _SettleDrainResult(list(outcomes or []), suppressed)
+
+    return settle_drain
+
+
+def _outcome_counts(outcomes: list[Any]) -> dict[str, int]:
+    counts = {"new_chunk": 0, "reinforced": 0, "needs_reconcile": 0}
+    for outcome in outcomes:
+        key = getattr(getattr(outcome, "kind", None), "value", None)
+        if key in counts:
+            counts[key] += 1
+    return counts
 
 
 def _effective_ingest_profile(event: IngestEvent, config: Config | None) -> str:
@@ -200,6 +234,7 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
             "profile_id": event.profile_id,
             "event": event.event.value,
             "ack_ordinal": memory.transcript_watermark(effective_profile, event.session_id),
+            "deduped": True,
         }
     try:
         segmenter.ingest(event)
@@ -289,13 +324,15 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     # never blocks the event loop for the whole store write; the response still
     # waits for the drain future (ack = completed-applied). Guarded so injection
     # seams that bind a drain-less pipeline keep working.
+    capture = getattr(request.app.state, "capture", None)
     lane = getattr(request.app.state, "drain_lane", None)
-    drain = getattr(getattr(request.app.state, "capture", None), "drain", None)
-    if drain is not None:
+    result: _SettleDrainResult | None = None
+    if getattr(capture, "drain", None) is not None:
+        drain_fn = _drain_for_settle(capture, req.credit_pool)
         if lane is not None:
-            await lane.drain(drain, req.session_id)
+            result = await lane.drain(drain_fn, req.session_id)
         else:
-            drain(req.session_id)
+            result = drain_fn(req.session_id)
     # QA-5: the turns are persisted by the drain, so the settled session can
     # hand its buffers back (same guarded-seam pattern as drain).
     prune = getattr(getattr(request.app.state, "capture", None), "prune_settled", None)
@@ -316,13 +353,32 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
     memory = getattr(request.app.state, "memory", None)
     if memory is not None:
         memory.end_session(req.profile_id, req.session_id)
+    counts = _outcome_counts(result.outcomes) if result is not None else _outcome_counts([])
     return {
         "status": "settled",
         "session_id": req.session_id,
         "profile_id": req.profile_id,
         "turns": turn_range.end - turn_range.start + 1,
         "turn_range": turn_range,
+        "new_chunk": counts["new_chunk"],
+        "reinforced": counts["reinforced"],
+        "needs_reconcile": counts["needs_reconcile"],
+        "pool_points_suppressed": result.pool_points_suppressed if result is not None else 0.0,
     }
+
+
+@router.get("/session/active")
+async def session_active(profile_id: ProfileRef, request: Request) -> dict[str, Any]:
+    """Read-only snapshot of session ids buffered by the segmenter.
+
+    The capture buffer is not profile-scoped, so the answer is the full buffered
+    set; callers intersect it with the identities they own. Sessions that have
+    ingested no event yet are absent — this is a best-effort liveness view.
+    """
+    del profile_id
+    capture = getattr(request.app.state, "capture", None)
+    sessions = capture.sessions() if capture is not None else ()
+    return {"sessions": list(sessions)}
 
 
 @router.post("/flush")

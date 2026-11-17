@@ -585,7 +585,7 @@ def test_session_end_posts_only_the_settle(
     assert capsys.readouterr().out == ""
     assert [path for path, _ in captured_posts] == ["/session/end"]
     body = captured_posts[0][1]
-    assert set(body) == {"session_id", "profile_id", "ts"}
+    assert set(body) == {"session_id", "profile_id", "ts", "credit_pool"}
     assert body["session_id"] == SESSION
     assert body["profile_id"] == "default"
 

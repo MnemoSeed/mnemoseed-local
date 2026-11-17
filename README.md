@@ -59,6 +59,23 @@ Ollama convenience; hardware requirements depend on the bound model.
 Connect only the hosts you choose with the [host commands](docs/guide.md#host-setup).
 Host coverage varies by platform. Codex Desktop app-server mode is unverified.
 
+## Import historical sessions
+
+Backfill sessions that predate hook capture with
+`mnemoseed-local import --host codex_cli` (options: `--source`, `--profile`,
+`--limit`, `--dry-run`, `--json`, `--yes`). Progress goes to stderr and the
+reconciled report to stdout; `--dry-run` counts turns without sending anything.
+
+The importer resumes from `~/.mnemoseed-local/import-ledger-<host>.json`. A
+rollout is recorded only after its settle succeeds, so an interrupted run is
+safe to repeat and picks up after the last settled ordinal.
+
+Historical turns are stored **verbatim**: Codex records can contain plaintext
+secrets and injected host scaffolding, and import performs no redaction.
+Import does not add score-pool credit and therefore does not trigger dreams;
+run `mnemoseed-local dream --once` yourself if you want consolidation.
+See the [import guide](docs/guide.md#import-historical-sessions).
+
 ## Documentation and support
 
 - [Complete guide](docs/guide.md): setup, memory behavior, configuration, and troubleshooting.

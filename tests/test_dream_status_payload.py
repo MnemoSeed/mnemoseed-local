@@ -499,6 +499,7 @@ def test_external_surface_inventory_equals_frozen_baseline(
         "/daemon/shutdown",
         "/ingest",
         "/session/end",
+        "/session/active",
         "/flush",
         "/session/recall-pending",
         "/session/recent",

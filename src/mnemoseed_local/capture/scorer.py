@@ -235,6 +235,11 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return max(-1.0, min(1.0, dot))
 
 
+#: Texts one TurnScorer memoizes; FIFO beyond the bound. The drain lane is
+#: single-worker, so the memo needs no lock.
+_EMBED_MEMO_CAPACITY = 256
+
+
 class TurnScorer:
     """F2/F3 in one deterministic call. Fits the capture funnel's drain side."""
 
@@ -248,6 +253,23 @@ class TurnScorer:
         self._config = config if config is not None else ScoringConfig()
         self._lexicon = lexicon if lexicon is not None else Lexicon()
         self._prototype_cache: tuple[Sequence[float], Sequence[float]] | None = None
+        self._embed_memo: dict[str, Sequence[float]] = {}
+
+    def _embed(self, text: str) -> Sequence[float]:
+        """Dense vector for one text, computed at most once per scorer.
+
+        The embedder is a pure function of the text, so the recent-window
+        rescans of the previous turn's texts can serve from the memo. The
+        oldest inserted entry is evicted once the bound is reached.
+        """
+        dense = self._embed_memo.get(text)
+        if dense is not None:
+            return dense
+        dense = self._embedder.embed(text).dense
+        if len(self._embed_memo) >= _EMBED_MEMO_CAPACITY:
+            del self._embed_memo[next(iter(self._embed_memo))]
+        self._embed_memo[text] = dense
+        return dense
 
     def _prototypes(self) -> tuple[Sequence[float], Sequence[float]]:
         """Lazy F3 prototype vectors: the first score_turn call embeds them.
@@ -276,14 +298,14 @@ class TurnScorer:
         score_max = config.score_max
         text = _user_text(turn)
         lower = text.casefold()
-        current = self._embedder.embed(text).dense
+        current = self._embed(text)
 
         # ---- novelty + near-verbatim repeat from the injected recent window
         max_sim = 0.0
         novelty = score_max
         is_repeat = False
         if recent_texts:
-            sims = [_cosine(current, self._embedder.embed(other).dense) for other in recent_texts]
+            sims = [_cosine(current, self._embed(other)) for other in recent_texts]
             max_sim = max(sims)
             is_repeat = max_sim >= config.repeat_cosine
             novelty = max(0.0, min(score_max, (1.0 - max_sim) * score_max))
