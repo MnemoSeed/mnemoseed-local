@@ -151,6 +151,28 @@ def _payload_for_rollout(name: str, path: Path, **overrides: object) -> dict:
     return payload
 
 
+def _direct_ingest_body(
+    session_id: str,
+    text: str,
+    *,
+    ordinal: int | None,
+    rollout: str | None = None,
+    host: str = "codex_cli",
+) -> dict:
+    body: dict[str, Any] = {
+        "host": host,
+        "event": "user_prompt",
+        "session_id": session_id,
+        "profile_id": "default",
+        "ts": 0.0,
+        "content": {"text": text},
+        "transcript_ordinal": ordinal,
+    }
+    if rollout is not None:
+        body["transcript_rollout_id"] = rollout
+    return body
+
+
 # ---------------------------------------------------------------- daemon-under-test seam
 
 
@@ -681,6 +703,7 @@ def test_resumed_run_ingests_its_own_ordinals(
     accepted: list[IngestEvent],
     daemon: TestClient,
 ) -> None:
+    """A rollout resumed after its predecessor settled still reaches the segmenter."""
     rollout_a = _write_named_rollout(
         tmp_path / f"rollout-2026-10-24T10-00-00-{RUN_A}.jsonl",
         RESUMED_CONVERSATION,
@@ -697,12 +720,21 @@ def test_resumed_run_ingests_its_own_ordinals(
         == 0
     )
     assert _run(monkeypatch, _payload_for_rollout("stop", rollout_a, session_id=session)) == 0
+    settled_a = daemon.post("/session/end", json={"session_id": session, "profile_id": "default"})
+    assert settled_a.status_code == 200
     assert (
         _run(monkeypatch, _payload_for_rollout("user_prompt", rollout_b, session_id=session, prompt="第二问"))
         == 0
     )
     assert _run(monkeypatch, _payload_for_rollout("stop", rollout_b, session_id=session)) == 0
 
+    resumed_ingests = [
+        (body, reply)
+        for path, body, reply in hook_posts
+        if path == "/ingest" and body and body.get("transcript_rollout_id") == RUN_B
+    ]
+    assert len(resumed_ingests) == 2
+    assert all(reply.get("status") == "accepted" for _, reply in resumed_ingests)
     assert [event.transcript_ordinal for event in accepted] == [0, 1, 0, 1]
     assert [(event.event.value, event.content.text) for event in accepted] == [
         ("user_prompt", "第一问"),
@@ -766,6 +798,64 @@ def test_resumed_run_first_prompt_anchor_is_not_deduped(
     ]
     assert len(resumed) == 1
     assert resumed[0].transcript_ordinal == 0
+
+
+def test_settled_rollout_does_not_block_resumed_rollout(daemon: TestClient) -> None:
+    """A settle seals one rollout, not the session id shared by later runs."""
+    session = "cx-resume-ordinals"
+    first = _direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+    assert daemon.post("/ingest", json=first).status_code == 202
+    settle = daemon.post("/session/end", json={"session_id": session, "profile_id": "default"})
+    assert settle.status_code == 200
+    assert settle.json()["turns"] == 1
+
+    resumed = _direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+    response = daemon.post("/ingest", json=resumed)
+    assert response.status_code == 202, response.text
+    assert response.json()["ack_ordinal"] == 0
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+
+def test_late_event_for_same_settled_rollout_is_rejected(daemon: TestClient) -> None:
+    """The settle stays terminal for the rollout it sealed, even after a resume."""
+    session = "cx-late-same-rollout"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    late = _direct_ingest_body(session, "late", ordinal=9, rollout=RUN_A)
+    assert daemon.post("/ingest", json=late).status_code == 409
+
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+    late_after_resume = _direct_ingest_body(session, "late-after", ordinal=10, rollout=RUN_A)
+    assert daemon.post("/ingest", json=late_after_resume).status_code == 409
+
+
+def test_host_without_rollout_id_still_seals_per_session(daemon: TestClient) -> None:
+    """Hosts that omit the rollout id keep whole-session sealing semantics."""
+    session = "cc-no-rollout"
+    first = _direct_ingest_body(session, "first", ordinal=0, host="claude_code")
+    assert daemon.post("/ingest", json=first).status_code == 202
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    again = _direct_ingest_body(session, "again", ordinal=1, host="claude_code")
+    response = daemon.post("/ingest", json=again)
+    assert response.status_code == 409
 
 
 def test_legacy_202_body_stays_byte_identical(daemon: TestClient) -> None:

@@ -9,7 +9,6 @@ with pool credit off, and the resume ledger advances only on that settle's 200.
 from __future__ import annotations
 
 import importlib
-import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -26,11 +25,10 @@ from mnemoseed_local.schema.turn import (
     MessageContent,
     SessionEndRequest,
 )
+from mnemoseed_local.util.rollout import rollout_run_id
 
 #: Settle can drain thousands of turns; the hook's short budget cannot wait.
 IMPORT_SETTLE_TIMEOUT_SECONDS = 900.0
-
-_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 class ImportPreflightError(Exception):
@@ -108,11 +106,6 @@ def preflight(client: DaemonClient) -> None:
     client.get("/healthz")
 
 
-def _run_uuid(path: Path) -> str:
-    matches = _UUID_RE.findall(path.stem)
-    return matches[-1] if matches else path.stem
-
-
 def _ingest_body(
     *,
     host: HostId,
@@ -184,7 +177,7 @@ def run_import(
             report.skip("zero-turn")
             note(0, 0)
             continue
-        session_id = _run_uuid(path)
+        session_id = rollout_run_id(path)
         if session_id in active or conversation_id in active:
             report.skip("active")
             note(0, 0)

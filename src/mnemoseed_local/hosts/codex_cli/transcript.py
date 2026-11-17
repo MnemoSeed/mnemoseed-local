@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import io
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mnemoseed_local.hosts.common.zstd import require_zstandard
+from mnemoseed_local.util.rollout import rollout_run_id
 
 
 @dataclass(frozen=True)
@@ -94,16 +94,11 @@ def iter_rollouts(root: Any) -> list[Path]:
     )
 
 
-_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-
-
 def rollout_id(path: Any) -> str | None:
     """The run id from a rollout filename: its uuid, or the stem when absent."""
     if not isinstance(path, (str, Path)) or not str(path).strip():
         return None
-    file = Path(path)
-    matches = _UUID_RE.findall(file.stem)
-    return matches[-1] if matches else file.stem
+    return rollout_run_id(Path(path))
 
 
 def read_session_meta(path: Any) -> str | None:
