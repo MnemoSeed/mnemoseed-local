@@ -70,7 +70,7 @@ daemon 的 per-session 水位按 `(profile, session_id)` 记，跳过 `<=` 水�
 
 每个 drain 的 turn 都会把 S 记入 profile 池（`capture/pipeline.py:333-337`），池到 50 触发 `FORCED_CONSOLIDATION`（`capture/pool.py:7`）。14,815 轮按每轮约 3 点估算会排出 **900–1,500 个强制巩固事件**：没有绑定 dream 路由时它们堆在 relay 里，一旦绑定就变成上千次 LLM 反思并永久污染 `sqlite_graph`。池的语义是"近期待处理经验带来的巩固压力"，历史回填不是这种压力。
 
-- `SessionEndRequest` 增加 `credit_pool: bool = True`（additive，缺省逐字节不变，沿用 `transcript_ordinal` 的 additive 先例，`schema/turn.py:102-106`）。
+- `SessionEndRequest` 增加 `credit_pool: bool = True`（wire additive，**行为一致、wire 非逐字节相同**：缺省时 `model_dump(mode="json")` 会多输出一个 `credit_pool: true` 键；沿用 `transcript_ordinal` 的 additive 先例，`schema/turn.py:102-106`）。
 - 由 `ScoringPipeline.drain` 透传；为 False 时跳过 `add_points`，但把**被抑制的 S 总和记入统计**，报告里如实打印。
 - 结果：导入不产生任何池事件，`/session/end` 的 relay flush 成为空操作。
 - 明确后果：导入不触发 dream；用户需要时自己跑 `dream --once`。
@@ -85,6 +85,12 @@ daemon 的 per-session 水位**不能**当断点：它是内存 dict（`daemon/m
 - 语义是"已 settle 到序数 X"：
   - 只有 `/session/end` 返回 200 才落账（ack = completed-applied，`daemon/ingest.py:288-298`）。
   - ingest 与 settle 之间被杀：重跑时 ingest 被水位去重，缓冲的 turn 恰好 drain 一次。
+  - **settle 200 之后、账本落盘之前被杀**：这不是 exactly-once 窗口。当前进程内 segmenter 已 settle，
+    同一 rollout 的 re-ingest 会被 409 拒绝（`capture/segment.py:66-69`）；必须先重启 daemon（或等价地清掉
+    内存 segmenter 状态）再重跑。重启后水位与缓冲都已消失，整份 rollout 会重新 ingest 并 drain 一次：
+    逐字近重复走 REINFORCE，chunk 数不变，池积分仍被抑制（`credit_pool=False`）；但与一次干净的导入
+    相比，记忆状态并不完全相同（多一次 reinforce 与一次被抑制的 S）。本批**不声称**该窗口 exactly-once，
+    回归测试只钉住 chunk 数不变且无重复 chunk。
   - daemon 重启：内存缓冲与水位都没了，账本从最后 settle 的序数重放——正确，因为未 settle 的缓冲随进程消失。
 - rollout 在导入后继续增长（append）：从 `settled_through_ordinal` 之后继续，天然正确。
 - daemon 侧不新增任何持久化，不改 schema。
@@ -149,7 +155,7 @@ importer/:  runner.py, ledger.py           # 不直接 import 任何 host 模块
 **同批必须更新的既有契约钉**：
 
 1. `tests/test_scorer.py` 里 `recent_texts` 的既有断言（签名不变，行为必须逐字节一致）；
-2. `SessionEndRequest` 的 wire 形状测试（缺省字段逐字节不变）；
+2. `SessionEndRequest` 的 wire 形状测试（缺省行为一致、wire additive）；
 3. CLI 动词表快照测试（新增 `import`）；
 4. `skills/mnemoseed/SKILL.md` 的动词清单；
 5. 冻结 HTTP 路由清单测试 `tests/test_dream_status_payload.py::test_external_surface_inventory_equals_frozen_baseline`
@@ -170,7 +176,7 @@ importer/:  runner.py, ledger.py           # 不直接 import 任何 host 模块
 - AC9：活跃会话——会话在 daemon 缓冲集内时，导入跳过并给出原因，其它会话继续，且**不** settle 它。
 - AC10：截断/损坏的 `.jsonl.zst` → 作业继续，文件计为 `skipped-corrupt`。
 - AC11：memo 化——计数 embedder 证明同一会话内窗口文本不再被重复 embed；打分结果与非 memo 版逐字节相同；只传 `recent_texts` 的既有调用方行为不变。
-- AC12：wire 兼容——不带 `credit_pool` 的 `SessionEndRequest` 行为逐字节不变。
+- AC12：wire 兼容——不带 `credit_pool` 的 `SessionEndRequest` 行为一致；wire 为 additive（缺省的 JSON 会多出 `credit_pool: true`），不是逐字节相同。
 - AC13：actor 诚实——导入流量不推进 hook 捕获观测闩锁（假 observability 断言 `note_capture_ingest` 未被调用）。
 - AC14：逐字契约——store 里一条 fixture chunk 的文本与原始 turn 逐字相同，且带完整 stamp。
 - AC15：有效 profile 路由——绑定 agent 的导入落进绑定 profile，语义与 hook 流量一致。
@@ -256,3 +262,13 @@ solution-architect 2026-11-16 裁定 **SHIP-WITH-ADJUSTMENTS**，四条调整与
 - **变异门禁**：AC-M1 dry-run 零 POST 且 turn 数与实际导入一致；AC-M2 账本只在 200 后前进；
   AC-M3 `skipped-active` 与 `already-imported` 分账；AC-M4 settle 预算为 900 s 而非 hook 的 2 s；
   均由 `tests/test_import_core.py` / `tests/test_import_cli.py` 钉住。
+- **实测基准（操作员数据；S3/S4 修复前在本机实测）**：30 会话回填 340 turns、0 错误、总计 2507 s；
+  逐会话 drain 0–434 s（多数 16–60 s），产生 44 个新 chunk。早前 8 会话试点为 100 turns / 28 chunk；
+  单次全程 18 turns 用 427 s、4 turns 用 24 s。这是实测记录，不是 D3 的小时数估计；耗时随文本长度
+  与 embedder 状态变化，因此 D3 仍不承诺小时数。
+- **SKILL.md 保持不变**：§3 pin 4 是既有护栏——`skills/mnemoseed/SKILL.md` 的 `Verbs:` 行钉住的是 MCP
+  工具清单（`tests/test_mcp_skill.py`），不是 CLI 动词；`import` 是顶层 CLI 动词，故该行按设计不改。
+- **对抗 QA 后修复**：补真实 daemon 的 `run_import` 端到端测试（含真实 `Observability` 未推进 hook
+  捕获计数）；D5 写明 settle 200 与账本落盘之间的非 exactly-once 窗口（重启后近重复 REINFORCE 兜底）；
+  settle 的三个漏斗计数改为由本次 drain 的 `WriteOutcome` 列表统计、抑制积分在 drain 函数内采样；
+  `/ingest` 去重路径新增 additive `deduped` 标记，修正 ack 等于末序数时的 off-by-one。
