@@ -71,6 +71,34 @@ globalThis.fetch = async (url, init) => {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// D5 outbox scenarios read tagged lines back from the reused debug sink and
+// capture the always-on warning without mutating the recorded daemon posts.
+async function outboxRecords() {
+  const raw = await readFile(join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"), "utf8").catch(
+    () => "",
+  )
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const parsed = JSON.parse(line)
+        return parsed.tag === "hook-outbox" ? [parsed.payload] : []
+      } catch {
+        return []
+      }
+    })
+}
+
+function captureErrors() {
+  const original = console.error
+  const seen = []
+  console.error = (...args) => {
+    seen.push(args.map(String).join(" "))
+  }
+  return { seen, restore: () => { console.error = original } }
+}
+
 const SES = "sess-behavior"
 // outage-hole: after the daemon rejects the live turn, the HOST's own store
 // still carries it — the fake listing "learns" it when the driver flips this.
@@ -1745,6 +1773,122 @@ async function main() {
           noSecondGeneration: !secondExists,
           freshStillSmall: fresh.length < cap,
           shapeCount: shapeLines.length,
+        }),
+      )
+      break
+    }
+
+    case "mcp-transform-sync": {
+      // The registered mcp.transform callback is synchronous: the host's
+      // transform contract is `(editor) => void` and no async verification is
+      // awaited here. Pins the documented limitation (no false coverage claim).
+      const cb = current.mcpTransforms[0]
+      const map = {}
+      const ret = cb(makeMcpEditor(map))
+      console.log(
+        JSON.stringify({
+          isPromise: ret instanceof Promise,
+          injected: Boolean(map.mnemoseed),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-spool": {
+      // A failed ingest POST spools a tagged line + visible warning (DEBUG off).
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/ingest")
+      const errors = captureErrors()
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_spool",
+        prompt: { text: "down turn" },
+      })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      const ingests = outbox.filter((entry) => entry.endpoint === "/ingest")
+      console.log(
+        JSON.stringify({
+          outboxCount: ingests.length,
+          text: ingests[0]?.body?.content?.text ?? null,
+          warned: errors.seen.some((line) => line.includes("spooled")),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-flush": {
+      // The spooled turn is re-POSTed in order before the next live POST once
+      // the daemon recovers; the sink spool is emptied.
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/ingest")
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_first",
+        prompt: { text: "first down turn" },
+      })
+      await delay(150)
+      failing.delete(base + "/ingest")
+      posts.length = 0
+      await fire.prompt({
+        sessionID: "sess-outbox",
+        messageID: "m_outbox_second",
+        prompt: { text: "live turn" },
+      })
+      await delay(250)
+      const order = posts
+        .filter((post) => post.url.endsWith("/ingest"))
+        .map((post) => post.body?.content?.text ?? null)
+      console.log(
+        JSON.stringify({
+          order,
+          remaining: (await outboxRecords()).length,
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-pull-recent": {
+      // An awaited T1 pull failure spools + warns, same as the fire-and-forget lane.
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/session/recent")
+      const errors = captureErrors()
+      const g1 = { system: ["BASE"] }
+      await fire.context({ sessionID: SES, system: g1.system })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      console.log(
+        JSON.stringify({
+          count: outbox.filter((entry) => entry.endpoint === "/session/recent").length,
+          warned: errors.seen.some((line) => line.includes("spooled")),
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-pull-pending": {
+      // An awaited T2 pull failure spools + warns (ingest and T1 succeed first).
+      const base = process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788"
+      failing.add(base + "/session/recall-pending")
+      recallPayload = RECALL_PAYLOAD
+      await fire.prompt({
+        sessionID: SES,
+        messageID: "m_outbox_t2",
+        prompt: { text: "陈渡桥已接好，查一下" },
+      })
+      await delay(100)
+      const errors = captureErrors()
+      const g1 = { system: ["BASE"] }
+      await fire.context({ sessionID: SES, system: g1.system })
+      await delay(200)
+      errors.restore()
+      const outbox = await outboxRecords()
+      console.log(
+        JSON.stringify({
+          count: outbox.filter((entry) => entry.endpoint === "/session/recall-pending").length,
+          warned: errors.seen.some((line) => line.includes("spooled")),
         }),
       )
       break

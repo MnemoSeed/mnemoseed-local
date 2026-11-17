@@ -440,6 +440,31 @@ const DEBUG_LOG_PATH: string = join(DATA_DIR, "hook-debug.jsonl")
 const _HOOK_DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
 const DEBUG_LOG_ARCHIVE_PATH: string = DEBUG_LOG_PATH + ".1"
 
+// D5 hook outbox: failed daemon POSTs are tagged lines in the SAME sink (reused
+// sink, rotation and serialization) so no second file writer is introduced.
+// Retention mirrors the Python hooks: 24h / 10MB, oldest dropped first.
+const OUTBOX_TAG = "hook-outbox"
+const OUTBOX_MAX_AGE_MS = 24 * 60 * 60 * 1000
+// Read-lane spool lines are dropped at flush; only capture writes are re-POSTed.
+const OUTBOX_READ_ENDPOINTS = ["/session/recent", "/session/recall-pending"]
+
+interface OutboxEntry {
+  endpoint: string
+  body: JsonRecord
+  ts: number
+}
+
+// A clean hook must not pay an async I/O boundary before its POST (that flips
+// the fire-and-forget arrival order). Detect a leftover spool synchronously at
+// load; spoolFailure arms it in-process; a full flush clears it.
+let outboxPending = false
+let spoolSeq = 0
+try {
+  outboxPending = readFileSync(DEBUG_LOG_PATH, "utf8").includes('"tag":"hook-outbox"')
+} catch {
+  outboxPending = false
+}
+
 // ---- daemon credential (design/04 trust boundary): the daemon HTTP surface
 // refuses every caller that cannot present the credential it issued. The plugin
 // reads the file the daemon writes — read-only, never issuing one itself — and
@@ -509,6 +534,15 @@ function mcpEntryHeaders(): Record<string, string> {
   }
 }
 
+// Endpoint verification is NOT wired into this MCP registration. OpenCode's
+// mcp.transform callback is typed `(editor) => void` — transforms are
+// synchronous edits and the host does not await an async callback. The daemon
+// writes/rotates endpoint.json independently of plugin setup, so awaiting the
+// async /healthz handshake in setup would freeze a URL that can go stale the
+// moment the daemon restarts and would poison the lazy verification cache the
+// actual bearer-carrying hook fetches rely on. Those fetches each await
+// effectiveBaseUrl() before attaching the credential; this config entry keeps
+// the raw local URL and is deliberately not claimed as verified.
 function remoteMcpEntry(): Record<string, unknown> {
   return {
     "type": "remote",
@@ -570,6 +604,101 @@ function debugLog(tag: string, payload: unknown): void {
     .catch((error: unknown) => console.debug("mnemoseed-local: debug sink failed:", error))
 }
 
+function outboxLine(entry: OutboxEntry): string {
+  return JSON.stringify({ ts: new Date(entry.ts).toISOString(), tag: OUTBOX_TAG, payload: entry })
+}
+
+function parseOutboxLine(line: string): OutboxEntry | null {
+  try {
+    const parsed = JSON.parse(line)
+    if (parsed?.tag !== OUTBOX_TAG) return null
+    const payload = parsed.payload
+    if (
+      typeof payload?.endpoint !== "string" ||
+      typeof payload?.body !== "object" ||
+      payload.body === null ||
+      typeof payload?.ts !== "number"
+    ) return null
+    return payload as OutboxEntry
+  } catch {
+    return null
+  }
+}
+
+// Always-on warning: a failed hook POST is visible even without the debug env.
+function spoolFailure(endpoint: string, body: JsonRecord): void {
+  const entry: OutboxEntry = { endpoint, body, ts: Date.now() }
+  outboxPending = true
+  spoolSeq++
+  console.error(`mnemoseed-local: daemon unreachable; ${endpoint} turn spooled for recovery`)
+  debugSinkChain = debugSinkChain
+    .catch(() => {})
+    .then(() => mkdir(dirname(DEBUG_LOG_PATH), { recursive: true }))
+    .then(() => rotateDebugLogIfOversized())
+    .then(() => appendFile(DEBUG_LOG_PATH, outboxLine(entry) + "\n", "utf8"))
+    .catch((error: unknown) => console.debug("mnemoseed-local: outbox sink failed:", error))
+}
+
+// Re-POST spooled turns in order before the next live POST; the daemon's
+// ordinal dedupe absorbs duplicates. True only when the spool is fully drained.
+async function flushOutbox(): Promise<boolean> {
+  if (!outboxPending) return true
+  const seen = spoolSeq
+  await debugSinkChain.catch(() => {})
+  let raw: string
+  try {
+    raw = await readFile(DEBUG_LOG_PATH, "utf8")
+  } catch {
+    outboxPending = false
+    return true
+  }
+  const lines = raw.split("\n").filter(Boolean)
+  const outbox: OutboxEntry[] = []
+  const others: string[] = []
+  const cutoff = Date.now() - OUTBOX_MAX_AGE_MS
+  let dropped = 0
+  for (const line of lines) {
+    const entry = parseOutboxLine(line)
+    if (entry === null) {
+      others.push(line)
+      continue
+    }
+    if (entry.ts < cutoff) {
+      dropped++
+      continue
+    }
+    outbox.push(entry)
+  }
+  if (dropped > 0) console.error(`mnemoseed-local: hook outbox overflow: dropped ${dropped} stale turn(s)`)
+  const remaining: string[] = []
+  for (const entry of outbox) {
+    if (OUTBOX_READ_ENDPOINTS.includes(entry.endpoint)) continue
+    try {
+      const base = await effectiveBaseUrl()
+      const response = await fetch(base + entry.endpoint, {
+        method: "POST",
+        headers: daemonHeaders(),
+        body: JSON.stringify(entry.body),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      })
+      if (!response.ok) remaining.push(outboxLine(entry))
+    } catch {
+      remaining.push(outboxLine(entry))
+    }
+  }
+  if (outbox.length > 0 || dropped > 0) {
+    const kept = others.concat(remaining)
+    debugSinkChain = debugSinkChain
+      .catch(() => {})
+      .then(() => writeFile(DEBUG_LOG_PATH, kept.length ? kept.join("\n") + "\n" : "", "utf8"))
+      .catch((error: unknown) => console.debug("mnemoseed-local: outbox flush write failed:", error))
+    await debugSinkChain.catch(() => {})
+  }
+  const drained = remaining.length === 0
+  outboxPending = !drained || spoolSeq !== seen
+  return drained
+}
+
 type JsonRecord = { [key: string]: unknown }
 
 // Fire-and-forget POST of a single-line JSON body; never throws. The daemon's
@@ -582,6 +711,11 @@ type JsonRecord = { [key: string]: unknown }
 function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () => void): void {
   void (async () => {
     try {
+      if (!(await flushOutbox())) {
+        spoolFailure(endpoint, body)
+        if (nack !== undefined) nack()
+        return
+      }
       const base = await effectiveBaseUrl()
       const response = await fetch(base + endpoint, {
         method: "POST",
@@ -591,6 +725,7 @@ function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () =>
       })
       if (!response.ok) {
         debugLog("daemon POST rejected", { endpoint, status: response.status })
+        spoolFailure(endpoint, body)
         if (nack !== undefined) nack()
         return
       }
@@ -598,6 +733,7 @@ function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () =>
     } catch (error) {
       console.debug("mnemoseed-local: POST", endpoint, "failed:", error)
       debugLog("daemon POST failed", { endpoint, error: String(error) })
+      spoolFailure(endpoint, body)
       if (nack !== undefined) nack()
     }
   })()
@@ -1113,6 +1249,7 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
     })
     if (!response.ok) {
       debugLog("session/recent rejected", { sessionID, status: response.status })
+      spoolFailure("/session/recent", body)
       return null
     }
     const data = await response.json()
@@ -1124,6 +1261,7 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
   } catch (error) {
     console.debug("mnemoseed-local: session/recent failed:", error)
     debugLog("session/recent failed", { sessionID, error: String(error) })
+    spoolFailure("/session/recent", body)
     return null
   }
 }
@@ -1135,20 +1273,22 @@ async function pullPendingRecall(sessionID: string): Promise<any | null> {
   // <=16); the daemon merges them into the selection so a focal hit never
   // re-serves a T1 replay. NOT a post() call site — the arity invariants
   // stay untouched.
+  const body: JsonRecord = {
+    profile_id: PROFILE_ID,
+    session_id: sessionID,
+    seen_chunk_ids: t1InjectedChunkIds.get(sessionID) ?? [],
+  }
   try {
     const base = await effectiveBaseUrl()
     const response = await fetch(base + "/session/recall-pending", {
       method: "POST",
       headers: daemonHeaders(),
-      body: JSON.stringify({
-        profile_id: PROFILE_ID,
-        session_id: sessionID,
-        seen_chunk_ids: t1InjectedChunkIds.get(sessionID) ?? [],
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(RECALL_PULL_TIMEOUT_MS),
     })
     if (!response.ok) {
       debugLog("session/recall-pending rejected", { sessionID, status: response.status })
+      spoolFailure("/session/recall-pending", body)
       return null
     }
     const data = await response.json()
@@ -1160,6 +1300,7 @@ async function pullPendingRecall(sessionID: string): Promise<any | null> {
   } catch (error) {
     console.debug("mnemoseed-local: session/recall-pending failed:", error)
     debugLog("session/recall-pending failed", { sessionID, error: String(error) })
+    spoolFailure("/session/recall-pending", body)
     return null
   }
 }
