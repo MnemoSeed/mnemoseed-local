@@ -3,8 +3,8 @@
 Two independent retrieval tracks produce one ranked candidate pool:
 
 - Vector track (FR-3.3): semantic neighbors from the store, embedded through
-  the ``Embedder`` port, restricted to the cue-entity overlap when the store
-  declares ``vector.metadata_filter``, and floored at ``min_decay``.
+  the ``Embedder`` port, floored at ``min_decay`` and ``min_similarity``.
+  Extracted entities feed the beta cue-overlap score, never a hard exclusion.
 - Graph track (FR-3.3): entity-subgraph 2-hop traversal seeded from every node
   carrying any query cue entity; the pool is decay-floored at the candidate
   boundary and the track caps at ``graph_top_k`` decay-weighted entries. Seeds
@@ -38,9 +38,8 @@ filter candidates; they feed the beta term as a low-weight blended component
 (entity 0.6 / tool 0.25 / context 0.15). Graph candidates carry only the entity
 component of beta (GraphNode stores no situational fields) and a zero semantic
 term; a chunk candidate's semantic term is the store similarity clamped to
-[0, 1]. Entity overlap folds case; the store metadata prefilter matches on the
-raw stored entities (embedded driver) so a chunk whose only entity match is
-case-differing may be cut before scoring.
+[0, 1]. Entity overlap folds case and feeds only the beta term; stored entity
+cues never exclude a chunk from the vector pool.
 """
 
 from __future__ import annotations
@@ -55,7 +54,6 @@ from mnemoseed_local.retrieve.temporal import evaluate_temporal
 from mnemoseed_local.schema.graph import GraphNode
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, Cues
 from mnemoseed_local.storage.ports import (
-    Capability,
     ChunkFilter,
     Embedder,
     GraphStore,
@@ -272,10 +270,7 @@ class HybridRetriever:
         config: HybridConfig,
         now: float | None = None,
     ) -> tuple[list[Candidate], int]:
-        entities = tuple(query.entities)
         embedding = embedder.embed(query_text)
-        supports_filter = Capability.VECTOR_METADATA_FILTER in vector_store.capabilities()
-        filter_entities = entities if supports_filter and entities else ()
         hits = vector_store.search(
             embedding.dense,
             embedding.sparse,
@@ -288,10 +283,6 @@ class HybridRetriever:
                 # cue-match condition below stays as defense-in-depth.
                 min_decay=config.min_decay,
                 pin_min_decay=config.rescue_min_decay,
-                entities=filter_entities,
-                # Recall-surface entity tolerance mirrors the post-filter below:
-                # missing stored cues are absence of evidence, never excluded.
-                entities_allow_missing=True,
                 # Merged chunks are the fact's retained evidence scene, never
                 # fresh recall surface: the dream merge marks them consolidated
                 # (design/03 §4, same semantics as the Freshness Guard probe).
@@ -320,11 +311,6 @@ class HybridRetriever:
                 rescued = True
             if not rescued and float(hit.similarity) < config.min_similarity:
                 floor_dropped += 1
-                continue
-            # Empty stored entity cues mean "no entity evidence" (e.g. written
-            # before the daemon filled them), never a contradiction: the gate
-            # only excludes positive mismatches (D2).
-            if entities and chunk.cues.entities and not _entity_overlap(entities, chunk.cues.entities):
                 continue
             semantic = max(0.0, min(1.0, float(hit.similarity)))
             breakdown = _breakdown(
@@ -535,11 +521,6 @@ def _graph_centrality(
 
 def _fold(value: str) -> str:
     return value.casefold()
-
-
-def _entity_overlap(query_entities: tuple[str, ...], stored_entities: Sequence[str]) -> bool:
-    query = {_fold(entity) for entity in query_entities}
-    return any(_fold(entity) in query for entity in stored_entities)
 
 
 def _ratio(query_items: Sequence[str], stored_items: Sequence[str]) -> float:
