@@ -1,0 +1,43 @@
+name: dependency-audit
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+
+concurrency:
+  group: dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - name: Export the locked dependency set
+        run: uv export --frozen --all-groups --no-emit-project --no-hashes --format requirements.txt --output-file audit-requirements.txt
+      - name: Audit locked dependencies
+        id: audit
+        # Pull-request jobs report the audit without failing; scheduled jobs fail.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: uv tool run --from pip-audit pip-audit --requirement audit-requirements.txt --progress-spinner off --strict
+      - name: Publish audit outcome
+        if: always()
+        shell: bash
+        run: |
+          outcome="${{ steps.audit.outcome }}"
+          {
+            echo "### Dependency audit"
+            echo
+            echo "Outcome: \`$outcome\` (trigger: \`${{ github.event_name }}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$outcome" != "success" ]; then
+            echo "::warning::Dependency audit ${outcome}; see the audit step log and job summary."
+          fi
