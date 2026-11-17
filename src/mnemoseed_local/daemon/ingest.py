@@ -29,6 +29,7 @@ from mnemoseed_local.schema.turn import (
     IngestEvent,
     IngestEventType,
     MessageContent,
+    ProfileRef,
     ProviderErrorContent,
     SessionEndRequest,
 )
@@ -325,6 +326,20 @@ async def session_end(req: SessionEndRequest, request: Request) -> dict[str, Any
         "turns": turn_range.end - turn_range.start + 1,
         "turn_range": turn_range,
     }
+
+
+@router.get("/session/active")
+async def session_active(profile_id: ProfileRef, request: Request) -> dict[str, Any]:
+    """Read-only snapshot of session ids buffered by the segmenter.
+
+    The capture buffer is not profile-scoped, so the answer is the full buffered
+    set; callers intersect it with the identities they own. Sessions that have
+    ingested no event yet are absent — this is a best-effort liveness view.
+    """
+    del profile_id
+    capture = getattr(request.app.state, "capture", None)
+    sessions = capture.sessions() if capture is not None else ()
+    return {"sessions": list(sessions)}
 
 
 @router.post("/flush")
