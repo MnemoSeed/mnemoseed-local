@@ -50,8 +50,8 @@ from mnemoseed_local.hosts.install import (
     uninstall_command,
 )
 from mnemoseed_local.mcp_gateway import instructions
-from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
-from mnemoseed_local.rest_client import DaemonClient, DaemonRestError
+from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT, DAEMON_DOWN_HINT
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 
 if TYPE_CHECKING:
     from mnemoseed_local.daemon.observability import RefinementStatus
@@ -2240,9 +2240,14 @@ def _emit_json(payload: Any) -> int:
 
 def _client_error(exc: Exception) -> int:
     """One honest failure line. A refused credential names its real causes
-    instead of being reported as a connectivity problem."""
+    instead of being reported as a connectivity problem; a down daemon carries
+    the start command instead of a bare connection refusal."""
     if isinstance(exc, DaemonRestError) and exc.status == _HTTP_UNAUTHORIZED:
         print(f"error: {DAEMON_AUTH_HINT}", file=sys.stderr)
+        return 1
+    if isinstance(exc, DaemonUnavailableError):
+        base_url = getattr(exc, "base_url", "the daemon")
+        print(f"error: {DAEMON_DOWN_HINT.format(base_url=base_url)} ({exc})", file=sys.stderr)
         return 1
     print(f"error: {exc}", file=sys.stderr)
     return 1

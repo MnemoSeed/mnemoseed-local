@@ -691,7 +691,10 @@ def test_watermark_loss_replays_without_duplicates(
     monkeypatch.setattr(DaemonClient, "post", recording)
     assert _run(monkeypatch, _payload_with("stop", tmp_path, turns, session_id=SESSION)) == 0
     ordinals = [body["transcript_ordinal"] for path, body, _ in recovery if path == "/ingest" and body]
-    assert ordinals == [1, 3], "the ack floor (2) skips ordinal 2 without an HTTP send"
+    # D5: the crashed batch's last turn (3) was spooled; the hook outbox flushes
+    # the spool before the next live POST, so 3 precedes the re-sent 1. Ordinal 2
+    # is still skipped by the ack floor (2) — no HTTP send either way.
+    assert ordinals == [3, 1], "the spool flushes before the live turn; ordinal 2 stays skipped"
     stored = [event.transcript_ordinal for event in accepted]
     assert stored == [0, 1, 2, 3], "replay filled the gap, no duplicates"
     settled = daemon.post("/session/end", json={"session_id": SESSION, "profile_id": "default"})

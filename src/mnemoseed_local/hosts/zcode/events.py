@@ -44,7 +44,8 @@ from mnemoseed_local.hosts.common.daemon import (
     POST_TIMEOUT_SECONDS,
     debug,
     enforce_project_binding,
-    hook_client,
+    hook_client_or_none,
+    post_capture,
     profile_id,
 )
 from mnemoseed_local.hosts.common.daemon import (
@@ -253,9 +254,11 @@ def transform_event(raw: str) -> int:
         debug(f"dropped unmapped or identity-less event {event.get('hook_event_name')!r}")
         return 0
     kind, body = action
-    client = hook_client(timeout=POST_TIMEOUT_SECONDS)
+    client = hook_client_or_none(timeout=POST_TIMEOUT_SECONDS)
     try:
         if kind == "t1":
+            if client is None:
+                return 0
             block = session_start_block(pull_session_tails(client, str(body)))
             if block is not None:
                 print(json.dumps(additional_context_payload(block, T1_HOOK_EVENT)))
@@ -263,15 +266,15 @@ def transform_event(raw: str) -> int:
         if kind == "stop":
             # persist-then-flush: the ingest ACKs first, then the flush closes
             # and drains the buffered turns without settling the session
-            client.post(ENDPOINTS["ingest"], body.model_dump(mode="json"))
+            post_capture(client, ENDPOINTS["ingest"], body.model_dump(mode="json"), host="zcode")
             flush = FlushRequest(session_id=body.session_id, profile_id=body.profile_id)
-            client.post(ENDPOINTS["flush"], flush.model_dump(mode="json"))
+            post_capture(client, ENDPOINTS["flush"], flush.model_dump(mode="json"), host="zcode")
             return 0
-        client.post(ENDPOINTS[kind], body.model_dump(mode="json"))
+        post_capture(client, ENDPOINTS[kind], body.model_dump(mode="json"), host="zcode")
         # only an ACKED user ingest parks the focal slot, so the pull runs
         # strictly after the 2xx (ack-implies-ready); a served selection is
         # emitted as additionalContext — the ONE stdout this lane may write
-        if isinstance(body, IngestEvent) and body.event is IngestEventType.USER_PROMPT:
+        if client is not None and isinstance(body, IngestEvent) and body.event is IngestEventType.USER_PROMPT:
             block = inject_recall_context(body.session_id, client)
             if block is not None:
                 print(json.dumps(additional_context_payload(block, INJECTION_HOOK_EVENT)))

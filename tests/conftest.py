@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,6 +28,20 @@ from _ports import reserved_port_occupancy
 reload_guard.activate()
 
 logger = logging.getLogger("mnemoseed_local.tests.isolation")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hook_outbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep the hook outbox off the real config home when a test does not pin one.
+
+    A host test that scripts a failed POST now spools a turn; without this the
+    line lands in the installed runtime's home and a later test's flush replays
+    it. Tests that pin CONFIG_DIR themselves override this cleanly.
+    """
+    from mnemoseed_local import config as _config
+
+    if _config.CONFIG_DIR == Path.home() / ".mnemoseed-local":
+        monkeypatch.setattr(_config, "CONFIG_DIR", tmp_path / ".mnemoseed-local")
 
 
 @pytest.fixture

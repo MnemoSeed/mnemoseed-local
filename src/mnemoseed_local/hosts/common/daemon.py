@@ -4,14 +4,17 @@ the per-event project binding gate."""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from httpx import Timeout
 
+from mnemoseed_local import config as config_mod
 from mnemoseed_local import endpoint
 from mnemoseed_local.config import live_home_dir
 from mnemoseed_local.hosts.common.project_binding import (
@@ -23,7 +26,7 @@ from mnemoseed_local.hosts.common.project_binding import (
     resolve_profile,
     roots_for_profile,
 )
-from mnemoseed_local.rest_client import DaemonClient, client_for
+from mnemoseed_local.rest_client import DaemonClient, DaemonUnavailableError, client_for
 
 #: Daemon base URL a hook posts to when no env override is set.
 DEFAULT_BASE_URL = "http://localhost:7788"
@@ -42,6 +45,15 @@ RECALL_PULL_MAX_CHARS = 1200
 
 #: The daemon reports its effective item budget on the wire under this key.
 RECALL_BUDGET_KEY = "budget_chars"
+
+#: Hook outbox: one JSONL line per failed POST, flushed in order on recovery.
+#: Retention defaults live here and are reversible: 24h / 10MB, oldest dropped.
+OUTBOX_FILENAME = "hook-outbox.jsonl"
+OUTBOX_MAX_AGE_SECONDS = 24 * 60 * 60
+OUTBOX_MAX_BYTES = 10 * 1024 * 1024
+
+#: Always-on stderr prefix (never gated by the debug lane).
+WARNING_PREFIX = "mnemoseed-local:"
 
 
 def resolve_base_url(*, verify: bool = False) -> str:
@@ -194,6 +206,133 @@ def debug(message: str) -> None:
 def hook_client(timeout: float | Timeout = POST_TIMEOUT_SECONDS) -> DaemonClient:
     """The hook POST client: verified base URL, env profile binding, hook actor."""
     return client_for(resolve_base_url(verify=True), profile_id=profile_id(), actor="hook", timeout=timeout)
+
+
+def hook_client_or_none(timeout: float | Timeout = POST_TIMEOUT_SECONDS) -> DaemonClient | None:
+    """A hook client, or None when the endpoint record is stale.
+
+    A stale record means the daemon is down (hard kill leaves the record behind)
+    or a different instance owns the port. No credential is presented in that
+    case; the caller routes the turn to the outbox via :func:`post_capture`.
+    """
+    try:
+        return hook_client(timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - a stale endpoint must never lose a turn
+        debug(f"hook client unavailable: {exc}")
+        return None
+
+
+def outbox_path() -> Path:
+    """The spool path, resolved from the config home at call time."""
+    return config_mod.CONFIG_DIR / OUTBOX_FILENAME
+
+
+def _warn(message: str) -> None:
+    """Emit an always-on stderr line (never gated by MNEMOSEED_LOCAL_DEBUG)."""
+    print(f"{WARNING_PREFIX} {message}", file=sys.stderr)
+
+
+def _read_outbox(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError, ValueError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and "path" in entry and "body" in entry:
+            entries.append(entry)
+    return entries
+
+
+def _write_outbox(path: Path, entries: list[dict[str, Any]]) -> None:
+    payload = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        _warn(f"hook outbox could not be written at {path}: {exc}")
+
+
+def _prune(entries: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    now = time.time()
+    kept = [
+        entry
+        for entry in entries
+        if isinstance(entry.get("ts"), (int, float)) and now - float(entry["ts"]) <= OUTBOX_MAX_AGE_SECONDS
+    ]
+    dropped = len(entries) - len(kept)
+    while kept and sum(len(json.dumps(entry)) + 1 for entry in kept) > OUTBOX_MAX_BYTES:
+        kept.pop(0)
+        dropped += 1
+    return kept, dropped
+
+
+def _spool(host: str, path: str, body: dict[str, Any]) -> None:
+    target = outbox_path()
+    entries = _read_outbox(target)
+    entries.append({"ts": time.time(), "host": host, "path": path, "body": body})
+    kept, dropped = _prune(entries)
+    _write_outbox(target, kept)
+    _warn(f"{host} {path} turn spooled to {target} (daemon unreachable; will flush on recovery)")
+    if dropped:
+        _warn(f"hook outbox overflow: dropped {dropped} oldest turn(s) from {target}")
+
+
+def _flush_outbox() -> bool:
+    """Re-POST spooled turns in order; True only when the spool is fully drained."""
+    target = outbox_path()
+    entries = _read_outbox(target)
+    if not entries:
+        return True
+    try:
+        client = hook_client()
+    except Exception:  # noqa: BLE001 - still down or the endpoint is still stale
+        return False
+    remaining: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            client.post(str(entry["path"]), entry["body"])
+        except Exception:  # noqa: BLE001 - keep the line for the next attempt
+            remaining.append(entry)
+    _write_outbox(target, remaining)
+    return not remaining
+
+
+def post_capture(
+    client: DaemonClient | None,
+    path: str,
+    body: dict[str, Any],
+    *,
+    host: str,
+) -> dict[str, Any]:
+    """One bounded hook POST with durable degradation.
+
+    Flushes the spool first (in order), so recovered turns precede this one;
+    daemon ordinal dedupe absorbs any duplicate. If the spool cannot drain or
+    the POST fails, appends one line, emits an always-on stderr warning and
+    re-raises so the host's fire-and-forget guard aborts the lane (no T2 pull
+    on a failed ingest). No retries are added.
+    """
+    if not _flush_outbox():
+        _spool(host, path, body)
+        raise DaemonUnavailableError(f"{host} {path} spooled; daemon unreachable")
+    if client is None:
+        _spool(host, path, body)
+        raise DaemonUnavailableError(f"{host} {path} spooled; daemon endpoint unavailable")
+    try:
+        return client.post(path, body)
+    except Exception as exc:  # noqa: BLE001 - spool, warn, then let the host guard abort
+        _spool(host, path, body)
+        debug(f"{host} {path} post failed: {exc}")
+        raise
 
 
 def pull_pending_recall(session_id: str, client: DaemonClient) -> dict[str, Any] | None:
