@@ -54,11 +54,13 @@ class _SessionState:
         profile_id: str,
         rollout_id: str | None = None,
         settled_rollouts: set[str] | None = None,
+        seen_rollouts: set[str] | None = None,
     ) -> None:
         self.session_id = session_id
         self.profile_id = profile_id
         self.rollout_id = rollout_id
         self.settled_rollouts = settled_rollouts if settled_rollouts is not None else set()
+        self.seen_rollouts = seen_rollouts if seen_rollouts is not None else set()
         self.turn_index = 0
         self.open_turn: Turn | None = None
         self.turn_range: TurnRange | None = None
@@ -66,6 +68,8 @@ class _SessionState:
 
     def ingest(self, event: IngestEvent, pipeline: CapturePipeline) -> None:
         self.last_ts = max(self.last_ts, event.ts)
+        if event.transcript_rollout_id is not None:
+            self.seen_rollouts.add(event.transcript_rollout_id)
         if event.profile_id != self.profile_id:
             raise ProfileMismatchError(
                 f"session {self.session_id!r} is bound to profile {self.profile_id!r}, "
@@ -133,8 +137,7 @@ class _SessionState:
             return self.turn_range
         if self.open_turn is not None:
             self._close_open_turn(time.time(), pipeline)
-        if self.rollout_id is not None:
-            self.settled_rollouts.add(self.rollout_id)
+        self.settled_rollouts.update(self.seen_rollouts)
         self.turn_range = TurnRange(start=0, end=self.turn_index - 1)
         pipeline.end_session(self.session_id, self.turn_range)
         return self.turn_range
@@ -201,7 +204,13 @@ class TurnSegmenter:
         if state is not None and state.turn_range is not None:
             rollout = event.transcript_rollout_id
             if state.rollout_id is not None and rollout is not None and rollout != state.rollout_id:
-                state = _SessionState(event.session_id, event.profile_id, rollout, state.settled_rollouts)
+                state = _SessionState(
+                    event.session_id,
+                    state.profile_id,
+                    rollout,
+                    state.settled_rollouts,
+                    state.seen_rollouts,
+                )
                 self._sessions[event.session_id] = state
         if state is None:
             state = _SessionState(event.session_id, event.profile_id, event.transcript_rollout_id)

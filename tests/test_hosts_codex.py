@@ -844,6 +844,56 @@ def test_late_event_for_same_settled_rollout_is_rejected(daemon: TestClient) -> 
     assert daemon.post("/ingest", json=late_after_resume).status_code == 409
 
 
+def test_late_event_for_middle_settled_rollout_is_rejected(daemon: TestClient) -> None:
+    """A rollout seen before settle is sealed even when it was not the first."""
+    session = "cx-late-middle-rollout"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "middle", ordinal=1, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    late = _direct_ingest_body(session, "late", ordinal=9, rollout=RUN_B)
+    assert daemon.post("/ingest", json=late).status_code == 409
+
+
+def test_reopen_rejects_foreign_profile_without_rebinding(daemon: TestClient) -> None:
+    """A resumed rollout from another profile cannot rebind a settled session."""
+    session = "cx-reopen-profile"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    foreign = _direct_ingest_body(session, "foreign", ordinal=0, rollout=RUN_B)
+    foreign["profile_id"] = "other"
+    response = daemon.post("/ingest", json=foreign)
+    assert response.status_code == 409, response.text
+    assert "bound to profile 'default'" in response.text
+
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+
+
 def test_host_without_rollout_id_still_seals_per_session(daemon: TestClient) -> None:
     """Hosts that omit the rollout id keep whole-session sealing semantics."""
     session = "cc-no-rollout"
