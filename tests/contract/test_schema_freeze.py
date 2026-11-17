@@ -189,6 +189,9 @@ _FROZEN_META_TABLES = (
     "error_events",
     "reconcile_nominations",
     "reconciliation_attempts",
+    "ingest_events",
+    "ingest_watermarks",
+    "ingest_applied",
 )
 _FROZEN_META_INDEXES = (
     "idx_tokens_profile",
@@ -201,6 +204,7 @@ _FROZEN_META_INDEXES = (
     "idx_audit_log_dedup_key",
     "idx_reconciliation_attempts_profile_nomination",
     "idx_reconcile_nominations_profile_nomination",
+    "idx_ingest_events_stream",
 )
 _FROZEN_TRIGGERS = (
     ("trg_audit_no_update", "UPDATE"),

@@ -482,7 +482,7 @@ def test_v16_attempt_schema_forward_empty_and_immutable(tmp_path):
         assert apply_migrations(conn, "meta", target=15) == 15
         conn.execute("INSERT INTO audit_log(actor, action, at) VALUES ('test', 'old', 'old')")
         before = tuple(tuple(row) for row in conn.execute("SELECT * FROM audit_log"))
-        assert apply_migrations(conn, "meta") == 16
+        assert apply_migrations(conn, "meta") == 17
         assert tuple(tuple(row) for row in conn.execute("SELECT * FROM audit_log")) == before
         assert conn.execute("SELECT COUNT(*) FROM reconciliation_attempts").fetchone()[0] == 0
         columns = [

@@ -375,10 +375,10 @@ def test_dream_run_finish_completes_the_row(stack) -> None:
 
 def test_schema_version_and_migrate_forward_only(stack) -> None:
     """Meta migrations are idempotent and forward-only at the independent head."""
-    assert stack.meta.schema_version() == 16
-    assert stack.meta.migrate() == 16
-    assert stack.meta.migrate(target=1) == 16
-    assert stack.meta.schema_version() == 16
+    assert stack.meta.schema_version() == 17
+    assert stack.meta.migrate() == 17
+    assert stack.meta.migrate(target=1) == 17
+    assert stack.meta.schema_version() == 17
 
 
 def test_dream_token_ledger_atomic_increment(stack) -> None:

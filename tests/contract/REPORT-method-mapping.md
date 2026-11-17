@@ -62,7 +62,7 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (43 methods)
+## MetaStore (49 methods)
 
 | Method | Contract test |
 |---|---|
@@ -85,6 +85,12 @@ Driver family covered by the `stack` fixture:
 | get_config | `test_contract_meta.py::test_config_versioned_get_set_rollback` |
 | get_profile | `test_contract_meta.py::test_profile_crud_and_token_cascade` |
 | get_user_by_username | `test_contract_meta.py::test_users_crud_and_password_rotation` |
+| ingest_apply | `test_ingest_queue.py::test_apply_writes_marker_and_pool_credit_in_one_transaction` |
+| ingest_pending | `test_ingest_queue.py::test_applied_rows_are_skipped_by_pending` |
+| ingest_prune | `test_ingest_queue.py::test_prune_bounds_terminal_rows_but_keeps_watermarks` |
+| ingest_record | `test_ingest_queue.py::test_record_persists_envelope_and_advances_seen_together` |
+| ingest_seen | `test_ingest_queue.py::test_seen_and_applied_are_independent_watermarks` |
+| ingest_watermarks | `test_ingest_queue.py::test_seen_and_applied_are_independent_watermarks` |
 | issue_token | `test_contract_meta.py::test_issue_token_and_revoke` |
 | list_dream_runs | `test_contract_meta.py::test_dream_runs_roundtrip` |
 | list_profiles | `test_contract_meta.py::test_profile_crud_and_token_cascade` |

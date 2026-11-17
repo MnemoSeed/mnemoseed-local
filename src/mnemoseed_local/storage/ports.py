@@ -242,6 +242,54 @@ class PoolState:
 
 
 @dataclass(frozen=True)
+class IngestStream:
+    """The (profile, session, rollout) key both ingest watermarks share."""
+
+    profile_id: str
+    session_id: str
+    rollout_id: str
+
+
+@dataclass(frozen=True)
+class IngestRecord:
+    """One persisted ingest envelope and its caller attribution."""
+
+    event_id: str
+    profile_id: str
+    session_id: str
+    rollout_id: str
+    ordinal: int
+    kind: str
+    payload: str
+    actor: str
+    host: str
+    received_at: float
+
+    @property
+    def stream(self) -> IngestStream:
+        return IngestStream(self.profile_id, self.session_id, self.rollout_id)
+
+
+@dataclass(frozen=True)
+class IngestAppliedEvent:
+    """One replay-skip marker plus the points credited by its drain."""
+
+    event_id: str
+    ordinal: int
+    points: float
+
+
+@dataclass(frozen=True)
+class PoolCreditOp:
+    """A pool ledger mutation applied inside the applied-marker transaction."""
+
+    kind: str
+    profile_id: str
+    balance: float
+    turn_range: TurnRange
+
+
+@dataclass(frozen=True)
 class StoredProfile:
     """Profile record (identity namespace for D5 isolation)."""
 
@@ -1265,6 +1313,41 @@ class MetaStore(Protocol):
         raise NotImplementedError
 
     def advance_watermark(self, profile_id: str, turn_range: TurnRange) -> None:
+        raise NotImplementedError
+
+    def ingest_record(self, record: IngestRecord) -> None:
+        """Store the envelope and raise the seen watermark in one transaction."""
+        raise NotImplementedError
+
+    def ingest_seen(self, profile_id: str, session_id: str, rollout_id: str, ordinal: int) -> int:
+        raise NotImplementedError
+
+    def ingest_watermarks(self, stream: IngestStream) -> tuple[int, int]:
+        """The stream's (seen, applied) ordinals, -1 before the first event."""
+        raise NotImplementedError
+
+    def ingest_pending(
+        self,
+        *,
+        profile_id: str | None = None,
+        session_id: str | None = None,
+    ) -> tuple[IngestRecord, ...]:
+        """Seen-but-unapplied envelopes in insertion order."""
+        raise NotImplementedError
+
+    def ingest_apply(
+        self,
+        *,
+        stream: IngestStream,
+        applications: Sequence[IngestAppliedEvent],
+        credits: Sequence[PoolCreditOp],
+        at: float,
+    ) -> None:
+        """Commit applied markers and pool credits in one meta transaction."""
+        raise NotImplementedError
+
+    def ingest_prune(self, *, keep: int) -> int:
+        """Drop the oldest applied envelopes beyond ``keep``; return the count."""
         raise NotImplementedError
 
     def upsert_profile(self, profile: StoredProfile) -> None:

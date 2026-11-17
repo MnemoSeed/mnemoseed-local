@@ -128,6 +128,13 @@ COVERAGE: dict[str, dict[str, str]] = {
         "count_users": "test_contract_meta.py::test_users_crud_and_password_rotation",
         "update_user_password": "test_contract_meta.py::test_users_crud_and_password_rotation",
         "authenticate_token": "test_contract_meta.py::test_token_secret_hashed_at_rest_and_authenticates",
+        # durable ingest queue
+        "ingest_record": "test_ingest_queue.py::test_record_persists_envelope_and_advances_seen_together",
+        "ingest_seen": "test_ingest_queue.py::test_seen_and_applied_are_independent_watermarks",
+        "ingest_watermarks": "test_ingest_queue.py::test_seen_and_applied_are_independent_watermarks",
+        "ingest_pending": "test_ingest_queue.py::test_applied_rows_are_skipped_by_pending",
+        "ingest_apply": "test_ingest_queue.py::test_apply_writes_marker_and_pool_credit_in_one_transaction",
+        "ingest_prune": "test_ingest_queue.py::test_prune_bounds_terminal_rows_but_keeps_watermarks",
     },
     "Embedder": {
         "capabilities": "test_contract_embed.py::test_capabilities",
@@ -160,6 +167,6 @@ COVERAGE: dict[str, dict[str, str]] = {
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
     "GraphStore": 28,
-    "MetaStore": 43,
+    "MetaStore": 49,
     "Embedder": 3,
 }
