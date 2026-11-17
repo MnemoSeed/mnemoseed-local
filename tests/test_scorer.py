@@ -7,6 +7,8 @@ F3, with valence restricted to the cues field and the importance_hint max-merge.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 
 from mnemoseed_local.capture.scorer import (
@@ -17,6 +19,7 @@ from mnemoseed_local.capture.scorer import (
 )
 from mnemoseed_local.schema.turn import HostId, Turn, TurnRole, TurnStep
 from mnemoseed_local.storage.drivers.synthetic_embedder import SyntheticEmbedder
+from mnemoseed_local.storage.ports import Capability, EmbeddingResult
 
 
 def _turn(text: str, *, index: int = 0, profile: str = "prof-main") -> Turn:
@@ -307,3 +310,75 @@ def test_score_bounds_and_result_shape() -> None:
     assert 0.0 <= result.importance <= 10.0
     assert result.turn.turn_index == 0
     assert result.durability.confidence <= 1.0
+
+
+# ---------------------------------------------------------------- embedding memo
+
+
+class _CountingEmbedder:
+    """Deterministic embedder that counts every embed call per text."""
+
+    info = SyntheticEmbedder.info
+    dimension = 64
+
+    def __init__(self) -> None:
+        self._inner = SyntheticEmbedder()
+        self.counts: dict[str, int] = {}
+
+    def capabilities(self) -> frozenset[Capability]:
+        return self._inner.capabilities()
+
+    def embed(self, text: str) -> EmbeddingResult:
+        self.counts[text] = self.counts.get(text, 0) + 1
+        return self._inner.embed(text)
+
+    def embed_batch(self, texts: Sequence[str]) -> list[EmbeddingResult]:
+        return [self.embed(text) for text in texts]
+
+
+def test_recent_window_texts_embed_exactly_once() -> None:
+    embedder = _CountingEmbedder()
+    scorer = TurnScorer(embedder=embedder)
+    scorer.score_turn(_turn("第一轮的窗口文本"))
+    scorer.score_turn(_turn("第二轮的窗口文本"), recent_texts=["第一轮的窗口文本"])
+    scorer.score_turn(
+        _turn("第三轮的窗口文本"),
+        recent_texts=["第一轮的窗口文本", "第二轮的窗口文本"],
+    )
+    assert embedder.counts["第一轮的窗口文本"] == 1
+    assert embedder.counts["第二轮的窗口文本"] == 1
+    assert embedder.counts["第三轮的窗口文本"] == 1
+
+
+def test_reused_scorer_scores_identically_to_a_cold_scorer() -> None:
+    """A memo hit serves exactly the vector the embedder computes: every score
+    of a long-lived scorer equals a fresh scorer's score, turn for turn."""
+    steps: list[tuple[str, tuple[str, ...]]] = [
+        ("第一轮的窗口文本", ()),
+        ("第二轮的窗口文本", ("第一轮的窗口文本",)),
+        ("第三轮的窗口文本", ("第一轮的窗口文本", "第二轮的窗口文本")),
+        ("第一轮的窗口文本", ("第三轮的窗口文本",)),
+    ]
+    reused = TurnScorer(embedder=SyntheticEmbedder())
+    warm = [reused.score_turn(_turn(text), recent_texts=recent) for text, recent in steps]
+    cold = [
+        TurnScorer(embedder=SyntheticEmbedder()).score_turn(_turn(text), recent_texts=recent)
+        for text, recent in steps
+    ]
+    assert warm == cold
+
+
+def test_embed_memo_holds_256_entries_with_fifo_eviction() -> None:
+    embedder = _CountingEmbedder()
+    scorer = TurnScorer(embedder=embedder)
+    payloads = [f"window payload {i}" for i in range(300)]
+    scorer.score_turn(_turn(payloads[50]), recent_texts=payloads)
+    # the priming call inserts 300 distinct texts; a 256-entry first-in-first-out
+    # memo keeps payloads[43] resident and drops payloads[42] / payloads[50]
+    scorer.score_turn(_turn(payloads[60]), recent_texts=[payloads[43]])
+    assert embedder.counts[payloads[60]] == 1
+    assert embedder.counts[payloads[43]] == 1
+    scorer.score_turn(_turn(payloads[60]), recent_texts=[payloads[42]])
+    assert embedder.counts[payloads[42]] == 2
+    scorer.score_turn(_turn(payloads[60]), recent_texts=[payloads[50]])
+    assert embedder.counts[payloads[50]] == 2
