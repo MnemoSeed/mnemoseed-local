@@ -781,6 +781,6 @@ def test_default_config_documented_defaults() -> None:
     assert config.min_decay == 0.4
     assert config.weight_semantic == 1.0
     assert config.weight_cue_overlap == 1.0
-    assert config.weight_decay == 0.8
+    assert config.weight_decay == 0.2
     assert config.weight_centrality == 0.5
     assert config.centrality_saturation == 8

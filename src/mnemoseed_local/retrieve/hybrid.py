@@ -94,7 +94,7 @@ class HybridConfig:
 
     weight_semantic: float = 1.0
     weight_cue_overlap: float = 1.0
-    weight_decay: float = 0.8
+    weight_decay: float = 0.2
     weight_centrality: float = 0.5
     min_decay: float = 0.4
     rescue_min_decay: float = DEFAULT_RECALL_RESCUE_FLOOR
@@ -149,6 +149,7 @@ class HybridRecall:
     vector_hits: int
     graph_hits: int
     cooccurrence_term: bool = False
+    floor_dropped: int = 0
 
 
 # ---------------------------------------------------------------- engine
@@ -219,14 +220,16 @@ class HybridRetriever:
             graph_store,
             config,
         )
+        vector_candidates, floor_dropped = vector_future.result()
         return _merge(
-            vector_future.result(),
+            vector_candidates,
             graph_future.result(),
             activation_snapshot=activation_snapshot,
             profile_id=profile_id,
             session_id=session_id,
             now=now,
             config=config,
+            floor_dropped=floor_dropped,
         )
 
     def _recall_sequential(
@@ -249,11 +252,11 @@ class HybridRetriever:
         """
         config = self._config
         query = cues.cues
-        vector_candidates = self._vector_track(
+        vector_candidates, floor_dropped = self._vector_track(
             query_text, query, profile_id, vector_store, embedder, config, now
         )
         graph_candidates = self._graph_track(query, profile_id, graph_store, config)
-        return _merge(vector_candidates, graph_candidates, config=config)
+        return _merge(vector_candidates, graph_candidates, config=config, floor_dropped=floor_dropped)
 
     # ----------------------------------------------------------- vector track
 
@@ -266,7 +269,7 @@ class HybridRetriever:
         embedder: Embedder,
         config: HybridConfig,
         now: float | None = None,
-    ) -> list[Candidate]:
+    ) -> tuple[list[Candidate], int]:
         entities = tuple(query.entities)
         embedding = embedder.embed(query_text)
         supports_filter = Capability.VECTOR_METADATA_FILTER in vector_store.capabilities()
@@ -295,6 +298,7 @@ class HybridRetriever:
             config.vector_top_k,
         )
         candidates: list[Candidate] = []
+        floor_dropped = 0
         for hit in hits:
             chunk = hit.chunk
             rescued = False
@@ -337,7 +341,7 @@ class HybridRetriever:
                     expired_window=evaluate_temporal(chunk.text, now).expired_window,
                 )
             )
-        return candidates
+        return candidates, floor_dropped
 
     # ------------------------------------------------------------ graph track
 
@@ -426,6 +430,7 @@ def _merge(
     session_id: str | None = None,
     now: float | None = None,
     config: HybridConfig | None = None,
+    floor_dropped: int = 0,
 ) -> HybridRecall:
     """Fuse both track pools into one order-insensitive ranked recall."""
     merged_candidates = [*vector_candidates, *graph_candidates]
@@ -445,6 +450,7 @@ def _merge(
         candidates=merged,
         vector_hits=len(vector_candidates),
         graph_hits=len(graph_candidates),
+        floor_dropped=floor_dropped,
     )
 
 

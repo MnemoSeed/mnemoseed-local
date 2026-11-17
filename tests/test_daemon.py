@@ -454,6 +454,23 @@ def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
         assert recall["memory"]["entries"], recall
 
 
+def test_recall_empty_payload_reports_honest_contract(config_path: Path) -> None:
+    """A profile with no serving candidates returns the empty result as data:
+    entries empty, budget intact, no usage, and the floor accounting verbatim."""
+    with _boot(config_path) as client:
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "nothing was ever stored", "top_k": 5},
+        ).json()
+        memory = recall["memory"]
+        assert memory["entries"] == []
+        assert memory["dropped_count"] == 0
+        assert memory["tokens_used"] == 0
+        assert memory["budget_tokens"] == 800
+        assert memory["coverage"]["vector_hits"] == 0
+        assert memory["coverage"]["floor_dropped"] == 0
+
+
 def test_capture_stamps_epoch_domain_timestamps(config_path: Path) -> None:
     """D3 serving-surface assertion: a turn drained through the daemon must
     land epoch-domain ``ingested_at`` so the decay sweeper's epoch baseline

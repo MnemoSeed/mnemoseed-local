@@ -203,6 +203,29 @@ def test_call_recall_passes_arguments_and_returns_payload_json() -> None:
     assert client.calls == [("/memory/recall", {"profile_id": "default", "query": "x", "top_k": 3})]
 
 
+def test_call_recall_serializes_empty_result_without_crashing() -> None:
+    payload = {
+        "memory": {
+            "entries": [],
+            "dropped_count": 0,
+            "tokens_used": 0,
+            "budget_tokens": 800,
+            "coverage": {"vector_hits": 0, "graph_hits": 0, "floor_dropped": 3},
+        }
+    }
+    client = StubClient(payload=payload)
+    _, responses = run_gateway(
+        [_request(3, "tools/call", {"name": "recall", "arguments": {"query": "x"}})],
+        client,
+    )
+    result = responses[0]["result"]
+    assert result["isError"] is False
+    body = json.loads(result["content"][0]["text"])
+    assert body == payload
+    assert body["memory"]["entries"] == []
+    assert body["memory"]["coverage"]["floor_dropped"] == 3
+
+
 def test_call_recall_omits_top_k_when_absent() -> None:
     client = StubClient(payload={"memory": {"entries": []}})
     run_gateway(
