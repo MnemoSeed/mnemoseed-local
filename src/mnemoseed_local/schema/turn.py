@@ -104,6 +104,9 @@ class IngestEvent(BaseModel):
     # normalized from. The daemon skips ordinals at or below the session's
     # high watermark and echoes ack_ordinal on the 202.
     transcript_ordinal: int | None = Field(default=None, ge=0)
+    # Per-run id for transcript-differential hosts whose conversation spans
+    # multiple rollout files; absent keeps the watermark per session.
+    transcript_rollout_id: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from mnemoseed_local.hosts.common.zstd import require_zstandard
+from mnemoseed_local.util.rollout import rollout_run_id
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,13 @@ def iter_rollouts(root: Any) -> list[Path]:
     return sorted(
         path for pattern in ("*.jsonl.zst", "*.jsonl") for path in base.rglob(pattern) if path.is_file()
     )
+
+
+def rollout_id(path: Any) -> str | None:
+    """The run id from a rollout filename: its uuid, or the stem when absent."""
+    if not isinstance(path, (str, Path)) or not str(path).strip():
+        return None
+    return rollout_run_id(Path(path))
 
 
 def read_session_meta(path: Any) -> str | None:

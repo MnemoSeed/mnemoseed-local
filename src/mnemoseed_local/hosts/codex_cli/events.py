@@ -43,7 +43,7 @@ import sys
 import time
 from typing import Any
 
-from mnemoseed_local.hosts.codex_cli.transcript import TranscriptTurn, anchor_ordinal, read_turns
+from mnemoseed_local.hosts.codex_cli.transcript import TranscriptTurn, anchor_ordinal, read_turns, rollout_id
 from mnemoseed_local.hosts.common.daemon import (
     POST_TIMEOUT_SECONDS as POST_TIMEOUT_SECONDS,
 )
@@ -138,6 +138,7 @@ def _ingest_body(
         ts=time.time(),
         content=MessageContent(text=text, model_id=model_id),
         transcript_ordinal=ordinal,
+        transcript_rollout_id=rollout_id(payload.get("transcript_path")),
         raw=payload,
     )
 

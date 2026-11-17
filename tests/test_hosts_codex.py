@@ -132,6 +132,47 @@ def _payload_with(name: str, tmp_path: Path, turns: list[tuple[int, str, str]], 
     return payload
 
 
+RUN_A = "01a0f786-1111-4111-8111-111111111111"
+RUN_B = "7bd2c999-2222-4222-8222-222222222222"
+RESUMED_CONVERSATION = "conv-resume-395"
+
+
+def _write_named_rollout(path: Path, conversation_id: str, turns: list[tuple[int, str, str]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"session_id": conversation_id}})
+    path.write_text("\n".join([meta, *(_transcript_line(*turn) for turn in turns)]) + "\n", encoding="utf-8")
+    return path
+
+
+def _payload_for_rollout(name: str, path: Path, **overrides: object) -> dict:
+    payload = dict(_fixture(name))
+    payload["transcript_path"] = str(path)
+    payload.update(overrides)
+    return payload
+
+
+def _direct_ingest_body(
+    session_id: str,
+    text: str,
+    *,
+    ordinal: int | None,
+    rollout: str | None = None,
+    host: str = "codex_cli",
+) -> dict:
+    body: dict[str, Any] = {
+        "host": host,
+        "event": "user_prompt",
+        "session_id": session_id,
+        "profile_id": "default",
+        "ts": 0.0,
+        "content": {"text": text},
+        "transcript_ordinal": ordinal,
+    }
+    if rollout is not None:
+        body["transcript_rollout_id"] = rollout
+    return body
+
+
 # ---------------------------------------------------------------- daemon-under-test seam
 
 
@@ -653,6 +694,218 @@ def test_watermark_loss_replays_without_duplicates(
     assert stored == [0, 1, 2, 3], "replay filled the gap, no duplicates"
     settled = daemon.post("/session/end", json={"session_id": SESSION, "profile_id": "default"})
     assert settled.json()["turns"] == 1
+
+
+def test_resumed_run_ingests_its_own_ordinals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_posts: list[tuple[str, dict | None, dict]],
+    accepted: list[IngestEvent],
+    daemon: TestClient,
+) -> None:
+    """A rollout resumed after its predecessor settled still reaches the segmenter."""
+    rollout_a = _write_named_rollout(
+        tmp_path / f"rollout-2026-10-24T10-00-00-{RUN_A}.jsonl",
+        RESUMED_CONVERSATION,
+        [(0, "user", "第一问"), (1, "assistant", "第一答")],
+    )
+    rollout_b = _write_named_rollout(
+        tmp_path / f"rollout-2026-10-25T10-00-00-{RUN_B}.jsonl",
+        RESUMED_CONVERSATION,
+        [(0, "user", "第二问"), (1, "assistant", "第二答")],
+    )
+    session = RESUMED_CONVERSATION
+    assert (
+        _run(monkeypatch, _payload_for_rollout("user_prompt", rollout_a, session_id=session, prompt="第一问"))
+        == 0
+    )
+    assert _run(monkeypatch, _payload_for_rollout("stop", rollout_a, session_id=session)) == 0
+    settled_a = daemon.post("/session/end", json={"session_id": session, "profile_id": "default"})
+    assert settled_a.status_code == 200
+    assert (
+        _run(monkeypatch, _payload_for_rollout("user_prompt", rollout_b, session_id=session, prompt="第二问"))
+        == 0
+    )
+    assert _run(monkeypatch, _payload_for_rollout("stop", rollout_b, session_id=session)) == 0
+
+    resumed_ingests = [
+        (body, reply)
+        for path, body, reply in hook_posts
+        if path == "/ingest" and body and body.get("transcript_rollout_id") == RUN_B
+    ]
+    assert len(resumed_ingests) == 2
+    assert all(reply.get("status") == "accepted" for _, reply in resumed_ingests)
+    assert [event.transcript_ordinal for event in accepted] == [0, 1, 0, 1]
+    assert [(event.event.value, event.content.text) for event in accepted] == [
+        ("user_prompt", "第一问"),
+        ("assistant_message", "第一答"),
+        ("user_prompt", "第二问"),
+        ("assistant_message", "第二答"),
+    ]
+    ingests = [body for path, body, _ in hook_posts if path == "/ingest"]
+    assert [(body["session_id"], body["transcript_ordinal"]) for body in ingests] == [
+        (session, 0),
+        (session, 1),
+        (session, 0),
+        (session, 1),
+    ]
+    assert {body["transcript_rollout_id"] for body in ingests} == {RUN_A, RUN_B}
+    daemon.post("/session/end", json={"session_id": session, "profile_id": "default"})
+    assert not [key for key in daemon.app.state.memory._transcript_ordinals if key[1] == session]
+
+
+def test_resumed_run_first_prompt_anchor_is_not_deduped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_posts: list[tuple[str, dict | None, dict]],
+    accepted: list[IngestEvent],
+    daemon: TestClient,
+) -> None:
+    rollout_a = _write_named_rollout(
+        tmp_path / f"rollout-2026-10-24T10-00-00-{RUN_A}.jsonl",
+        RESUMED_CONVERSATION,
+        [
+            (0, "user", "旧问题"),
+            (1, "assistant", "旧答"),
+            (2, "user", "旧问题二"),
+            (3, "assistant", "旧答二"),
+        ],
+    )
+    rollout_b = _write_named_rollout(
+        tmp_path / f"rollout-2026-10-25T10-00-00-{RUN_B}.jsonl",
+        RESUMED_CONVERSATION,
+        [(0, "user", "新问题"), (1, "assistant", "新答")],
+    )
+    assert transcript.anchor_ordinal(transcript.read_turns(str(rollout_b)), "新问题") == 0
+
+    session = RESUMED_CONVERSATION
+    assert (
+        _run(monkeypatch, _payload_for_rollout("user_prompt", rollout_a, session_id=session, prompt="旧问题"))
+        == 0
+    )
+    assert _run(monkeypatch, _payload_for_rollout("stop", rollout_a, session_id=session)) == 0
+    assert (
+        _run(monkeypatch, _payload_for_rollout("user_prompt", rollout_b, session_id=session, prompt="新问题"))
+        == 0
+    )
+
+    prompts = [body for path, body, _ in hook_posts if path == "/ingest" and body["event"] == "user_prompt"]
+    assert prompts[-1]["transcript_ordinal"] == 0
+    resumed = [
+        event
+        for event in accepted
+        if isinstance(event.content, MessageContent) and event.content.text == "新问题"
+    ]
+    assert len(resumed) == 1
+    assert resumed[0].transcript_ordinal == 0
+
+
+def test_settled_rollout_does_not_block_resumed_rollout(daemon: TestClient) -> None:
+    """A settle seals one rollout, not the session id shared by later runs."""
+    session = "cx-resume-ordinals"
+    first = _direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+    assert daemon.post("/ingest", json=first).status_code == 202
+    settle = daemon.post("/session/end", json={"session_id": session, "profile_id": "default"})
+    assert settle.status_code == 200
+    assert settle.json()["turns"] == 1
+
+    resumed = _direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+    response = daemon.post("/ingest", json=resumed)
+    assert response.status_code == 202, response.text
+    assert response.json()["ack_ordinal"] == 0
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+
+def test_late_event_for_same_settled_rollout_is_rejected(daemon: TestClient) -> None:
+    """The settle stays terminal for the rollout it sealed, even after a resume."""
+    session = "cx-late-same-rollout"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    late = _direct_ingest_body(session, "late", ordinal=9, rollout=RUN_A)
+    assert daemon.post("/ingest", json=late).status_code == 409
+
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+    late_after_resume = _direct_ingest_body(session, "late-after", ordinal=10, rollout=RUN_A)
+    assert daemon.post("/ingest", json=late_after_resume).status_code == 409
+
+
+def test_late_event_for_middle_settled_rollout_is_rejected(daemon: TestClient) -> None:
+    """A rollout seen before settle is sealed even when it was not the first."""
+    session = "cx-late-middle-rollout"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "middle", ordinal=1, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    late = _direct_ingest_body(session, "late", ordinal=9, rollout=RUN_B)
+    assert daemon.post("/ingest", json=late).status_code == 409
+
+
+def test_reopen_rejects_foreign_profile_without_rebinding(daemon: TestClient) -> None:
+    """A resumed rollout from another profile cannot rebind a settled session."""
+    session = "cx-reopen-profile"
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "first", ordinal=0, rollout=RUN_A)
+        ).status_code
+        == 202
+    )
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    foreign = _direct_ingest_body(session, "foreign", ordinal=0, rollout=RUN_B)
+    foreign["profile_id"] = "other"
+    response = daemon.post("/ingest", json=foreign)
+    assert response.status_code == 409, response.text
+    assert "bound to profile 'default'" in response.text
+
+    assert (
+        daemon.post(
+            "/ingest", json=_direct_ingest_body(session, "resumed", ordinal=0, rollout=RUN_B)
+        ).status_code
+        == 202
+    )
+
+
+def test_host_without_rollout_id_still_seals_per_session(daemon: TestClient) -> None:
+    """Hosts that omit the rollout id keep whole-session sealing semantics."""
+    session = "cc-no-rollout"
+    first = _direct_ingest_body(session, "first", ordinal=0, host="claude_code")
+    assert daemon.post("/ingest", json=first).status_code == 202
+    assert (
+        daemon.post("/session/end", json={"session_id": session, "profile_id": "default"}).status_code == 200
+    )
+
+    again = _direct_ingest_body(session, "again", ordinal=1, host="claude_code")
+    response = daemon.post("/ingest", json=again)
+    assert response.status_code == 409
 
 
 def test_legacy_202_body_stays_byte_identical(daemon: TestClient) -> None:

@@ -200,6 +200,7 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     observability = _observability(request)
     config = getattr(request.app.state, "config", None)
     effective_profile = _effective_ingest_profile(event, config)
+    rollout_id = event.transcript_rollout_id
     if observability is not None:
         # B2.12: capture-hook activity (vs other actors) feeds the doctor's
         # registered-but-never-connected check; every sighting feeds the
@@ -226,14 +227,16 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
     if (
         event.transcript_ordinal is not None
         and memory is not None
-        and memory.transcript_ordinal_dedupes(effective_profile, event.session_id, event.transcript_ordinal)
+        and memory.transcript_ordinal_dedupes(
+            effective_profile, event.session_id, event.transcript_ordinal, rollout_id
+        )
     ):
         return {
             "status": "accepted",
             "session_id": event.session_id,
             "profile_id": event.profile_id,
             "event": event.event.value,
-            "ack_ordinal": memory.transcript_watermark(effective_profile, event.session_id),
+            "ack_ordinal": memory.transcript_watermark(effective_profile, event.session_id, rollout_id),
             "deduped": True,
         }
     try:
@@ -258,7 +261,7 @@ async def ingest(event: IngestEvent, request: Request) -> dict[str, Any]:
         if memory is not None:
             try:
                 ack_ordinal = memory.note_transcript_ordinal(
-                    effective_profile, event.session_id, event.transcript_ordinal
+                    effective_profile, event.session_id, event.transcript_ordinal, rollout_id
                 )
             except Exception:  # pragma: no cover - accounting must not fail ingest
                 logger.warning("transcript watermark bookkeeping failed", exc_info=True)
