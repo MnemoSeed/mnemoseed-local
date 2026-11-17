@@ -52,6 +52,9 @@ DEFAULT_PRESET = "embedded"
 DEFAULT_INSTANCE = "main"
 
 
+ROLE_ROUTE_REQUIRED_MESSAGE = "this role has no default route and must set both 'driver' and 'model'"
+
+
 class ConfigError(ValueError):
     """Config parse or resolution error with the offending key named."""
 
@@ -765,10 +768,7 @@ def load_config(path: Path | None = None) -> Config:
                 driver = _optional_driver(entry_table.get("driver"), f"{role_path}.driver")
                 model = _optional_driver(entry_table.get("model"), f"{role_path}.model")
                 if driver is None or model is None:
-                    raise ConfigError(
-                        role_path,
-                        "this role has no default route and must set both 'driver' and 'model'",
-                    )
+                    raise ConfigError(role_path, ROLE_ROUTE_REQUIRED_MESSAGE)
                 params = {k: v for k, v in entry_table.items() if k not in ("driver", "model")}
                 if "api_key_env" in params:
                     _validate_api_key_ref(role, params["api_key_env"])

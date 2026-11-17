@@ -572,6 +572,24 @@ def _refinement_state() -> RefinementStatus | None:
     )
 
 
+def _capability_lines(caps: dict[str, Any]) -> list[str]:
+    def is_ready(value: object) -> bool:
+        return isinstance(value, dict) and bool(value.get("ready"))
+
+    dream_value = caps.get("dream")
+    dream: dict[str, Any] = dream_value if isinstance(dream_value, dict) else {}
+    lines = [
+        "capabilities: capture={}, recall={}, dream={}".format(
+            "ready" if is_ready(caps.get("capture")) else "unavailable",
+            "ready" if is_ready(caps.get("recall")) else "unavailable",
+            "ready" if is_ready(dream) else "unavailable",
+        )
+    ]
+    if not is_ready(dream) and dream.get("detail"):
+        lines.append(f"dream unavailable: {dream['detail']}")
+    return lines
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from mnemoseed_local.rest_client import resolve_client
 
@@ -596,6 +614,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"dream auto_trigger: {config['dream']['auto_trigger']}")
     dream_driver = config.get("dream", {}).get("llm", {}).get("dream", {}).get("driver")
     print(f"dream llm driver:  {dream_driver if dream_driver else 'not configured'}")
+    for line in _capability_lines(health.get("capabilities", {})):
+        print(line)
     print(f"profile: {client.profile_id}")
     if refinement is None:
         print("refinement: unknown (the config could not be loaded)")
@@ -729,6 +749,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "'mnemoseed-local profile create <id>'; typo'd ids present as empty memory",
             )
         )
+    storage_ok = next((ok for name, ok, _ in checks if name == "storage"), False)
+    dream_ready, dream_detail = next(
+        ((ok, detail) for name, ok, detail in checks if name == "dream llm"),
+        (False, "not configured"),
+    )
+    for line in _capability_lines(
+        {
+            "capture": {"ready": storage_ok},
+            "recall": {"ready": storage_ok},
+            "dream": {"ready": dream_ready, "detail": dream_detail},
+        }
+    ):
+        print(line)
     return _doctor_report(checks, warnings)
 
 

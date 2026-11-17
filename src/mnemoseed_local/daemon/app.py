@@ -79,7 +79,7 @@ from mnemoseed_local.dream import (
     resume_boundary,
 )
 from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
-from mnemoseed_local.dream.readiness import DreamRouteReadiness
+from mnemoseed_local.dream.readiness import NO_ROUTE_DETAIL, DreamRouteReadiness
 from mnemoseed_local.llm import RoleRouter
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -260,6 +260,25 @@ class HealthSnapshot:
     gate_ok: bool
     degradations: list[dict[str, str]]
     hard_missing: list[dict[str, str]]
+
+
+def _capabilities_payload(snap: HealthSnapshot, readiness: DreamRouteReadiness | None) -> dict[str, Any]:
+    """Capability report: core memory is storage-gated, dream is route-gated."""
+    dream = readiness.status() if readiness is not None else None
+    if dream is None:
+        dream = {
+            "ready": False,
+            "driver": None,
+            "model": None,
+            "detail": NO_ROUTE_DETAIL,
+            "checked_at": None,
+        }
+    return {
+        "capture": {"ready": snap.gate_ok},
+        "recall": {"ready": snap.gate_ok},
+        "dream": dream,
+        "storage": {"ok": snap.gate_ok},
+    }
 
 
 def _issue_payload(issue: CapabilityIssue) -> dict[str, str]:
@@ -1328,6 +1347,7 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
                 "hard_missing": snap.hard_missing,
             },
             "dream_route": readiness.status() if readiness is not None else None,
+            "capabilities": _capabilities_payload(snap, readiness),
             "process_commit_mb": process_commit_mb(),
         }
 
