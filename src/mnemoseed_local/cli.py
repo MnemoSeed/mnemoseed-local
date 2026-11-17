@@ -1,7 +1,7 @@
 """mnemoseed-local CLI entry point (A2 MVP).
 
-Verbs: init / up / on / off / status / doctor / recall / remember / dream
-(--once, status) / forget / profile (create | list | archive | unarchive) /
+Verbs: init / up / on / off / status / doctor / recall / remember / import /
+dream (--once, status) / forget / profile (create | list | archive | unarchive) /
 config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
 hook (install | uninstall | status) / host (install | uninstall | status) /
 project (bind | run) / mcp (MCP stdio gateway) / instructions (--surface).
@@ -1789,6 +1789,13 @@ HOOK_HOSTS: dict[str, HostBinding] = {
     for host, module in ADAPTER_MODULES.items()
 }
 
+#: Hosts whose rollouts can be imported, mapped to the module exposing the
+#: transcript readers. The importer resolves the module through this registry
+#: and never imports a host module itself.
+IMPORT_SOURCES: dict[str, str] = {
+    "codex_cli": "mnemoseed_local.hosts.codex_cli.transcript",
+}
+
 
 def cmd_hook(args: argparse.Namespace) -> int:
     """Host hook management (design/01 §4.5).
@@ -2207,6 +2214,83 @@ def _client_error(exc: Exception) -> int:
     return 1
 
 
+def _import_progress(line: str) -> None:
+    print(line, file=sys.stderr)
+
+
+def _print_import_report(report: Any) -> None:
+    print(f"sessions_scanned: {report.sessions_scanned}")
+    print(f"sessions_imported: {report.sessions_imported}")
+    for reason in sorted(report.skipped):
+        print(f"skipped.{reason}: {report.skipped[reason]}")
+    print(f"turns_ingested: {report.turns_ingested}")
+    print(f"turns_deduped: {report.turns_deduped}")
+    print(f"new_chunk: {report.new_chunk}")
+    print(f"reinforced: {report.reinforced}")
+    print(f"needs_reconcile: {report.needs_reconcile}")
+    print(f"pool_points_suppressed: {report.pool_points_suppressed}")
+    print(f"elapsed_s: {report.elapsed_s:.2f}")
+
+
+def _import_base_url() -> str:
+    try:
+        return load_config().baseurl.rstrip("/")
+    except (ValueError, ConfigError):
+        return "http://localhost:7788"
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import historical rollouts into the configured profile."""
+    from mnemoseed_local.importer import runner
+    from mnemoseed_local.importer.ledger import ImportLedger
+
+    host = args.host
+    if host not in IMPORT_SOURCES:
+        print(f"error: unknown import host {host!r}", file=sys.stderr)
+        return 2
+    client: DaemonClient | None = None
+    try:
+        source = runner.load_source(host, IMPORT_SOURCES[host])
+        root = Path(args.source).expanduser() if args.source else Path(source.default_source).expanduser()
+        if not root.is_dir():
+            print(f"error: source directory does not exist: {root}", file=sys.stderr)
+            return 1
+        if not args.dry_run and not args.yes and not sys.stdin.isatty():
+            print(
+                "error: a long import needs confirmation in a non-interactive session (use --yes)",
+                file=sys.stderr,
+            )
+            return 1
+        if not args.dry_run and not args.yes:
+            answer = input(f"Import rollouts from {root} into profile {args.profile}? [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                return 1
+        if args.dry_run:
+            runner.preflight_zstandard()
+        else:
+            client = runner.build_client(_import_base_url(), args.profile)
+            runner.preflight(client)
+        report = runner.run_import(
+            source=source,
+            root=root,
+            profile_id=args.profile,
+            client=client,
+            ledger=ImportLedger(host),
+            limit=args.limit,
+            dry_run=args.dry_run,
+            progress=_import_progress,
+        )
+    except runner.ImportPreflightError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        return _client_error(exc)
+    if args.json:
+        return _emit_json(asdict(report))
+    _print_import_report(report)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mnemoseed-local",
@@ -2255,6 +2339,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_remember.add_argument("text")
     p_remember.add_argument("--baseurl", default=None)
     p_remember.add_argument("--json", action="store_true")
+
+    p_import = sub.add_parser("import", help="import a host's historical sessions into a profile")
+    p_import.add_argument("--host", required=True, choices=tuple(IMPORT_SOURCES), help="host to import from")
+    p_import.add_argument("--source", default=None, help="rollout root (default: the host's own location)")
+    p_import.add_argument("--profile", default=DEFAULT_PROFILE, help="profile namespace to write")
+    p_import.add_argument("--limit", type=int, default=None, help="import at most this many rollouts")
+    p_import.add_argument("--dry-run", action="store_true", help="enumerate and count turns without any POST")
+    p_import.add_argument("--json", action="store_true", help="emit the final report as JSON")
+    p_import.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
     p_dream = sub.add_parser("dream", help="manual consolidation: dream --once or dream status")
     dream_sub = p_dream.add_subparsers(dest="dream_command")
@@ -2431,6 +2524,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_recall(args)
     if args.command == "remember":
         return cmd_remember(args)
+    if args.command == "import":
+        return cmd_import(args)
     if args.command == "dream":
         return cmd_dream(args)
     if args.command == "forget":

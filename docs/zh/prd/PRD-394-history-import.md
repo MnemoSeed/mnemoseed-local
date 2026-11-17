@@ -95,7 +95,10 @@ settle 一个正在使用的会话会关掉它当前的 turn，后续 hook inges
 
 - 新增只读端点 `GET /session/active?profile_id=…` → `{"sessions": [...]}`，返回 segmenter 的缓冲会话集（`capture/pipeline.py:75` 的 `sessions()`）。
 - importer 对集合内的 rollout **跳过并报告** `skipped-active`，绝不 settle。
-- 这是尽力而为：尚未 ingest 过任何事件的活跃会话不在集合里。报告措辞不得声称"保证不碰活跃会话"。
+- 这是尽力而为，且比初稿更弱：`InMemoryCapturePipeline.sessions()` 反映的是 `submit_turn`，
+  只有轮次闭合才会触发；一个仍开着单个 user turn 的活跃会话**不在**集合里。尚未 ingest 过任何
+  事件的活跃会话同样不在集合里。缺席不能当作"不活跃"的证据，报告措辞不得声称"保证不碰活跃会话"，
+  只能表述为尽力而为检查。
 
 ### D7 进度与报告
 
@@ -148,7 +151,11 @@ importer/:  runner.py, ledger.py           # 不直接 import 任何 host 模块
 1. `tests/test_scorer.py` 里 `recent_texts` 的既有断言（签名不变，行为必须逐字节一致）；
 2. `SessionEndRequest` 的 wire 形状测试（缺省字段逐字节不变）；
 3. CLI 动词表快照测试（新增 `import`）；
-4. `skills/mnemoseed/SKILL.md` 的动词清单。
+4. `skills/mnemoseed/SKILL.md` 的动词清单；
+5. 冻结 HTTP 路由清单测试 `tests/test_dream_status_payload.py::test_external_surface_inventory_equals_frozen_baseline`
+   （S2 新增的 `/session/active` 已在基线里；S3/S4 不新增路由，必须保持绿）；
+6. `tests/test_sqlite_graph.py` / `tests/test_sqlite_meta.py` 的 autouse re-register fixture
+   （`test_registry.py::_clear_registries` 清空共享驱动注册表后重新注册），属于既有护栏，必须保持绿。
 
 ## 4. 验收标准
 
@@ -226,3 +233,26 @@ solution-architect 2026-11-16 裁定 **SHIP-WITH-ADJUSTMENTS**，四条调整与
 - 历史语料含明文密钥与宿主脚手架，逐字入库（§6）。
 
 批次内自发现的补充事实：`session_meta.session_id` 跨 rollout 复用、各文件序数从 0 重启，导致按对话 id 导入会丢整段——已并入 §D2 与 AC16，并另开 #395 记录在线路径的同源缺陷。
+
+### S3/S4 收口记录（#394）
+
+- **S3 落地**：新增 `src/mnemoseed_local/importer/{runner,ledger}.py`；`hosts/codex_cli/transcript.py`
+  增加 `iter_rollouts` / `read_session_meta` / `validate_rollout`，轮次解析继续复用唯一的 `read_turns`。
+  会话身份取 rollout 文件名的 run uuid，`session_meta.session_id` 仅作账本 lineage 元数据。
+  账本 `~/.mnemoseed-local/import-ledger-<host>.json` 原子写，只在 `/session/end` 返回 200 后推进，
+  续跑从 `settled_through_ordinal` 之后开始。客户端 `build_client` 用 `actor=cli` 与 900 s settle 预算；
+  压缩帧完整性、zstandard 与 daemon 可达性都在第一个 POST 前预检。
+- **S4 落地**：顶层 `import` 动词 + `IMPORT_SOURCES` 注册表（importer 不直接 import 宿主模块）；
+  `--dry-run` 零 HTTP 且报告 turn 数；进度走 stderr，最终报告走 stdout / `--json`。README 与
+  docs/guide 增加命令、续跑语义、逐字入库披露（明文密钥与宿主脚手架原样存储、不脱敏）以及
+  "导入不触发 dream，需自行 `dream --once`"的后果。
+- **修正一（HTTP surface）**：`pool_points_suppressed` 不另开端点，而是作为 additive 字段加在
+  **`POST /session/end` 的响应**上，与当次 settle 的 `new_chunk` / `reinforced` / `needs_reconcile`
+  增量一并返回；导入器从 settle 回复读取并计入报告。wire pin 见
+  `tests/test_credit_pool_suppression.py` 的两条 settle-response 断言。
+- **修正二（D6 措辞）**：活跃会话检查比原文更弱——`sessions()` 由 `submit_turn` 驱动，只覆盖已闭合
+  的轮次；单个仍开着的 user turn 不会进集合。报告只能称"尽力而为检查"，缺席不等于不活跃（D6 已改）。
+- **修正三（§3 pin 清单）**：补入冻结 HTTP 路由清单测试与 storage 的 autouse re-register fixture（§3 已补）。
+- **变异门禁**：AC-M1 dry-run 零 POST 且 turn 数与实际导入一致；AC-M2 账本只在 200 后前进；
+  AC-M3 `skipped-active` 与 `already-imported` 分账；AC-M4 settle 预算为 900 s 而非 hook 的 2 s；
+  均由 `tests/test_import_core.py` / `tests/test_import_cli.py` 钉住。

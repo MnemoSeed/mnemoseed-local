@@ -160,6 +160,43 @@ The local web console is served at the daemon root (default
 `http://localhost:7788/`). If nothing is captured, inspect host status, the
 Codex trust step where applicable, config-home consistency, and daemon logs.
 
+## Import historical sessions
+
+`mnemoseed-local import --host codex_cli` backfills rollouts that were created
+before hook capture was installed. One rollout file is one import session; the
+run uuid in its filename is the session id, while the conversation id in
+`session_meta` is kept only as lineage metadata.
+
+```
+mnemoseed-local import --host codex_cli [--source <dir>] [--profile <id>]
+                       [--limit N] [--dry-run] [--json] [--yes]
+```
+
+`--source` defaults to `~/.codex/sessions`; `--profile` defaults to `default`.
+`--dry-run` enumerates and counts turns without making any request. A long
+import asks for confirmation unless `--yes` is given (and refuses to run
+unattended without it). Progress lines go to stderr, the final report to
+stdout, and `--json` emits that report as JSON. The report reconciles
+`sessions_scanned`, `sessions_imported`, `skipped` by reason, `turns_ingested`,
+`turns_deduped`, `new_chunk`, `reinforced`, `needs_reconcile`,
+`pool_points_suppressed`, and `elapsed_s`.
+
+Resume is client-side: `~/.mnemoseed-local/import-ledger-<host>.json` records a
+rollout only after `/session/end` returned 200, together with the ordinal it
+settled through. Re-running after an interruption, a Ctrl-C, or a daemon
+restart continues past that ordinal; a completed rollout is reported as
+`already-imported` without new requests. Sessions the daemon currently holds
+in its capture buffer are reported as `skipped-active` and are never settled.
+That check is best-effort: a live session that has not closed a turn yet is not
+in the buffer and cannot be detected.
+
+Historical turns are stored verbatim. Codex records can contain plaintext
+secrets and injected host scaffolding such as `<environment_context>`; import
+does no redaction, so that content enters the profile as-is. Import also
+settles with pool credit disabled, so it produces no consolidation pressure
+and **does not trigger dreams**. Run `mnemoseed-local dream --once` yourself if
+you want consolidation of the imported material.
+
 ## Dream model setup
 
 Dreaming is optional and off until you bind a model: a fresh setup runs
