@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
-from mnemoseed_local.storage.ports import PoolState, TurnRange
+from mnemoseed_local.storage.ports import PoolCreditOp, PoolState, TurnRange
 
 if TYPE_CHECKING:
     from mnemoseed_local.config import Config
@@ -126,21 +126,35 @@ class ScorePool:
             return self._forced_cap
         return self._config.dream.pool_forced_cap
 
+    def _persist(
+        self,
+        op: PoolCreditOp,
+        ops_sink: list[PoolCreditOp] | None = None,
+    ) -> None:
+        if ops_sink is not None:
+            ops_sink.append(op)
+        elif self._backend is not None:
+            if op.kind == "credit":
+                self._backend.pool_credit(op.profile_id, op.balance, op.turn_range)
+            else:
+                self._backend.pool_drain(op.profile_id, op.turn_range)
+
     def add_points(
         self,
         profile_id: str,
         points: float,
         turn_range: TurnRange,
+        *,
+        ops_sink: list[PoolCreditOp] | None = None,
     ) -> tuple[PoolEvent, ...]:
         """Pool points for a profile; returns any events fired by this credit.
 
         ``points`` are the S value of one scored turn; ``turn_range`` bounds that
-        turn. Every state change mirrors into the optional backend: the new
-        balance persists first (ordinary credit), then a fired event moves the
-        whole gauge into the lifetime ledger with ONE atomic ``pool_drain``
-        before the sink is notified — persistence always completes before the
-        event is delivered, so a crash can leave points pending but never lets
-        a launched dream re-fire them.
+        turn. Every state change persists through :meth:`_persist`: the new
+        balance first (ordinary credit), then a fired event moves the whole
+        gauge into the lifetime ledger with one drain before the sink is
+        notified. An ``ops_sink`` collects the mutations instead of applying
+        them, so a caller can commit them atomically with another write.
         """
         with self._lock:
             ledger = self._ledgers.setdefault(profile_id, _Ledger())
@@ -160,8 +174,7 @@ class ScorePool:
             ledger.range_end = end
             ledger.last_add = now
 
-            if self._backend is not None:
-                self._backend.pool_credit(profile_id, accumulator, span)
+            self._persist(PoolCreditOp("credit", profile_id, accumulator, span), ops_sink)
 
             if self._event_gate is not None and not self._event_gate():
                 return ()
@@ -192,8 +205,7 @@ class ScorePool:
                 ledger.range_start = None
                 ledger.range_end = 0
                 ledger.last_add = None
-                if self._backend is not None:
-                    self._backend.pool_drain(profile_id, span)
+                self._persist(PoolCreditOp("drain", profile_id, accumulator, span), ops_sink)
                 if self._sink is not None:
                     self._sink(event)
                 return (event,)

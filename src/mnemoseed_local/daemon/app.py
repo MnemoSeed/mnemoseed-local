@@ -60,6 +60,8 @@ from mnemoseed_local.daemon.auth import (
 )
 from mnemoseed_local.daemon.idle_flush import IdleFlushSweeper
 from mnemoseed_local.daemon.ingest import router as ingest_router
+from mnemoseed_local.daemon.ingest_queue import IngestQueue
+from mnemoseed_local.daemon.ingest_recovery import queue_drain_fn, recover_pending
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
 from mnemoseed_local.daemon.observability import Observability
@@ -1144,6 +1146,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.dream_readiness,
     ) = _build_capture(stores, config, app.state.configwrite)
     app.state.segmenter = TurnSegmenter(app.state.capture)
+    app.state.ingest_queue = IngestQueue(stores.meta)
+    app.state.drain = queue_drain_fn(app.state.ingest_queue, app.state.capture)
+    # Durable replay runs before the idle sweeper can observe the restored
+    # segmenter state.
+    recover_pending(app.state.ingest_queue, app.state.segmenter, app.state.drain)
     # B6 (W-C): the drain lane runs WritingPipeline.drain off the event loop on
     # one dedicated daemon thread. Per-lifespan (drains are recoverable-critical,
     # unlike the never-closed scan singleton); teardown stops it before the
@@ -1154,7 +1161,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # semantics, no settle). The segmenter flush runs on the event loop; the
     # store drain rides the shared drain lane.
     app.state.idle_flush = IdleFlushSweeper(
-        app.state.segmenter, app.state.capture, config, lane=app.state.drain_lane
+        app.state.segmenter,
+        app.state.capture,
+        config,
+        lane=app.state.drain_lane,
+        drain_fn=app.state.drain,
     )
     app.state.idle_flush_task = asyncio.create_task(app.state.idle_flush.run_forever())
     # Dream chain thread (T1a): the capture/memory surface never blocks on a
@@ -1258,7 +1269,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("teardown: drain capture lane")
     segmenter = getattr(app.state, "segmenter", None)
     capture = getattr(app.state, "capture", None)
-    drain = getattr(capture, "drain", None)
+    drain = getattr(app.state, "drain", None)
     lane = getattr(app.state, "drain_lane", None)
     if segmenter is not None and drain is not None and capture is not None:
         segmenter.flush_all()

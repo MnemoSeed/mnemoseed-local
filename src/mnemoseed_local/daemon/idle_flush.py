@@ -60,6 +60,7 @@ class IdleFlushSweeper:
         config: Config,
         *,
         lane: DrainSubmitter | None = None,
+        drain_fn: Callable[[str], Any] | None = None,
         clock: Callable[[], float] | None = None,
         max_per_tick: int = MAX_SESSIONS_PER_TICK,
         tick_s: float = IDLE_FLUSH_TICK_S,
@@ -68,6 +69,7 @@ class IdleFlushSweeper:
         self._capture = capture
         self._config = config
         self._lane = lane
+        self._drain_fn = drain_fn
         self._clock = clock if clock is not None else time.time
         self._max_per_tick = max_per_tick
         self._tick_s = tick_s
@@ -124,7 +126,8 @@ class IdleFlushSweeper:
         keeping the failure ledger true — a success clears the retry flag, a
         failure sets it (the fire-and-forget lane never reports back)."""
         try:
-            self._capture.drain(session_id)
+            drain = self._drain_fn if self._drain_fn is not None else self._capture.drain
+            drain(session_id)
         except Exception:
             with self._failed_lock:
                 self._failed.add(session_id)

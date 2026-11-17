@@ -1,9 +1,9 @@
 """Client-side resume ledger for history imports.
 
-The daemon's watermark is in memory and is popped at settle, so the durable
-resume point lives here: one entry per rollout, advanced only after a 200 from
-``/session/end``. The conversation id is lineage metadata only — session
-identity is the run uuid in the rollout filename.
+This ledger keeps the client-side resume floor: one entry per rollout, advanced
+only after a 200 from ``/session/end``. The daemon persists its own seen/applied
+watermarks and absorbs re-posted ordinals. The conversation id is lineage
+metadata only — session identity is the run uuid in the rollout filename.
 """
 
 from __future__ import annotations

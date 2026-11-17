@@ -637,6 +637,9 @@ def test_meta_file_contains_only_meta_tables(tmp_path):
             "error_events",
             "reconcile_nominations",
             "reconciliation_attempts",
+            "ingest_events",
+            "ingest_watermarks",
+            "ingest_applied",
         }
         # v2/v5 are graph-only; v3/v4/v6/v7/v8/v9/v11/v12/v13/v14 are meta (identity chain
         # lands in v6, the profile archive flag in v7, the reserved
