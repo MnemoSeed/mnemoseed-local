@@ -59,6 +59,7 @@ def zc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     return tmp_path / ".zcode"
 
 
@@ -71,6 +72,7 @@ def captured_posts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
         calls.append((path, body or {}))
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -107,6 +109,7 @@ def _capture_pull(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tuple[
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -150,6 +153,7 @@ def _capture_recent(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tupl
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -466,6 +470,7 @@ def test_ingest_rejection_never_pulls(
             raise DaemonRestError(409, "already settled")
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert _run_transformer(monkeypatch, _fixture("user_prompt")) == 0
     assert [path for path, _ in calls] == ["/ingest"]
@@ -1122,6 +1127,7 @@ def test_installed_mcp_entry_spawns_a_working_gateway(
     )
     env = {k: v for k, v in os.environ.items() if k not in ENV_VARS}
     env["MNEMOSEED_LOCAL_HOME"] = str(tmp_path)
+    env["MNEMOSEED_LOCAL_BASEURL"] = "http://localhost:7788"
     proc = subprocess.Popen(
         [entry["command"], *entry["args"]],
         stdin=subprocess.PIPE,

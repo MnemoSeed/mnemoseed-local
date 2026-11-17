@@ -134,6 +134,7 @@ def test_missing_zstandard_message_names_codex_extra(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     root = tmp_path / "sessions"
     _write_rollout(root)
     monkeypatch.setattr(runner, "find_spec", lambda name: None)
@@ -163,6 +164,7 @@ def test_progress_on_stderr_report_on_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     root = tmp_path / "sessions"
     _write_rollout(root)
     _patch_client(monkeypatch, _FakeClient())

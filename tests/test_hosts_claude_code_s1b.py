@@ -53,6 +53,7 @@ def cc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     return tmp_path / ".claude"
 
 
@@ -116,6 +117,7 @@ def _capture_recent(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tupl
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -292,6 +294,7 @@ def test_session_start_pull_failure_stays_silent(
     def dead_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
         raise DaemonRestError(503, "daemon down")
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", dead_post)
     assert _run_transformer(monkeypatch, _SESSION_START_STDIN) == 0
     assert capsys.readouterr().out == ""

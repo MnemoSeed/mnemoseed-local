@@ -68,6 +68,7 @@ def cc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     return tmp_path / ".claude"
 
 
@@ -80,6 +81,7 @@ def captured_posts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
         calls.append((path, body or {}))
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -732,6 +734,7 @@ def test_session_end_uses_tight_per_phase_timeout_budget(monkeypatch: pytest.Mon
         seen["timeouts"] = seen.get("timeouts", []) + [kwargs.get("timeout")]
         return FakeResponse()
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr("mnemoseed_local.rest_client.httpx.post", fake_post)
     _feed_stdin(monkeypatch, {"session_id": "s1", "hook_event_name": "SessionEnd", "reason": "clear"})
     assert main(["_hook-event", "--host", "claude_code"]) == 0
@@ -903,6 +906,7 @@ def _capture_pull(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tuple[
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -1235,6 +1239,7 @@ def test_transformer_emits_additional_context_only_on_a_served_pull(
             return _pull_payload(budget_chars=200)
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert (
         _run_transformer(
@@ -1259,6 +1264,7 @@ def test_transformer_never_pulls_before_the_ingest_ack(
     def fake_post(self: DaemonClient, path: str, body: dict | None = None) -> dict:
         raise DaemonRestError(409, "already settled")
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert (
         _run_transformer(
@@ -1280,6 +1286,7 @@ def test_transformer_fail_open_when_pull_fails_keeps_stdout_empty(
             raise DaemonUnavailableError("daemon went away mid-pull")
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert (
         _run_transformer(
@@ -1499,6 +1506,7 @@ def test_transformer_emits_the_capture_only_payload_when_recall_is_disabled(
             return _pull_payload(enabled=False, items=[], visibility={"mode": "compact", "capture": True})
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert (
         _run_transformer(
@@ -1521,6 +1529,7 @@ def test_transformer_stays_silent_when_off_despite_a_pending_capture(
             return _pull_payload(enabled=False, items=[], visibility={"mode": "off", "capture": True})
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert (
         _run_transformer(

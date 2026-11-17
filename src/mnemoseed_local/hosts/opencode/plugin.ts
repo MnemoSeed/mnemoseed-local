@@ -83,8 +83,8 @@ const STALE_ENDPOINT_MESSAGE = "mnemoseed-local: daemon endpoint is stale; no cr
 
 // The daemon's per-start endpoint record gates every bearer-carrying fetch:
 // a cheap PID pre-filter, then the unauthenticated /healthz instance id. The
-// verification request deliberately carries no headers at all.
-let endpointResolution: Promise<string> | null = null
+// verification request deliberately carries no headers at all. It runs on each
+// call so a listener replaced between turns cannot reuse a stale result.
 
 async function verifyEndpoint(): Promise<string> {
   if (BASE_URL_OVERRIDE) {
@@ -95,8 +95,7 @@ async function verifyEndpoint(): Promise<string> {
   try {
     raw = await readFile(ENDPOINT_PATH, "utf8")
   } catch {
-    console.error("mnemoseed-local: no daemon endpoint record; instance verification skipped")
-    return BASE_URL
+    throw new Error("no daemon endpoint record")
   }
   const record = JSON.parse(raw) as Record<string, unknown>
   const pid = Number(record.pid)
@@ -116,13 +115,10 @@ async function verifyEndpoint(): Promise<string> {
 }
 
 function effectiveBaseUrl(): Promise<string> {
-  if (endpointResolution === null) {
-    endpointResolution = verifyEndpoint().catch((error: unknown) => {
-      console.error(STALE_ENDPOINT_MESSAGE + ":", error)
-      throw error
-    })
-  }
-  return endpointResolution
+  return verifyEndpoint().catch((error: unknown) => {
+    console.error(STALE_ENDPOINT_MESSAGE + ":", error)
+    throw error
+  })
 }
 
 // ---- B2.1 T1/T3 session-start recall injection + consumption guard. The

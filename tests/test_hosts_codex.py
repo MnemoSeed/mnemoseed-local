@@ -74,6 +74,7 @@ def cx_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CODEX_HOME", str(home))
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     return home
 
 
@@ -86,6 +87,7 @@ def captured_posts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
         calls.append((path, body or {}))
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -291,6 +293,7 @@ def _capture_pull(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tuple[
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -333,6 +336,7 @@ def _capture_recent(monkeypatch: pytest.MonkeyPatch, payload: dict) -> list[tupl
             return payload
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return calls
 
@@ -583,6 +587,7 @@ def test_ingest_rejection_never_pulls(
             raise DaemonRestError(409, "already settled")
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     turns = [(0, "user", "按模块梳理召回链路的测试盲区")]
     assert _run(monkeypatch, _payload_with("user_prompt", tmp_path, turns)) == 0
@@ -606,6 +611,7 @@ def test_differential_uses_the_first_ack_as_the_intra_process_floor(
             return {"ack_ordinal": 2}
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     assert _run(monkeypatch, _payload_with("stop", tmp_path, turns)) == 0
     ordinals = [body["transcript_ordinal"] for path, body in captured_posts if path == "/ingest"]

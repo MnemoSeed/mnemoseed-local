@@ -26,7 +26,7 @@ from mnemoseed_local.hosts.common.project_binding import (
     resolve_profile,
     roots_for_profile,
 )
-from mnemoseed_local.rest_client import DaemonClient, DaemonUnavailableError, client_for
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError, client_for
 
 #: Daemon base URL a hook posts to when no env override is set.
 DEFAULT_BASE_URL = "http://localhost:7788"
@@ -66,7 +66,7 @@ def resolve_base_url(*, verify: bool = False) -> str:
     raw = (override or DEFAULT_BASE_URL).rstrip("/")
     if not verify:
         return raw
-    return endpoint.resolve(raw, override=bool(override), allow_missing=True)
+    return endpoint.resolve(raw, override=bool(override))
 
 
 def profile_id() -> str:
@@ -286,23 +286,29 @@ def _spool(host: str, path: str, body: dict[str, Any]) -> None:
         _warn(f"hook outbox overflow: dropped {dropped} oldest turn(s) from {target}")
 
 
-def _flush_outbox() -> bool:
+def _flush_outbox(client: DaemonClient | None) -> bool:
     """Re-POST spooled turns in order; True only when the spool is fully drained."""
     target = outbox_path()
     entries = _read_outbox(target)
     if not entries:
         return True
-    try:
-        client = hook_client()
-    except Exception:  # noqa: BLE001 - still down or the endpoint is still stale
+    if client is None:
         return False
     remaining: list[dict[str, Any]] = []
+    dropped = 0
     for entry in entries:
         try:
             client.post(str(entry["path"]), entry["body"])
-        except Exception:  # noqa: BLE001 - keep the line for the next attempt
+        except DaemonRestError as exc:
+            if 400 <= exc.status < 500:
+                dropped += 1
+            else:
+                remaining.append(entry)
+        except Exception:  # noqa: BLE001 - keep the line for a later attempt
             remaining.append(entry)
     _write_outbox(target, remaining)
+    if dropped:
+        _warn(f"hook outbox dropped {dropped} non-retryable line(s) from {target}")
     return not remaining
 
 
@@ -321,7 +327,7 @@ def post_capture(
     re-raises so the host's fire-and-forget guard aborts the lane (no T2 pull
     on a failed ingest). No retries are added.
     """
-    if not _flush_outbox():
+    if not _flush_outbox(client):
         _spool(host, path, body)
         raise DaemonUnavailableError(f"{host} {path} spooled; daemon unreachable")
     if client is None:

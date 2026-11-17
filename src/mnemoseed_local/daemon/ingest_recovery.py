@@ -57,21 +57,23 @@ def queue_drain_fn(
         streams: dict[IngestStream, list[Any]] = {}
         for record in pending:
             streams.setdefault(record.stream, []).append(record)
-        profiles = {op.profile_id for op in credit_ops}
-        for record in pending:
-            profiles.add(record.profile_id)
-        for profile_id in profiles:
-            matched = [
-                (stream, records) for stream, records in streams.items() if stream.profile_id == profile_id
-            ]
-            stream = matched[0][0] if matched else IngestStream(profile_id, session_id, "")
+        credited_profiles: set[str] = set()
+        for stream, records in streams.items():
             applications = tuple(
-                IngestAppliedEvent(record.event_id, record.ordinal, 0.0)
-                for _, records in matched
-                for record in records
+                IngestAppliedEvent(record.event_id, record.ordinal, 0.0) for record in records
             )
-            credits = tuple(op for op in credit_ops if op.profile_id == profile_id)
+            credits: tuple[PoolCreditOp, ...] = ()
+            if stream.profile_id not in credited_profiles:
+                credits = tuple(op for op in credit_ops if op.profile_id == stream.profile_id)
+                credited_profiles.add(stream.profile_id)
             queue.apply(stream, applications, credits=credits, at=time.time())
+        for profile_id in {op.profile_id for op in credit_ops} - credited_profiles:
+            queue.apply(
+                IngestStream(profile_id, session_id, ""),
+                (),
+                credits=tuple(op for op in credit_ops if op.profile_id == profile_id),
+                at=time.time(),
+            )
         return outcomes
 
     return drain

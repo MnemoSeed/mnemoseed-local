@@ -17,7 +17,7 @@ import pytest
 
 from mnemoseed_local import config as config_mod
 from mnemoseed_local.hosts.common import daemon as hook_daemon
-from mnemoseed_local.rest_client import DaemonClient, DaemonUnavailableError
+from mnemoseed_local.rest_client import DaemonClient, DaemonRestError, DaemonUnavailableError
 
 
 @pytest.fixture
@@ -181,6 +181,47 @@ def test_age_pruning_drops_stale_lines(outbox_home: Path, monkeypatch: pytest.Mo
     )
     _post(_client(), "/ingest", {"ordinal": 2}, host="zcode")
     assert [entry["body"]["ordinal"] for entry in _lines(outbox_home)] == [1, 2]
+
+
+def test_permanent_4xx_line_cannot_block_the_live_turn(
+    outbox_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delivered: list[int] = []
+    poison = {"ts": time.time(), "host": "opencode", "path": "/ingest", "body": {"ordinal": 99}}
+
+    def scripted(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        if int((body or {}).get("ordinal", -1)) == 99:
+            raise DaemonRestError(422, "permanent rejection")
+        delivered.append(int((body or {}).get("ordinal", -1)))
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", scripted)
+    (outbox_home / hook_daemon.OUTBOX_FILENAME).write_text(json.dumps(poison) + "\n", encoding="utf-8")
+
+    assert hook_daemon.post_capture(_client(), "/ingest", {"ordinal": 100}, host="opencode") == {}
+    assert delivered == [100], "the live turn must be posted, not spooled behind the poison line"
+    assert _lines(outbox_home) == [], "the non-retryable line is dropped"
+    err = capsys.readouterr().err.lower()
+    assert "unreachable" not in err, "a healthy daemon must not be reported as unreachable"
+
+    hook_daemon.post_capture(_client(), "/ingest", {"ordinal": 101}, host="opencode")
+    assert delivered == [100, 101], "the next turn is also live-ACKed"
+
+
+def test_5xx_line_stays_queued_for_retry(outbox_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    poison = {"ts": time.time(), "host": "opencode", "path": "/ingest", "body": {"ordinal": 55}}
+
+    def scripted(self: DaemonClient, path: str, body: dict | None = None) -> dict:
+        if int((body or {}).get("ordinal", -1)) == 55:
+            raise DaemonRestError(503, "try later")
+        return {}
+
+    monkeypatch.setattr(DaemonClient, "post", scripted)
+    (outbox_home / hook_daemon.OUTBOX_FILENAME).write_text(json.dumps(poison) + "\n", encoding="utf-8")
+
+    with pytest.raises(DaemonUnavailableError):
+        hook_daemon.post_capture(_client(), "/ingest", {"ordinal": 56}, host="opencode")
+    assert [e["body"]["ordinal"] for e in _lines(outbox_home)] == [55, 56]
 
 
 # ---------------------------------------------------------------- host routing

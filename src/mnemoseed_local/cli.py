@@ -2249,6 +2249,9 @@ def _client_error(exc: Exception) -> int:
         base_url = getattr(exc, "base_url", "the daemon")
         print(f"error: {DAEMON_DOWN_HINT.format(base_url=base_url)} ({exc})", file=sys.stderr)
         return 1
+    if isinstance(exc, endpoint.StaleEndpointError):
+        print(f"error: {exc}; {DAEMON_DOWN_HINT.format(base_url='the daemon')}", file=sys.stderr)
+        return 1
     print(f"error: {exc}", file=sys.stderr)
     return 1
 
@@ -2274,12 +2277,12 @@ def _print_import_report(report: Any) -> None:
 def _import_base_url() -> str:
     override = (os.environ.get("MNEMOSEED_LOCAL_BASEURL") or "").strip().rstrip("/")
     if override:
-        return endpoint.resolve(override, override=True, allow_missing=True)
+        return endpoint.resolve(override, override=True)
     try:
         config_base = load_config().baseurl.rstrip("/")
     except ValueError, ConfigError:
         config_base = "http://localhost:7788"
-    return endpoint.resolve(config_base, allow_missing=True)
+    return endpoint.resolve(config_base)
 
 
 def cmd_import(args: argparse.Namespace) -> int:

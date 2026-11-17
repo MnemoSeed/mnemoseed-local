@@ -177,7 +177,6 @@ def resolve_client(args: Any, *, require_session: bool = False) -> DaemonClient:
     base_url = endpoint.resolve(
         arg_base or env_base or config_base.rstrip("/"),
         override=override,
-        allow_missing=True,
     )
     profile_id = os.environ.get("MNEMOSEED_LOCAL_PROFILE_ID") or DEFAULT_PROFILE_ID
     if require_session and not profile_id:

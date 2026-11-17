@@ -195,6 +195,7 @@ def _record_posts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, 
         posts.append((path, body or {}))
         return {}
 
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr(DaemonClient, "post", fake_post)
     return posts
 

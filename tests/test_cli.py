@@ -1347,6 +1347,7 @@ class _FakeProfileDaemon:
 
 def _mock_profile_daemon(monkeypatch: pytest.MonkeyPatch) -> _FakeProfileDaemon:
     daemon = _FakeProfileDaemon(base_url="http://localhost:7788")
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     monkeypatch.setattr("mnemoseed_local.rest_client.DaemonClient", lambda **kwargs: daemon)
     return daemon
 

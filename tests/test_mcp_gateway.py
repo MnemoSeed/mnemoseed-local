@@ -619,7 +619,8 @@ def test_eof_exits_cleanly() -> None:
 # ---------------------------------------------------------------- client seam
 
 
-def test_build_client_marks_actor_mcp() -> None:
+def test_build_client_marks_actor_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     client = server.build_client()
     assert client.actor == "mcp"
     assert client.profile_id

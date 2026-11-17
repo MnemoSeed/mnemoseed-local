@@ -14,6 +14,13 @@ if (!bundle || !scenario) {
   process.exit(64)
 }
 
+// Behavior scenarios predate the endpoint handshake and rely on the explicit
+// base-URL override, which skips verification. Endpoint scenarios leave it
+// unset so they exercise the handshake itself.
+if (!scenario.startsWith("endpoint-") && !process.env.MNEMOSEED_LOCAL_BASEURL) {
+  process.env.MNEMOSEED_LOCAL_BASEURL = "http://localhost:7788"
+}
+
 // provider-failure scenarios consume the committed synthetic bus_event
 // fixtures; the runner passes the directory explicitly so nothing depends on
 // cwd or machine paths.
@@ -97,6 +104,21 @@ function captureErrors() {
     seen.push(args.map(String).join(" "))
   }
   return { seen, restore: () => { console.error = original } }
+}
+
+async function seedEndpoint(instanceId) {
+  await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+  await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+  await writeFile(
+    ENDPOINT_PATH,
+    JSON.stringify({
+      pid: process.pid,
+      instance_id: instanceId,
+      base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
+      started_at: Date.now() / 1000,
+    }),
+    "utf8",
+  )
 }
 
 const SES = "sess-behavior"
@@ -3258,18 +3280,7 @@ async function main() {
     }
 
     case "endpoint-stale": {
-      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
-      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
-      await writeFile(
-        ENDPOINT_PATH,
-        JSON.stringify({
-          pid: process.pid,
-          instance_id: TEST_INSTANCE,
-          base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
-          started_at: Date.now() / 1000,
-        }),
-        "utf8",
-      )
+      await seedEndpoint(TEST_INSTANCE)
       servedInstance = "forged-instance"
       await fire.prompt({ sessionID: "sess-stale", messageID: "m_stale_1", prompt: { text: "stale turn" } })
       await delay(200)
@@ -3282,19 +3293,50 @@ async function main() {
     }
 
     case "endpoint-valid": {
+      await seedEndpoint(TEST_INSTANCE)
+      await fire.prompt({ sessionID: "sess-valid", messageID: "m_valid_1", prompt: { text: "fresh turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-rotated": {
+      await seedEndpoint(TEST_INSTANCE)
+      await fire.prompt({ sessionID: "sess-rotated", messageID: "m_rot_1", prompt: { text: "first turn" } })
+      await delay(200)
+      servedInstance = "forged-instance"
+      await fire.prompt({ sessionID: "sess-rotated", messageID: "m_rot_2", prompt: { text: "second turn" } })
+      await delay(200)
+      console.log(
+        JSON.stringify({
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
+        }),
+      )
+      break
+    }
+
+    case "endpoint-record-missing": {
       await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
       await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
-      await writeFile(
-        ENDPOINT_PATH,
+      await fire.prompt({ sessionID: "sess-no-record", messageID: "m_nr_1", prompt: { text: "no record turn" } })
+      await delay(200)
+      console.log(
         JSON.stringify({
-          pid: process.pid,
-          instance_id: TEST_INSTANCE,
-          base_url: process.env.MNEMOSEED_LOCAL_BASEURL || "http://localhost:7788",
-          started_at: Date.now() / 1000,
+          posts: posts.map((post) => ({ url: post.url, headers: post.headers })),
         }),
-        "utf8",
       )
-      await fire.prompt({ sessionID: "sess-valid", messageID: "m_valid_1", prompt: { text: "fresh turn" } })
+      break
+    }
+
+    case "endpoint-record-malformed": {
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      await writeFile(ENDPOINT_PATH, "{not-json", "utf8")
+      await fire.prompt({ sessionID: "sess-bad-record", messageID: "m_br_1", prompt: { text: "bad record turn" } })
       await delay(200)
       console.log(
         JSON.stringify({
