@@ -755,7 +755,7 @@ def _opencode_mcp_registered(path: Path) -> bool:
     anything — quiet False, never an error."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return False
     mcp = data.get("mcp") if isinstance(data, dict) else None
     entry = mcp.get("mnemoseed") if isinstance(mcp, dict) else None
@@ -796,7 +796,7 @@ def _mnemoseed_mcp_entry(path: Path) -> object | None:
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     mcp = data.get("mcp") if isinstance(data, dict) else None
     if not isinstance(mcp, dict):
@@ -914,7 +914,7 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
         )
     try:
         num_ctx = int(num_ctx_raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return (
             "dream ctx window",
             False,
@@ -923,7 +923,7 @@ def _dream_ctx_window_check(config: Config) -> tuple[str, bool, str]:
     num_predict_raw = params.get("num_predict", DREAM_MARGIN_TOKENS_DEFAULT)
     try:
         margin = int(num_predict_raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return (
             "dream ctx window",
             False,
@@ -1068,7 +1068,7 @@ def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
             )
         try:
             num_ctx = int(num_ctx_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return ("verifier ctx window", False, f"num_ctx must be an integer, got {num_ctx_raw!r}")
         from mnemoseed_local.dream.delta import estimate_tokens
         from mnemoseed_local.dream.verify import VERIFY_MARGIN_TOKENS, build_verify_prefix
@@ -1112,7 +1112,7 @@ def _verifier_ctx_window_check(config: Config) -> tuple[str, bool, str]:
         )
     try:
         num_ctx = int(num_ctx_raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return ("verifier ctx window", False, f"num_ctx must be an integer, got {num_ctx_raw!r}")
     from mnemoseed_local.dream.delta import estimate_tokens
     from mnemoseed_local.dream.verify import VERIFY_MARGIN_TOKENS, build_verify_prefix
@@ -1284,7 +1284,7 @@ def _task_script_paths() -> tuple[Path, Path] | None:
         bootstrap_path = Path(str(packaged / "windows-logon.ps1"))
         if task_path.is_file() and bootstrap_path.is_file():
             return task_path, bootstrap_path
-    except (ImportError, OSError, TypeError):
+    except ImportError, OSError, TypeError:
         pass
     return None
 
@@ -1962,7 +1962,7 @@ def _host_write_guidance(host: str, exc: OSError | ConfigParseError) -> str | No
     try:
         target = config_path().resolve()
         on_config = any(Path(value).resolve() == target for value in carried)
-    except (OSError, ValueError, ConfigParseError):
+    except OSError, ValueError, ConfigParseError:
         return None
     return hint if on_config else None
 
@@ -1978,7 +1978,7 @@ def cmd_host(args: argparse.Namespace) -> int:
     """
     try:
         entry = _host_lifecycle(args.host, args.host_command)
-    except (ModuleNotFoundError, LookupError):
+    except ModuleNotFoundError, LookupError:
         print(f"mnemoseed-local: not implemented yet for host {args.host}", file=sys.stderr)
         return 1
     try:
@@ -2109,7 +2109,7 @@ def _capture_window() -> float:
 
     try:
         return load_config().capture.idle_flush_sec
-    except (ConfigError, ValueError):
+    except ConfigError, ValueError:
         return DEFAULT_CAPTURE_IDLE_FLUSH_SEC
 
 
@@ -2235,7 +2235,7 @@ def _print_import_report(report: Any) -> None:
 def _import_base_url() -> str:
     try:
         return load_config().baseurl.rstrip("/")
-    except (ValueError, ConfigError):
+    except ValueError, ConfigError:
         return "http://localhost:7788"
 
 

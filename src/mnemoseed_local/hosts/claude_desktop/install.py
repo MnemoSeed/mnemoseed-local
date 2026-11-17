@@ -329,7 +329,7 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     target = path or config_path()
     try:
         data = load_object(target)
-    except (ConfigParseError, OSError):
+    except ConfigParseError, OSError:
         state = "unreadable"
     else:
         servers = data.get(MCP_KEY)

@@ -1522,7 +1522,7 @@ def _contains_float(value: Any) -> bool:
 def _is_uuid4(value: str) -> bool:
     try:
         parsed = uuid.UUID(value)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return False
     return parsed.version == 4
 

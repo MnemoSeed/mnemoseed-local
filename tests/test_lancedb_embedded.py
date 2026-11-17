@@ -352,21 +352,21 @@ class _LimitSpy:
         self._limits = limits
         self._record = record
 
-    def where(self, *args: Any, **kwargs: Any) -> "_LimitSpy":
+    def where(self, *args: Any, **kwargs: Any) -> _LimitSpy:
         self._query = self._query.where(*args, **kwargs)
         return self
 
-    def metric(self, *args: Any, **kwargs: Any) -> "_LimitSpy":
+    def metric(self, *args: Any, **kwargs: Any) -> _LimitSpy:
         self._query = self._query.metric(*args, **kwargs)
         return self
 
-    def limit(self, n: int) -> "_LimitSpy":
+    def limit(self, n: int) -> _LimitSpy:
         if self._record:
             self._limits.append(n)
         self._query = self._query.limit(n)
         return self
 
-    def offset(self, n: int) -> "_LimitSpy":
+    def offset(self, n: int) -> _LimitSpy:
         self._query = self._query.offset(n)
         return self
 

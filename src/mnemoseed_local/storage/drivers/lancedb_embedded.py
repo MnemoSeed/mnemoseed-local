@@ -739,7 +739,7 @@ class LanceDbEmbeddedStore:
             return []
         try:
             parsed = json.loads(raw)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return []
         return parsed if isinstance(parsed, list) else []
 
@@ -757,7 +757,7 @@ class LanceDbEmbeddedStore:
         detail_raw = event.get("detail") or "{}"
         try:
             detail = json.loads(detail_raw)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             detail = {}
         return {
             "at": float(event.get("at", 0.0)),

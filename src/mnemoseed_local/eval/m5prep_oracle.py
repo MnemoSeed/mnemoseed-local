@@ -209,7 +209,7 @@ def validate_inputs_schema(inputs_bytes: bytes) -> list[str]:
     problems: list[str] = []
     try:
         doc: Any = json.loads(inputs_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except UnicodeDecodeError, ValueError:
         return [_schema_abort("root", "not-json")]
     if not isinstance(doc, dict):
         return [_schema_abort("root", "not-object")]
@@ -242,7 +242,7 @@ def validate_truth_schema(truth_bytes: bytes) -> list[str]:
     problems: list[str] = []
     try:
         doc: Any = json.loads(truth_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except UnicodeDecodeError, ValueError:
         return [_schema_abort("root", "not-json")]
     if not isinstance(doc, dict):
         return [_schema_abort("root", "not-object")]
@@ -329,7 +329,7 @@ def verify_seal(inputs_bytes: bytes, truth_bytes: bytes, seal: dict[str, Any]) -
             cases: Any = payload.get("cases") if isinstance(payload, dict) else None
             if not count_ok or not isinstance(cases, list) or len(cases) != count_value:
                 problems.append("seal-mismatch:n_cases")
-        except (UnicodeDecodeError, ValueError):
+        except UnicodeDecodeError, ValueError:
             problems.append("seal-mismatch:n_cases")
     elif not count_ok:
         problems.append("seal-mismatch:n_cases")

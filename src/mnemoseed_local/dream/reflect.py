@@ -1018,7 +1018,7 @@ def _parse_triple(
         route = Route(str(item["route"]))
         preference = bool(item.get("preference", False))
         polarity = str(item.get("polarity", "positive"))
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None  # malformed mention: skip, keep the pipeline alive
     if not subject or not predicate or not obj:
         return None
@@ -1198,7 +1198,7 @@ def result_from_payload(payload: dict[str, Any] | None) -> ReflectionResult | No
             consumed_chunk_ids=consumed_chunk_ids,
             batched=bool(payload.get("batched", False)),
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         logger.warning("ignoring unrecoverable reflect_result payload")
         return None
 

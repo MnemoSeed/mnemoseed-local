@@ -71,7 +71,7 @@ def _private_commit_windows() -> int | None:
         if not ok:
             return None
         return int(counters.PrivateUsage)
-    except (AttributeError, OSError, ValueError):
+    except AttributeError, OSError, ValueError:
         return None
 
 
@@ -83,6 +83,6 @@ def _private_commit_linux() -> int | None:
             for line in handle:
                 if line.startswith(("Private_Clean:", "Private_Dirty:", "Swap:")):
                     total_kib += int(line.split()[1])
-    except (OSError, IndexError, ValueError):
+    except OSError, IndexError, ValueError:
         return None
     return total_kib * 1024 if total_kib > 0 else None

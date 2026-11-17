@@ -89,7 +89,7 @@ class GatewayClient:
         """
         try:
             return replace(self._client, timeout=RETRY_TIMEOUT_SECONDS)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return self._client
 
     def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

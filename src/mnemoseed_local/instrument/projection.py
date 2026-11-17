@@ -126,7 +126,7 @@ def _validated_cutoff(cutoff_seconds: object) -> float | None:
         return None
     try:
         cutoff = float(cutoff_seconds)
-    except (OverflowError, ValueError):
+    except OverflowError, ValueError:
         return None
     if not math.isfinite(cutoff) or cutoff <= 0.0:
         return None
@@ -144,7 +144,7 @@ def _decode_now(now_raw: str | None, clock_source: str) -> tuple[float | None, t
         return None, ("unbound_now",)
     try:
         epoch = float.fromhex(now_raw)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return None, ("invalid_now",) + source_codes
     if not math.isfinite(epoch):
         return None, ("invalid_now",) + source_codes
@@ -157,7 +157,7 @@ def _decode_applied_at(applied_at_raw: str) -> tuple[float | None, str]:
     """Return the decoded epoch of a persisted ISO text and its failure code."""
     try:
         epoch = epoch_from_iso(applied_at_raw)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return None, "unparsable"
     if not math.isfinite(epoch):
         return None, "non_finite"

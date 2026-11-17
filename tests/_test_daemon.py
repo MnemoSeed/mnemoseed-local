@@ -145,7 +145,7 @@ def _await_readiness(daemon: DaemonUnderTest) -> None:
             raise AssertionError(f"the daemon child exited before readiness (code {daemon.proc.returncode})")
         try:
             health = client.get("/healthz")
-        except (DaemonRestError, DaemonUnavailableError):
+        except DaemonRestError, DaemonUnavailableError:
             if time.monotonic() >= deadline:
                 raise AssertionError("the daemon child never answered /healthz") from None
             time.sleep(0.1)

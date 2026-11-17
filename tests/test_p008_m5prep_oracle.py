@@ -566,7 +566,7 @@ class TestCorpusShape:
             "src/mnemoseed_local/eval/experience_contract.py": "0a5b1fef0288509d453e1995f82de9eca83b67be",
             "tests/test_p008_extraction_contract.py": "4736d7f0d62117d04f41b0baae9ce39c9314b0e9",
             "src/mnemoseed_local/eval/experience_metrics.py": "91d08b096d441816fc6e82bad1f38cdaea3e8375",
-            "src/mnemoseed_local/eval/experience_baseline.py": "81dc1ece15fcf73e18a0686ff193d7082f96d89f",
+            "src/mnemoseed_local/eval/experience_baseline.py": "e759d446d941f5dced31f3d10b324b0b986a93e9",
             "tests/test_p008_experience_metrics.py": "d04fbf6f9dface63522804d2002b229522a1470a",
             "tests/test_p008_baseline.py": "cf0e0b05488fbcc4fc839ec0445fab97c3193bc4",
             "tests/fixtures/p008_golden/inputs.json": "f694cb8d569688953e95b7d3f2d0d7d86b26ddd8",

@@ -122,7 +122,7 @@ def _discover_installed_binary() -> tuple[Path, str] | None:
         return None
     try:
         meta = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     version = str(meta.get("version", "unknown"))
     binary = cli_pkg / "bin" / "opencode.exe"

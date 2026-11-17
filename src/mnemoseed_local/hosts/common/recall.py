@@ -195,7 +195,7 @@ def _iso_ended(group: dict[str, Any]) -> str:
     if isinstance(latest, (int, float)) and not isinstance(latest, bool):
         try:
             return datetime.fromtimestamp(latest, tz=UTC).isoformat()
-        except (OverflowError, OSError, ValueError):
+        except OverflowError, OSError, ValueError:
             return ""
     return ""
 
@@ -375,7 +375,7 @@ def transcript_tail(path: Any) -> tuple[str | None, str]:
         return None, ""
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None, ""
     for line in reversed(lines):
         stripped = line.strip()

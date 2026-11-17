@@ -22,11 +22,11 @@ def verify_blind_report(report: object) -> list[str]:
             return ["canonical-malformed:files_read"]
     try:
         json.dumps(stripped, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return ["canonical-unserializable"]
     try:
         computed = canonical_sha256(stripped)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return ["canonical-unserializable"]
     if computed != stored:
         return ["canonical-mismatch"]

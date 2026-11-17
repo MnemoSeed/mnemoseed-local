@@ -1574,7 +1574,7 @@ class MemoryService:
             for rule_dict in chunk.rules:
                 try:
                     rule = RecallRule(**rule_dict)
-                except (ValidationError, TypeError, ValueError):
+                except ValidationError, TypeError, ValueError:
                     kind_label = rule_dict.get("kind", "<unknown>")
                     logger.warning("rules_budget skipping malformed/unknown-kind rule (kind=%s)", kind_label)
                     logger.debug("rules_budget malformed/unknown kind", extra={"kind": kind_label})
@@ -1620,7 +1620,7 @@ class MemoryService:
         if isinstance(value, list) and len(value) >= 2:
             try:
                 return str(value[0]), float(value[1])
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return None, 0.0
         return None, 0.0
 
@@ -1929,7 +1929,7 @@ class MemoryService:
             for rule_dict in chunk.rules:
                 try:
                     rule = RecallRule(**rule_dict)
-                except (ValidationError, TypeError, ValueError):
+                except ValidationError, TypeError, ValueError:
                     continue
                 if rule.kind != "standing_rule":
                     continue
@@ -1962,7 +1962,7 @@ class MemoryService:
             return None
         try:
             parsed = json.loads(value)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
         return parsed if isinstance(parsed, dict) else None
 

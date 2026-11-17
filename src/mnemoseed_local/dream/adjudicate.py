@@ -309,7 +309,7 @@ def parse_pair_seat_output(text: str) -> SeatOutcome:
         return SeatOutcome(status=SeatStatus.EMPTY_RESPONSE)
     try:
         raw = json.loads(text, object_pairs_hook=_unique_object)
-    except (json.JSONDecodeError, TypeError, _DuplicateKeyError):
+    except json.JSONDecodeError, TypeError, _DuplicateKeyError:
         return SeatOutcome(status=SeatStatus.INVALID_OUTPUT)
     if isinstance(raw, list):
         if not raw:
@@ -331,7 +331,7 @@ def parse_pair_seat_output(text: str) -> SeatOutcome:
         return SeatOutcome(status=SeatStatus.INVALID_OUTPUT)
     try:
         decision = _decision_from_mapping(raw)
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return SeatOutcome(status=SeatStatus.INVALID_OUTPUT)
     return SeatOutcome(status=SeatStatus.COMPLETE, decisions=(decision,))
 
@@ -395,7 +395,7 @@ def adjudicate(input: PairAdjudicationInput) -> AdjudicationResult:
             return _result(nomination, Disposition.DEFERRED, ReasonCode.IDENTITY_MISMATCH)
         if input.ensemble_mode == "vote" and _semantic_key(decisions[0]) != _semantic_key(decisions[1]):
             return _result(nomination, Disposition.DEFERRED, ReasonCode.SEAT_DISAGREEMENT)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return _result(nomination, Disposition.DEFERRED, ReasonCode.INVALID_TYPED_OUTPUT)
 
     decision = decisions[0]

@@ -447,6 +447,7 @@ KNOWN_CALLERS: dict[str, str] = {
     ".github/FUNDING.yml": OPEN_SET,
     ".github/ISSUE_TEMPLATE/queue-issue.yml": OPEN_SET,
     ".github/workflows/ci.yml": OPEN_SET,
+    ".github/workflows/dependency-audit.yml": OPEN_SET,
     ".github/workflows/release.yml": OPEN_SET,
     "install.sh": OPEN_SET,
     "install.ps1": OPEN_SET,

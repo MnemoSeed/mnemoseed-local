@@ -171,7 +171,7 @@ def disable_plugin(root: Path | None = None) -> tuple[Path, bool]:
         path.replace(disabled)
     except FileNotFoundError:
         return path, False
-    except (FileExistsError, OSError):
+    except FileExistsError, OSError:
         try:
             if disabled.exists():
                 disabled.unlink()
@@ -181,7 +181,7 @@ def disable_plugin(root: Path | None = None) -> tuple[Path, bool]:
             path.replace(disabled)
         except FileNotFoundError:
             return path, False
-        except (FileExistsError, OSError):
+        except FileExistsError, OSError:
             return path, False
     return path, True
 
@@ -198,7 +198,7 @@ def enable_plugin(root: Path | None = None) -> tuple[Path, bool]:
         disabled.replace(path)
     except FileNotFoundError:
         return path, False
-    except (FileExistsError, OSError):
+    except FileExistsError, OSError:
         try:
             if path.exists():
                 path.unlink()
@@ -208,7 +208,7 @@ def enable_plugin(root: Path | None = None) -> tuple[Path, bool]:
             disabled.replace(path)
         except FileNotFoundError:
             return path, False
-        except (FileExistsError, OSError):
+        except FileExistsError, OSError:
             return path, False
     return path, True
 
@@ -306,7 +306,7 @@ def hook_status(root: Path | None = None, base_url: str | None = None) -> HookSt
     else:
         try:
             data = path.read_bytes()
-        except (FileNotFoundError, PermissionError, OSError):
+        except FileNotFoundError, PermissionError, OSError:
             # transient race: file disappeared or locked between is_file and read
             try:
                 is_disabled = disabled.is_file()

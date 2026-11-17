@@ -571,7 +571,7 @@ def _matches_applied_at(raw: Any, expected: float) -> bool:
         return False
     try:
         decoded = epoch_from_iso(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return decoded == expected
 

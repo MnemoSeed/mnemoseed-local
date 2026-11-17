@@ -381,10 +381,10 @@ if ($DryRun) {
     $cliCmd = Get-Command mnemoseed-local -ErrorAction SilentlyContinue
     if ($null -ne $cliCmd) {
         Write-Host "    probe: mnemoseed-local command FOUND at $($cliCmd.Source)"
-        Write-Host "    plan:  would run ``uv tool upgrade --python 3.12 $CliPin``"
+        Write-Host "    plan:  would run ``uv tool upgrade --python 3.14 $CliPin``"
     } else {
         Write-Host '    probe: mnemoseed-local command NOT FOUND'
-        Write-Host "    plan:  would run ``uv tool install --python 3.12 $CliPin``"
+        Write-Host "    plan:  would run ``uv tool install --python 3.14 $CliPin``"
     }
     Write-Host '[4] MnemoSeed logon task'
     Write-Host "    plan:  register the current-user $MnemoSeedTaskName task after the CLI is installed; never use an unknown same-name task"
@@ -495,12 +495,12 @@ Add-ToProcessPath $UvBinDir
 Write-Host '[3/9] mnemoseed-local CLI'
 if (Test-CommandExists 'mnemoseed-local') {
     Write-Host "      found - upgrading via uv tool ($CliPin)..."
-    & uv tool upgrade --python 3.12 $CliPin
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool upgrade --python 3.12 $CliPin' failed (exit $LASTEXITCODE)" }
+    & uv tool upgrade --python 3.14 $CliPin
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool upgrade --python 3.14 $CliPin' failed (exit $LASTEXITCODE)" }
 } else {
     Write-Host "      not found - installing via uv tool ($CliPin)..."
-    & uv tool install --python 3.12 $CliPin
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool install --python 3.12 $CliPin' failed (exit $LASTEXITCODE)" }
+    & uv tool install --python 3.14 $CliPin
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "'uv tool install --python 3.14 $CliPin' failed (exit $LASTEXITCODE)" }
 }
 if (-not (Test-CommandExists 'mnemoseed-local')) {
     Exit-WithError "mnemoseed-local was installed but is not on PATH; add $UvBinDir to PATH and re-run"

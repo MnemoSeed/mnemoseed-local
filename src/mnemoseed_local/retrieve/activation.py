@@ -37,7 +37,7 @@ class ActivationSnapshot:
             elapsed = max(0.0, now - refreshed_at)
             result = value * math.pow(0.5, elapsed / self.half_life)
             return result if math.isfinite(result) and result > 0.0 else 0.0
-        except (ArithmeticError, TypeError, ValueError):
+        except ArithmeticError, TypeError, ValueError:
             return 0.0
 
 
@@ -81,7 +81,7 @@ class ShortTermActivation:
             self._entries[key] = (timestamp, self._boost_value)
             while self._capacity >= 0 and len(self._entries) > self._capacity:
                 self._entries.popitem(last=False)
-        except (ArithmeticError, TypeError, ValueError):
+        except ArithmeticError, TypeError, ValueError:
             return
 
     def snapshot(self) -> ActivationSnapshot:

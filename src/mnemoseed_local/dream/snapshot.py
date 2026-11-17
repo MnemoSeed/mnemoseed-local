@@ -431,12 +431,12 @@ def load_snapshot_file(path: Path) -> Snapshot | None:
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         logger.warning("skipping corrupt snapshot file %s", path)
         return None
     try:
         snapshot = _snapshot_from_dict(data)
-    except (TypeError, ValueError, KeyError):
+    except TypeError, ValueError, KeyError:
         logger.warning("skipping corrupt snapshot file %s", path)
         return None
     if snapshot is None:

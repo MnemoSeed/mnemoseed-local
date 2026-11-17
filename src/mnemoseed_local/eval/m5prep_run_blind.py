@@ -76,7 +76,7 @@ def _list_home(home: str | None) -> set[str] | None:
         return None
     try:
         return set(os.listdir(home))
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError, NotADirectoryError:
         return None
 
 
@@ -215,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             inputs_doc = json.loads(inputs_bytes.decode("utf-8"))
             truth_doc = json.loads(truth_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+        except UnicodeDecodeError, ValueError:
             raise _ReservedAbort("abort:malformed-input") from None
         prose = " ".join(_CLAIMS + [note] + list(m5prep_bar.NOT_OBSERVED_TOPICS))
         outcome = m5prep_bar.check_report_claims(prose)

@@ -53,7 +53,7 @@ def test_installers_pin_the_exact_project_version() -> None:
 
 PIN_VARIABLES = {"install.sh": "$CLI_PIN", "install.ps1": "$CliPin"}
 UV_TOOL_INVOCATION = re.compile(r"^\s*(?:if\s+!\s+)?&?\s*uv\s+tool\s+(install|upgrade)\s+(?P<args>.*)$")
-PYTHON_PIN = re.compile(r"--python[\s=]+3\.12\b")
+PYTHON_PIN = re.compile(r"--python[\s=]+3\.14\b")
 
 
 def _code_lines(name: str) -> list[str]:
@@ -92,10 +92,10 @@ def _planned_arguments(name: str) -> dict[str, list[str]]:
 
 
 @pytest.mark.parametrize("name", sorted(PIN_VARIABLES))
-def test_actual_uv_tool_commands_request_python_312(name: str) -> None:
+def test_actual_uv_tool_commands_request_python_314(name: str) -> None:
     for verb, args in _branch_arguments(name).items():
         assert PYTHON_PIN.search(args), (
-            f"{name}: `uv tool {verb}` must pass an explicit --python 3.12"
+            f"{name}: `uv tool {verb}` must pass an explicit --python 3.14"
             f" before the pinned spec, got {args!r}"
         )
         assert PIN_VARIABLES[name] in args, (
@@ -108,7 +108,7 @@ def test_dry_run_plan_announces_the_python_request(name: str) -> None:
     for verb, lines in _planned_arguments(name).items():
         assert lines, f"{name}: dry-run plan must announce `uv tool {verb}`"
         assert any(PYTHON_PIN.search(line) for line in lines), (
-            f"{name}: dry-run plan must show the --python 3.12 request for `uv tool {verb}`; got {lines!r}"
+            f"{name}: dry-run plan must show the --python 3.14 request for `uv tool {verb}`; got {lines!r}"
         )
         assert any(PIN_VARIABLES[name] in line for line in lines), (
             f"{name}: dry-run plan must keep the pinned spec for `uv tool {verb}`; got {lines!r}"

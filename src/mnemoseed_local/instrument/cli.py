@@ -297,7 +297,7 @@ def _cutoff_argument(text: str) -> Any:
     """The cutoff as a project-validated object; unparsable text stays visible."""
     try:
         return float(text)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return text
 
 

@@ -125,7 +125,7 @@ def _host_model_setup() -> dict[str, Any]:
     try:
         host_config = Path.home() / ".config" / "opencode" / "opencode.json"
         data = json.loads(host_config.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return {}
     return data if isinstance(data, dict) else {}
 

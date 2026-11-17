@@ -133,7 +133,7 @@ def _list_home(home: str | None) -> set[str] | None:
         return None
     try:
         return set(os.listdir(home))
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError, NotADirectoryError:
         return None
 
 

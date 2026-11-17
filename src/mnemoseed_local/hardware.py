@@ -66,7 +66,7 @@ def _probe_ram_windows() -> float | None:
         if not ok:
             return None
         return float(status.ullTotalPhys) / _BYTES_PER_GIB
-    except (AttributeError, OSError, ValueError):
+    except AttributeError, OSError, ValueError:
         return None
 
 
@@ -77,7 +77,7 @@ def _probe_ram_linux() -> float | None:
             for line in handle:
                 if line.startswith("MemTotal:"):
                     return float(line.split()[1]) / (1024**2)
-    except (IndexError, OSError, ValueError):
+    except IndexError, OSError, ValueError:
         return None
     return None
 
@@ -95,7 +95,7 @@ def _probe_ram_macos() -> float | None:
         if proc.returncode != 0:
             return None
         return float(proc.stdout.strip()) / _BYTES_PER_GIB
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except OSError, ValueError, subprocess.SubprocessError:
         return None
 
 
@@ -113,7 +113,7 @@ def probe_max_vram_gb() -> float:
             timeout=3,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return 0.0
     if proc.returncode != 0:
         return 0.0
