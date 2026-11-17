@@ -258,7 +258,7 @@ def test_dream_outcome_seam_wired_to_scheduler(config_path: Path) -> None:
         assert getattr(seam, "__func__", None) is DreamScheduler.report_outcome
 
 
-def test_capture_recall_dream_config_audit_loop(config_path: Path) -> None:
+def test_capture_recall_dream_config_audit_loop(config_path: Path, no_similarity_floor: None) -> None:
     with _boot(config_path) as client:
         # ---- capture: one durable user turn, then settle (drain + relay)
         response = client.post(
@@ -424,7 +424,7 @@ def test_daemon_write_context_carries_turn_origin_agent() -> None:
     assert ctx.origin_agent == "build"
 
 
-def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
+def test_capture_recall_with_entity_bearing_query(config_path: Path, no_similarity_floor: None) -> None:
     """D2 end-to-end on the serving surface: a durable turn drained into the
     store must be reachable by a query whose cues extract entities (the
     scenario that 100%-missed before the fix)."""
@@ -452,6 +452,56 @@ def test_capture_recall_with_entity_bearing_query(config_path: Path) -> None:
             json={"profile_id": PROFILE, "query": "MnemoSeed 缓存完整性", "top_k": 5},
         ).json()
         assert recall["memory"]["entries"], recall
+
+
+def test_recall_empty_payload_reports_honest_contract(config_path: Path) -> None:
+    """A profile with no serving candidates returns the empty result as data:
+    entries empty, budget intact, no usage, and the floor accounting verbatim."""
+    with _boot(config_path) as client:
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "nothing was ever stored", "top_k": 5},
+        ).json()
+        memory = recall["memory"]
+        assert memory["entries"] == []
+        assert memory["dropped_count"] == 0
+        assert memory["tokens_used"] == 0
+        assert memory["budget_tokens"] == 800
+        assert memory["coverage"]["vector_hits"] == 0
+        assert memory["coverage"]["floor_dropped"] == 0
+
+
+def test_recall_empty_when_every_chunk_is_below_the_similarity_floor(config_path: Path) -> None:
+    """A stored chunk whose text is unrelated to the query clears decay but not
+    the similarity floor: the daemon serves the empty result as data, never a
+    forced top-k of irrelevant rows."""
+    with _boot(config_path) as client:
+        response = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": SESSION,
+                "profile_id": PROFILE,
+                "ts": 1.0,
+                "content": {"text": "the university library at noon"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        settled = client.post("/session/end", json={"session_id": SESSION, "profile_id": PROFILE})
+        assert settled.status_code == 200, settled.text
+
+        recall = client.post(
+            "/memory/recall",
+            json={"profile_id": PROFILE, "query": "quantum physics of black holes", "top_k": 5},
+        ).json()
+        memory = recall["memory"]
+        assert memory["entries"] == []
+        assert memory["coverage"]["vector_hits"] == 0
+        assert memory["coverage"]["floor_dropped"] >= 1
+        assert memory["dropped_count"] == 0
+        assert memory["tokens_used"] == 0
+        assert memory["budget_tokens"] == 800
 
 
 def test_capture_stamps_epoch_domain_timestamps(config_path: Path) -> None:
@@ -486,7 +536,9 @@ def test_capture_stamps_epoch_domain_timestamps(config_path: Path) -> None:
         assert abs(ingested_at - time.time()) < 300
 
 
-def test_recall_entries_carry_session_provenance_and_iso_ingested_at(config_path: Path) -> None:
+def test_recall_entries_carry_session_provenance_and_iso_ingested_at(
+    config_path: Path, no_similarity_floor: None
+) -> None:
     """Chunk recall entries report their verbatim session id and an ISO-8601
     UTC ingest time (never a raw epoch float) — the comparative structure the
     time-comparison surface needs."""
@@ -567,7 +619,9 @@ def test_recall_graph_entries_carry_iso_valid_from_and_null_session(config_path:
         assert graph_entry["explicit_pin"] is False
 
 
-def test_recall_chunk_entries_carry_asserted_by_and_needs_reconcile(config_path: Path) -> None:
+def test_recall_chunk_entries_carry_asserted_by_and_needs_reconcile(
+    config_path: Path, no_similarity_floor: None
+) -> None:
     """R2 provenance-trust recall wire: a chunk entry exposes who asserted it
     and the storage needs_reconcile flag (additive provenance fields)."""
     with _boot(config_path) as client:
@@ -690,7 +744,7 @@ def test_memory_supersede_self_reference_is_400(config_path: Path) -> None:
         assert response.status_code == 400
 
 
-def test_recall_entries_carry_origin_agent_and_host(config_path: Path) -> None:
+def test_recall_entries_carry_origin_agent_and_host(config_path: Path, no_similarity_floor: None) -> None:
     """B2.9 recall read-back: chunk entries expose the inert origin agent label
     and the encoding host; a session captured without an agent reports
     consistent nulls (with the host still present) instead of a guessed label."""
@@ -1442,7 +1496,7 @@ def test_daemon_write_context_no_agent_keeps_wire_profile() -> None:
     assert ctx.agent_label is None
 
 
-def test_bound_agent_captures_isolated_via_daemon(config_path: Path) -> None:
+def test_bound_agent_captures_isolated_via_daemon(config_path: Path, no_similarity_floor: None) -> None:
     """End-to-end isolation: a bound agent whose host still sends
     profile_id=default writes its chunk under the bound profile, not default."""
     config_path.write_text(

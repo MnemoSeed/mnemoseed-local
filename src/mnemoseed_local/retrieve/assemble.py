@@ -178,6 +178,7 @@ class CoverageReport:
     watermark: TurnRange | None = None
     fresh_evidence_chunks: int = 0
     pending_marked: int = 0
+    floor_dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,7 @@ class Assembler:
             pool_size=len(pool),
             profile_chunks=self._profile_chunk_count(vector_store, profile_id),
             watermark=watermark,
+            floor_dropped=recall.floor_dropped,
         )
 
         admitted, dropped = self._select(pool, effective, tokens, config)

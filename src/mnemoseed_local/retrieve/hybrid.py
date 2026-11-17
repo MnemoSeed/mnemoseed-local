@@ -85,18 +85,20 @@ RETRIEVER_CLOSE_TIMEOUT_S = 2.0
 class HybridConfig:
     """Tunable fusion weights and candidate-pool floors (FR-3.4).
 
-    Defaults: alpha=1.0, beta=1.0, gamma=0.8, delta=0.5; candidate-pool decay
+    Defaults: alpha=1.0, beta=1.0, gamma=0.2, delta=0.5; candidate-pool decay
     floor 0.4 (design item 2: decay_weight < 0.4 never enters the pool);
-    per-track pools capped at 20; graph 1-hop degree centrality saturates at 8
-    neighbors. The rescue band (design/09 §3.5) admits flashbulb pins below
-    the main floor when the cue match is strong enough.
+    store-similarity floor 0.45 on ordinary vector hits (rescued pins bypass
+    it); per-track pools capped at 20; graph 1-hop degree centrality saturates
+    at 8 neighbors. The rescue band (design/09 §3.5) admits flashbulb pins
+    below the main floor when the cue match is strong enough.
     """
 
     weight_semantic: float = 1.0
     weight_cue_overlap: float = 1.0
-    weight_decay: float = 0.8
+    weight_decay: float = 0.2
     weight_centrality: float = 0.5
     min_decay: float = 0.4
+    min_similarity: float = 0.45
     rescue_min_decay: float = DEFAULT_RECALL_RESCUE_FLOOR
     rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
     vector_top_k: int = 20
@@ -149,6 +151,7 @@ class HybridRecall:
     vector_hits: int
     graph_hits: int
     cooccurrence_term: bool = False
+    floor_dropped: int = 0
 
 
 # ---------------------------------------------------------------- engine
@@ -219,14 +222,16 @@ class HybridRetriever:
             graph_store,
             config,
         )
+        vector_candidates, floor_dropped = vector_future.result()
         return _merge(
-            vector_future.result(),
+            vector_candidates,
             graph_future.result(),
             activation_snapshot=activation_snapshot,
             profile_id=profile_id,
             session_id=session_id,
             now=now,
             config=config,
+            floor_dropped=floor_dropped,
         )
 
     def _recall_sequential(
@@ -249,11 +254,11 @@ class HybridRetriever:
         """
         config = self._config
         query = cues.cues
-        vector_candidates = self._vector_track(
+        vector_candidates, floor_dropped = self._vector_track(
             query_text, query, profile_id, vector_store, embedder, config, now
         )
         graph_candidates = self._graph_track(query, profile_id, graph_store, config)
-        return _merge(vector_candidates, graph_candidates, config=config)
+        return _merge(vector_candidates, graph_candidates, config=config, floor_dropped=floor_dropped)
 
     # ----------------------------------------------------------- vector track
 
@@ -266,7 +271,7 @@ class HybridRetriever:
         embedder: Embedder,
         config: HybridConfig,
         now: float | None = None,
-    ) -> list[Candidate]:
+    ) -> tuple[list[Candidate], int]:
         entities = tuple(query.entities)
         embedding = embedder.embed(query_text)
         supports_filter = Capability.VECTOR_METADATA_FILTER in vector_store.capabilities()
@@ -295,6 +300,7 @@ class HybridRetriever:
             config.vector_top_k,
         )
         candidates: list[Candidate] = []
+        floor_dropped = 0
         for hit in hits:
             chunk = hit.chunk
             rescued = False
@@ -312,6 +318,9 @@ class HybridRetriever:
                 if _chunk_cue_overlap(query, chunk) < config.rescue_cue_min:
                     continue
                 rescued = True
+            if not rescued and float(hit.similarity) < config.min_similarity:
+                floor_dropped += 1
+                continue
             # Empty stored entity cues mean "no entity evidence" (e.g. written
             # before the daemon filled them), never a contradiction: the gate
             # only excludes positive mismatches (D2).
@@ -337,7 +346,7 @@ class HybridRetriever:
                     expired_window=evaluate_temporal(chunk.text, now).expired_window,
                 )
             )
-        return candidates
+        return candidates, floor_dropped
 
     # ------------------------------------------------------------ graph track
 
@@ -426,6 +435,7 @@ def _merge(
     session_id: str | None = None,
     now: float | None = None,
     config: HybridConfig | None = None,
+    floor_dropped: int = 0,
 ) -> HybridRecall:
     """Fuse both track pools into one order-insensitive ranked recall."""
     merged_candidates = [*vector_candidates, *graph_candidates]
@@ -445,6 +455,7 @@ def _merge(
         candidates=merged,
         vector_hits=len(vector_candidates),
         graph_hits=len(graph_candidates),
+        floor_dropped=floor_dropped,
     )
 
 
