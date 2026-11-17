@@ -43,7 +43,7 @@ class ImportLedger:
     def _load(self) -> dict[str, Any]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return self._empty()
         return data if isinstance(data, dict) and isinstance(data.get("sessions"), dict) else self._empty()
 

@@ -153,7 +153,7 @@ def _int_or_none(value: Any) -> int | None:
     """Coerce a reported count; malformed values degrade to None."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

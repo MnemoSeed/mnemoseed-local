@@ -1101,31 +1101,31 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
     # v12 columns are nullable and may be absent on old DBs; use dict-like access with fallback
     try:
         provider = row["provider"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         provider = None
     try:
         model = row["model"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         model = None
     try:
         status = row["status"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         status = None
     try:
         reason = row["reason"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         reason = None
     try:
         retryable = row["retryable"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         retryable = None
     try:
         composite_group = row["composite_group_id"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         composite_group = None
     try:
         nomination_id = row["nomination_id"]  # type: ignore[index]
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         nomination_id = None
     return ErrorEvent(
         profile_id=str(row["profile_id"]),

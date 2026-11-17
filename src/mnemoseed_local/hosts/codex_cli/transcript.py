@@ -125,7 +125,7 @@ def read_turns(path: Any) -> list[TranscriptTurn]:
         return []
     try:
         lines = _read_lines(Path(path).expanduser())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return []
     turns: list[TranscriptTurn] = []
     for index, line in enumerate(lines):

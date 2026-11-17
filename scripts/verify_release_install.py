@@ -1225,7 +1225,7 @@ def install_artifact(verifier: Verifier, context: Context) -> None:
     scratch.mkdir(parents=True, exist_ok=True)
     requirement = f"{PROJECT}[{CODEX_EXTRA}] @ {context.wheel.resolve().as_uri()}"
     verifier.run(
-        [context.uv, "tool", "install", "--python", "3.12", requirement],
+        [context.uv, "tool", "install", "--python", "3.14", requirement],
         cwd=scratch,
         env=context.uv_env(),
         label="uv tool install (built wheel with codex extra)",

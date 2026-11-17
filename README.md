@@ -19,13 +19,13 @@ The current install route is a source checkout. The package is not yet published
 on PyPI, so the package-index installers are currently unavailable.
 
 Prepare [Git](https://git-scm.com/downloads),
-[uv](https://docs.astral.sh/uv/getting-started/installation/), and Python 3.12 or
+[uv](https://docs.astral.sh/uv/getting-started/installation/), and Python 3.14 or
 newer (uv can provision Python). Then run:
 
 ```sh
 git clone https://github.com/MnemoSeed/mnemoseed-local.git
 cd mnemoseed-local
-uv tool install --python 3.12 --force ".[codex]"
+uv tool install --python 3.14 --force ".[codex]"
 mnemoseed-local init --mode capture-recall
 mnemoseed-local doctor
 ```

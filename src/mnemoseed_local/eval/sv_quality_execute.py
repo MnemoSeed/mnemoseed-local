@@ -496,7 +496,7 @@ def run_executor(
         nomination, left, right = adjudication_carrier_for(item.fixture_id)
         try:
             user = render_pair_adjudication_prompt(_prompt_only_input(nomination, left, right))
-        except (TypeError, ValueError, AssertionError):
+        except TypeError, ValueError, AssertionError:
             raise
         try:
             text_a = _seat_text(verify_client, user)

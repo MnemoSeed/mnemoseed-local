@@ -411,7 +411,7 @@ def _force_utf8_lane(stream: TextIO, *, newline: bool) -> None:
             reconfigure(encoding="utf-8", newline="")
         else:
             reconfigure(encoding="utf-8")
-    except (OSError, ValueError):  # a hostile stream never kills the gateway
+    except OSError, ValueError:  # a hostile stream never kills the gateway
         pass
 
 

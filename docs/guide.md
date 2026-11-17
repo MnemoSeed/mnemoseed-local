@@ -23,14 +23,14 @@ The `mnemoseed-local` package is not yet published on PyPI. Use a source checkou
 the package-index installers described below are currently unavailable.
 
 Prepare [Git](https://git-scm.com/downloads),
-[uv](https://docs.astral.sh/uv/getting-started/installation/), and Python 3.12 or
-newer. The command below asks uv to use Python 3.12; uv can provision it when
+[uv](https://docs.astral.sh/uv/getting-started/installation/), and Python 3.14 or
+newer. The command below asks uv to use Python 3.14; uv can provision it when
 needed. The `[codex]` extra includes `zstandard` for compressed Codex transcripts.
 
 ```sh
 git clone https://github.com/MnemoSeed/mnemoseed-local.git
 cd mnemoseed-local
-uv tool install --python 3.12 --force ".[codex]"
+uv tool install --python 3.14 --force ".[codex]"
 mnemoseed-local init --mode capture-recall
 mnemoseed-local doctor
 ```
