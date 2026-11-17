@@ -39,6 +39,7 @@ let servedInstance = TEST_INSTANCE
 const posts = []
 const failing = new Set()
 const throwing = new Set()
+const rejectBodyTexts = new Set()
 // daemon-e2e: pass fetches through to the REAL loopback daemon pytest booted;
 // responses are the daemon's own, the recording stays (status included).
 const realFetch = globalThis.fetch.bind(globalThis)
@@ -61,6 +62,10 @@ globalThis.fetch = async (url, init) => {
     const response = await realFetch(url, init)
     posts.push({ url, body, headers: init?.headers ?? null, accepted: response.ok, status: response.status })
     return response
+  }
+  if (typeof body?.content?.text === "string" && rejectBodyTexts.has(body.content.text)) {
+    posts.push({ url, body, headers: init?.headers ?? null, accepted: false, status: 422 })
+    return { ok: false, status: 422 }
   }
   const accepted = !failing.has(url)
   posts.push({ url, body, headers: init?.headers ?? null, accepted, status: accepted ? 200 : 503 })
@@ -1865,6 +1870,33 @@ async function main() {
       console.log(
         JSON.stringify({
           order,
+          remaining: (await outboxRecords()).length,
+        }),
+      )
+      break
+    }
+
+    case "hook-outbox-4xx": {
+      // A permanent 4xx spool line must be dropped at flush so the next live
+      // turn posts normally, with a single visible drop warning.
+      rejectBodyTexts.add("poison turn")
+      const errors = captureErrors()
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_poison", prompt: { text: "poison turn" } })
+      await delay(200)
+      errors.seen.length = 0
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_live1", prompt: { text: "live turn one" } })
+      await delay(200)
+      await fire.prompt({ sessionID: "sess-4xx", messageID: "m_4xx_live2", prompt: { text: "live turn two" } })
+      await delay(200)
+      errors.restore()
+      const ingests = posts
+        .filter((post) => post.url.endsWith("/ingest"))
+        .map((post) => ({ text: post.body?.content?.text ?? null, status: post.status }))
+      console.log(
+        JSON.stringify({
+          ingests,
+          dropWarnings: errors.seen.filter((line) => line.includes("dropped")).length,
+          repeatWarnings: errors.seen.filter((line) => line.includes("unreachable")).length,
           remaining: (await outboxRecords()).length,
         }),
       )

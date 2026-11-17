@@ -667,6 +667,7 @@ async function flushOutbox(): Promise<boolean> {
   }
   if (dropped > 0) console.error(`mnemoseed-local: hook outbox overflow: dropped ${dropped} stale turn(s)`)
   const remaining: string[] = []
+  let rejected = 0
   for (const entry of outbox) {
     if (OUTBOX_READ_ENDPOINTS.includes(entry.endpoint)) continue
     try {
@@ -677,10 +678,18 @@ async function flushOutbox(): Promise<boolean> {
         body: JSON.stringify(entry.body),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       })
-      if (!response.ok) remaining.push(outboxLine(entry))
+      if (response.ok) continue
+      if (response.status >= 400 && response.status < 500) {
+        rejected++
+        continue
+      }
+      remaining.push(outboxLine(entry))
     } catch {
       remaining.push(outboxLine(entry))
     }
+  }
+  if (rejected > 0) {
+    console.error(`mnemoseed-local: hook outbox dropped ${rejected} non-retryable line(s)`)
   }
   if (outbox.length > 0 || dropped > 0) {
     const kept = others.concat(remaining)
