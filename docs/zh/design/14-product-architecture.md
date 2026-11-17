@@ -98,7 +98,7 @@ Windows 登录任务只修正确性（从配置读 base URL，不硬编码 7788�
 - CPython 官方状态（2026-11-17 查）：3.12 已进 **security-only**（EOL 2028-10），3.13 同；**3.14 / 3.15 为 bugfix 全支持**，EOL 分别 2030-10 / 2031-10；3.10 已 EOL（2026-10-01）。
 - 3.15 暂不可升：本机原生依赖 wheel 只到 cp314——onnxruntime 1.32.0、zstandard 0.25.0、tokenizers 0.23.3 均无 cp315；numpy 2.5.5 有 cp315。等这些上游补齐再评估 3.15。
 - CVE 视角：3.12 仍在安全补丁期内，不是紧急事故；真正的暴露面是 64 个依赖包（lancedb 固定 0.36.0、onnxruntime、numpy、pydantic-core 等）。因此升级批次同时引入依赖审计与锁文件刷新机制（CI 定期跑，而非只在 release 时）。
-- 升级步骤：`requires-python` / ruff / mypy / CI 矩阵统一 3.14，`uv lock` 刷新，四门全绿后发版；保留 3.12 至少一个大版本作为回退窗口。
+- 升级步骤：`requires-python` / ruff / mypy / CI 矩阵统一 3.14，`uv lock` 刷新，四门全绿后发版。不保留 3.12 源码回退窗口——ruff `py314` 会生成 PEP 758 `except A, B:` 语法，3.12 无法解析；回退只能在已发布制品层面做。
 
 ## 8. 理论锚
 
