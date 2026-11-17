@@ -3,8 +3,8 @@
 Two independent retrieval tracks produce one ranked candidate pool:
 
 - Vector track (FR-3.3): semantic neighbors from the store, embedded through
-  the ``Embedder`` port, restricted to the cue-entity overlap when the store
-  declares ``vector.metadata_filter``, and floored at ``min_decay``.
+  the ``Embedder`` port, floored at ``min_decay`` and ``min_similarity``.
+  Extracted entities feed the beta cue-overlap score, never a hard exclusion.
 - Graph track (FR-3.3): entity-subgraph 2-hop traversal seeded from every node
   carrying any query cue entity; the pool is decay-floored at the candidate
   boundary and the track caps at ``graph_top_k`` decay-weighted entries. Seeds
@@ -38,9 +38,8 @@ filter candidates; they feed the beta term as a low-weight blended component
 (entity 0.6 / tool 0.25 / context 0.15). Graph candidates carry only the entity
 component of beta (GraphNode stores no situational fields) and a zero semantic
 term; a chunk candidate's semantic term is the store similarity clamped to
-[0, 1]. Entity overlap folds case; the store metadata prefilter matches on the
-raw stored entities (embedded driver) so a chunk whose only entity match is
-case-differing may be cut before scoring.
+[0, 1]. Entity overlap folds case and feeds only the beta term; stored entity
+cues never exclude a chunk from the vector pool.
 """
 
 from __future__ import annotations
@@ -55,7 +54,6 @@ from mnemoseed_local.retrieve.temporal import evaluate_temporal
 from mnemoseed_local.schema.graph import GraphNode
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE, ChunkStamp, Cues
 from mnemoseed_local.storage.ports import (
-    Capability,
     ChunkFilter,
     Embedder,
     GraphStore,
@@ -85,18 +83,20 @@ RETRIEVER_CLOSE_TIMEOUT_S = 2.0
 class HybridConfig:
     """Tunable fusion weights and candidate-pool floors (FR-3.4).
 
-    Defaults: alpha=1.0, beta=1.0, gamma=0.8, delta=0.5; candidate-pool decay
+    Defaults: alpha=1.0, beta=1.0, gamma=0.2, delta=0.5; candidate-pool decay
     floor 0.4 (design item 2: decay_weight < 0.4 never enters the pool);
-    per-track pools capped at 20; graph 1-hop degree centrality saturates at 8
-    neighbors. The rescue band (design/09 §3.5) admits flashbulb pins below
-    the main floor when the cue match is strong enough.
+    store-similarity floor 0.45 on ordinary vector hits (rescued pins bypass
+    it); per-track pools capped at 20; graph 1-hop degree centrality saturates
+    at 8 neighbors. The rescue band (design/09 §3.5) admits flashbulb pins
+    below the main floor when the cue match is strong enough.
     """
 
     weight_semantic: float = 1.0
     weight_cue_overlap: float = 1.0
-    weight_decay: float = 0.8
+    weight_decay: float = 0.2
     weight_centrality: float = 0.5
     min_decay: float = 0.4
+    min_similarity: float = 0.45
     rescue_min_decay: float = DEFAULT_RECALL_RESCUE_FLOOR
     rescue_cue_min: float = DEFAULT_RECALL_RESCUE_CUE_MIN
     vector_top_k: int = 20
@@ -149,6 +149,7 @@ class HybridRecall:
     vector_hits: int
     graph_hits: int
     cooccurrence_term: bool = False
+    floor_dropped: int = 0
 
 
 # ---------------------------------------------------------------- engine
@@ -219,14 +220,16 @@ class HybridRetriever:
             graph_store,
             config,
         )
+        vector_candidates, floor_dropped = vector_future.result()
         return _merge(
-            vector_future.result(),
+            vector_candidates,
             graph_future.result(),
             activation_snapshot=activation_snapshot,
             profile_id=profile_id,
             session_id=session_id,
             now=now,
             config=config,
+            floor_dropped=floor_dropped,
         )
 
     def _recall_sequential(
@@ -249,11 +252,11 @@ class HybridRetriever:
         """
         config = self._config
         query = cues.cues
-        vector_candidates = self._vector_track(
+        vector_candidates, floor_dropped = self._vector_track(
             query_text, query, profile_id, vector_store, embedder, config, now
         )
         graph_candidates = self._graph_track(query, profile_id, graph_store, config)
-        return _merge(vector_candidates, graph_candidates, config=config)
+        return _merge(vector_candidates, graph_candidates, config=config, floor_dropped=floor_dropped)
 
     # ----------------------------------------------------------- vector track
 
@@ -266,11 +269,8 @@ class HybridRetriever:
         embedder: Embedder,
         config: HybridConfig,
         now: float | None = None,
-    ) -> list[Candidate]:
-        entities = tuple(query.entities)
+    ) -> tuple[list[Candidate], int]:
         embedding = embedder.embed(query_text)
-        supports_filter = Capability.VECTOR_METADATA_FILTER in vector_store.capabilities()
-        filter_entities = entities if supports_filter and entities else ()
         hits = vector_store.search(
             embedding.dense,
             embedding.sparse,
@@ -283,10 +283,6 @@ class HybridRetriever:
                 # cue-match condition below stays as defense-in-depth.
                 min_decay=config.min_decay,
                 pin_min_decay=config.rescue_min_decay,
-                entities=filter_entities,
-                # Recall-surface entity tolerance mirrors the post-filter below:
-                # missing stored cues are absence of evidence, never excluded.
-                entities_allow_missing=True,
                 # Merged chunks are the fact's retained evidence scene, never
                 # fresh recall surface: the dream merge marks them consolidated
                 # (design/03 §4, same semantics as the Freshness Guard probe).
@@ -295,6 +291,7 @@ class HybridRetriever:
             config.vector_top_k,
         )
         candidates: list[Candidate] = []
+        floor_dropped = 0
         for hit in hits:
             chunk = hit.chunk
             rescued = False
@@ -312,10 +309,8 @@ class HybridRetriever:
                 if _chunk_cue_overlap(query, chunk) < config.rescue_cue_min:
                     continue
                 rescued = True
-            # Empty stored entity cues mean "no entity evidence" (e.g. written
-            # before the daemon filled them), never a contradiction: the gate
-            # only excludes positive mismatches (D2).
-            if entities and chunk.cues.entities and not _entity_overlap(entities, chunk.cues.entities):
+            if not rescued and float(hit.similarity) < config.min_similarity:
+                floor_dropped += 1
                 continue
             semantic = max(0.0, min(1.0, float(hit.similarity)))
             breakdown = _breakdown(
@@ -337,7 +332,7 @@ class HybridRetriever:
                     expired_window=evaluate_temporal(chunk.text, now).expired_window,
                 )
             )
-        return candidates
+        return candidates, floor_dropped
 
     # ------------------------------------------------------------ graph track
 
@@ -426,6 +421,7 @@ def _merge(
     session_id: str | None = None,
     now: float | None = None,
     config: HybridConfig | None = None,
+    floor_dropped: int = 0,
 ) -> HybridRecall:
     """Fuse both track pools into one order-insensitive ranked recall."""
     merged_candidates = [*vector_candidates, *graph_candidates]
@@ -445,6 +441,7 @@ def _merge(
         candidates=merged,
         vector_hits=len(vector_candidates),
         graph_hits=len(graph_candidates),
+        floor_dropped=floor_dropped,
     )
 
 
@@ -524,11 +521,6 @@ def _graph_centrality(
 
 def _fold(value: str) -> str:
     return value.casefold()
-
-
-def _entity_overlap(query_entities: tuple[str, ...], stored_entities: Sequence[str]) -> bool:
-    query = {_fold(entity) for entity in query_entities}
-    return any(_fold(entity) in query for entity in stored_entities)
 
 
 def _ratio(query_items: Sequence[str], stored_items: Sequence[str]) -> float:

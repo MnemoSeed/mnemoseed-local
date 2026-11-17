@@ -13,7 +13,7 @@ Determinism is contractual: identical inputs produce identical packages.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -189,7 +189,8 @@ def _recall(
     cues: ExtractedCues,
     config: HybridConfig | None = None,
 ) -> HybridRecall:
-    return HybridRetriever(config).recall(
+    effective = replace(config if config is not None else HybridConfig(), min_similarity=-1e9)
+    return HybridRetriever(effective).recall(
         text,
         cues,
         profile_id=_PROFILE,
@@ -400,7 +401,7 @@ def _freshness_stack(stack: _Stack) -> None:
         _node("g_main", statement="alpha bravo charlie delta", entities=("LanceDb",), decay=0.9)
     )
     stack.graph.upsert_node(_node("g_alt", statement="prefers stable editor config", entities=("Editor",)))
-    for i in range(6):
+    for i in range(8):
         stack.graph.upsert_node(_node(f"g_n{i}", NodeType.EPISODE, (), statement=f"neighbor fact {i}"))
         _edge(stack, "g_alt", f"g_n{i}")
     _edge(stack, "g_main", "g_alt")
@@ -455,7 +456,7 @@ def test_freshness_marks_pending_with_demoted_score_and_evidence(stack) -> None:
     assert EntryFlag.PENDING_CONSOLIDATION in entry.flags
     assert EntryFlag.FRESH_EVIDENCE in entry.flags
     assert entry.recent_evidence == ("recently switched to emacs and never looked back",)
-    assert entry.score == pytest.approx(0.8 * 1.3825, abs=1e-9)
+    assert entry.score == pytest.approx(0.8 * 0.8425, abs=1e-9)
     assert stack.graph.get_node("g_main").pending_consolidation is True
 
 
@@ -672,6 +673,18 @@ def test_honest_empty_reports_coverage(stack) -> None:
     assert result.coverage.graph_hits == 0
     assert result.coverage.profile_chunks == 0
     assert result.coverage.watermark is None
+    assert result.coverage.floor_dropped == 0
+
+
+def test_floor_dropped_is_reported_in_coverage(stack) -> None:
+    recall = HybridRecall(candidates=[], vector_hits=0, graph_hits=0, floor_dropped=7)
+    result = _assemble(stack, recall)
+    assert result.entries == ()
+    assert result.dropped_count == 0
+    assert result.tokens_used == 0
+    assert result.budget_tokens == 800
+    assert result.coverage.vector_hits == 0
+    assert result.coverage.floor_dropped == 7
 
 
 def test_honest_empty_when_everything_dropped(stack) -> None:

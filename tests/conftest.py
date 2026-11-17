@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from dataclasses import replace
+from typing import Any
 
 import pytest
 import reload_guard
@@ -25,6 +27,25 @@ from _ports import reserved_port_occupancy
 reload_guard.activate()
 
 logger = logging.getLogger("mnemoseed_local.tests.isolation")
+
+
+@pytest.fixture
+def no_similarity_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate tests of other contracts from the vector similarity floor.
+
+    Synthetic-embedder chunks whose text differs from the query score below
+    the production floor, so retrieval tests unrelated to ranking opt out.
+    """
+    from mnemoseed_local.daemon import memory as memory_mod
+
+    real_retriever = memory_mod.HybridRetriever
+
+    def build(config: Any = None, **kwargs: Any) -> Any:
+        cfg = config if config is not None else memory_mod.HybridConfig()
+        return real_retriever(replace(cfg, min_similarity=-1e9), **kwargs)
+
+    monkeypatch.setattr(memory_mod, "HybridRetriever", build)
+
 
 _OCCUPANCY_AT_SESSION_START: dict[int, bool] = {}
 

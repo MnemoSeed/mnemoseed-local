@@ -63,6 +63,21 @@ def test_entities_cap_enforced() -> None:
     assert result.cues.entities == ["FooBar", "BazQux"]
 
 
+def test_id_shaped_all_caps_token_becomes_entity() -> None:
+    result = extract_cues("PRD-387 hookless surfaces")
+    assert "PRD-387" in result.cues.entities
+
+
+def test_short_id_tokens_become_entities() -> None:
+    result = extract_cues("L1 L2 L3")
+    assert result.cues.entities == ["L1", "L2", "L3"]
+
+
+def test_all_caps_prose_words_are_not_id_entities() -> None:
+    result = extract_cues("JSON API TODO are not identifiers")
+    assert not {"JSON", "API", "TODO"} & set(result.cues.entities)
+
+
 # --------------------------------------------------------------- project
 
 

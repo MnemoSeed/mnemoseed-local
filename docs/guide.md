@@ -442,6 +442,11 @@ Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `capture(text)`,
 `session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
 connectivity error.
 
+A `recall` result can be empty when no stored candidate clears the semantic
+relevance floor; that is a meaningful answer ("no relevant memory"), not a
+transport failure. In `coverage`, `vector_hits` is the count after the floor is
+applied and `floor_dropped` is how many candidates it excluded.
+
 The handshake also carries a short instruction block (`initialize.result.instructions`) that states the four
 execution rules — use an injected memory block instead of re-querying, recall before answering about past work,
 `capture` a durable statement the user makes, `remember` when the user asks for a pin. The MCP specification

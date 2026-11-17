@@ -2,16 +2,16 @@
 
 Behavioral contract over the real embedded drivers (LanceDB + sqlite-graph +
 synthetic embedder), mirroring the retrieval-sequence-diagram: the vector track
-returns semantic neighbors within the cue-entity overlap and a decay floor; the
-graph track returns the 2-hop entity-subgraph; the fusion rerank produces one
-ranked union with a per-candidate score breakdown. Determinism is contractual:
-no clocks, no randomness, no network.
+returns semantic neighbors above a similarity and decay floor, with entity cues
+contributing only to the beta score; the graph track returns the 2-hop
+entity-subgraph; the fusion rerank produces one ranked union with a per-candidate
+score breakdown. Determinism is contractual: no clocks, no randomness, no network.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import pytest
@@ -195,7 +195,8 @@ def _recall(
     *,
     now: float | None = None,
 ) -> HybridRecall:
-    return HybridRetriever(config).recall(
+    effective = replace(config if config is not None else HybridConfig(), min_similarity=-1e9)
+    return HybridRetriever(effective).recall(
         text,
         cues,
         profile_id=_PROFILE,
@@ -203,6 +204,22 @@ def _recall(
         graph_store=stack.graph,
         embedder=stack.embed,
         now=now,
+    )
+
+
+def _recall_at_floor(
+    stack: _Stack,
+    text: str,
+    cues: ExtractedCues,
+    config: HybridConfig | None = None,
+) -> HybridRecall:
+    return HybridRetriever(config if config is not None else HybridConfig()).recall(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
     )
 
 
@@ -217,35 +234,48 @@ def _graph_candidates(result: HybridRecall) -> list[Candidate]:
 # ------------------------------------------------------------ vector track
 
 
-def test_vector_track_returns_semantic_neighbors_filtered_by_cue_entities(stack) -> None:
+def test_vector_track_returns_semantic_neighbors_regardless_of_cue_entities(stack) -> None:
     _write(stack, _chunk("c_mem", "the LanceDb loader caches vectors", decay=0.9, entities=("LanceDb",)))
     _write(stack, _chunk("c_other", "the university library at noon", decay=0.9, entities=("University",)))
     result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_mem" in ids
-    assert "c_other" not in ids
+    assert "c_other" in ids
 
 
-def test_entity_filter_blocks_token_overlap_without_cue_entity(stack) -> None:
+def test_entity_mismatch_does_not_block_token_overlap(stack) -> None:
     _write(stack, _chunk("c_ent", "the LanceDb retrieval loader", decay=0.9, entities=("LanceDb",)))
     _write(stack, _chunk("c_noent", "the LanceDb retrieval loader too", decay=0.9, entities=("Cache",)))
     result = _recall(stack, "lancedb retrieval loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_ent" in ids
-    assert "c_noent" not in ids
+    assert "c_noent" in ids
 
 
 def test_vector_track_keeps_chunks_missing_entity_cues(stack) -> None:
-    """D2 (live-drain finding): chunks whose stored entity cues are EMPTY —
-    written before the daemon filled them, or written by paths with nothing to
-    extract — mean 'no entity evidence', never a contradiction. The entity
-    gate must only exclude positive mismatches."""
+    """Chunks with no stored entity cues carry no entity evidence and stay
+    matchable."""
     _write(stack, _chunk("c_untagged", "the LanceDb loader caches vectors", decay=0.9, entities=()))
     _write(stack, _chunk("c_tagged", "the LanceDb retrieval loader", decay=0.9, entities=("LanceDb",)))
     result = _recall(stack, "lancedb loader", _query_cues(("LanceDb",)))
     ids = {c.id for c in _chunk_candidates(result)}
     assert "c_untagged" in ids
     assert "c_tagged" in ids
+
+
+def test_entity_mismatch_does_not_veto_vector_hit_at_floor(stack) -> None:
+    """Stored cues disjoint from the query entities are a soft signal: a chunk
+    whose similarity clears the floor is still served."""
+    _write(stack, _chunk("needle", "lancedb loader", decay=0.9, entities=("Unrelated",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert "needle" in {c.id for c in _chunk_candidates(result)}
+
+
+def test_id_query_without_matching_cue_still_serves_chunk(stack) -> None:
+    text = "PRD-387 hook-less capture remember"
+    _write(stack, _chunk("needle", text, decay=0.9, entities=("Hookless",)))
+    result = _recall_at_floor(stack, text, extract_cues(text))
+    assert "needle" in {c.id for c in _chunk_candidates(result)}
 
 
 def test_vector_track_excludes_decay_below_floor(stack) -> None:
@@ -585,6 +615,23 @@ def test_graph_track_empty_cue_entities_yields_no_candidates(stack) -> None:
     assert _graph_candidates(result) == []
 
 
+def test_unbackticked_id_query_seeds_matching_graph_node(stack) -> None:
+    stack.graph.upsert_node(_node("PRD-387", NodeType.DECISION, ("PRD-387",), decay=0.9))
+    text = "PRD-387 hookless surfaces"
+    result = _recall(stack, text, extract_cues(text))
+    assert "PRD-387" in {c.id for c in _graph_candidates(result)}
+
+
+def test_graph_seeding_uses_extracted_entities(stack) -> None:
+    stack.graph.upsert_node(_node("match", NodeType.DECISION, ("PRD-387",), decay=0.9))
+    stack.graph.upsert_node(_node("other", NodeType.DECISION, ("OTHER-1",), decay=0.9))
+    text = "PRD-387 hook-less capture remember"
+    result = _recall(stack, text, extract_cues(text))
+    ids = {c.id for c in _graph_candidates(result)}
+    assert "match" in ids
+    assert "other" not in ids
+
+
 def test_graph_track_caps_at_config_top_k(stack) -> None:
     stack.graph.upsert_node(_node("hub", NodeType.PREFERENCE, ("LanceDb",), decay=0.9))
     for i in range(24):
@@ -779,8 +826,63 @@ def test_default_config_documented_defaults() -> None:
     assert config.vector_top_k == 20
     assert config.graph_top_k == 20
     assert config.min_decay == 0.4
+    assert config.min_similarity == 0.45
     assert config.weight_semantic == 1.0
     assert config.weight_cue_overlap == 1.0
-    assert config.weight_decay == 0.8
+    assert config.weight_decay == 0.2
     assert config.weight_centrality == 0.5
     assert config.centrality_saturation == 8
+
+
+# ------------------------------------------------------------ similarity floor
+
+
+def test_similarity_floor_drops_low_hits_and_counts_them(stack) -> None:
+    _write(stack, _chunk("needle", "lancedb loader", entities=("LanceDb",)))
+    for i in range(3):
+        _write(stack, _chunk(f"noise-{i}", f"unrelated topic number {i}", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.floor_dropped == 3
+    assert result.vector_hits == 1
+    assert [c.id for c in _chunk_candidates(result)] == ["needle"]
+
+
+def test_empty_result_when_every_candidate_is_below_floor(stack) -> None:
+    _write(stack, _chunk("noise-a", "unrelated topic number one", entities=("LanceDb",)))
+    _write(stack, _chunk("noise-b", "unrelated topic number two", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.candidates == []
+    assert result.vector_hits == 0
+    assert result.floor_dropped == 2
+
+
+def test_needle_ranks_first_above_surviving_boilerplate(stack) -> None:
+    _write(stack, _chunk("needle", "lancedb loader", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-a", "lancedb loader pipeline", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-b", "lancedb loader loader loader", entities=("LanceDb",)))
+    _write(stack, _chunk("bp-c", "lancedb loader and more", entities=("LanceDb",)))
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)))
+    assert result.floor_dropped == 0
+    assert [c.id for c in _chunk_candidates(result)][0] == "needle"
+
+
+def test_rescued_pin_below_floor_is_still_admitted(stack) -> None:
+    config = HybridConfig(rescue_min_decay=0.25, rescue_cue_min=0.3)
+    _write(
+        stack,
+        _chunk(
+            "pin", "unrelated topic number one", decay=0.3, entities=("LanceDb",), source=EXPLICIT_PIN_SOURCE
+        ),
+    )
+    query_embedding = stack.embed.embed("lancedb loader")
+    raw_hits = stack.vector.search(
+        query_embedding.dense, query_embedding.sparse, ChunkFilter(profile_id=_PROFILE), 20
+    )
+    pin_hit = next(hit for hit in raw_hits if hit.chunk.chunk_id == "pin")
+    assert pin_hit.similarity < config.min_similarity
+
+    result = _recall_at_floor(stack, "lancedb loader", _query_cues(("LanceDb",)), config)
+    pins = [c for c in _chunk_candidates(result) if c.id == "pin"]
+    assert len(pins) == 1
+    assert pins[0].rescued is True
+    assert result.floor_dropped == 0

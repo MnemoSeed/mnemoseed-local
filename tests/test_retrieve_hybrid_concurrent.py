@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 import pytest
 
 from mnemoseed_local.retrieve.cues import ExtractedCues, Intent
-from mnemoseed_local.retrieve.hybrid import HybridRecall, HybridRetriever
+from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRecall, HybridRetriever
 from mnemoseed_local.schema.graph import Edge, GraphNode, NodeType, RelType
 from mnemoseed_local.schema.stamp import ChunkStamp, CognitiveTier, Cues, Provenance
 from mnemoseed_local.storage.drivers.lancedb_embedded import LanceDbEmbeddedStore
@@ -32,6 +32,7 @@ _DIM = 64
 _PROFILE = "alice"
 _WORKER_COUNT = 8
 _PER_WORKER = 20
+_NO_FLOOR_CONFIG = HybridConfig(min_similarity=-1e9)
 
 
 @dataclass
@@ -166,11 +167,13 @@ def _canonical(result: HybridRecall) -> bytes:
         )
         for candidate in result.candidates
     ]
-    return repr((result.vector_hits, result.graph_hits, result.cooccurrence_term, rows)).encode("utf-8")
+    return repr(
+        (result.vector_hits, result.graph_hits, result.floor_dropped, result.cooccurrence_term, rows)
+    ).encode("utf-8")
 
 
 def _recall(stack: _Stack, text: str, cues: ExtractedCues) -> HybridRecall:
-    return HybridRetriever().recall(
+    return HybridRetriever(_NO_FLOOR_CONFIG).recall(
         text,
         cues,
         profile_id=_PROFILE,
@@ -194,7 +197,7 @@ def test_concurrent_recall_byte_identical_to_sequential_reference(stack) -> None
     _seed(stack)
     text = "lancedb loader"
     cues = _query_cues(("LanceDb",), host="cursor")
-    retriever = HybridRetriever()
+    retriever = HybridRetriever(_NO_FLOOR_CONFIG)
     concurrent = retriever.recall(
         text,
         cues,
@@ -213,6 +216,33 @@ def test_concurrent_recall_byte_identical_to_sequential_reference(stack) -> None
     )
     assert concurrent.vector_hits == sequential.vector_hits
     assert concurrent.graph_hits == sequential.graph_hits
+    assert _canonical(concurrent) == _canonical(sequential)
+
+
+def test_floor_accounting_byte_identical_on_concurrent_and_sequential_paths(stack) -> None:
+    _write(stack, _chunk("needle", "lancedb loader", entities=("LanceDb",)))
+    for i in range(3):
+        _write(stack, _chunk(f"noise-{i}", f"unrelated topic number {i}", entities=("LanceDb",)))
+    text = "lancedb loader"
+    cues = _query_cues(("LanceDb",))
+    retriever = HybridRetriever(HybridConfig())
+    concurrent = retriever.recall(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
+    )
+    sequential = retriever._recall_sequential(
+        text,
+        cues,
+        profile_id=_PROFILE,
+        vector_store=stack.vector,
+        graph_store=stack.graph,
+        embedder=stack.embed,
+    )
+    assert concurrent.floor_dropped == sequential.floor_dropped == 3
     assert _canonical(concurrent) == _canonical(sequential)
 
 
@@ -236,7 +266,7 @@ def test_expired_window_flag_identical_on_concurrent_and_sequential_paths(stack)
     now = datetime(2026, 10, 31, tzinfo=UTC).timestamp()
     text = "lancedb loader"
     cues = _query_cues(("LanceDb",), host="cursor")
-    retriever = HybridRetriever()
+    retriever = HybridRetriever(_NO_FLOOR_CONFIG)
     concurrent = retriever.recall(
         text,
         cues,
@@ -332,7 +362,7 @@ def test_concurrent_tracks_overlap_in_wall_time(stack) -> None:
     vector_probe = _TrackProbe(stack.vector, "vector", barrier, events, lock)
     graph_probe = _TrackProbe(stack.graph, "graph", barrier, events, lock)
 
-    HybridRetriever().recall(
+    HybridRetriever(_NO_FLOOR_CONFIG).recall(
         "lancedb loader",
         _query_cues(("LanceDb",)),
         profile_id=_PROFILE,
@@ -391,7 +421,7 @@ def test_retriever_close_bounded_when_track_wedged(stack) -> None:
     _seed(stack)
     block = threading.Event()
     blocking = _BlockingSearchStore(stack.vector, block)
-    retriever = HybridRetriever(close_timeout=0.2)
+    retriever = HybridRetriever(_NO_FLOOR_CONFIG, close_timeout=0.2)
     recall_thread = threading.Thread(
         target=retriever.recall,
         kwargs={
@@ -423,7 +453,7 @@ def test_recall_after_close_raises_runtime_error(stack) -> None:
     raises the executor's RuntimeError instead of deadlocking — the retriever
     never serves after teardown."""
     _seed(stack)
-    retriever = HybridRetriever()
+    retriever = HybridRetriever(_NO_FLOOR_CONFIG)
     retriever.close()
     with pytest.raises(RuntimeError):
         retriever.recall(
@@ -440,7 +470,7 @@ def test_recalls_from_eight_threads_do_not_corrupt_state(stack) -> None:
     _seed(stack)
     text = "lancedb loader"
     cues = _query_cues(("LanceDb",), host="cursor")
-    retriever = HybridRetriever()
+    retriever = HybridRetriever(_NO_FLOOR_CONFIG)
     baseline = _canonical(_recall(stack, text, cues))
 
     barrier = threading.Barrier(_WORKER_COUNT)
