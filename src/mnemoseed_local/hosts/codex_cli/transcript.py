@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,18 @@ def iter_rollouts(root: Any) -> list[Path]:
     return sorted(
         path for pattern in ("*.jsonl.zst", "*.jsonl") for path in base.rglob(pattern) if path.is_file()
     )
+
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def rollout_id(path: Any) -> str | None:
+    """The run id from a rollout filename: its uuid, or the stem when absent."""
+    if not isinstance(path, (str, Path)) or not str(path).strip():
+        return None
+    file = Path(path)
+    matches = _UUID_RE.findall(file.stem)
+    return matches[-1] if matches else file.stem
 
 
 def read_session_meta(path: Any) -> str | None:
