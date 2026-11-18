@@ -35,7 +35,8 @@ import logging
 import re
 import sys
 from dataclasses import replace
-from typing import Any, TextIO
+from datetime import UTC, datetime
+from typing import Any, Final, TextIO
 
 from mnemoseed_local import __version__, daemon_state
 from mnemoseed_local.mcp_gateway import instructions
@@ -62,6 +63,23 @@ METHOD_NOT_FOUND = -32601
 
 #: Audit actor the daemon attributes this surface to.
 ACTOR = "mcp"
+
+#: Immutable failure vocabulary; each gateway failure has exactly one kind.
+ENTRY_FAILURE_KINDS: Final[frozenset[str]] = frozenset(
+    {"entry_unavailable", "auth_refused", "result_not_delivered", "tool_error"}
+)
+
+#: Alternate entry advertised when the daemon could not be entered.
+STDIO_ALTERNATE = "stdio gateway: mnemoseed-local mcp"
+
+#: Credential and config-home cues carried on a refused-credential failure.
+AUTH_ALTERNATE = (
+    "credential/config-home: check MNEMOSEED_LOCAL_HOME on both processes "
+    "or run 'mnemoseed-local credential rotate'"
+)
+
+#: Bounded retry guidance carried on every typed entry failure.
+RETRY_POLICY = "one bounded retry via the stdio gateway"
 
 #: The tool surface: JSON Schema inputSchemas in MCP tools/list shape.
 TOOLS: list[dict[str, Any]] = [
@@ -306,15 +324,60 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
         if exc.status == 401:
             # A refused credential is its own failure shape: it must never
             # read as a connectivity problem.
-            return _error_result(DAEMON_AUTH_HINT)
-        return _error_result(f"daemon error: {exc}")
+            return entry_error_result(
+                "auth_refused", DAEMON_AUTH_HINT, observed_at=_now_iso(), alternate=AUTH_ALTERNATE
+            )
+        return entry_error_result(
+            "result_not_delivered",
+            f"daemon error: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     except DaemonUnavailableError as exc:
-        return _error_result(f"daemon error: {exc}")
+        return entry_error_result(
+            "entry_unavailable",
+            f"daemon error: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     except Exception as exc:  # never kill the loop on a tool call
-        return _error_result(f"tool {name!r} failed: {exc}")
+        return entry_error_result(
+            "tool_error",
+            f"tool {name!r} failed: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     return {
         "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}],
         "isError": False,
+    }
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def entry_error_result(
+    kind: str,
+    reason: str,
+    *,
+    observed_at: str,
+    alternate: str,
+) -> dict[str, Any]:
+    """An isError result that keeps ``reason`` verbatim and adds a typed,
+    additive entry-failure descriptor for callers that can act on it."""
+    if kind not in ENTRY_FAILURE_KINDS:
+        raise ValueError(f"unknown entry failure kind: {kind!r}")
+    datetime.fromisoformat(observed_at)
+    return {
+        "content": [{"type": "text", "text": reason}],
+        "isError": True,
+        "entry_failure": {
+            "kind": kind,
+            "observed_at": observed_at,
+            "alternate": alternate,
+            "retry_policy": RETRY_POLICY,
+        },
     }
 
 
