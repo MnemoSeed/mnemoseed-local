@@ -13,7 +13,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Measured worst case ~8 min on ubuntu-latest; see docs/ci-timeout-measurement.md.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
