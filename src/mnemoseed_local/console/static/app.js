@@ -500,6 +500,20 @@ function specForKey(key){
   return {};
 }
 
+function configWriteHeaders(){
+  const headers = {"content-type":"application/json", "x-mnemoseed-actor":"console"};
+  if(configGeneration!=null){
+    headers["if-match"] = String(configGeneration);
+    headers["If-Match"] = String(configGeneration);
+  }
+  return headers;
+}
+
+function roleRouteField(key){
+  const m = /^dream\.llm\.([^.]+)\.(driver|model)$/.exec(key);
+  return m ? { role:m[1], field:m[2] } : null;
+}
+
 async function saveConfigKey(key){
   const inp = $(`[data-key="${key}"]`);
   const errEl = $(`[data-err="${key}"]`);
@@ -507,6 +521,9 @@ async function saveConfigKey(key){
   if(errEl) errEl.hidden = true;
   if(row) row.classList.remove("is-error");
   if(!inp){ return; }
+
+  const roleRoute = roleRouteField(key);
+  if(roleRoute) return saveRoleRoute(roleRoute.role, key);
 
   let value;
   const spec = specForKey(key);
@@ -532,14 +549,9 @@ async function saveConfigKey(key){
   const btn = $(`[data-save-key="${key}"]`);
   if(btn){ btn.disabled = true; btn.textContent = "Saving\u2026"; }
   try{
-    const headers = {"content-type":"application/json", "x-mnemoseed-actor":"console"};
-    if(configGeneration!=null){
-      headers["if-match"] = String(configGeneration);
-      headers["If-Match"] = String(configGeneration);
-    }
     await fetchJson("/api/v1/config/set", {
       method:"POST",
-      headers,
+      headers: configWriteHeaders(),
       body: JSON.stringify({ key_path: key, value }),
     });
     a11yLive(`Saved ${key}`);
@@ -563,6 +575,51 @@ async function saveConfigKey(key){
     }
   } finally {
     if(btn){ btn.disabled = false; btn.textContent = "Save"; }
+  }
+}
+
+async function saveRoleRoute(role, triggerKey){
+  const driverKey = `dream.llm.${role}.driver`;
+  const modelKey = `dream.llm.${role}.model`;
+  const driverInp = $(`[data-key="${driverKey}"]`);
+  const modelInp = $(`[data-key="${modelKey}"]`);
+  if(!driverInp || !modelInp) return;
+  const driver = driverInp.value;
+  const model = modelInp.value;
+  if(!driver) return cfgFieldError(driverKey, "driver is required to bind a role");
+  if(!model) return cfgFieldError(modelKey, "model is required to bind a role");
+
+  const btns = [driverKey, modelKey].map(k=>$(`[data-save-key="${k}"]`)).filter(Boolean);
+  btns.forEach(b=>{ b.disabled = true; b.textContent = "Saving\u2026"; });
+  try{
+    await fetchJson("/api/v1/config/set-many", {
+      method:"POST",
+      headers: configWriteHeaders(),
+      body: JSON.stringify({ updates:[
+        { key_path: driverKey, value: driver },
+        { key_path: modelKey, value: model },
+      ]}),
+    });
+    a11yLive(`Saved ${role} route (driver + model)`);
+    await loadConfigPage();
+    if($("#config-versions-body").dataset.loaded === "true"){
+      await loadConfigVersions();
+    }
+  }catch(e){
+    if(e.status===409){
+      cfgFieldError(triggerKey, "Someone else changed this \u2014 reloaded. Your change was not applied.");
+      await loadConfigPage();
+      if($("#config-versions-body").dataset.loaded === "true") await loadConfigVersions();
+    } else if(e.status===422){
+      const raw = (e.message||"").replace(/^config\[[^\]]*\]:\s*/, "");
+      cfgFieldError(triggerKey, raw || "invalid role route");
+    } else if(e.status===403){
+      cfgFieldError(triggerKey, "Config writes are rejected \u2014 the daemon baseurl is non-loopback.");
+    } else {
+      cfgFieldError(triggerKey, e.message||"write failed");
+    }
+  }finally{
+    btns.forEach(b=>{ b.disabled = false; b.textContent = "Save"; });
   }
 }
 
