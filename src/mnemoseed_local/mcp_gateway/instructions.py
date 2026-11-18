@@ -33,33 +33,35 @@ SURFACES = ("claude_chat", "chatgpt", "claude_code", "generic")
 #: The generic lead: the block exactly as the handshake serves it.
 PREAMBLE = "MnemoSeed is this machine's long-term memory for you, shared across sessions and hosts."
 
-#: The four execution intentions, the meaning of an empty result, and the
+#: The six execution intentions, the meaning of an empty result, and the
 #: pin-versus-captured distinction. ``{recall}``-style placeholders resolve to
 #: the identifiers in ``TOOL_PLACEHOLDERS``.
 BODY = """\
 The rules below are situations and actions, not suggestions:
 
-1. If a memory block was already injected into this conversation, that block is
-   your memory channel: use it. Do not call {recall} again for the same topic.
+1. If a memory block was already injected, use it as your memory channel; do not
+   call {recall} again for the same topic.
 2. If no memory block was injected and this client has no capture hook, you are
-   the memory channel yourself. When the user mentions past work, an earlier
-   decision, or a stated preference, call {recall} first, querying with the
-   user's own words (names, paths, issue numbers, the wording they used); never
-   rewrite the query into your own synonyms. One call per topic is enough.
+   the memory channel yourself. For past work, a decision, or a stated
+   preference, call {recall} first with the user's own words (names, paths,
+   issue numbers); never rewrite the query into synonyms. One call per topic
+   suffices.
 3. No memory block, this client has no capture hook, and the user states a
    durable decision, preference, or constraint: call {capture} with their words
-   quoted verbatim. Never capture your own guesses, drafts, or reasoning.
-4. If the user explicitly asks to remember or pin something, call {remember}.
-   Call {supersede} only when the user asks to replace one specific belief.
+   verbatim. Never capture your own guesses, drafts, or reasoning.
+4. If the user explicitly asks to remember or pin something, call {remember};
+   call {supersede} only to replace one specific belief.
+5. Entry failure not absence: retry once via 'mnemoseed-local mcp' (stdio, own
+   credential); negatives: observed_at, reverify.
 
-An empty result means no relevant memory exists: say so plainly and continue.
-Do not guess, and do not repeat the query.
-{recent_sessions} unresolved: resolution failed, not "no relevant history"; follow
-next_step (bind, add resume_query id).
+An empty result means no relevant memory exists: say so and continue; do not
+guess or repeat the query.
+{recent_sessions} unresolved: resolution failed, not "no relevant history";
+follow next_step (bind, add resume_query id).
 
 A pin is an entry the user explicitly asked to keep: provenance_source is
-"memory.remember", or explicit_pin is true. A captured entry is one written
-from a conversation instead, with explicit_pin false.
+"memory.remember", or explicit_pin is true. A captured entry is written from a
+conversation instead, with explicit_pin false.
 """
 
 #: The per-surface leads: the entry point a user actually pastes into, plus this

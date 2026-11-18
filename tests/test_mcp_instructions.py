@@ -10,6 +10,7 @@ cannot drift apart.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from string import Formatter
 
 import pytest
@@ -33,27 +34,29 @@ CONTRACT_PREAMBLE = "MnemoSeed is this machine's long-term memory for you, share
 CONTRACT_BODY = """\
 The rules below are situations and actions, not suggestions:
 
-1. If a memory block was already injected into this conversation, that block is
-   your memory channel: use it. Do not call {recall} again for the same topic.
+1. If a memory block was already injected, use it as your memory channel; do not
+   call {recall} again for the same topic.
 2. If no memory block was injected and this client has no capture hook, you are
-   the memory channel yourself. When the user mentions past work, an earlier
-   decision, or a stated preference, call {recall} first, querying with the
-   user's own words (names, paths, issue numbers, the wording they used); never
-   rewrite the query into your own synonyms. One call per topic is enough.
+   the memory channel yourself. For past work, a decision, or a stated
+   preference, call {recall} first with the user's own words (names, paths,
+   issue numbers); never rewrite the query into synonyms. One call per topic
+   suffices.
 3. No memory block, this client has no capture hook, and the user states a
    durable decision, preference, or constraint: call {capture} with their words
-   quoted verbatim. Never capture your own guesses, drafts, or reasoning.
-4. If the user explicitly asks to remember or pin something, call {remember}.
-   Call {supersede} only when the user asks to replace one specific belief.
+   verbatim. Never capture your own guesses, drafts, or reasoning.
+4. If the user explicitly asks to remember or pin something, call {remember};
+   call {supersede} only to replace one specific belief.
+5. Entry failure not absence: retry once via 'mnemoseed-local mcp' (stdio, own
+   credential); negatives: observed_at, reverify.
 
-An empty result means no relevant memory exists: say so plainly and continue.
-Do not guess, and do not repeat the query.
-{recent_sessions} unresolved: resolution failed, not "no relevant history"; follow
-next_step (bind, add resume_query id).
+An empty result means no relevant memory exists: say so and continue; do not
+guess or repeat the query.
+{recent_sessions} unresolved: resolution failed, not "no relevant history";
+follow next_step (bind, add resume_query id).
 
 A pin is an entry the user explicitly asked to keep: provenance_source is
-"memory.remember", or explicit_pin is true. A captured entry is one written
-from a conversation instead, with explicit_pin false.
+"memory.remember", or explicit_pin is true. A captured entry is written from a
+conversation instead, with explicit_pin false.
 """
 
 #: Phrases the delivery contract requires: the injected-block intention, the
@@ -134,11 +137,11 @@ def test_the_block_carries_every_required_phrase() -> None:
         assert phrase in text, phrase
 
 
-def test_the_block_states_the_four_intentions_as_situations_and_actions() -> None:
+def test_the_block_states_the_six_intentions_as_situations_and_actions() -> None:
     """Every rule is a situation -> action pair (the implementation-intention
     shape); a capability statement ("you can use X") is not one."""
     text = _flatten(_surfaced("generic"))
-    for name in ("recall", "capture", "remember", "supersede"):
+    for name in ("recall", "capture", "remember", "supersede", "recent_sessions"):
         assert name in text, name
     # intention 1: with an injected block, use it and do not re-query
     assert "already injected" in text
@@ -148,6 +151,73 @@ def test_the_block_states_the_four_intentions_as_situations_and_actions() -> Non
     assert "Never capture" in text and "guesses" in text
     # intention 4: an explicit ask -> remember; replacement -> supersede
     assert "explicitly asks to remember" in text
+    # intention 5: an entry failure is not absence; retry via the stdio gateway
+    assert "Entry failure" in text and "not absence" in text
+    assert "mnemoseed-local mcp" in text and "observed_at" in text
+    # intention 6: an unresolved recovery is a resolution failure, not an empty recall
+    assert "unresolved: resolution failed" in text and "next_step" in text
+
+
+def test_entry_failure_rule_fits_every_surface_below_the_ceiling() -> None:
+    """The one added rule stays <=122 chars, and all five surfaces render."""
+    import re
+
+    resolved = _surfaced("generic")
+    match = re.search(r"5\. (.*?)\n\n", resolved, re.S)
+    assert match is not None
+    rule = " ".join(match.group(1).split())
+    assert len(rule) <= 122, len(rule)
+    for phrase in (
+        "Entry failure",
+        "not absence",
+        "mnemoseed-local mcp",
+        "retry once",
+        "observed_at",
+        "reverify",
+    ):
+        assert phrase in rule, phrase
+    for surface in SURFACES:
+        text = instructions.surface_text(surface, GATEWAY_TOOL_NAMES)
+        assert len(text) <= instructions.MAX_CHARS, surface
+
+
+def test_namespace_absent_still_recalls_via_stdio_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-A3: the host registers no MCP tools, yet the stdio gateway recalls."""
+    import io
+    import json
+
+    from mnemoseed_local import cli as cli_module
+    from mnemoseed_local.mcp_gateway import server
+
+    config = tmp_path / "opencode.json"
+    config.write_text('{"mcp": {}}', encoding="utf-8")
+    monkeypatch.setattr("mnemoseed_local.cli.OPENCODE_CONFIG_PATH", config)
+    assert cli_module._opencode_mcp_registered(config) is False
+
+    payload = {"memory": {"entries": [{"kind": "fact", "text": "durable recall", "score": 0.9}]}}
+
+    class _Client:
+        profile_id = "default"
+
+        def post(self, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+            del path, body
+            return payload
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "recall", "arguments": {"query": "durable recall"}},
+    }
+    stdin = io.StringIO(json.dumps(request) + "\n")
+    stdout = io.StringIO()
+    code = server.serve(stdin=stdin, stdout=stdout, client=_Client())  # type: ignore[arg-type]
+    assert code == 0
+    result = json.loads(stdout.getvalue())["result"]
+    assert result["isError"] is False
+    assert "durable recall" in result["content"][0]["text"]
 
 
 def test_the_block_distinguishes_unresolved_recovery_from_no_history() -> None:

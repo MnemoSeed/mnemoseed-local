@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemoseed_local.cli import build_parser, main, models_contain
+from mnemoseed_local.cli import _opencode_mcp_registered, build_parser, main, models_contain
 from mnemoseed_local.config import default_config_toml, load_config
 from mnemoseed_local.hardware import recommended_tier
 from mnemoseed_local.llm.types import HealthReport
@@ -1126,6 +1126,31 @@ def test_doctor_stays_quiet_without_a_live_registration(
     _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
+
+
+def test_namespace_absent_cli_and_gateway_still_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-A3: no MCP tools registered in the host, yet the CLI and the stdio
+    gateway still work."""
+    from mnemoseed_local.mcp_gateway import server
+
+    config = tmp_path / "opencode.json"
+    config.write_text('{"mcp": {}}', encoding="utf-8")
+    assert _opencode_mcp_registered(config) is False
+
+    assert main(["instructions", "--surface", "generic"]) == 0
+    assert capsys.readouterr().out.strip()
+
+    class _Client:
+        profile_id = "default"
+
+        def post(self, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+            del path, body
+            return {"memory": {"entries": []}}
+
+    result = server.call_tool(_Client(), "recall", {"query": "x"})  # type: ignore[arg-type]
+    assert result["isError"] is False
 
 
 def test_doctor_absent_opencode_config_skips_silently(
