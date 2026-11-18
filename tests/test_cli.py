@@ -999,6 +999,8 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     """A stale plugin does not error — it keeps calling the daemon the old way,
     which the credential boundary refuses. The doctor must name it, or capture
     stops silently after an upgrade."""
+    import httpx
+
     from mnemoseed_local import cli
     from mnemoseed_local.hosts import install as hook_install
 
@@ -1011,6 +1013,17 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
         monkeypatch.delenv(var, raising=False)
+    # the real warning resolves its daemon base from the environment; aim it at
+    # the unroutable loopback base so a doctor run cannot dial the live daemon
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", hook_install.DETECTION_PROBE_BASE)
+    probed_urls: list[str] = []
+    real_get = httpx.get
+
+    def _record_get(url: str, **kwargs: object) -> httpx.Response:
+        probed_urls.append(url)
+        return real_get(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", _record_get)
     root = tmp_path / ".config" / "opencode"
     target = hook_install.target_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1022,6 +1035,7 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     assert "[warn] stale plugin:" in out
     assert "hook install opencode" in out
     assert str(target) in out
+    assert set(probed_urls) == {f"{hook_install.DETECTION_PROBE_BASE}/healthz"}
 
 
 def _write_opencode_registration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str = "") -> Path:
