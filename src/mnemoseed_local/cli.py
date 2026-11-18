@@ -1831,6 +1831,7 @@ HOOK_HOSTS: dict[str, HostBinding] = {
 #: and never imports a host module itself.
 IMPORT_SOURCES: dict[str, str] = {
     "codex_cli": "mnemoseed_local.hosts.codex_cli.transcript",
+    "claude_code": "mnemoseed_local.hosts.claude_code.transcript",
 }
 
 
@@ -2314,11 +2315,12 @@ def cmd_import(args: argparse.Namespace) -> int:
             answer = input(f"Import rollouts from {root} into profile {args.profile}? [y/N] ")
             if answer.strip().lower() not in ("y", "yes"):
                 return 1
+        discovered = source.iter_rollouts(root)
         if args.dry_run:
-            runner.preflight_zstandard()
+            runner.preflight_zstandard(discovered)
         else:
             client = runner.build_client(_import_base_url(), args.profile)
-            runner.preflight(client)
+            runner.preflight(client, discovered)
         report = runner.run_import(
             source=source,
             root=root,

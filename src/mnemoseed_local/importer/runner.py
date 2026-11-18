@@ -91,8 +91,10 @@ def build_client(base_url: str, profile_id: str) -> DaemonClient:
     )
 
 
-def preflight_zstandard() -> None:
-    """Fail before the first ingest when the compressed-rollout extra is absent."""
+def preflight_zstandard(rollouts: Sequence[Path] = ()) -> None:
+    """Fail before the first ingest only when a discovered rollout is compressed."""
+    if not any(path.suffix == ".zst" for path in rollouts):
+        return
     if find_spec("zstandard") is None:
         raise ImportPreflightError(
             "zstandard is required to read compressed rollouts "
@@ -100,9 +102,9 @@ def preflight_zstandard() -> None:
         )
 
 
-def preflight(client: DaemonClient) -> None:
+def preflight(client: DaemonClient, rollouts: Sequence[Path] = ()) -> None:
     """Local setup check first, then one read-only daemon reachability probe."""
-    preflight_zstandard()
+    preflight_zstandard(rollouts)
     client.get("/healthz")
 
 

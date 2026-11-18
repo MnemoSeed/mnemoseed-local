@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+import zstandard
 
 from mnemoseed_local import cli
 from mnemoseed_local.importer import runner
@@ -18,8 +19,9 @@ from mnemoseed_local.rest_client import DaemonUnavailableError
 RUN_A = "c0de5e55-0000-4000-8000-000000000001"
 
 
-def _write_rollout(root: Path) -> Path:
-    path = root / "2026" / "09" / "10" / f"rollout-2026-09-10t10-00-00-000000-{RUN_A}.jsonl"
+def _write_rollout(root: Path, *, compressed: bool = False) -> Path:
+    name = f"rollout-2026-09-10t10-00-00-000000-{RUN_A}.jsonl"
+    path = root / "2026" / "09" / "10" / (name + ".zst" if compressed else name)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps({"ordinal": 0, "type": "session_meta", "payload": {"session_id": "conv-7"}}),
@@ -31,7 +33,8 @@ def _write_rollout(root: Path) -> Path:
             }
         ),
     ]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    path.write_bytes(zstandard.ZstdCompressor().compress(data) if compressed else data)
     return path
 
 
@@ -124,8 +127,9 @@ def test_dry_run_makes_zero_http_and_reports_turn_count(
 def test_missing_zstandard_fails_before_posts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "home"))
     root = tmp_path / "sessions"
-    _write_rollout(root)
+    _write_rollout(root, compressed=True)
     monkeypatch.setattr(runner, "find_spec", lambda name: None)
+    monkeypatch.setattr(httpx, "get", _no_http)
     monkeypatch.setattr(httpx, "post", _no_http)
     assert cli.main(["import", "--host", "codex_cli", "--source", str(root), "--yes"]) == 1
 
@@ -136,8 +140,9 @@ def test_missing_zstandard_message_names_codex_extra(
     monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
     root = tmp_path / "sessions"
-    _write_rollout(root)
+    _write_rollout(root, compressed=True)
     monkeypatch.setattr(runner, "find_spec", lambda name: None)
+    monkeypatch.setattr(httpx, "get", _no_http)
     assert cli.main(["import", "--host", "codex_cli", "--source", str(root), "--yes"]) == 1
     assert "[codex]" in capsys.readouterr().err
 
