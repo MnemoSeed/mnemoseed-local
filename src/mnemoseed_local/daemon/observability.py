@@ -23,6 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from mnemoseed_local.config import RoleLLMConfig
 from mnemoseed_local.dream.readiness import DreamRouteReadiness
@@ -30,6 +31,27 @@ from mnemoseed_local.rest_client import DEFAULT_PROFILE_ID
 from mnemoseed_local.util.process_memory import process_commit_mb
 
 logger = logging.getLogger("mnemoseed_local.daemon.observability")
+
+
+def _iso_utc(ts: float) -> str:
+    """An ISO-8601 UTC observation time. Distinct from DB/float epoch values."""
+    return datetime.fromtimestamp(ts, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+def _is_iso8601(value: object) -> bool:
+    """Whether ``value`` is an ISO-8601 timestamp string (not a float epoch)."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+#: The re-anchor status carried additively on the daemon's observability read.
+ANCHOR_STATUS_STALE = "stale"
+ANCHOR_STATUS_REVERIFIED = "reverified"
 
 
 class Observability:
@@ -46,10 +68,18 @@ class Observability:
         # observation numbers — no per-session breakdown, no ids, no text.
         self._recall_injection_count = 0
         self._recall_injection_chars_total = 0
+        # The newest hook-attributed ingest is the real verification instant
+        # the host status reads back over REST. No TS debug file or wire marker
+        # is involved: stale is the honest default, and a hook ingest observed
+        # after a stale persisted capture reports reverified (capture-neutral).
+        self._last_anchored_at: str | None = None
+        self._anchor_status = ANCHOR_STATUS_STALE
 
     def note_capture_ingest(self) -> None:
         with self._lock:
             self._capture_ingests += 1
+            self._last_anchored_at = _iso_utc(time.time())
+            self._anchor_status = ANCHOR_STATUS_REVERIFIED
 
     def note_authenticated_request(self, actor: str) -> None:
         """Count one request the credential gate admitted, per audit actor.
@@ -89,6 +119,8 @@ class Observability:
                 "recall_injection_count": self._recall_injection_count,
                 "recall_injection_chars_total": self._recall_injection_chars_total,
                 "recall_pending_served_count": self._recall_injection_count,
+                "last_anchored_at": self._last_anchored_at,
+                "anchor_status": self._anchor_status,
                 "process_commit_mb": process_commit_mb(),
             }
 
@@ -173,6 +205,24 @@ CAPTURE_EVIDENCE_NONE = "none"
 CAPTURE_EVIDENCE_RECENT = "recent"
 CAPTURE_EVIDENCE_STALE = "stale"
 CAPTURE_EVIDENCE_UNKNOWN = "unknown"
+# A stale capture that a D3 re-anchor re-verified: verified_at carries the
+# real hook-ingest observation time the daemon reported over REST.
+CAPTURE_EVIDENCE_REVERIFIED = "reverified"
+
+#: The four-way memory-entry diagnosis vocabulary. Each kind has exactly one
+#: observable trigger; no entry is vacuous and none overlaps another.
+MEMORY_DIAGNOSIS_DAEMON_DOWN = "daemon_down"
+MEMORY_DIAGNOSIS_CAPTURE_STALE = "capture_stale"
+MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE = "index_unavailable"
+MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED = "result_not_delivered"
+_MEMORY_DIAGNOSIS_KINDS = frozenset(
+    {
+        MEMORY_DIAGNOSIS_DAEMON_DOWN,
+        MEMORY_DIAGNOSIS_CAPTURE_STALE,
+        MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE,
+        MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED,
+    }
+)
 
 #: The since-boot counter vocabulary shared by the ingest-acknowledgement and
 #: replay observations: a counter that moved, one that has not, and one that
@@ -199,21 +249,47 @@ class CaptureEvidenceStatus:
 
     ``last_persisted_at`` is the newest host-attributed persisted chunk's
     ingest time (None for absence and for unknown); ``window_s`` is the
-    freshness window the state was computed against.
+    freshness window the state was computed against. ``observed_at`` is the
+    ISO-8601 instant the state was computed; ``verified_at`` is the ISO-8601
+    re-anchor observation (only set on the reverified state). Both default so
+    existing positional construction and the read-only `.line()` oracle stay
+    compatible.
     """
 
     state: str
     detail: str
     last_persisted_at: float | None
     window_s: float
+    observed_at: str = ""
+    verified_at: str | None = None
 
     def line(self) -> str:
         return f"capture: {self.state} ({self.detail})"
 
 
+@dataclass(frozen=True)
+class MemoryEntryDiagnosis:
+    """One typed memory-entry failure diagnosis with a real observation time."""
+
+    kind: str
+    observed_at: str
+
+
+def memory_entry_diagnosis(kind: str, *, observed_at: str) -> MemoryEntryDiagnosis:
+    """Build a diagnosis from the closed four-way vocabulary. An unknown kind
+    or a non-ISO observation time is RED, never silently accepted."""
+    if kind not in _MEMORY_DIAGNOSIS_KINDS:
+        raise ValueError(f"unknown memory-entry diagnosis kind: {kind!r}")
+    if not _is_iso8601(observed_at):
+        raise ValueError(f"observed_at is not ISO-8601: {observed_at!r}")
+    return MemoryEntryDiagnosis(kind, observed_at)
+
+
 def unreadable_capture_evidence(detail: str, *, window_s: float) -> CaptureEvidenceStatus:
     """The unknown state for evidence that could not be read — never a guess."""
-    return CaptureEvidenceStatus(CAPTURE_EVIDENCE_UNKNOWN, detail, None, window_s)
+    return CaptureEvidenceStatus(
+        CAPTURE_EVIDENCE_UNKNOWN, detail, None, window_s, observed_at=_iso_utc(time.time())
+    )
 
 
 def capture_evidence_status(
@@ -231,17 +307,19 @@ def capture_evidence_status(
     """
     if now is None:
         now = time.time()
+    observed_at = _iso_utc(now)
     if last_persisted_at is None:
         return CaptureEvidenceStatus(
             CAPTURE_EVIDENCE_NONE,
             "no persisted capture observed for this host",
             None,
             window_s,
+            observed_at=observed_at,
         )
     age = max(0.0, now - last_persisted_at)
     detail = f"last persisted {_human_duration(age)} ago (window {_human_duration(window_s)})"
     state = CAPTURE_EVIDENCE_RECENT if age <= window_s else CAPTURE_EVIDENCE_STALE
-    return CaptureEvidenceStatus(state, detail, last_persisted_at, window_s)
+    return CaptureEvidenceStatus(state, detail, last_persisted_at, window_s, observed_at=observed_at)
 
 
 @dataclass(frozen=True)
