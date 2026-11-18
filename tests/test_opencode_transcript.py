@@ -13,7 +13,7 @@ import pytest
 
 from mnemoseed_local.hosts.opencode import transcript
 from mnemoseed_local.importer.ledger import ImportLedger
-from mnemoseed_local.importer.runner import RolloutSource, run_import
+from mnemoseed_local.importer.runner import RolloutSource, load_source, run_import
 from mnemoseed_local.util.rollout import rollout_run_id
 
 SESSION_A = "ses_a1111111111WgK5b3MDl0WTIU"
@@ -226,3 +226,156 @@ def test_runner_real_import_ingests_with_statable_handles(
     assert len(ingests) == 2
     assert all(body["session_id"] == SESSION_A for body in ingests)
     assert report.sessions_imported == 1
+
+
+def _open_wal_db(root: Path) -> tuple[Path, sqlite3.Connection]:
+    root.mkdir(parents=True, exist_ok=True)
+    db = root / "opencode.db"
+    writer = sqlite3.connect(db)
+    try:
+        mode = writer.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        assert mode == "wal"
+        writer.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER)"
+        )
+        writer.execute(
+            "CREATE TABLE session_message "
+            "(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, "
+            "time_created INTEGER, data TEXT)"
+        )
+        writer.execute(
+            "INSERT INTO session_v2 (id, title, directory, time_created) VALUES (?, ?, ?, ?)",
+            (SESSION_A, "title", "G:/work/proj", 1000),
+        )
+        writer.execute(
+            "INSERT INTO session_message "
+            "(id, session_id, type, seq, time_created, data) VALUES (?, ?, ?, ?, ?, ?)",
+            ("m0", SESSION_A, "user", 0, 1000, json.dumps({"text": "baseline"})),
+        )
+        writer.commit()
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        writer.execute(
+            "INSERT INTO session_message "
+            "(id, session_id, type, seq, time_created, data) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "m1",
+                SESSION_A,
+                "assistant",
+                1,
+                1001,
+                json.dumps({"content": [{"type": "text", "text": "wal-only"}]}),
+            ),
+        )
+        writer.commit()
+    except BaseException:
+        writer.close()
+        raise
+    return db, writer
+
+
+def test_read_turns_sees_wal_only_turns_through_readonly_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "opencode"
+    _db, writer = _open_wal_db(root)
+    stub = root / ".mnemoseed-rollouts" / f"{SESSION_A}.opencode"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.touch()
+    uris: list[str] = []
+    real_connect = transcript.sqlite3.connect
+
+    def record_connect(database: Any, **kwargs: Any) -> sqlite3.Connection:
+        uris.append(str(database))
+        return real_connect(database, **kwargs)
+
+    monkeypatch.setattr(transcript.sqlite3, "connect", record_connect)
+    try:
+        turns = transcript.read_turns(str(stub))
+    finally:
+        writer.close()
+    assert [turn.text for turn in turns] == ["baseline", "wal-only"]
+    assert len(uris) == 1
+    assert "mode=ro" in uris[0]
+    assert "immutable" not in uris[0]
+    assert "nolock" not in uris[0]
+
+
+def test_iter_rollouts_skips_session_ids_that_escape_the_stub_dir(tmp_path: Path) -> None:
+    root = tmp_path / "opencode"
+    _write_db(
+        root,
+        [
+            ("user", SESSION_A, 0, 1000, json.dumps({"text": "ok"})),
+            ("user", "../escaped", 0, 1000, json.dumps({"text": "bad"})),
+            ("user", "..\\windows-escaped", 0, 1000, json.dumps({"text": "bad"})),
+            ("user", str(root / "abs-escaped"), 0, 1000, json.dumps({"text": "bad"})),
+        ],
+    )
+    handles = transcript.iter_rollouts(root)
+    assert [handle.name for handle in handles] == [f"{SESSION_A}.opencode"]
+    stub_dir = root / ".mnemoseed-rollouts"
+    assert all(handle.parent == stub_dir for handle in handles)
+    assert not (root / "escaped.opencode").exists()
+    assert not (root / "windows-escaped.opencode").exists()
+    assert not (root / "abs-escaped.opencode").exists()
+    assert list(root.rglob("*escaped*")) == []
+
+
+def test_iter_rollouts_raises_actionable_error_when_stub_dir_is_a_file(tmp_path: Path) -> None:
+    root = tmp_path / "opencode"
+    _write_db(root, [("user", SESSION_A, 0, 1000, json.dumps({"text": "ok"}))])
+    (root / ".mnemoseed-rollouts").write_text("not a directory", encoding="utf-8")
+    with pytest.raises(Exception) as excinfo:
+        transcript.iter_rollouts(root)
+    assert type(excinfo.value).__name__ == "OpencodeTranscriptError"
+    assert "stub" in str(excinfo.value).lower()
+
+
+def test_runner_dry_run_creates_no_stub_files(tmp_path: Path) -> None:
+    root = tmp_path / "opencode"
+    _write_db(root, [_user("u0", seq=0), _user("u1", seq=1)])
+    source = load_source("opencode", "mnemoseed_local.hosts.opencode.transcript")
+    report = run_import(
+        source=source,
+        root=root,
+        profile_id="default",
+        client=_FakeClient(),
+        ledger=ImportLedger("opencode", home=tmp_path / "home"),
+        dry_run=True,
+        progress=_quiet,
+    )
+    assert report.turns_ingested == 2
+    stub_dir = root / ".mnemoseed-rollouts"
+    assert not stub_dir.exists() or not any(stub_dir.iterdir())
+
+
+def test_runner_labels_locked_database_distinct_from_corrupt(tmp_path: Path) -> None:
+    def locked_turns(_path: str) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    def broken_turns(_path: str) -> Any:
+        raise ValueError("bad row")
+
+    source = RolloutSource(
+        host="opencode",
+        default_source="",
+        iter_rollouts=lambda _root: [Path("locked.opencode"), Path("broken.opencode")],
+        read_session_meta=lambda _path: "conv",
+        read_turns=lambda path: (
+            locked_turns(path) if str(path).endswith("locked.opencode") else broken_turns(path)
+        ),
+        validate_rollout=lambda _path: None,
+    )
+    emitted: list[str] = []
+    report = run_import(
+        source=source,
+        root=tmp_path,
+        profile_id="default",
+        client=None,
+        ledger=ImportLedger("opencode", home=tmp_path / "home"),
+        dry_run=True,
+        progress=emitted.append,
+    )
+    assert report.skipped.get("locked") == 1
+    assert report.skipped.get("corrupt") == 1
+    assert any("warning" in line.lower() and "lock" in line.lower() for line in emitted)

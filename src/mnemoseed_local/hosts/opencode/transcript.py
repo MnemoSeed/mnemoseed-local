@@ -11,6 +11,7 @@ turns; reasoning and tool parts are excluded.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -23,6 +24,11 @@ DEFAULT_SOURCE = "~/.local/share/opencode"
 _DB_NAME = "opencode.db"
 _STUB_DIR = ".mnemoseed-rollouts"
 _STUB_SUFFIX = ".opencode"
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+class OpencodeTranscriptError(Exception):
+    """The opencode history source could not be enumerated safely."""
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,11 @@ def _open_db(db: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
 
 
+def _valid_session_id(session_id: Any) -> bool:
+    """Only plain ids may become stub file names; path syntax is never a name."""
+    return isinstance(session_id, str) and _SESSION_ID_RE.fullmatch(session_id) is not None
+
+
 def _decode(path: Any) -> tuple[Path, str]:
     handle = Path(path)
     if handle.parent.name != _STUB_DIR:
@@ -50,8 +61,12 @@ def _decode(path: Any) -> tuple[Path, str]:
     return handle.parent.parent / _DB_NAME, session_id
 
 
-def iter_rollouts(root: Any) -> list[Path]:
-    """Stat-able per-session handles, ordered by creation time then id."""
+def iter_rollouts(root: Any, *, create_stubs: bool = True) -> list[Path]:
+    """Per-session handles, ordered by creation time then id.
+
+    Stub files are created only when requested; a dry import names the same
+    handles without touching the source directory.
+    """
     base = Path(root).expanduser()
     db = base / _DB_NAME
     if not db.is_file():
@@ -59,11 +74,23 @@ def iter_rollouts(root: Any) -> list[Path]:
     with closing(_open_db(db)) as con:
         rows = con.execute("SELECT id, time_created FROM session_v2 ORDER BY time_created, id").fetchall()
     stub_dir = base / _STUB_DIR
-    stub_dir.mkdir(parents=True, exist_ok=True)
+    if create_stubs:
+        try:
+            stub_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OpencodeTranscriptError(
+                f"cannot create opencode rollout stub directory {stub_dir}: {exc}"
+            ) from exc
     handles: list[Path] = []
     for session_id, _created in rows:
+        if not _valid_session_id(session_id):
+            continue
         handle = stub_dir / f"{session_id}{_STUB_SUFFIX}"
-        handle.touch(exist_ok=True)
+        if create_stubs:
+            try:
+                handle.touch(exist_ok=True)
+            except OSError as exc:
+                raise OpencodeTranscriptError(f"cannot create opencode rollout stub {handle}: {exc}") from exc
         handles.append(handle)
     return handles
 

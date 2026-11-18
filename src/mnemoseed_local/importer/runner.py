@@ -9,6 +9,8 @@ with pool credit off, and the resume ledger advances only on that settle's 200.
 from __future__ import annotations
 
 import importlib
+import inspect
+import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -45,10 +47,11 @@ class TranscriptTurnLike(Protocol):
 class RolloutSource:
     host: str
     default_source: str
-    iter_rollouts: Callable[[Any], list[Path]]
+    iter_rollouts: Callable[..., list[Path]]
     read_session_meta: Callable[[Any], str | None]
     read_turns: Callable[[Any], Sequence[TranscriptTurnLike]]
     validate_rollout: Callable[[Any], None]
+    supports_create_stubs: bool = False
 
 
 @dataclass
@@ -78,6 +81,7 @@ def load_source(host: str, module_path: str) -> RolloutSource:
         read_session_meta=module.read_session_meta,
         read_turns=module.read_turns,
         validate_rollout=module.validate_rollout,
+        supports_create_stubs="create_stubs" in inspect.signature(module.iter_rollouts).parameters,
     )
 
 
@@ -145,7 +149,10 @@ def run_import(
     active: set[str] = set()
     if not dry_run and client is not None:
         active = set(client.get("/session/active", params={"profile_id": profile_id}).get("sessions", []))
-    rollouts = source.iter_rollouts(root)
+    if source.supports_create_stubs:
+        rollouts = source.iter_rollouts(root, create_stubs=not dry_run)
+    else:
+        rollouts = source.iter_rollouts(root)
     if limit is not None:
         rollouts = rollouts[:limit]
     total = len(rollouts)
@@ -165,6 +172,15 @@ def run_import(
             turns = sorted(source.read_turns(str(path)), key=lambda turn: int(turn.ordinal))
         except RuntimeError:
             raise
+        except sqlite3.OperationalError as exc:
+            note(0, 0)
+            if "locked" in str(exc).lower():
+                report.skip("locked")
+                if progress is not None:
+                    progress(f"warning: database is locked, skipping {path.name}")
+                continue
+            report.skip("corrupt")
+            continue
         except Exception:
             report.skip("corrupt")
             note(0, 0)
