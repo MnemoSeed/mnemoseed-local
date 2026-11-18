@@ -169,6 +169,66 @@ def test_anthropic_usage_maps_input_output_and_cache_legs() -> None:
     )
 
 
+def test_anthropic_nested_usage_garbage_degrades_to_none_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {"input_tokens": {}},
+            },
+        )
+
+    llm = _driver(handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is None
+
+
+def test_anthropic_nested_usage_numeric_strings_coerce() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {
+                    "input_tokens": "5",
+                    "output_tokens": "2",
+                    "cache_read_input_tokens": "42",
+                    "cache_creation_input_tokens": "7",
+                },
+            },
+        )
+
+    llm = _driver(handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage == Usage(
+        prompt_tokens=5,
+        completion_tokens=2,
+        cache_read_input_tokens=42,
+        cache_creation_input_tokens=7,
+    )
+
+
+def test_anthropic_nested_usage_garbage_field_becomes_none() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {"input_tokens": 5, "output_tokens": {}},
+            },
+        )
+
+    llm = _driver(handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 5
+    assert result.usage.completion_tokens is None
+
+
 @pytest.mark.parametrize("garbage", [{"foo": "bar"}, ["nope"]])
 def test_anthropic_garbage_shape_degrades_to_empty_text(garbage: Any) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
