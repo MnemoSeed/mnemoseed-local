@@ -143,7 +143,7 @@ def test_ping_returns_empty_result() -> None:
     assert responses == [{"jsonrpc": "2.0", "id": 9, "result": {}}]
 
 
-def test_tools_list_has_exactly_the_seven_tools_with_valid_schemas() -> None:
+def test_tools_list_has_exactly_the_eight_tools_with_valid_schemas() -> None:
     _, responses = run_gateway([_request(2, "tools/list")], StubClient())
     tools = responses[0]["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
@@ -154,6 +154,7 @@ def test_tools_list_has_exactly_the_seven_tools_with_valid_schemas() -> None:
         "dream_once",
         "recent_sessions",
         "session_windows",
+        "recall_feedback",
     }
     for tool in tools:
         assert tool["description"]

@@ -12,7 +12,7 @@ own — these tools are for deliberately querying, pinning, and replacing memory
 
 ## Verbs
 
-Verbs: `recall`, `remember`, `capture`, `supersede`, `dream_once`, `recent_sessions`, `session_windows`
+Verbs: `recall`, `remember`, `capture`, `supersede`, `dream_once`, `recent_sessions`, `session_windows`, `recall_feedback`
 
 - `recall` — search memory for past decisions, preferences, and prior work on a topic. Required `query`; optional `top_k` caps the result count.
 - `remember` — store one fact verbatim as a pin. Call it when the user explicitly asks to keep or pin that fact: this verb is the pin path, and a statement the user merely makes is a `capture` instead.
@@ -21,6 +21,7 @@ Verbs: `recall`, `remember`, `capture`, `supersede`, `dream_once`, `recent_sessi
 - `dream_once` — launch exactly one dream consolidation cycle and return its launched/state payload.
 - `recent_sessions` — fetch recent sessions' verbatim tails to re-anchor on where the previous conversation ended.
 - `session_windows` — fetch per-session activity time windows (first/latest ISO-8601 UTC, chunk counts, active flags); use them to attribute an unfamiliar workspace artifact (a file mtime) to the session that produced it.
+- `recall_feedback` — after a recall that missed, record the miss with `kind="not_useful"` and an ISO-8601 `observed_at`. It stores the signal only: no reranking, no retention change, no calibration from it alone.
 
 ### recent_sessions and resume_query
 
