@@ -17,7 +17,9 @@ Isolation: materialization is FAIL-LOUD — construction refuses a root that
 already carries state (fresh = absent or an empty directory; kept forensics
 are never wiped), and callers scope each rig under
 ``root / "runs" / <run-id> / <point_id>`` for per-point namespaces. The whole
-daemon world lives under the root — config, stores, journal, daemon.log.
+daemon world lives under the root — config, stores, journal, daemon.log — with
+a spare loopback port identity and a temp MNEMOSEED_LOCAL_HOME for the boot
+window.
 
 The needle oracle reproduces the shipped TS hook byte-for-byte
 (plugin.ts:58-60,221-253): JS string semantics are UTF-16 CODE UNITS, so the
@@ -28,7 +30,9 @@ code point in Python, pinned by tests/test_needle_oracle.py.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import socket
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -163,6 +167,24 @@ def cited_chunk_ids(reply: str, registry: Mapping[str, Iterable[str]]) -> list[s
 
 # ---------------------------------------------------------------- config seam
 
+_LOOPBACK_HOST = "127.0.0.1"
+
+
+def _spare_loopback_port() -> int:
+    """An ephemeral loopback port: the kernel hands one out on an explicit bind
+    to port zero, so the rig's daemon identity never names a reserved port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((_LOOPBACK_HOST, 0))
+        return int(probe.getsockname()[1])
+
+
+def _restore_home_env(previous: str | None) -> None:
+    """Hand MNEMOSEED_LOCAL_HOME back to the caller after the rig's boot window."""
+    if previous is None:
+        os.environ.pop("MNEMOSEED_LOCAL_HOME", None)
+    else:
+        os.environ["MNEMOSEED_LOCAL_HOME"] = previous
+
 
 @contextmanager
 def _point_config(root: Path, config_path: Path) -> Iterator[None]:
@@ -180,9 +202,10 @@ def _point_config(root: Path, config_path: Path) -> Iterator[None]:
         config_module.CONFIG_PATH, config_module.CONFIG_DIR, snapshot_module.CONFIG_DIR = saved
 
 
-def _config_toml(root: Path, focal_floor: float, budget_chars: int) -> str:
+def _config_toml(root: Path, base_url: str, focal_floor: float, budget_chars: int) -> str:
     stores = root / "stores"
     return (
+        f'baseurl = "{base_url}"\n'
         'preset = "embedded"\n'
         f'[storage.vector]\nuri = "{(stores / "chunks.lance").as_posix()}"\ndimensions = 64\n'
         f'[storage.graph]\npath = "{(stores / "cortex.db").as_posix()}"\n'
@@ -264,7 +287,10 @@ class RecallRig:
         self.focal_floor = focal_floor
         self.budget_chars = budget_chars
         self.profile_id = profile_id
-        (root / "config.toml").write_text(_config_toml(root, focal_floor, budget_chars), encoding="utf-8")
+        base_url = f"http://{_LOOPBACK_HOST}:{_spare_loopback_port()}"
+        (root / "config.toml").write_text(
+            _config_toml(root, base_url, focal_floor, budget_chars), encoding="utf-8"
+        )
         self._stack: ExitStack | None = None
         self._client: TestClient | None = None
 
@@ -282,6 +308,9 @@ class RecallRig:
     def __enter__(self) -> RecallRig:
         stack = ExitStack()
         try:
+            previous_home = os.environ.get("MNEMOSEED_LOCAL_HOME")
+            os.environ["MNEMOSEED_LOCAL_HOME"] = str(self.root)
+            stack.callback(_restore_home_env, previous_home)
             stack.enter_context(_point_config(self.root, self.root / "config.toml"))
             self._client = stack.enter_context(rig_client())
         except BaseException:
