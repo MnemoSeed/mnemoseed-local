@@ -21,7 +21,14 @@ from collections.abc import Iterable
 #: The tool identifiers the template may interpolate. A placeholder outside this
 #: set is unreachable; one inside it that the gateway does not serve makes
 #: :func:`render` refuse instead of emitting a dead reference.
-TOOL_PLACEHOLDERS = ("recall", "capture", "remember", "supersede", "recent_sessions")
+TOOL_PLACEHOLDERS = (
+    "recall",
+    "capture",
+    "remember",
+    "supersede",
+    "recent_sessions",
+    "recall_feedback",
+)
 
 #: Length ceiling: the block rides the system prompt of every session, so it has
 #: to stay short. A block past it is refused rather than silently shipped.
@@ -33,7 +40,7 @@ SURFACES = ("claude_chat", "chatgpt", "claude_code", "generic")
 #: The generic lead: the block exactly as the handshake serves it.
 PREAMBLE = "MnemoSeed is this machine's long-term memory for you, shared across sessions and hosts."
 
-#: The six execution intentions, the meaning of an empty result, and the
+#: The execution intentions, the meaning of an empty result, and the
 #: pin-versus-captured distinction. ``{recall}``-style placeholders resolve to
 #: the identifiers in ``TOOL_PLACEHOLDERS``.
 BODY = """\
@@ -43,9 +50,8 @@ The rules below are situations and actions, not suggestions:
    call {recall} again for the same topic.
 2. If no memory block was injected and this client has no capture hook, you are
    the memory channel yourself. For past work, a decision, or a stated
-   preference, call {recall} first with the user's own words (names, paths,
-   issue numbers); never rewrite the query into synonyms. One call per topic
-   suffices.
+   preference, call {recall} first with the user's own words; never use synonyms.
+   One call per topic suffices.
 3. No memory block, this client has no capture hook, and the user states a
    durable decision, preference, or constraint: call {capture} with their words
    verbatim. Never capture your own guesses, drafts, or reasoning.
@@ -54,14 +60,17 @@ The rules below are situations and actions, not suggestions:
 5. Entry failure not absence: retry once via 'mnemoseed-local mcp' (stdio, own
    credential); negatives: observed_at, reverify.
 
+6. Recall missed: log it with {recall_feedback}(not_useful, ISO observed_at);
+   the signal never reranks.
+
 An empty result means no relevant memory exists: say so and continue; do not
 guess or repeat the query.
 {recent_sessions} unresolved: resolution failed, not "no relevant history";
 follow next_step (bind, add resume_query id).
 
-A pin is an entry the user explicitly asked to keep: provenance_source is
-"memory.remember", or explicit_pin is true. A captured entry is written from a
-conversation instead, with explicit_pin false.
+A pin is one the user asked to keep: provenance_source "memory.remember" or
+explicit_pin true. A captured entry comes from a conversation: explicit_pin
+false.
 """
 
 #: The per-surface leads: the entry point a user actually pastes into, plus this

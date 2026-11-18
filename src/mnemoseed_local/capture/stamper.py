@@ -242,12 +242,18 @@ class StampWriter:
         self._pool = pool
         self._config = config if config is not None else WriteConfig()
         self._checker = checker if checker is not None else NearDuplicateChecker()
+        self._pool_points_suppressed = 0.0
 
     @property
     def config(self) -> WriteConfig:
         return self._config
 
-    def write(self, scored: ScoredTurn, ctx: WriteContext) -> WriteOutcome:
+    @property
+    def pool_points_suppressed(self) -> float:
+        """Prediction-error points withheld by ``credit_pool=False`` drains."""
+        return self._pool_points_suppressed
+
+    def write(self, scored: ScoredTurn, ctx: WriteContext, *, credit_pool: bool = True) -> WriteOutcome:
         """Write one durable scored turn; returns the outcome.
 
         The chunk text is embedded and probed against the store: a strong and
@@ -257,10 +263,15 @@ class StampWriter:
         upserted as a fresh chunk.
         """
         pending = self._decide(scored, ctx, self._clock())
-        self._flush_single(pending, scored, ctx)
+        self._flush_single(pending, scored, ctx, credit_pool=credit_pool)
         return pending.outcome
 
-    def write_many(self, items: Sequence[tuple[ScoredTurn, WriteContext]]) -> list[WriteOutcome]:
+    def write_many(
+        self,
+        items: Sequence[tuple[ScoredTurn, WriteContext]],
+        *,
+        credit_pool: bool = True,
+    ) -> list[WriteOutcome]:
         """Write several scored turns, batching the store persistence (B6).
 
         Each turn is decided exactly as ``write`` (same single ranked probe at
@@ -269,17 +280,25 @@ class StampWriter:
         store call instead of one per turn — a single lock/commit per action
         kind for the whole drain, not per turn. The pool prediction-error
         credits still fire per conflict (they are in-memory ledgers, not store
-        round-trips). Returns one outcome per item, in order. As-is boundary:
+        round-trips) unless ``credit_pool`` is False. Identical
+        ``(profile_id, assembled text)`` pairs collapse
+        to the first occurrence before any probe: a drain holding the same
+        verbatim text twice must not upsert two freshly-id'd chunks. Returns one
+        outcome per distinct pair, in first-occurrence order. As-is boundary:
         intra-batch ingested_at is constructively monotonic (``now + i * 1ms``
-        in items order), not a per-item real clock read — isomorphic to the
-        pre-B6 per-write semantics.
+        in distinct items order), not a per-item real clock read — isomorphic to
+        the pre-B6 per-write semantics.
         """
+        unique: dict[tuple[str, str], tuple[ScoredTurn, WriteContext]] = {}
+        for scored, ctx in items:
+            unique.setdefault((ctx.profile_id, _assemble_text(scored.turn)), (scored, ctx))
+        distinct = list(unique.values())
         now = self._clock()
         pendings = [
-            self._decide(item, ctx, now + index * _BATCH_INGEST_STEP_S)
-            for index, (item, ctx) in enumerate(items)
+            self._decide(scored, ctx, now + index * _BATCH_INGEST_STEP_S)
+            for index, (scored, ctx) in enumerate(distinct)
         ]
-        self._flush_batch(pendings, items)
+        self._flush_batch(pendings, distinct, credit_pool=credit_pool)
         return [pending.outcome for pending in pendings]
 
     def _decide(self, scored: ScoredTurn, ctx: WriteContext, now: float) -> _PendingWrite:
@@ -332,7 +351,9 @@ class StampWriter:
             sparse=embedded.sparse,
         )
 
-    def _flush_single(self, pending: _PendingWrite, scored: ScoredTurn, ctx: WriteContext) -> None:
+    def _flush_single(
+        self, pending: _PendingWrite, scored: ScoredTurn, ctx: WriteContext, *, credit_pool: bool
+    ) -> None:
         """Apply one pending write's persistence immediately (the standalone
         ``write`` path)."""
         if pending.chunk is not None:
@@ -342,10 +363,14 @@ class StampWriter:
         if pending.reconcile_id is not None:
             self._store.update_chunk_state([pending.reconcile_id], needs_reconcile=True)
         if pending.outcome.kind is WriteOutcomeKind.NEEDS_RECONCILE:
-            self._credit_prediction_error(ctx, scored.turn.turn_index)
+            self._credit_prediction_error(ctx, scored.turn.turn_index, credit_pool=credit_pool)
 
     def _flush_batch(
-        self, pendings: Sequence[_PendingWrite], items: Sequence[tuple[ScoredTurn, WriteContext]]
+        self,
+        pendings: Sequence[_PendingWrite],
+        items: Sequence[tuple[ScoredTurn, WriteContext]],
+        *,
+        credit_pool: bool,
     ) -> None:
         """Apply the pending writes of a drain, one batched store call per
         action kind (B6)."""
@@ -367,16 +392,20 @@ class StampWriter:
             self._store.update_chunk_state(reconcile_ids, needs_reconcile=True)
         for pending, (scored, ctx) in zip(pendings, items, strict=True):
             if pending.outcome.kind is WriteOutcomeKind.NEEDS_RECONCILE:
-                self._credit_prediction_error(ctx, scored.turn.turn_index)
+                self._credit_prediction_error(ctx, scored.turn.turn_index, credit_pool=credit_pool)
 
-    def _credit_prediction_error(self, ctx: WriteContext, turn_index: int) -> None:
+    def _credit_prediction_error(self, ctx: WriteContext, turn_index: int, *, credit_pool: bool) -> None:
         """FR-1.8: prediction-error acceleration on a detected conflict."""
-        if self._pool is not None:
-            self._pool.add_points(
-                ctx.profile_id,
-                self._config.prediction_error_bonus,
-                TurnRange(turn_index, turn_index),
-            )
+        if self._pool is None:
+            return
+        if not credit_pool:
+            self._pool_points_suppressed += self._config.prediction_error_bonus
+            return
+        self._pool.add_points(
+            ctx.profile_id,
+            self._config.prediction_error_bonus,
+            TurnRange(turn_index, turn_index),
+        )
 
     def _assemble(self, scored: ScoredTurn, ctx: WriteContext, now: float) -> ChunkStamp:
         """Build a complete stamp from the scored turn + write context.

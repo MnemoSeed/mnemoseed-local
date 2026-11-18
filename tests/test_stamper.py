@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from mnemoseed_local.capture.pipeline import ScoringPipeline, WritingPipeline
 from mnemoseed_local.capture.pool import ScorePool
 from mnemoseed_local.capture.scorer import (
     Durability,
@@ -471,6 +472,53 @@ def test_write_many_stamps_batch_chunks_with_monotonic_ingested_at() -> None:
     assert quantized == {1000.0, 1000.001, 1000.002}, (
         "ms-quantized stamps must stay distinct: a smaller epsilon would collapse back to a tie"
     )
+
+
+def test_write_many_collapses_identical_text_within_one_batch() -> None:
+    """A drain batch decides every turn before persisting any, so two identical
+    assembled texts both see an empty store and would both become NEW_CHUNK."""
+    store = _FakeVectorStore()
+    items = [
+        (_scored("以后都用 pnpm"), WriteContext(profile_id=PROFILE)),
+        (_scored("以后都用 pnpm"), WriteContext(profile_id=PROFILE)),
+    ]
+
+    outcomes = _writer(store, _Clock()).write_many(items)
+
+    assert [o.kind for o in outcomes] == [WriteOutcomeKind.NEW_CHUNK]
+    assert len(store.upserts) == 1
+    assert store.upserts[0].text == "user: 以后都用 pnpm"
+
+
+def test_write_many_keeps_identical_text_across_profiles() -> None:
+    store = _FakeVectorStore()
+    items = [
+        (_scored("以后都用 pnpm"), WriteContext(profile_id=PROFILE)),
+        (_scored("以后都用 pnpm"), WriteContext(profile_id=BOB)),
+    ]
+
+    outcomes = _writer(store, _Clock()).write_many(items)
+
+    assert [o.kind for o in outcomes] == [WriteOutcomeKind.NEW_CHUNK] * 2
+    assert len(store.upserts) == 2
+
+
+def test_conflict_prediction_error_credit_is_suppressed_with_the_pool() -> None:
+    store = _FakeVectorStore()
+    existing = _existing("我用 tabs 写代码")
+    store.script[0.9] = []
+    store.script[0.85] = [existing]
+    pool = ScorePool(clock=_Clock())
+    inner = ScoringPipeline(scorer=TurnScorer(embedder=SyntheticEmbedder()), pool=pool)
+    writer = _writer(store, _Clock(), pool)
+    pipe = WritingPipeline(store, inner=inner, writer=writer)
+    pipe.submit_turn(_turn("以后都不用 tabs，统一用空格"))
+
+    outcomes = pipe.drain(SESSION, credit_pool=False)
+
+    assert [o.kind for o in outcomes] == [WriteOutcomeKind.NEEDS_RECONCILE]
+    assert pool.stats(PROFILE) is None
+    assert pipe.pool_points_suppressed == pytest.approx(inner.stats.pool_points_suppressed + 2.0)
 
 
 # ------------------------------------------------------------- consistency v1

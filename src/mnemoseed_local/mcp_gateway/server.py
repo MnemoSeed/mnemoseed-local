@@ -14,10 +14,11 @@ Protocol surface (MCP ``2024-11-05`` shape):
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
 - ``tools/list`` -> the daemon tools (recall / remember / capture / supersede /
-  dream_once / recent_sessions / session_windows — recent_sessions is the B2
-  time-ordered resume surface, session_windows the B2.4 per-session
-  time-window surface, supersede the deliberate belief-replacement verb, and
-  capture the hook-less chat write arm of remember);
+  dream_once / recent_sessions / session_windows / recall_feedback —
+  recent_sessions is the B2 time-ordered resume surface, session_windows the
+  B2.4 per-session time-window surface, supersede the deliberate
+  belief-replacement verb, capture the hook-less chat write arm of remember,
+  and recall_feedback the store-only one-shot miss signal);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -39,6 +40,7 @@ from datetime import UTC, datetime
 from typing import Any, Final, TextIO
 
 from mnemoseed_local import __version__, daemon_state
+from mnemoseed_local.daemon.observability import RECALL_FEEDBACK_KINDS, is_iso8601
 from mnemoseed_local.mcp_gateway import instructions
 from mnemoseed_local.mcp_gateway.reliable_client import (
     DAEMON_AUTH_HINT,
@@ -240,6 +242,28 @@ TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "recall_feedback",
+        "description": "Record a one-shot 'this recall was not useful' signal after a recall miss. "
+        "Stores the signal only: no reranking, no retention change, and no calibration from it alone. "
+        "Call it once per miss; it never changes what future recalls return.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(RECALL_FEEDBACK_KINDS),
+                    "description": "stable signal kind; the first cut serves only 'not_useful'",
+                },
+                "observed_at": {
+                    "type": "string",
+                    "description": "ISO-8601 instant the miss was observed",
+                },
+            },
+            "required": ["kind", "observed_at"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 #: Sentinel: no request id could be salvaged from a broken line.
@@ -318,6 +342,17 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             if arguments.get("n_sessions") is not None:
                 windows_body["sessions"] = arguments["n_sessions"]
             payload = client.post("/session/windows", windows_body)
+        elif name == "recall_feedback":
+            kind = arguments.get("kind")
+            if kind not in RECALL_FEEDBACK_KINDS:
+                return _error_result(f"recall_feedback requires a kind in {sorted(RECALL_FEEDBACK_KINDS)}")
+            observed_at = arguments.get("observed_at")
+            if not isinstance(observed_at, str) or not is_iso8601(observed_at):
+                return _error_result("recall_feedback requires an ISO-8601 observed_at")
+            payload = client.post(
+                "/memory/recall_feedback",
+                {"profile_id": client.profile_id, "kind": kind, "observed_at": observed_at},
+            )
         else:
             return _error_result(f"unknown tool: {name!r}")
     except DaemonRestError as exc:

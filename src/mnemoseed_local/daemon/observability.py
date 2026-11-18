@@ -38,7 +38,7 @@ def _iso_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
-def _is_iso8601(value: object) -> bool:
+def is_iso8601(value: object) -> bool:
     """Whether ``value`` is an ISO-8601 timestamp string (not a float epoch)."""
     if not isinstance(value, str) or not value:
         return False
@@ -52,6 +52,11 @@ def _is_iso8601(value: object) -> bool:
 #: The re-anchor status carried additively on the daemon's observability read.
 ANCHOR_STATUS_STALE = "stale"
 ANCHOR_STATUS_REVERIFIED = "reverified"
+
+#: The closed kind set for the one-shot recall-feedback signal. One kind ships in
+#: the first cut; a new kind is an explicit vocabulary change, never a free string.
+RECALL_FEEDBACK_NOT_USEFUL = "not_useful"
+RECALL_FEEDBACK_KINDS: frozenset[str] = frozenset({RECALL_FEEDBACK_NOT_USEFUL})
 
 
 class Observability:
@@ -280,7 +285,7 @@ def memory_entry_diagnosis(kind: str, *, observed_at: str) -> MemoryEntryDiagnos
     or a non-ISO observation time is RED, never silently accepted."""
     if kind not in _MEMORY_DIAGNOSIS_KINDS:
         raise ValueError(f"unknown memory-entry diagnosis kind: {kind!r}")
-    if not _is_iso8601(observed_at):
+    if not is_iso8601(observed_at):
         raise ValueError(f"observed_at is not ISO-8601: {observed_at!r}")
     return MemoryEntryDiagnosis(kind, observed_at)
 
