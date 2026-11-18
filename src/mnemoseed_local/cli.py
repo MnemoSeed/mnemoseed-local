@@ -1833,6 +1833,7 @@ IMPORT_SOURCES: dict[str, str] = {
     "codex_cli": "mnemoseed_local.hosts.codex_cli.transcript",
     "claude_code": "mnemoseed_local.hosts.claude_code.transcript",
     "opencode": "mnemoseed_local.hosts.opencode.transcript",
+    "zcode": "mnemoseed_local.hosts.zcode.transcript",
 }
 
 
