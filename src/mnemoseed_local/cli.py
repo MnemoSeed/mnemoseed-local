@@ -2401,7 +2401,7 @@ def cmd_import(args: argparse.Namespace) -> int:
             root=root,
             profile_id=args.profile,
             client=client,
-            ledger=ImportLedger(host),
+            ledger=ImportLedger(host, args.profile),
             limit=args.limit,
             dry_run=args.dry_run,
             progress=_import_progress,
