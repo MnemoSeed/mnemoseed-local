@@ -14,7 +14,7 @@ import math
 import os
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from mnemoseed_local.schema.graph import NodeType
@@ -579,6 +579,21 @@ def _optional_driver(value: Any, key: str) -> str | None:
     return value
 
 
+def _resolve_storage_paths(params: dict[str, Any], home: Path) -> dict[str, Any]:
+    """Rebind a home-relative storage ``path`` to the active live home.
+
+    Absolute paths and ``~`` forms are left verbatim so existing configs keep
+    their meaning; only relative paths (as shipped by the template) follow the
+    active ``MNEMOSEED_LOCAL_HOME`` at load time.
+    """
+    value = params.get("path")
+    if not isinstance(value, str) or not value:
+        return params
+    if value.startswith("~") or Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        return params
+    return {**params, "path": str(home / value)}
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load and validate config from the TOML file (STORAGE_MODE overrides preset)."""
     path = path or CONFIG_PATH
@@ -597,6 +612,7 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError("baseurl", "must be a string")
 
     storage: dict[str, LayerSpec] = {}
+    home = live_home_dir()
     storage_raw = raw.get("storage")
     if storage_raw is not None:
         storage_table = _require_table(storage_raw, "storage")
@@ -610,7 +626,9 @@ def load_config(path: Path | None = None) -> Config:
             layer_table = _require_table(layer_value, layer_path)
 
             driver = _optional_driver(layer_table.get("driver"), f"{layer_path}.driver")
-            params = {k: v for k, v in layer_table.items() if k not in ("driver", "instances")}
+            params = _resolve_storage_paths(
+                {k: v for k, v in layer_table.items() if k not in ("driver", "instances")}, home
+            )
 
             overrides: dict[str, _InstanceOverride] = {}
             instances_raw = layer_table.get("instances")
@@ -624,7 +642,9 @@ def load_config(path: Path | None = None) -> Config:
                     )
                     overrides[name] = _InstanceOverride(
                         driver=entry_driver,
-                        params={k: v for k, v in entry_table.items() if k != "driver"},
+                        params=_resolve_storage_paths(
+                            {k: v for k, v in entry_table.items() if k != "driver"}, home
+                        ),
                     )
 
             storage[layer_key] = LayerSpec(
@@ -988,7 +1008,7 @@ baseurl = "http://localhost:7788"
 # here, never to the main graph. A fresh init writes this table.
 [storage.graph.instances.isolated]
 driver = "sqlite_graph"
-path = "~/.mnemoseed-local/isolated.db"
+path = "isolated.db"
 
 # Dream LLM role routing ([dream.llm.<role>]): fresh installs ship with NO
 # dream route — dreams defer (honestly) until a model is bound. Roles:
