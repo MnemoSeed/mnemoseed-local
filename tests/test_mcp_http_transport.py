@@ -43,6 +43,7 @@ TOOL_NAMES = {
     "dream_once",
     "recent_sessions",
     "session_windows",
+    "recall_feedback",
 }
 
 #: The tools/call round trip must finish far below the self-call's own 30s

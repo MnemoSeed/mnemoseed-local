@@ -56,12 +56,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from mnemoseed_local.capture.stamper import ConsistencyVerdict, NearDuplicateChecker, WriteConfig
 from mnemoseed_local.config import Config, live_home_dir
 from mnemoseed_local.daemon.actor import resolve_actor
-from mnemoseed_local.daemon.observability import Observability
+from mnemoseed_local.daemon.observability import RECALL_FEEDBACK_KINDS, Observability, is_iso8601
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
 from mnemoseed_local.hosts.common.project_binding import (
@@ -326,6 +326,28 @@ class ReinforceRequest(BaseModel):
         if not self.chunk_ids and not self.node_ids:
             raise ValueError("reinforce requires at least one chunk_id or node_id target")
         return self
+
+
+class RecallFeedbackRequest(BaseModel):
+    """One-shot store-only recall miss signal."""
+
+    profile_id: ProfileRef
+    kind: str
+    observed_at: str
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, value: str) -> str:
+        if value not in RECALL_FEEDBACK_KINDS:
+            raise ValueError(f"unknown recall feedback kind: {value!r}")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def _iso_observation(cls, value: str) -> str:
+        if not is_iso8601(value):
+            raise ValueError("observed_at must be ISO-8601")
+        return value
 
 
 # Scoped-resume anchor extraction (issue #187): bare kebab identifiers (at
@@ -2790,6 +2812,18 @@ class MemoryService:
             "limit": page.limit,
         }
 
+    def recall_feedback(self, *, profile_id: str, kind: str, observed_at: str, actor: str) -> dict[str, Any]:
+        """Append one miss signal to the immutable audit ledger and change nothing else."""
+        self._stores.meta.audit_append(
+            AuditEntry(
+                actor=actor,
+                action="recall_feedback",
+                detail={"profile_id": profile_id, "kind": kind, "observed_at": observed_at},
+                at=time.time(),
+            )
+        )
+        return {"ok": True, "kind": kind, "observed_at": observed_at}
+
     def _audit(self, profile_id: str, action: str, detail: dict[str, Any], *, actor: str = "console") -> None:
         self._stores.meta.audit_append(AuditEntry(actor=actor, action=action, detail=detail, at=time.time()))
 
@@ -2953,6 +2987,18 @@ def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, 
     """B1 read route: profile-scoped error_events with evidence-fate resolution."""
     service: MemoryService = request.app.state.memory
     return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
+
+
+@router.post("/memory/recall_feedback")
+def memory_recall_feedback(req: RecallFeedbackRequest, request: Request) -> dict[str, Any]:
+    """Store-only one-shot recall miss signal; no ranking or retention effect."""
+    service: MemoryService = request.app.state.memory
+    return service.recall_feedback(
+        profile_id=req.profile_id,
+        kind=req.kind,
+        observed_at=req.observed_at,
+        actor=resolve_actor(request),
+    )
 
 
 @router.post("/memory/forget_this")

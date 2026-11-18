@@ -449,8 +449,8 @@ JSON-RPC body to `/mcp`.
 Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `capture(text)`,
 `supersede(superseded_node_id, successor_node_id)`,
 `dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?, caller_cwd?)`,
-`session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
-connectivity error.
+`session_windows(n_sessions?)`, `recall_feedback(kind, observed_at)`. The handshake works even when the daemon is
+down; only tool calls report the connectivity error.
 
 A `recall` result can be empty when no stored candidate clears the semantic
 relevance floor; that is a meaningful answer ("no relevant memory"), not a
