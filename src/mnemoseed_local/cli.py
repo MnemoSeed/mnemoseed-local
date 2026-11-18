@@ -2034,13 +2034,14 @@ def cmd_host(args: argparse.Namespace) -> int:
         return 1
     if args.host_command == "status":
         observations = _host_status_observations(args.host, result)
+        structure_state = _structure_state_for_display(result.state, observations.trust)
         if args.json:
             return _emit_json(
                 {
                     "host": args.host,
                     "profile_id": observations.profile_id,
                     "structure": {
-                        "state": result.state,
+                        "state": structure_state,
                         "path": str(result.path),
                         "daemon_reachable": result.daemon_reachable,
                         "base_url": result.base_url,
@@ -2064,7 +2065,7 @@ def cmd_host(args: argparse.Namespace) -> int:
                     "trust": {"state": observations.trust.state, "detail": observations.trust.detail},
                 }
             )
-        print(_host_structure_line(result.state, observations.trust))
+        print(f"host: {structure_state}")
         print(f"path: {result.path}")
         print(f"daemon: {'reachable' if result.daemon_reachable else 'unreachable'} ({result.base_url})")
         for line in observations.lines():
@@ -2101,12 +2102,13 @@ class TrustStatus:
         return f"trust: {self.state} ({self.detail})"
 
 
-def _host_structure_line(structure_state: str, trust: TrustStatus) -> str:
-    """The human structure headline. Once observed hook traffic resolves the
-    manual trust step, the install's stale review advice is not reprinted."""
+def _structure_state_for_display(structure_state: str, trust: TrustStatus) -> str:
+    """Render the structure state with the resolved trust observation. Once
+    observed hook traffic verifies the manual step, its stale review advice is
+    replaced rather than repeated; the rest of the structure is left intact."""
     if trust.state == TRUST_VERIFIED and ", trust" in structure_state:
-        structure_state = f"{structure_state.split(', trust', 1)[0]}, trust verified (hook ingests observed)"
-    return f"host: {structure_state}"
+        return f"{structure_state.split(', trust', 1)[0]}, trust verified (hook ingests observed)"
+    return structure_state
 
 
 def _trust_status(host: str, structure_state: str, hook_ingests_observed: bool = False) -> TrustStatus:

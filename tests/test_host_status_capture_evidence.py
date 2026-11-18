@@ -386,12 +386,19 @@ def test_codex_hook_ingests_make_trust_verified_without_hooks_advice(
         trust = payload["trust"]
         assert trust["state"] == "verified"
         assert "/hooks" not in trust["detail"]
+        structure = payload["structure"]
+        assert structure["state"] == "installed, trust verified (hook ingests observed)"
+        assert "/hooks" not in structure["state"]
 
         capsys.readouterr()
         assert main(["host", "status", "--host", "codex_cli"]) == 0
-        out = capsys.readouterr().out
-        assert "/hooks" not in out
-        assert "trust: verified" in out
+        lines = capsys.readouterr().out.splitlines()
+        host_line = next(line for line in lines if line.startswith("host: "))
+        trust_line = next(line for line in lines if line.startswith("trust: "))
+        assert host_line == "host: installed, trust verified (hook ingests observed)"
+        assert "/hooks" not in host_line
+        assert "/hooks" not in trust_line
+        assert "trust: verified" in trust_line
 
 
 def test_reinstall_writes_config_but_never_reports_capture_working(
