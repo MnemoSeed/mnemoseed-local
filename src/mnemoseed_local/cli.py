@@ -35,10 +35,20 @@ from mnemoseed_local.config import (
     load_config,
 )
 from mnemoseed_local.daemon.observability import (
+    ANCHOR_STATUS_REVERIFIED,
     CAPTURE_EVIDENCE_NONE,
+    CAPTURE_EVIDENCE_REVERIFIED,
+    CAPTURE_EVIDENCE_STALE,
+    CAPTURE_EVIDENCE_UNKNOWN,
+    MEMORY_DIAGNOSIS_CAPTURE_STALE,
+    MEMORY_DIAGNOSIS_DAEMON_DOWN,
+    MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE,
+    MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED,
     CaptureEvidenceStatus,
+    MemoryEntryDiagnosis,
     SinceBootObservation,
     capture_evidence_status,
+    memory_entry_diagnosis,
     since_boot_observation,
     unreadable_capture_evidence,
 )
@@ -2053,6 +2063,8 @@ def cmd_host(args: argparse.Namespace) -> int:
                         "state": observations.capture.state,
                         "last_persisted_at": observations.capture.last_persisted_at,
                         "window_s": observations.capture.window_s,
+                        "observed_at": observations.capture.observed_at,
+                        "verified_at": observations.capture.verified_at,
                         "detail": observations.capture.detail,
                     },
                     "replay_evidence": {
@@ -2061,6 +2073,9 @@ def cmd_host(args: argparse.Namespace) -> int:
                         "detail": observations.replay.detail,
                     },
                     "trust": {"state": observations.trust.state, "detail": observations.trust.detail},
+                    "entry_diagnosis": asdict(observations.entry_diagnosis)
+                    if observations.entry_diagnosis is not None
+                    else None,
                 }
             )
         print(f"host: {result.state}")
@@ -2129,6 +2144,7 @@ class HostStatusObservations:
     capture: CaptureEvidenceStatus
     replay: SinceBootObservation
     trust: TrustStatus
+    entry_diagnosis: MemoryEntryDiagnosis | None = None
 
     def lines(self) -> list[str]:
         return [self.ingest_ack.line(), self.capture.line(), self.replay.line(), self.trust.line()]
@@ -2153,9 +2169,14 @@ def _capture_window() -> float:
         return DEFAULT_CAPTURE_IDLE_FLUSH_SEC
 
 
-def _capture_evidence(client: DaemonClient, host: str, window_s: float) -> CaptureEvidenceStatus:
+def _capture_evidence(
+    client: DaemonClient, host: str, window_s: float, activity: dict[str, Any] | None
+) -> CaptureEvidenceStatus:
     """The persisted-capture observation for one host+profile: the daemon
-    reads its own store, and every failure mode lands on the honest unknown."""
+    reads its own store, and every failure mode lands on the honest unknown.
+    ``activity`` is the daemon's additive re-anchor observation read over REST;
+    a stale capture with a fresh hook-ingest verification becomes reverified
+    with that daemon-reported time as verified_at."""
     try:
         reply = client.post("/api/v1/host/capture-evidence", {"profile_id": client.profile_id, "host": host})
     except Exception as exc:  # noqa: BLE001 - any transport failure means "unknown"
@@ -2173,7 +2194,33 @@ def _capture_evidence(client: DaemonClient, host: str, window_s: float) -> Captu
         evidence = replace(
             evidence, detail=f"{evidence.detail}; the profile holds captures from other sources"
         )
+    if isinstance(activity, dict) and evidence.state == CAPTURE_EVIDENCE_STALE:
+        anchor_status = activity.get("anchor_status")
+        last_anchored = activity.get("last_anchored_at")
+        if anchor_status == ANCHOR_STATUS_REVERIFIED and isinstance(last_anchored, str) and last_anchored:
+            evidence = replace(
+                evidence,
+                state=CAPTURE_EVIDENCE_REVERIFIED,
+                verified_at=last_anchored,
+                detail=f"{evidence.detail}; re-anchored at {last_anchored}",
+            )
     return evidence
+
+
+def _entry_diagnosis(
+    *, daemon_reachable: bool, activity: dict[str, Any] | None, capture: CaptureEvidenceStatus
+) -> MemoryEntryDiagnosis | None:
+    """One typed memory-entry diagnosis from the status observations. Each
+    kind has exactly one trigger; a healthy/recent capture is not a failure."""
+    if not daemon_reachable or activity is None:
+        return memory_entry_diagnosis(MEMORY_DIAGNOSIS_DAEMON_DOWN, observed_at=capture.observed_at)
+    if capture.state == CAPTURE_EVIDENCE_REVERIFIED:
+        return memory_entry_diagnosis(MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED, observed_at=capture.observed_at)
+    if capture.state == CAPTURE_EVIDENCE_STALE:
+        return memory_entry_diagnosis(MEMORY_DIAGNOSIS_CAPTURE_STALE, observed_at=capture.observed_at)
+    if capture.state == CAPTURE_EVIDENCE_UNKNOWN:
+        return memory_entry_diagnosis(MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE, observed_at=capture.observed_at)
+    return None
 
 
 def _host_status_observations(host: str, result: Any) -> HostStatusObservations:
@@ -2202,12 +2249,16 @@ def _host_status_observations(host: str, result: Any) -> HostStatusObservations:
         not_observed="no replay serve observed since boot",
         unknown="the since-boot counters were unreadable",
     )
+    capture = _capture_evidence(client, host, window_s, activity)
     return HostStatusObservations(
         profile_id=client.profile_id,
         ingest_ack=ingest_ack,
-        capture=_capture_evidence(client, host, window_s),
+        capture=capture,
         replay=replay,
         trust=_trust_status(host, result.state),
+        entry_diagnosis=_entry_diagnosis(
+            daemon_reachable=result.daemon_reachable, activity=activity, capture=capture
+        ),
     )
 
 

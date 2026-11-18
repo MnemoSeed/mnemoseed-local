@@ -1001,6 +1001,109 @@ async function main() {
       break
     }
 
+    case "inject-reanchor-no-match": {
+      // no_matching_selection is an expressed intent, not an infrastructure
+      // failure. It must NOT be retried on a later transform.
+      recentPayload = { ...RECENT_PAYLOAD, selection: "unresolved" }
+      const a = { system: ["BASE-A"] }
+      await fire.context({ sessionID: "sess-nomatch", system: a.system })
+      const b = { system: ["BASE-B"] }
+      await fire.context({ sessionID: "sess-nomatch", system: b.system })
+      const recentCount = posts.filter(
+        (post) =>
+          post.url.endsWith("/session/recent") && post.body?.exclude_session_id === "sess-nomatch",
+      ).length
+      console.log(
+        JSON.stringify({ first: sysTexts(a.system), second: sysTexts(b.system), recentCount }),
+      )
+      break
+    }
+
+    case "inject-reanchor-cap": {
+      // Cap probe: three consecutive retryable failures and three transforms.
+      // The bound must be enforced by REANCHOR_MAX_ATTEMPTS, not by the number
+      // of contexts the test happens to fire: no third /session/recent read and
+      // no attempt logged above 2.
+      recentPayload = RECENT_PAYLOAD
+      failing.add("http://localhost:7788/session/recent")
+      const systems = []
+      for (let i = 0; i < 3; i++) {
+        const sys = { system: [`BASE-CAP${i}`] }
+        await fire.context({ sessionID: "sess-cap", system: sys.system })
+        systems.push(sysTexts(sys.system))
+      }
+      await delay(80)
+      const recentCount = posts.filter(
+        (post) =>
+          post.url.endsWith("/session/recent") && post.body?.exclude_session_id === "sess-cap",
+      ).length
+      const raw = await readFile(
+        join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"),
+        "utf8",
+      ).catch(() => "")
+      const attempts = raw
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((entry) => entry.tag === "re-anchor attempt")
+        .map((entry) => entry.payload)
+      const maxAttempt = attempts.reduce((max, entry) => Math.max(max, entry.attempt), 0)
+      console.log(JSON.stringify({ systems, recentCount, maxAttempt, attempts }))
+      break
+    }
+
+    case "inject-reanchor-recovery": {
+      // A failed T1 leaves the system untouched and records a bounded
+      // re-anchor observation. After the daemon recovers the NEXT
+      // onSessionContext re-reads /session/recent and injects a re-anchor
+      // block built from the daemon's real data; a third call must not
+      // re-read (cap of two attempts).
+      recentPayload = RECENT_PAYLOAD
+      failing.add("http://localhost:7788/session/recent")
+      const first = { system: ["BASE-STALE"] }
+      await fire.context({ sessionID: "sess-reanchor", system: first.system })
+      failing.clear()
+      const second = { system: ["BASE-RECOVERED"] }
+      await fire.context({ sessionID: "sess-reanchor", system: second.system })
+      const third = { system: ["BASE-AFTER"] }
+      await fire.context({ sessionID: "sess-reanchor", system: third.system })
+      await delay(80)
+      const recentCount = posts.filter(
+        (post) =>
+          post.url.endsWith("/session/recent") &&
+          post.body?.exclude_session_id === "sess-reanchor",
+      ).length
+      const reanchorIngests = posts
+        .filter(
+          (post) =>
+            post.url.endsWith("/ingest") && post.body?.content?.tool_name === "mnemoseed.reanchor",
+        )
+        .map((post) => post.body.content.input)
+      const raw = await readFile(
+        join(process.env.MNEMOSEED_LOCAL_DATA_DIR, "hook-debug.jsonl"),
+        "utf8",
+      ).catch(() => "")
+      const attempts = raw
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((entry) => entry.tag === "re-anchor attempt")
+        .map((entry) => entry.payload)
+      console.log(
+        JSON.stringify({
+          first: sysTexts(first.system),
+          second: sysTexts(second.system),
+          third: sysTexts(third.system),
+          recentCount,
+          reanchorIngests,
+          attempts,
+        }),
+      )
+      break
+    }
+
     case "citation-reinforce": {
       // T3: reinforcement lands only when the assistant's own reply text
       // actually cites the injected slice; a re-citation of the same chunk is

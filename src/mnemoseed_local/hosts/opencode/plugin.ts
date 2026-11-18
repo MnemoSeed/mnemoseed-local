@@ -165,6 +165,9 @@ const REINFORCE_BATCH_SIZE = 64
 const T1_SIGNAL = "[mnemoseed] replayed context from a previous session"
 const T2_SIGNAL = "[mnemoseed] recalled related memories"
 const CAPTURE_SIGNAL = "[mnemoseed] captured this session"
+// The re-anchor signal makes the recovery explicit so a reader can tell a
+// re-verified block from a first-turn replay.
+const REANCHOR_SIGNAL_PREFIX = "[mnemoseed] re-anchored"
 
 function visibilityModeOf(payload: any): string | null {
   // "off" is a known explicit mode (it must update the observed-mode state);
@@ -807,6 +810,31 @@ function parentIdOfSessionID(cache: Map<string, string | null>, sessionID: strin
 // never double-inject; it never evicts (no seen()-style cap) — the only
 // removal is the explicit session.deleted cleanup.
 const injectedSessions = new Map<string, true>()
+// Bounded re-anchor: a failed T1 records one observation here; the next
+// onSessionContext (host-awaited, event-driven — never a timer) re-reads the
+// tails at most once more. Failure set mirrors fetchSessionTails; a stale
+// negative is an observation, never an injection precondition.
+type TailFailure =
+  | "daemon_unreachable"
+  | "index_unavailable"
+  | "result_not_delivered"
+  | "no_matching_selection"
+  | "none"
+interface TailResult {
+  data: any | null
+  failure: TailFailure
+}
+interface ReanchorState {
+  attempts: number
+  observed_at: string
+  last_status: string
+  verified_at?: string
+}
+const REANCHOR_MAX_ATTEMPTS = 2
+const REANCHOR_RETRYABLE: ReadonlySet<string> = new Set(
+  ["daemon_unreachable", "index_unavailable", "result_not_delivered"]
+)
+const reanchorState = new Map<string, ReanchorState>()
 // sessionID -> needle -> chunk ids: the consumption fingerprint registry, one
 // entry per INJECTED slice (needles derive from the exact sanitized/sliced
 // text that actually entered the block — never from budget-dropped content).
@@ -1226,9 +1254,11 @@ function pollCandidates(served: any): number {
   return typeof served?.non_focal_above_floor === "number" ? served.non_focal_above_floor : 0
 }
 
-async function fetchSessionTails(sessionID: string): Promise<any> {
+async function fetchSessionTails(sessionID: string): Promise<TailResult> {
   // The ONE awaited network call in the whole hook (invariant): the daemon
   // read that feeds the injection, bounded by AbortSignal and fail-open.
+  // A typed failure replaces the old bare null so a bounded re-anchor can
+  // tell an infrastructure failure (retryable) from a no-match (terminal).
   const body: JsonRecord = {
     profile_id: PROFILE_ID,
     sessions: SESSION_TAIL_SESSIONS,
@@ -1255,20 +1285,102 @@ async function fetchSessionTails(sessionID: string): Promise<any> {
     if (!response.ok) {
       debugLog("session/recent rejected", { sessionID, status: response.status })
       spoolFailure("/session/recent", body)
-      return null
+      const failure: TailFailure =
+        response.status === 404 || response.status === 410
+          ? "index_unavailable"
+          : response.status >= 500
+            ? "daemon_unreachable"
+            : "result_not_delivered"
+      return { data: null, failure }
     }
     const data = await response.json()
     if (!Array.isArray(data?.sessions)) {
       debugLog("session/recent malformed", { sessionID })
-      return null
+      return { data: null, failure: "result_not_delivered" }
     }
-    return data
+    const selection = (data as any)?.selection
+    const failure: TailFailure =
+      typeof selection === "string" && selection !== "matched" ? "no_matching_selection" : "none"
+    return { data, failure }
   } catch (error) {
     console.debug("mnemoseed-local: session/recent failed:", error)
     debugLog("session/recent failed", { sessionID, error: String(error) })
     spoolFailure("/session/recent", body)
-    return null
+    return { data: null, failure: "daemon_unreachable" }
   }
+}
+
+// Bounded re-anchor: event-driven from onSessionContext, never a timer.
+// A stale observation is recorded but is never an injection precondition; only
+// a retryable infrastructure failure with a real observed_at earns a second
+// read. Success rebuilds the block from the daemon's real selection via the
+// same builders as T1 — no content is fabricated — and posts a re-anchor tool
+// event through the existing hook->daemon /ingest channel. The daemon's anchor
+// status comes from its own hook-ingest observation, not from a wire marker.
+async function tryReanchor(sessionID: string, event: any): Promise<void> {
+  const state = reanchorState.get(sessionID)
+  if (state === undefined || !state.observed_at) return
+  if (state.attempts >= REANCHOR_MAX_ATTEMPTS) return
+  if (!REANCHOR_RETRYABLE.has(state.last_status)) return
+
+  state.attempts += 1
+  const logAttempt = (failure: TailFailure): void => {
+    debugLog("re-anchor attempt", {
+      sessionID,
+      attempt: state.attempts,
+      failure,
+      observed_at: state.observed_at,
+      verified_at: state.verified_at,
+    })
+  }
+  const tail = await fetchSessionTails(sessionID)
+  if (tail.failure !== "none" || tail.data === null) {
+    state.last_status =
+      state.attempts >= REANCHOR_MAX_ATTEMPTS || !REANCHOR_RETRYABLE.has(tail.failure)
+        ? "stale"
+        : tail.failure
+    logAttempt(tail.failure)
+    return
+  }
+  const data = tail.data
+  const dataMode = visibilityModeOf(data)
+  if (dataMode !== null) lastVisibilityMode.set(sessionID, dataMode)
+  const sentQuery = sessionFirstMessages.has(sessionID)
+  const sel = data?.selection
+  const injectionAllowed = typeof sel !== "string" ? !sentQuery : sel === "matched"
+  if (!injectionAllowed) {
+    state.last_status = "stale" // intent not matched: terminal, never retried
+    logAttempt("no_matching_selection")
+    return
+  }
+  const built = buildRecallInjection(data.sessions, data.self_window, dataMode)
+  if (built === null) {
+    state.last_status = "stale"
+    logAttempt("result_not_delivered")
+    return
+  }
+  const verifiedAt = new Date().toISOString()
+  event.system.push({ type: "text", text: built.block })
+  event.system.push({ type: "text", text: `${REANCHOR_SIGNAL_PREFIX} at ${verifiedAt}` })
+  injectedRegistry.set(sessionID, built.registry)
+  t1InjectedChunkIds.set(sessionID, built.includedIds)
+  const rulesBlock = buildRulesBudgetInjection(data.rules_budget)
+  if (rulesBlock !== null) event.system.push({ type: "text", text: rulesBlock })
+  state.verified_at = verifiedAt
+  state.last_status = "reverified"
+  logAttempt("none")
+  // Reuse the pinned tool-ingest site: the verification rides the existing
+  // hook->daemon /ingest channel as a re-anchor tool event. No new call site,
+  // no wire marker the daemon has to interpret — its anchor status is derived
+  // from the hook ingest it actually observed.
+  postToolIngest(
+    sessionID,
+    "mnemoseed.reanchor",
+    { observed_at: state.observed_at, verified_at: verifiedAt },
+    "",
+    Date.now() / 1000,
+    {},
+  )
 }
 
 async function pullPendingRecall(sessionID: string): Promise<any | null> {
@@ -1335,7 +1447,8 @@ async function onSessionContext(event: any): Promise<void> {
     // whole mid-session lane).
     if (!injectedSessions.has(sessionID)) {
       injectedSessions.set(sessionID, true) // SYNCHRONOUS, before the first await
-      const data = await fetchSessionTails(sessionID)
+      const tail = await fetchSessionTails(sessionID)
+      const data = tail.data
       const dataMode = visibilityModeOf(data)
       if (dataMode !== null) lastVisibilityMode.set(sessionID, dataMode)
       // Scoped-resume (issue #187): T1 injection proceeds only when the
@@ -1387,6 +1500,28 @@ async function onSessionContext(event: any): Promise<void> {
         const rulesBlock = buildRulesBudgetInjection(data.rules_budget)
         if (rulesBlock !== null) event.system.push({ type: "text", text: rulesBlock })
       }
+      // Record the failed first attempt for a bounded re-anchor. Only a real
+      // failure is an observation; a successful injection leaves no pending
+      // state so the once-per-session gate is unchanged.
+      if (tail.failure !== "none") {
+        const observedAt = new Date().toISOString()
+        reanchorState.set(sessionID, {
+          attempts: 1,
+          observed_at: observedAt,
+          last_status: REANCHOR_RETRYABLE.has(tail.failure) ? tail.failure : "stale",
+        })
+        debugLog("re-anchor attempt", {
+          sessionID,
+          attempt: 1,
+          failure: tail.failure,
+          observed_at: observedAt,
+        })
+      }
+    } else {
+      // The bounded re-anchor runs on a SUBSEQUENT transform, only for a
+      // session whose T1 already ran, and BEFORE the T2 lane so its early
+      // returns (pull failed / budget drop) can never starve a re-verification.
+      await tryReanchor(sessionID, event)
     }
     const pull = pendingPull.get(sessionID)
     if (pull !== undefined && pull.armed && pull.acked) {
@@ -2697,6 +2832,7 @@ async function onBusEvent(event: any): Promise<void> {
         // gate, consumption registry, cited set, pending-recall arm and T1
         // seen list are dropped with it.
         injectedSessions.delete(sessionID)
+        reanchorState.delete(sessionID)
         injectedRegistry.delete(sessionID)
         citedChunks.delete(sessionID)
         pendingPull.delete(sessionID)

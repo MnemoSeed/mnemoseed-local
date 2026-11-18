@@ -469,17 +469,80 @@ def test_inject_old_daemon_payload_renders_exactly_as_today(tmp_path: Path) -> N
 
 def test_inject_fail_open_leaves_system_untouched_and_attempts_once(tmp_path: Path) -> None:
     """PRD-B2.1 T1 fail-open: a daemon failure (503 or a thrown network error)
-    must leave the system array untouched AND still consume the attempt gate —
-    the session pays at most one bounded read, then stays quiet."""
+    must leave the system array untouched. The attempt gate permits a bounded
+    second read (#410 re-anchor), so a session pays at most two reads then
+    stays quiet."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "inject-fail-open")
     for system in transcript["systems"]:
         assert len(system) == 1, f"failure must leave system untouched: {system}"
-    assert transcript["attempts503"] == 1, "the 503 lane gets exactly one attempt per session"
-    assert transcript["attemptsThrow"] == 1, "the throw lane gets exactly one attempt per session"
+    assert 1 <= transcript["attempts503"] <= 2, "the 503 lane gets at most two bounded attempts"
+    assert 1 <= transcript["attemptsThrow"] <= 2, "the throw lane gets at most two bounded attempts"
     # IMPORTANT-1 (QA): a handler fault (frozen system array) must not reject
     # the host's awaited model-call hook nor mutate the array.
     assert transcript["frozenSystem"] == ["BASE"], transcript["frozenSystem"]
+
+
+def test_inject_reanchor_recovers_after_stale(tmp_path: Path) -> None:
+    """#410 D3: a failed T1 records a bounded re-anchor observation; after the
+    daemon recovers the next onSessionContext re-reads and injects a real
+    re-anchor block with the re-anchored signal, verified_at and a re-anchor
+    tool event through the existing /ingest channel. The block must carry the
+    ACTUAL served payload, not a fabricated stand-in behind the fence."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "inject-reanchor-recovery")
+    assert transcript["first"] == ["BASE-STALE"], "a failed T1 leaves the system untouched"
+    second = transcript["second"]
+    assert len(second) >= 2, second
+    assert any("[mnemoseed] re-anchored" in text for text in second), second
+    blocks = [text for text in second if "<mnemoseed-memory-recall>" in text]
+    assert len(blocks) == 1, second
+    block = blocks[0]
+    # The wrapper marker alone cannot distinguish a rebuilt block from a
+    # fabricated one: pin the verbatim served payload instead.
+    assert "我们决定把发布窗口固定在每月第一周" in block, block
+    assert "评测臂报告目录固定在" in block, block
+    assert transcript["third"] == ["BASE-AFTER"], "the attempt cap holds after two reads"
+    assert transcript["recentCount"] == 2, "at most the initial read + one re-anchor read"
+    ingests = transcript["reanchorIngests"]
+    assert ingests, "the re-anchor reports through the existing /ingest channel"
+    report = ingests[0]
+    assert report["verified_at"] and report["observed_at"], report
+    attempts = transcript["attempts"]
+    assert attempts, "each re-anchor attempt writes a debug line"
+    assert all(entry["attempt"] <= 2 for entry in attempts), attempts
+    assert all(entry.get("observed_at") for entry in attempts), attempts
+    assert any(entry.get("verified_at") for entry in attempts), attempts
+
+
+def test_inject_reanchor_cap_is_enforced_by_the_constant_not_the_context_count(
+    tmp_path: Path,
+) -> None:
+    """#410 D3 closure: three consecutive retryable failures and three
+    transforms still produce exactly two reads, and no logged attempt exceeds
+    two. A REANCHOR_MAX_ATTEMPTS 2->3 mutant must go RED here."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "inject-reanchor-cap")
+    assert transcript["systems"] == [
+        ["BASE-CAP0"],
+        ["BASE-CAP1"],
+        ["BASE-CAP2"],
+    ], "every failed attempt leaves the system untouched"
+    assert transcript["recentCount"] == 2, "the cap blocks a third /session/recent read"
+    assert transcript["maxAttempt"] == 2, "no attempt above the frozen bound may be logged"
+    assert len(transcript["attempts"]) == 2, transcript["attempts"]
+    plugin = Path(__file__).parent.parent / "src" / "mnemoseed_local" / "hosts" / "opencode" / "plugin.ts"
+    assert "const REANCHOR_MAX_ATTEMPTS = 2" in plugin.read_text(encoding="utf-8")
+
+
+def test_inject_reanchor_does_not_retry_no_matching_selection(tmp_path: Path) -> None:
+    """#410 D3 closure: an unresolved selection is a terminal intent signal,
+    not a retryable infrastructure failure — a later context must not re-read."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "inject-reanchor-no-match")
+    assert transcript["first"] == ["BASE-A"]
+    assert transcript["second"] == ["BASE-B"]
+    assert transcript["recentCount"] == 1, "no_matching_selection is never retried"
 
 
 def test_citation_reinforce_only_records_actually_consumed_injections(tmp_path: Path) -> None:
