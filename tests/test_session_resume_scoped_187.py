@@ -174,6 +174,12 @@ def test_ambiguous_prompt_is_unresolved_with_no_tails(config_path: Path) -> None
         payload = body.json()
         assert payload["selection"] == "unresolved"
         assert payload["sessions"] == []
+        reason = payload["selection_reason"]
+        assert "no anchor" in reason
+        assert "no relevant history" in reason
+        step = payload["next_step"]
+        assert "resume_query" in step
+        assert "project bind" in step
 
 
 def test_assistant_only_mention_does_not_match(config_path: Path) -> None:

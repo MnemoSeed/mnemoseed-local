@@ -21,7 +21,7 @@ from collections.abc import Iterable
 #: The tool identifiers the template may interpolate. A placeholder outside this
 #: set is unreachable; one inside it that the gateway does not serve makes
 #: :func:`render` refuse instead of emitting a dead reference.
-TOOL_PLACEHOLDERS = ("recall", "capture", "remember", "supersede")
+TOOL_PLACEHOLDERS = ("recall", "capture", "remember", "supersede", "recent_sessions")
 
 #: Length ceiling: the block rides the system prompt of every session, so it has
 #: to stay short. A block past it is refused rather than silently shipped.
@@ -54,6 +54,8 @@ The rules below are situations and actions, not suggestions:
 
 An empty result means no relevant memory exists: say so plainly and continue.
 Do not guess, and do not repeat the query.
+{recent_sessions} unresolved: resolution failed, not "no relevant history"; follow
+next_step (bind, add resume_query id).
 
 A pin is an entry the user explicitly asked to keep: provenance_source is
 "memory.remember", or explicit_pin is true. A captured entry is one written

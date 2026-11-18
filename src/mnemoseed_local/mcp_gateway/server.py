@@ -161,30 +161,45 @@ TOOLS: list[dict[str, Any]] = [
         "Pass caller_cwd (the current workspace directory) for project-context recovery: "
         "the daemon verifies the project binding first and serves only the bound project's "
         "root conversation — selection=unresolved with a reason means nothing was recovered, "
-        "never search other workspaces or chats on your own.",
+        "never search other workspaces or chats on your own. "
+        "Only resume_query produces anchors: its raw text is scanned for bare kebab-case "
+        "identifiers, snake_case, backticked tokens, dotted paths and path basenames. "
+        "n_sessions, n_per_session, self_parent_id and caller_cwd never produce anchors: "
+        "caller_cwd only verifies the binding and self_parent_id only filters roots. "
+        "selection=unresolved carries a reason and next_step and means resolution failed, "
+        "never 'no relevant history'; follow next_step (bind a workspace with "
+        "'mnemoseed-local project bind --root <dir> --profile <id>', or add an identifier "
+        "to resume_query) instead of reporting no history.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "n_sessions": {
                     "type": "integer",
-                    "description": "how many recent session groups to return (default 2, max 5)",
+                    "description": "how many recent session groups to return (default 2, max 5); "
+                    "does not produce anchors",
                 },
                 "n_per_session": {
                     "type": "integer",
-                    "description": "verbatim tail size per session, in chunks (default 20, max 100)",
+                    "description": "verbatim tail size per session, in chunks (default 20, max 100); "
+                    "does not produce anchors",
                 },
                 "resume_query": {
                     "type": "string",
-                    "description": "raw current prompt for scoped-resume matching (max 500 chars)",
+                    "description": "raw current prompt for scoped-resume matching (max 500 chars); "
+                    "the ONLY field whose text produces anchors (kebab-case, snake_case, "
+                    "backticked tokens, dotted paths, path basenames)",
                 },
                 "self_parent_id": {
                     "type": "string",
-                    "description": "the calling session's own parent id (None=root caller, string=child)",
+                    "description": "the calling session's own parent id (None=root caller, string=child); "
+                    "filters roots, never produces anchors",
                 },
                 "caller_cwd": {
                     "type": "string",
                     "description": "the current workspace directory; enables project-context recovery "
-                    "verified against the project binding registry",
+                    "verified against the project binding registry; verifies the binding only, "
+                    "never an anchor — with no binding and no anchors the result is "
+                    "selection=unresolved with a binding next_step",
                 },
             },
             "required": ["resume_query"],
