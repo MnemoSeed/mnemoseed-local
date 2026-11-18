@@ -629,6 +629,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"dream auto_trigger: {config['dream']['auto_trigger']}")
     dream_driver = config.get("dream", {}).get("llm", {}).get("dream", {}).get("driver")
     print(f"dream llm driver:  {dream_driver if dream_driver else 'not configured'}")
+    dream_route = health.get("dream_route")
+    if (
+        isinstance(dream_route, dict)
+        and dream_route.get("driver")
+        and dream_route.get("ready") is False
+        and dream_route.get("checked_at") is not None
+    ):
+        print("dream: paused (provider unreachable)")
     for line in _capability_lines(health.get("capabilities", {})):
         print(line)
     print(f"profile: {client.profile_id}")
