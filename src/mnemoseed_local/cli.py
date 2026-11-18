@@ -44,6 +44,7 @@ from mnemoseed_local.daemon.observability import (
     MEMORY_DIAGNOSIS_DAEMON_DOWN,
     MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE,
     MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED,
+    OBSERVATION_OBSERVED,
     CaptureEvidenceStatus,
     MemoryEntryDiagnosis,
     SinceBootObservation,
@@ -2043,13 +2044,14 @@ def cmd_host(args: argparse.Namespace) -> int:
         return 1
     if args.host_command == "status":
         observations = _host_status_observations(args.host, result)
+        structure_state = _structure_state_for_display(result.state, observations.trust)
         if args.json:
             return _emit_json(
                 {
                     "host": args.host,
                     "profile_id": observations.profile_id,
                     "structure": {
-                        "state": result.state,
+                        "state": structure_state,
                         "path": str(result.path),
                         "daemon_reachable": result.daemon_reachable,
                         "base_url": result.base_url,
@@ -2078,7 +2080,7 @@ def cmd_host(args: argparse.Namespace) -> int:
                     else None,
                 }
             )
-        print(f"host: {result.state}")
+        print(f"host: {structure_state}")
         print(f"path: {result.path}")
         print(f"daemon: {'reachable' if result.daemon_reachable else 'unreachable'} ({result.base_url})")
         for line in observations.lines():
@@ -2090,10 +2092,12 @@ def cmd_host(args: argparse.Namespace) -> int:
 
 
 #: The manual-trust vocabulary of the host status surface: a known manual
-#: step whose verification the tool never performs, a host whose install
-#: design asks no manual trust step, and a structure the trust state cannot
-#: be assessed from. Never guessed, never automated.
+#: step whose verification the tool never performs, positive evidence from
+#: observed hook traffic, a host whose install design asks no manual trust
+#: step, and a structure the trust state cannot be assessed from. Never
+#: guessed, never automated.
 TRUST_UNVERIFIED = "unverified"
+TRUST_VERIFIED = "verified"
 TRUST_NOT_REQUIRED = "not_required"
 TRUST_UNKNOWN = "unknown"
 
@@ -2113,11 +2117,22 @@ class TrustStatus:
         return f"trust: {self.state} ({self.detail})"
 
 
-def _trust_status(host: str, structure_state: str) -> TrustStatus:
+def _structure_state_for_display(structure_state: str, trust: TrustStatus) -> str:
+    """Render the structure state with the resolved trust observation. Once
+    observed hook traffic verifies the manual step, its stale review advice is
+    replaced rather than repeated; the rest of the structure is left intact."""
+    if trust.state == TRUST_VERIFIED and ", trust" in structure_state:
+        return f"{structure_state.split(', trust', 1)[0]}, trust verified (hook ingests observed)"
+    return structure_state
+
+
+def _trust_status(host: str, structure_state: str, hook_ingests_observed: bool = False) -> TrustStatus:
     """The manual-trust observation: a known requirement with its standing
     state, or an honest unknown. An adapter declares its manual step with
     ``MANUAL_TRUST_STATE`` / ``MANUAL_TRUST_STEP``; a partial or unreadable
-    structure stays unknown rather than guessing a verdict."""
+    structure stays unknown rather than guessing a verdict. Observed hook
+    ingests are positive evidence: unapproved hooks cannot post them, so a
+    config with hook traffic reads verified instead of pending review."""
     if structure_state == _STRUCTURE_NOT_INSTALLED:
         return TrustStatus(TRUST_NOT_REQUIRED, "no mnemoseed hooks registered for this host")
     module = importlib.import_module(HOOK_HOSTS[host].install)
@@ -2125,6 +2140,10 @@ def _trust_status(host: str, structure_state: str) -> TrustStatus:
     if pending is None:
         return TrustStatus(TRUST_NOT_REQUIRED, "no manual trust step in this host's install flow")
     if structure_state == pending:
+        if hook_ingests_observed:
+            return TrustStatus(
+                TRUST_VERIFIED, "hook ingests observed since boot; approved hooks are executing"
+            )
         return TrustStatus(TRUST_UNVERIFIED, str(getattr(module, "MANUAL_TRUST_STEP", pending)))
     return TrustStatus(
         TRUST_UNKNOWN,
@@ -2255,7 +2274,7 @@ def _host_status_observations(host: str, result: Any) -> HostStatusObservations:
         ingest_ack=ingest_ack,
         capture=capture,
         replay=replay,
-        trust=_trust_status(host, result.state),
+        trust=_trust_status(host, result.state, ingest_ack.state == OBSERVATION_OBSERVED),
         entry_diagnosis=_entry_diagnosis(
             daemon_reachable=result.daemon_reachable, activity=activity, capture=capture
         ),
