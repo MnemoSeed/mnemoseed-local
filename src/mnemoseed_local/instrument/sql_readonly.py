@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,10 +23,12 @@ from mnemoseed_local.instrument.ledger import (
     sha256_hex,
 )
 from mnemoseed_local.storage.drivers._time import epoch_from_iso
+from mnemoseed_local.storage.ports import NodeFilter, Page
 
 if TYPE_CHECKING:
     from mnemoseed_local.schema.graph import GraphNode
     from mnemoseed_local.storage.drivers.sqlite_graph import SqliteGraphDriver
+    from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
     from mnemoseed_local.storage.ports import ReconciliationReceipt
 
 
@@ -57,6 +59,14 @@ SCHEMA_MASTER_QUERY = "SELECT type, name, sql FROM sqlite_master ORDER BY type, 
 
 TABLE_INFO_NODES = "PRAGMA table_info(nodes)"
 TABLE_INFO_NODE_VERSIONS = "PRAGMA table_info(node_versions)"
+
+RECEIPT_UNRESOLVED_COLUMNS: tuple[str, ...] = (
+    "nomination_id",
+    "disposition",
+    "reason_code",
+    "applied_at",
+)
+RECEIPT_REQUIRED_TEXT_COLUMNS: tuple[str, ...] = ("nomination_id", "disposition", "reason_code")
 
 RECEIPT_PUBLIC_FIELDS: tuple[str, ...] = (
     "nomination_id",
@@ -191,6 +201,14 @@ class NodeVersionSnapshot:
 
 
 @dataclass(frozen=True)
+class ProductNodePage:
+    """The bounded current-node page of one profile."""
+
+    node_ids: tuple[str, ...]
+    total: int
+
+
+@dataclass(frozen=True)
 class NodeIntegritySnapshot:
     """The integrity evidence of one profile's nodes at one point in time."""
 
@@ -278,18 +296,20 @@ def read_unresolved_receipts(conn: sqlite3.Connection) -> list[ProjectionReceipt
     rows = _fetch_rows(conn, RECEIPT_UNRESOLVED_QUERY)
     snapshots: list[ProjectionReceiptSnapshot] = []
     for row in rows:
-        nomination_id = str(row[0])
-        applied_at = row[3]
+        values = _row_cells(row, RECEIPT_UNRESOLVED_COLUMNS)
+        identifiers = _cell_evidence(values, ("nomination_id",))
+        _require_row_columns(values, RECEIPT_REQUIRED_TEXT_COLUMNS, "receipt_row_missing", identifiers)
+        applied_at = values["applied_at"]
         if applied_at is None:
             raise BindingIncompleteError(
-                {"reason": "receipt_applied_at_missing", "nomination_id": nomination_id}
+                {"reason": "receipt_applied_at_missing", "nomination_id": values["nomination_id"]}
             )
         snapshots.append(
             ProjectionReceiptSnapshot(
-                nomination_id=nomination_id,
-                disposition=str(row[1]),
-                reason_code=str(row[2]),
-                applied_at_raw=str(applied_at),
+                nomination_id=values["nomination_id"],
+                disposition=values["disposition"],
+                reason_code=values["reason_code"],
+                applied_at_raw=applied_at,
             )
         )
     return snapshots
@@ -350,7 +370,12 @@ def crosscheck_receipts(
     """
     verify_receipt_schema(conn)
     rows = _fetch_rows(conn, RECEIPT_ROWS_QUERY)
-    persisted = {str(row[0]): row for row in rows}
+    persisted: dict[str, Any] = {}
+    for row in rows:
+        values = dict(zip(RECEIPT_PUBLIC_FIELDS, tuple(row), strict=True))
+        identifiers = _cell_evidence(values, ("nomination_id",))
+        _require_row_columns(values, ("nomination_id",), "receipt_row_missing", identifiers)
+        persisted[str(values["nomination_id"])] = row
     checks: list[ReceiptCrosscheck] = []
     for nomination_id in nomination_ids:
         row = persisted.get(nomination_id)
@@ -585,44 +610,94 @@ def _fetch_rows(conn: sqlite3.Connection, query: str, params: Sequence[Any] = ()
         raise BindingIncompleteError(detail) from exc
 
 
+def read_product_profile_ids(graph: SqliteGraphDriver, *, limit: int) -> tuple[str, ...]:
+    """The profiles of the pending audit backlog behind the typed read boundary."""
+    entries = _read_product(
+        lambda: graph.pending_reconciliation_audits(limit),
+        query_reason="product_audit_query_error",
+        decode_reason="product_audit_decode_error",
+    )
+    return tuple(sorted({str(entry.profile_id) for entry in entries}))
+
+
+def read_product_node_page(graph: SqliteGraphDriver, *, profile_id: str, limit: int) -> ProductNodePage:
+    """The bounded current-node page of one profile behind the typed read boundary."""
+    page = _read_product(
+        lambda: graph.list_nodes(NodeFilter(profile_id=profile_id), Page(offset=0, limit=limit)),
+        query_reason="product_node_page_query_error",
+        decode_reason="product_node_page_decode_error",
+        profile_id=profile_id,
+    )
+    return ProductNodePage(node_ids=tuple(node.node_id for node in page.items), total=page.total)
+
+
+def read_product_node(graph: SqliteGraphDriver, *, node_id: str) -> GraphNode | None:
+    """The product decode of one current node behind the typed read boundary."""
+    return _read_product(
+        lambda: graph.get_node(node_id),
+        query_reason="product_node_query_error",
+        decode_reason="product_node_decode_error",
+        node_id=node_id,
+    )
+
+
+def read_product_version_count(graph: SqliteGraphDriver, *, node_id: str) -> int:
+    """The version-chain length of one node behind the typed read boundary."""
+    versions = _read_product(
+        lambda: graph.versions(node_id),
+        query_reason="product_version_query_error",
+        decode_reason="product_version_decode_error",
+        node_id=node_id,
+    )
+    return len(versions)
+
+
+def read_product_receipt_counts(graph: SqliteGraphDriver, *, profile_id: str) -> dict[str, int]:
+    """The disposition counts of one profile behind the typed read boundary."""
+    return _read_product(
+        lambda: graph.count_reconciliation_receipts(profile_id=profile_id),
+        query_reason="product_receipt_count_query_error",
+        decode_reason="product_receipt_count_decode_error",
+        profile_id=profile_id,
+    )
+
+
+def read_meta_profile_count(meta: SqliteMetaDriver) -> int:
+    """The stored profile count behind the typed read boundary."""
+    profiles = _read_product(
+        meta.list_profiles,
+        query_reason="product_profile_query_error",
+        decode_reason="product_profile_decode_error",
+    )
+    return len(profiles)
+
+
+def _read_product[T](decode: Callable[[], T], *, query_reason: str, decode_reason: str, **fields: Any) -> T:
+    """Run one product decode behind the typed read boundary.
+
+    A product SQLite failure and content the product cannot decode both become
+    binding failures with distinct reasons and keep the original error as the
+    cause. Decoding errors include JSON and pydantic validation failures.
+    """
+    try:
+        return decode()
+    except sqlite3.Error as exc:
+        raise BindingIncompleteError(_read_detail(query_reason, exc, **fields)) from exc
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise BindingIncompleteError(_read_detail(decode_reason, exc, **fields)) from exc
+
+
 def _read_product_receipt(
     graph: SqliteGraphDriver, *, profile_id: str, nomination_id: str
 ) -> ReconciliationReceipt | None:
-    """The product decode of one receipt behind the typed read boundary.
-
-    A SQLite failure of the product connection and a receipt content the
-    product cannot decode both become binding failures, each with its own
-    reason, and keep the original error as their cause.
-    """
-    try:
-        return graph.get_reconciliation_receipt(profile_id=profile_id, nomination_id=nomination_id)
-    except sqlite3.Error as exc:
-        detail = _read_detail(
-            "product_receipt_query_error", exc, profile_id=profile_id, nomination_id=nomination_id
-        )
-        raise BindingIncompleteError(detail) from exc
-    except (ValueError, TypeError, OverflowError) as exc:
-        detail = _read_detail(
-            "product_receipt_decode_error", exc, profile_id=profile_id, nomination_id=nomination_id
-        )
-        raise BindingIncompleteError(detail) from exc
-
-
-def _read_product_node(graph: SqliteGraphDriver, *, node_id: str) -> GraphNode | None:
-    """The product decode of one current node behind the typed read boundary.
-
-    A SQLite failure of the product connection and node content the product
-    cannot decode both become binding failures, each with its own reason, and
-    keep the original error as their cause.
-    """
-    try:
-        return graph.get_node(node_id)
-    except sqlite3.Error as exc:
-        detail = _read_detail("product_node_query_error", exc, node_id=node_id)
-        raise BindingIncompleteError(detail) from exc
-    except (ValueError, TypeError, OverflowError) as exc:
-        detail = _read_detail("product_node_decode_error", exc, node_id=node_id)
-        raise BindingIncompleteError(detail) from exc
+    """The product decode of one receipt behind the typed read boundary."""
+    return _read_product(
+        lambda: graph.get_reconciliation_receipt(profile_id=profile_id, nomination_id=nomination_id),
+        query_reason="product_receipt_query_error",
+        decode_reason="product_receipt_decode_error",
+        profile_id=profile_id,
+        nomination_id=nomination_id,
+    )
 
 
 def _read_detail(reason: str, error: BaseException | None = None, **fields: Any) -> dict[str, Any]:
@@ -679,7 +754,7 @@ def _version_row_hash(values: dict[str, Any]) -> str:
 
 def _current_node_hash(graph: SqliteGraphDriver, node_id: str) -> str:
     """The hash of the full current content of one node."""
-    node = _read_product_node(graph, node_id=node_id)
+    node = read_product_node(graph, node_id=node_id)
     if node is None:
         return sha256_hex(canonical_json(None).encode("utf-8"))
     return sha256_hex(canonical_node_json(node).encode("utf-8"))
@@ -705,7 +780,9 @@ def _require_placeholder_count(value: object) -> int:
 __all__ = [
     "NODE_VERSIONS_QUERY_TEMPLATE",
     "OUTBOX_ROWS_QUERY",
+    "RECEIPT_REQUIRED_TEXT_COLUMNS",
     "RECEIPT_ROWS_QUERY",
+    "RECEIPT_UNRESOLVED_COLUMNS",
     "RECEIPT_UNRESOLVED_QUERY",
     "SCHEMA_MASTER_QUERY",
     "TABLE_INFO_NODE_VERSIONS",
@@ -713,6 +790,7 @@ __all__ = [
     "NodeIntegritySnapshot",
     "NodeVersionSnapshot",
     "OutboxRowSnapshot",
+    "ProductNodePage",
     "ProjectionReceiptSnapshot",
     "ReceiptCrosscheck",
     "assert_node_integrity",
@@ -720,8 +798,14 @@ __all__ = [
     "crosscheck_receipts",
     "query_hash",
     "query_hash_for",
+    "read_meta_profile_count",
     "read_node_versions",
     "read_outbox_rows",
+    "read_product_node",
+    "read_product_node_page",
+    "read_product_profile_ids",
+    "read_product_receipt_counts",
+    "read_product_version_count",
     "read_schema_master",
     "read_table_columns",
     "read_unresolved_receipts",
