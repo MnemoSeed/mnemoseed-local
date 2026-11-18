@@ -2317,7 +2317,10 @@ def cmd_import(args: argparse.Namespace) -> int:
             answer = input(f"Import rollouts from {root} into profile {args.profile}? [y/N] ")
             if answer.strip().lower() not in ("y", "yes"):
                 return 1
-        discovered = source.iter_rollouts(root)
+        if source.supports_create_stubs:
+            discovered = source.iter_rollouts(root, create_stubs=not args.dry_run)
+        else:
+            discovered = source.iter_rollouts(root)
         if args.dry_run:
             runner.preflight_zstandard(discovered)
         else:

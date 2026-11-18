@@ -13,6 +13,7 @@ import pytest
 
 from mnemoseed_local import cli
 from mnemoseed_local.hosts.zcode import transcript
+from mnemoseed_local.importer import runner
 from mnemoseed_local.importer.ledger import ImportLedger
 from mnemoseed_local.importer.runner import RolloutSource, load_source, run_import
 from mnemoseed_local.util.rollout import rollout_run_id
@@ -344,3 +345,53 @@ def test_runner_labels_locked_database_distinct_from_corrupt(tmp_path: Path) -> 
     assert report.skipped.get("locked") == 1
     assert report.skipped.get("corrupt") == 1
     assert any("warning" in line.lower() and "lock" in line.lower() for line in emitted)
+
+
+def test_cli_dry_run_leaves_source_directory_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "hermetic-home"))
+    root = tmp_path / "zcode-db"
+    m0 = _msg(SESSION_A, 0, "user")
+    _write_db(root, [(SESSION_A, 1000)], [m0], [_part(m0[0], SESSION_A, 0, "text", "u0")])
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("dry-run must not contact a daemon")
+
+    monkeypatch.setattr(runner, "build_client", forbidden)
+
+    code = cli.main(["import", "--host", "zcode", "--source", str(root), "--dry-run", "--json"])
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["turns_ingested"] == 1
+    stub_dir = root / ".mnemoseed-rollouts"
+    assert not stub_dir.exists() or not any(stub_dir.iterdir())
+
+
+def test_cli_real_import_creates_stubs_and_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "hermetic-home"))
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
+    root = tmp_path / "zcode-db"
+    m0 = _msg(SESSION_A, 0, "user")
+    _write_db(root, [(SESSION_A, 1000)], [m0], [_part(m0[0], SESSION_A, 0, "text", "u0")])
+    client = _FakeClient()
+
+    def fake_client_for(
+        base_url: str,
+        *,
+        profile_id: str,
+        actor: str,
+        timeout: float,
+        token: str | None = None,
+    ) -> _FakeClient:
+        return client
+
+    monkeypatch.setattr(runner, "client_for", fake_client_for)
+
+    code = cli.main(["import", "--host", "zcode", "--source", str(root), "--yes", "--json"])
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["sessions_imported"] == 1
+    assert (root / ".mnemoseed-rollouts" / f"{SESSION_A}.zcode").is_file()
