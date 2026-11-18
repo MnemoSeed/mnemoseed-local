@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+
 import pytest
 
 from mnemoseed_local import cli
-from mnemoseed_local.mcp_gateway import reliable_client
+from mnemoseed_local.mcp_gateway import reliable_client, server
 from mnemoseed_local.rest_client import DaemonUnavailableError
 
 
@@ -25,3 +28,26 @@ def test_mcp_down_hint_contract_is_unchanged() -> None:
     assert "{base_url}" in reliable_client.DAEMON_DOWN_HINT
     assert "mnemoseed-local up" in reliable_client.DAEMON_DOWN_HINT
     assert reliable_client.RETRY_TIMEOUT_SECONDS == 1.5
+
+
+class _DownClient:
+    profile_id = "default"
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        del path, body
+        raise self.error
+
+
+def test_daemon_down_is_entry_unavailable_not_capability_absence() -> None:
+    client = _DownClient(DaemonUnavailableError("cannot reach http://127.0.0.1:1"))
+    result = server.call_tool(client, "recall", {"query": "x"})
+    failure = result["entry_failure"]
+    assert result["isError"] is True
+    assert failure["kind"] == "entry_unavailable"
+    assert failure["kind"] not in {"absent", "capability_absent", "index_unavailable"}
+    assert failure["alternate"] == "stdio gateway: mnemoseed-local mcp"
+    assert "cannot reach" in result["content"][0]["text"]
+    datetime.fromisoformat(failure["observed_at"])

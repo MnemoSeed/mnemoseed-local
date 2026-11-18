@@ -488,6 +488,167 @@ def test_evidence_query_scopes_to_the_selected_profile(
         assert payload["capture_evidence"]["state"] == "recent"
 
 
+# ---------------------------------------------------------------- #410 re-anchor diagnosis (D4)
+
+
+def _post_reanchor_ingest(base_url: str, credential: str, *, session_id: str) -> dict[str, Any]:
+    """A real hook-actor ingest through the existing /ingest channel. The daemon
+    derives anchor status from the ingest it observes (capture-neutral), with no
+    wire marker to interpret. Deliberately NOT settled, so the persisted capture
+    stays stale while a fresh hook ingest is observed."""
+    client = DaemonClient(base_url=base_url, token=credential, actor="hook")
+    acked = client.post(
+        "/ingest",
+        {
+            "host": "opencode",
+            "event": "user_prompt",
+            "session_id": session_id,
+            "profile_id": PROFILE,
+            "ts": 1.0,
+            "content": {"text": "user: re-anchored session context"},
+        },
+    )
+    assert acked.get("status") == "accepted", acked
+    return acked
+
+
+def test_memory_entry_diagnosis_vocabulary_is_four_way_and_isolated() -> None:
+    """D4: exactly four diagnosis kinds; each maps only to itself and carries a
+    real ISO-8601 observation time. Unknown kinds and non-ISO times are RED."""
+    from mnemoseed_local.daemon.observability import (
+        MEMORY_DIAGNOSIS_CAPTURE_STALE,
+        MEMORY_DIAGNOSIS_DAEMON_DOWN,
+        MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE,
+        MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED,
+        memory_entry_diagnosis,
+    )
+
+    kinds = {
+        MEMORY_DIAGNOSIS_DAEMON_DOWN,
+        MEMORY_DIAGNOSIS_CAPTURE_STALE,
+        MEMORY_DIAGNOSIS_INDEX_UNAVAILABLE,
+        MEMORY_DIAGNOSIS_RESULT_NOT_DELIVERED,
+    }
+    assert kinds == {"daemon_down", "capture_stale", "index_unavailable", "result_not_delivered"}
+    for kind in kinds:
+        diag = memory_entry_diagnosis(kind, observed_at="2026-11-18T00:00:00Z")
+        assert diag.kind == kind
+        assert diag.observed_at == "2026-11-18T00:00:00Z"
+    with pytest.raises(ValueError):
+        memory_entry_diagnosis("not_a_kind", observed_at="2026-11-18T00:00:00Z")
+    with pytest.raises(ValueError):
+        memory_entry_diagnosis(MEMORY_DIAGNOSIS_DAEMON_DOWN, observed_at=12345.0)  # type: ignore[arg-type]
+
+
+def test_stale_capture_carries_observed_at_and_a_capture_stale_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """D4: a persisted stale capture is a real observation with an ISO time,
+    and the host status names its diagnosis without calling it broken."""
+    with _daemon(tmp_path) as daemon:
+        monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", daemon["base_url"])
+        _seed_stale_capture(daemon["app"], host=HostId.OPENCODE.value, age_s=3600.0)
+        payload = _status_json(monkeypatch, capsys, "opencode")
+        capture = payload["capture_evidence"]
+        assert capture["state"] == "stale"
+        observed = capture["observed_at"]
+        assert isinstance(observed, str) and observed.endswith(("Z", "+00:00"))
+        diag = payload["entry_diagnosis"]
+        assert diag["kind"] == "capture_stale"
+        assert isinstance(diag["observed_at"], str)
+
+
+def test_reverified_state_and_verified_at_come_from_the_daemon_additive_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """D4 end-to-end: a stale persisted capture plus a fresh hook-actor ingest
+    makes the daemon expose last_anchored_at + anchor_status additively; host
+    status reads them from daemon REST (never the TS debug file) and reports
+    reverified + verified_at. Reverified means "hook ingest observed after a
+    stale capture" (capture-neutral), not "a D3-specific wire marker arrived"."""
+    with _daemon(tmp_path) as daemon:
+        monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", daemon["base_url"])
+        _seed_stale_capture(daemon["app"], host=HostId.OPENCODE.value, age_s=3600.0)
+        _post_reanchor_ingest(daemon["base_url"], daemon["credential"], session_id="sess-reanchor-py")
+
+        activity = DaemonClient(base_url=daemon["base_url"], token=daemon["credential"]).get(
+            "/api/v1/observability"
+        )
+        assert activity["anchor_status"] == "reverified"
+        assert isinstance(activity["last_anchored_at"], str) and activity["last_anchored_at"]
+
+        payload = _status_json(monkeypatch, capsys, "opencode")
+        capture = payload["capture_evidence"]
+        assert capture["state"] == "reverified"
+        assert capture["verified_at"] == activity["last_anchored_at"]
+        assert isinstance(capture["observed_at"], str)
+        assert payload["entry_diagnosis"]["kind"] == "result_not_delivered"
+
+
+def test_daemon_down_is_diagnosable_and_human_lines_stay_one_per_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """D4: a daemon we cannot reach yields a daemon_down diagnosis, and the
+    additive JSON field never adds a second human status line."""
+    home = tmp_path / "daemon-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(_config_toml(home), encoding="utf-8")
+    with auth_support.isolated_home(home):
+        auth_support.seed_credential(home)
+        monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", f"http://127.0.0.1:{unused_loopback_port()}")
+        payload = _status_json(monkeypatch, capsys, "opencode")
+        assert payload["entry_diagnosis"]["kind"] == "daemon_down"
+        capsys.readouterr()
+        assert main(["host", "status", "--host", "opencode"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        labels = [line.split(": ", 1)[0] for line in lines[3:]]
+        assert labels == ["ingest ack", "capture", "replay", "trust"]
+
+
+def test_daemon_recovery_reverifies_a_live_session_on_isolated_home_and_spare_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live session first observes the daemon down, then the daemon recovers
+    on a spare port and a re-anchor ingest is verified: the status moves from a
+    daemon_down observation to reverified with a daemon-reported verified_at.
+    No fixed port and no real runtime home are involved."""
+    home = tmp_path / "daemon-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(_config_toml(home), encoding="utf-8")
+    with auth_support.isolated_home(home):
+        credential = auth_support.seed_credential(home)
+        monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", f"http://127.0.0.1:{unused_loopback_port()}")
+        down = _status_json(monkeypatch, capsys, "opencode")
+        assert down["entry_diagnosis"]["kind"] == "daemon_down"
+        assert down["capture_evidence"]["state"] == "unknown"
+
+        app = create_app()
+        with auth_support.live_server(app, unused_loopback_port()) as base_url:
+            monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", base_url)
+            _seed_stale_capture(app, host=HostId.OPENCODE.value, age_s=3600.0)
+            stale = _status_json(monkeypatch, capsys, "opencode")
+            assert stale["capture_evidence"]["state"] == "stale"
+            assert stale["entry_diagnosis"]["kind"] == "capture_stale"
+
+            _post_reanchor_ingest(base_url, credential, session_id="sess-live-reanchor")
+            activity = DaemonClient(base_url=base_url, token=credential).get("/api/v1/observability")
+            assert activity["anchor_status"] == "reverified"
+
+            recovered = _status_json(monkeypatch, capsys, "opencode")
+            capture = recovered["capture_evidence"]
+            assert capture["state"] == "reverified"
+            assert capture["verified_at"] == activity["last_anchored_at"]
+            assert recovered["entry_diagnosis"]["kind"] == "result_not_delivered"
+
+
 def test_stale_scan_reads_past_newer_foreign_captures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

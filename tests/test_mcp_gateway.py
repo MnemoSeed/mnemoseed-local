@@ -10,12 +10,14 @@ import io
 import json
 import logging
 import sys
+from datetime import datetime
 from typing import Any
 
 import pytest
 
 from mnemoseed_local import __version__, cli
 from mnemoseed_local.mcp_gateway import server
+from mnemoseed_local.mcp_gateway.reliable_client import DAEMON_AUTH_HINT
 from mnemoseed_local.rest_client import DaemonRestError, DaemonUnavailableError
 
 
@@ -684,3 +686,134 @@ def test_serve_forces_utf8_and_untranslated_newlines_on_stdio_lanes() -> None:
     assert b"\r\n" not in wire  # no CRLF translation on the wire
     text = wire.decode("utf-8")  # the whole frame decodes as UTF-8
     assert "—" in text  # the B2 em-dash survives (mojibake would have died on decode)
+
+
+# ---------------------------------------------------------------- typed entry failure
+
+
+def _call_result(
+    client: StubClient, name: str = "recall", arguments: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    _, responses = run_gateway(
+        [_request(1, "tools/call", {"name": name, "arguments": arguments or {"query": "x"}})],
+        client,
+    )
+    return responses[0]["result"]
+
+
+def test_entry_failure_vocabulary_is_immutable_and_complete() -> None:
+    assert isinstance(server.ENTRY_FAILURE_KINDS, frozenset)
+    assert server.ENTRY_FAILURE_KINDS == frozenset(
+        {"entry_unavailable", "auth_refused", "result_not_delivered", "tool_error"}
+    )
+    assert "capability_absent" not in server.ENTRY_FAILURE_KINDS
+    assert "index_unavailable" not in server.ENTRY_FAILURE_KINDS
+    with pytest.raises(AttributeError):
+        server.ENTRY_FAILURE_KINDS.add("capability_absent")  # type: ignore[attr-defined]
+
+
+def test_entry_error_result_is_additive_verbatim_and_json_serializable() -> None:
+    observed = "2026-11-18T10:11:12.000Z"
+    result = server.entry_error_result(
+        "result_not_delivered",
+        "daemon error: HTTP 422",
+        observed_at=observed,
+        alternate=server.STDIO_ALTERNATE,
+    )
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": "daemon error: HTTP 422"}]
+    failure = result["entry_failure"]
+    assert failure["kind"] == "result_not_delivered"
+    assert failure["observed_at"] == observed
+    assert failure["alternate"] == server.STDIO_ALTERNATE
+    assert failure["retry_policy"]
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_entry_error_result_rejects_an_unknown_kind() -> None:
+    with pytest.raises(ValueError):
+        server.entry_error_result("capability_absent", "x", observed_at="2026-11-18T10:11:12Z", alternate="y")
+
+
+def test_entry_error_result_rejects_a_non_iso_observed_at() -> None:
+    with pytest.raises(ValueError):
+        server.entry_error_result("entry_unavailable", "x", observed_at="not-a-date", alternate="y")
+
+
+@pytest.mark.parametrize(
+    ("error", "name", "arguments", "kind", "reason"),
+    [
+        (
+            DaemonUnavailableError("cannot reach http://localhost:7788"),
+            "recall",
+            {"query": "x"},
+            "entry_unavailable",
+            "daemon error: cannot reach http://localhost:7788",
+        ),
+        (
+            DaemonRestError(401, "daemon credential required"),
+            "recall",
+            {"query": "x"},
+            "auth_refused",
+            DAEMON_AUTH_HINT,
+        ),
+        (
+            DaemonRestError(422, "query too long"),
+            "remember",
+            {"text": "x"},
+            "result_not_delivered",
+            "daemon error: HTTP 422: query too long",
+        ),
+        (
+            RuntimeError("boom"),
+            "recall",
+            {"query": "x"},
+            "tool_error",
+            "tool 'recall' failed: boom",
+        ),
+    ],
+)
+def test_each_failure_shape_maps_to_exactly_one_kind(
+    error: Exception, name: str, arguments: dict[str, Any], kind: str, reason: str
+) -> None:
+    result = _call_result(StubClient(error=error), name, arguments)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == reason
+    failure = result["entry_failure"]
+    assert failure["kind"] == kind
+    datetime.fromisoformat(failure["observed_at"])
+    if kind == "entry_unavailable":
+        assert failure["alternate"] == "stdio gateway: mnemoseed-local mcp"
+    if kind == "auth_refused":
+        assert "credential" in failure["alternate"] and "MNEMOSEED_LOCAL_HOME" in failure["alternate"]
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "prefix"),
+    [
+        ("capture", {}, "capture requires"),
+        ("recent_sessions", {}, "recent_sessions requires"),
+        ("bogus", {}, "unknown tool:"),
+    ],
+)
+def test_validation_errors_keep_verbatim_reason_without_entry_failure(
+    name: str, arguments: dict[str, Any], prefix: str
+) -> None:
+    result = _call_result(StubClient(), name, arguments)
+    assert result["isError"] is True
+    assert result["content"][0]["text"].startswith(prefix)
+    assert "entry_failure" not in result
+
+
+def test_entry_failure_reason_never_uses_a_validation_prefix() -> None:
+    prefixes = ("capture requires", "recent_sessions requires", "unknown tool:")
+    errors = [
+        DaemonUnavailableError("cannot reach x"),
+        DaemonRestError(401, "refused"),
+        DaemonRestError(422, "bad"),
+        RuntimeError("boom"),
+    ]
+    for error in errors:
+        result = _call_result(StubClient(error=error))
+        assert result["entry_failure"]["kind"] in server.ENTRY_FAILURE_KINDS
+        assert not result["content"][0]["text"].startswith(prefixes)
