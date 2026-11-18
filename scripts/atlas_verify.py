@@ -484,11 +484,6 @@ def main() -> int:
         config = home / "config.toml"
         config_text = config.read_text(encoding="utf-8")
         config_text = config_text.replace('baseurl = "http://localhost:7788"', f'baseurl = "{base_url}"', 1)
-        config_text = config_text.replace(
-            'path = "~/.mnemoseed-local/isolated.db"',
-            f'path = "{(home / "isolated.db").as_posix()}"',
-            1,
-        )
         config.write_text(config_text, encoding="utf-8")
         validate_config, validate_run_root = preflight_validators()
         guard_errors = validate_run_root(repo_root, run_dir, home, port, env)
