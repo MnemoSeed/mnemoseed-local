@@ -13,10 +13,14 @@ the reply-template needle mechanics.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
+from _ports import RESERVED_PORTS
 
+from mnemoseed_local.config import load_config
 from mnemoseed_local.eval.recall_harness import (
     RecallRig,
     build_needle_registry,
@@ -209,6 +213,19 @@ def test_rig_boots_a_daemon_under_its_root(tmp_path: Path) -> None:
     # the daemon's whole world lives under the rig root
     assert list(tmp_path.iterdir()) == [tmp_path / "rig"]
     assert (tmp_path / "rig" / "config.toml").exists()
+
+
+def test_rig_boots_off_a_spare_port_and_an_isolated_home(tmp_path: Path) -> None:
+    """The rig's daemon identity never names a reserved live port, and the boot
+    home is the rig's own temp root (MNEMOSEED_LOCAL_HOME), handed back to the
+    caller on exit — the suite's test/live isolation contract."""
+    caller_home = os.environ.get("MNEMOSEED_LOCAL_HOME")
+    root = tmp_path / "rig"
+    with RecallRig(root):
+        config = load_config(root / "config.toml")
+        assert urlparse(config.baseurl).port not in RESERVED_PORTS
+        assert Path(os.environ["MNEMOSEED_LOCAL_HOME"]).is_relative_to(root)
+    assert os.environ.get("MNEMOSEED_LOCAL_HOME") == caller_home
 
 
 def test_rig_full_pipeline_serves_reinforces_and_reads_evidence(tmp_path: Path) -> None:
