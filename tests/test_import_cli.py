@@ -165,6 +165,36 @@ def test_non_tty_requires_yes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert cli.main(["import", "--host", "codex_cli", "--source", str(root)]) == 1
 
 
+def test_import_ledger_file_is_scoped_to_the_requested_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(home))
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", "http://localhost:7788")
+    root = tmp_path / "sessions"
+    _write_rollout(root)
+    _patch_client(monkeypatch, _FakeClient())
+    assert (
+        cli.main(
+            [
+                "import",
+                "--host",
+                "codex_cli",
+                "--source",
+                str(root),
+                "--profile",
+                "alice",
+                "--yes",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (home / "import-ledger-codex_cli-alice.json").exists()
+    assert not (home / "import-ledger-codex_cli.json").exists()
+
+
 def test_progress_on_stderr_report_on_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

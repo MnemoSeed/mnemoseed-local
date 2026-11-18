@@ -484,7 +484,7 @@ class WritingPipeline:
 
                     ctx = replace(ctx, profile_id=effective, agent_label=expected_label)
             contexts.append((item, ctx))
-        outcomes = self._writer.write_many(contexts)
+        outcomes = self._writer.write_many(contexts, credit_pool=credit_pool)
         for outcome in outcomes:
             self._stats.turns_written += 1
             if outcome.kind is WriteOutcomeKind.NEW_CHUNK:
@@ -516,8 +516,11 @@ class WritingPipeline:
 
     @property
     def pool_points_suppressed(self) -> float:
-        """S withheld from the score pool by credit_pool=False settles."""
-        return self._inner.stats.pool_points_suppressed
+        """S and prediction-error points withheld by credit_pool=False settles."""
+        writer_suppressed = (
+            self._writer.pool_points_suppressed if isinstance(self._writer, StampWriter) else 0.0
+        )
+        return self._inner.stats.pool_points_suppressed + writer_suppressed
 
     @property
     def pool(self) -> ScorePool:

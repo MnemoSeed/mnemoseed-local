@@ -346,6 +346,8 @@ def test_codex_trust_is_its_own_sub_line_and_never_automated(
         capsys.readouterr()
 
         payload = _status_json(monkeypatch, capsys, "codex_cli")
+        # no hook traffic beyond config: the manual step stays the standing verdict
+        assert payload["ingest_ack"]["state"] == "not_observed"
         trust = payload["trust"]
         assert trust["state"] == "unverified"
         assert "/hooks" in trust["detail"]
@@ -356,6 +358,47 @@ def test_codex_trust_is_its_own_sub_line_and_never_automated(
         assert main(["host", "status", "--host", "codex_cli"]) == 0
         out = capsys.readouterr().out
         assert "trust: unverified (review and approve the hooks in Codex via /hooks)" in out
+
+
+def test_codex_hook_ingests_make_trust_verified_without_hooks_advice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Observed hook-attributed ingests are positive trust evidence: a config
+    plus real hook traffic reads as verified, with no /hooks reminder printed."""
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    with _daemon(tmp_path) as daemon:
+        monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", daemon["base_url"])
+        assert main(["host", "install", "--host", "codex_cli"]) == 0
+        capsys.readouterr()
+        _seed_hook_capture(
+            daemon["base_url"],
+            daemon["credential"],
+            host=HostId.CODEX_CLI.value,
+            session_id="sess-trust-evidence",
+            text="user: approved hook traffic",
+        )
+
+        payload = _status_json(monkeypatch, capsys, "codex_cli")
+        assert payload["ingest_ack"]["state"] == "observed"
+        trust = payload["trust"]
+        assert trust["state"] == "verified"
+        assert "/hooks" not in trust["detail"]
+        structure = payload["structure"]
+        assert structure["state"] == "installed, trust verified (hook ingests observed)"
+        assert "/hooks" not in structure["state"]
+
+        capsys.readouterr()
+        assert main(["host", "status", "--host", "codex_cli"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        host_line = next(line for line in lines if line.startswith("host: "))
+        trust_line = next(line for line in lines if line.startswith("trust: "))
+        assert host_line == "host: installed, trust verified (hook ingests observed)"
+        assert "/hooks" not in host_line
+        assert "/hooks" not in trust_line
+        assert "trust: verified" in trust_line
 
 
 def test_reinstall_writes_config_but_never_reports_capture_working(
