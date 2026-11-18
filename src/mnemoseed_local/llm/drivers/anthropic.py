@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from mnemoseed_local.llm.drivers._usage import build_usage
 from mnemoseed_local.llm.drivers.openai_compatible import _id_list
 from mnemoseed_local.llm.registry import LLM_DRIVERS, register
 from mnemoseed_local.llm.types import (
@@ -115,9 +116,9 @@ def _text_from(body: dict[str, Any]) -> str:
 def _usage_from(data: Any) -> Usage | None:
     if not isinstance(data, dict):
         return None
-    return Usage(
-        prompt_tokens=data.get("input_tokens"),
-        completion_tokens=data.get("output_tokens"),
-        cache_read_input_tokens=data.get("cache_read_input_tokens"),
-        cache_creation_input_tokens=data.get("cache_creation_input_tokens"),
+    return build_usage(
+        data.get("input_tokens"),
+        data.get("output_tokens"),
+        data.get("cache_read_input_tokens"),
+        data.get("cache_creation_input_tokens"),
     )

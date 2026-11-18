@@ -87,6 +87,42 @@ def test_openai_chat_sends_chat_completions_request() -> None:
     assert result.usage.cache_read_input_tokens is None
 
 
+def test_openai_nested_usage_garbage_degrades_to_none_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[]"}}],
+                "usage": {"prompt_tokens": {}, "completion_tokens": []},
+            },
+        )
+
+    llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
+    llm._client = _client("https://llm.test/v1", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is None
+
+
+def test_openai_nested_usage_numeric_strings_coerce() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "[]"}}],
+                "usage": {"prompt_tokens": "12", "completion_tokens": "4"},
+            },
+        )
+
+    llm = OpenAICompatibleLLM(base_url="https://llm.test/v1", api_key="k", model="m")
+    llm._client = _client("https://llm.test/v1", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 12
+    assert result.usage.completion_tokens == 4
+
+
 def test_openai_token_param_default_uses_max_tokens_field() -> None:
     sent: dict[str, Any] = {}
 
@@ -317,6 +353,42 @@ def test_ollama_chat_reads_native_root_token_counts() -> None:
     assert result.usage is not None
     assert result.usage.prompt_tokens == 91
     assert result.usage.completion_tokens == 27
+
+
+def test_ollama_nested_usage_garbage_degrades_to_none_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "message": {"content": "[]"},
+                "usage": {"prompt_tokens": {}, "completion_tokens": {}},
+            },
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is None
+
+
+def test_ollama_nested_usage_numeric_strings_coerce() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "message": {"content": "[]"},
+                "usage": {"prompt_eval_count": "9", "eval_count": "3"},
+            },
+        )
+
+    llm = OllamaLLM(base_url="http://127.0.0.1:11434")
+    llm._client = _client("http://127.0.0.1:11434", handler)
+    result = llm.chat(system="s", user="u")
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 9
+    assert result.usage.completion_tokens == 3
 
 
 def test_ollama_chat_forwards_think_option() -> None:

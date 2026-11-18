@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from mnemoseed_local.llm.drivers._usage import build_usage
 from mnemoseed_local.llm.registry import LLM_DRIVERS, register
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -130,7 +131,4 @@ def _id_list(data: Any) -> list[Any]:
 def _usage_from(data: Any) -> Usage | None:
     if not isinstance(data, dict):
         return None
-    return Usage(
-        prompt_tokens=data.get("prompt_tokens"),
-        completion_tokens=data.get("completion_tokens"),
-    )
+    return build_usage(data.get("prompt_tokens"), data.get("completion_tokens"))
