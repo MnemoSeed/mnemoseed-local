@@ -79,10 +79,28 @@ class _FakeDaemonClient:
         return {"config": self._config}
 
 
-def _fake_client(auto_trigger: bool) -> _FakeDaemonClient:
+def _dream_route(*, ready: bool, driver: str | None = "ollama", checked: bool = True) -> dict[str, Any]:
+    return {
+        "ready": ready,
+        "driver": driver,
+        "model": "qwen3.5:9b",
+        "detail": "provider checked",
+        "checked_at": 1.0 if checked else None,
+    }
+
+
+def _fake_client(
+    auto_trigger: bool,
+    dream_route: dict[str, Any] | None = None,
+    *,
+    config_driver: str | None = "ollama",
+) -> _FakeDaemonClient:
+    health: dict[str, Any] = {"status": "ok", "preset": "embedded", "gate": {"ok": True}}
+    if dream_route is not None:
+        health["dream_route"] = dream_route
     return _FakeDaemonClient(
-        health={"status": "ok", "preset": "embedded", "gate": {"ok": True}},
-        config={"dream": {"auto_trigger": auto_trigger, "llm": {"dream": {"driver": "ollama"}}}},
+        health=health,
+        config={"dream": {"auto_trigger": auto_trigger, "llm": {"dream": {"driver": config_driver}}}},
     )
 
 
@@ -269,11 +287,93 @@ def test_cli_enabled_with_unreachable_route_reports_provider_unavailable(
         raise OSError("connection refused")
 
     monkeypatch.setattr("httpx.get", _fail)
-    monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(True))
+    unreachable = _dream_route(ready=False)
+    monkeypatch.setattr(
+        "mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(True, unreachable)
+    )
     assert main(["status"]) == 0
     out = capsys.readouterr().out
     assert "refinement: enabled, provider unavailable (live check: Ollama API unavailable" in out
     assert "dream auto_trigger: True" in out
+    assert "dream: paused (provider unreachable)" in out
+
+
+def test_cli_scheduling_off_with_unreachable_route_reports_paused(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    """The daemon pauses the pipeline on readiness even with the schedule off."""
+    (cli_home / "config.toml").write_text(CAPTURE_RECALL_CONFIG, encoding="utf-8")
+    unreachable = _dream_route(ready=False)
+    monkeypatch.setattr(
+        "mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(False, unreachable)
+    )
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "refinement: disabled (capture-recall mode)" in out
+    assert "dream: paused (provider unreachable)" in out
+
+
+def test_cli_status_ready_route_does_not_report_paused(cli_home: Path, monkeypatch, capsys) -> None:
+    (cli_home / "config.toml").write_text(ENABLED_CONFIG, encoding="utf-8")
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"models": [{"name": "qwen3.5:9b"}]},
+    )
+    monkeypatch.setattr("httpx.get", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        "mnemoseed_local.rest_client.resolve_client",
+        lambda args: _fake_client(True, _dream_route(ready=True)),
+    )
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "refinement: ready" in out
+    assert "dream: paused (provider unreachable)" not in out
+
+
+def test_cli_status_disabled_posture_does_not_report_paused(cli_home: Path, monkeypatch, capsys) -> None:
+    (cli_home / "config.toml").write_text(CAPTURE_RECALL_CONFIG, encoding="utf-8")
+    monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(False))
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "refinement: disabled (capture-recall mode)" in out
+    assert "dream: paused (provider unreachable)" not in out
+
+
+def test_cli_status_corrupt_config_does_not_report_paused(cli_home: Path, monkeypatch, capsys) -> None:
+    (cli_home / "config.toml").write_text("not [valid toml", encoding="utf-8")
+    monkeypatch.setattr("mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(True))
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "refinement: unknown" in out
+    assert "dream: paused (provider unreachable)" not in out
+
+
+def test_cli_status_no_configured_provider_does_not_report_paused(
+    cli_home: Path, monkeypatch, capsys
+) -> None:
+    (cli_home / "config.toml").write_text(
+        'preset = "embedded"\n\n[dream]\nauto_trigger = true\n', encoding="utf-8"
+    )
+    no_route = _dream_route(ready=False, driver=None)
+    monkeypatch.setattr(
+        "mnemoseed_local.rest_client.resolve_client",
+        lambda args: _fake_client(True, no_route, config_driver=None),
+    )
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "dream llm driver:  not configured" in out
+    assert "dream: paused (provider unreachable)" not in out
+
+
+def test_cli_status_unchecked_route_does_not_report_paused(cli_home: Path, monkeypatch, capsys) -> None:
+    (cli_home / "config.toml").write_text(ENABLED_CONFIG, encoding="utf-8")
+    unchecked = _dream_route(ready=False, checked=False)
+    monkeypatch.setattr(
+        "mnemoseed_local.rest_client.resolve_client", lambda args: _fake_client(True, unchecked)
+    )
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "dream: paused (provider unreachable)" not in out
 
 
 def test_cli_status_with_a_corrupt_config_reports_unknown_not_a_traceback(
