@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
@@ -30,7 +31,13 @@ from mnemoseed_local.schema.turn import (
 from mnemoseed_local.util.rollout import rollout_run_id
 
 #: Settle can drain thousands of turns; the hook's short budget cannot wait.
-IMPORT_SETTLE_TIMEOUT_SECONDS = 900.0
+IMPORT_SETTLE_TIMEOUT_SECONDS = 3600.0
+IMPORT_SETTLE_TIMEOUT_ENV = "MNEMOSEED_IMPORT_SETTLE_TIMEOUT_SECONDS"
+
+
+def _settle_timeout_seconds() -> float:
+    raw = os.environ.get(IMPORT_SETTLE_TIMEOUT_ENV, "").strip()
+    return float(raw) if raw else IMPORT_SETTLE_TIMEOUT_SECONDS
 
 
 class ImportPreflightError(Exception):
@@ -91,7 +98,7 @@ def build_client(base_url: str, profile_id: str) -> DaemonClient:
         base_url,
         profile_id=profile_id,
         actor="cli",
-        timeout=IMPORT_SETTLE_TIMEOUT_SECONDS,
+        timeout=_settle_timeout_seconds(),
     )
 
 
