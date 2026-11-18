@@ -32,16 +32,16 @@
 
 | host | live | backfill | install/status |
 |---|---|---|---|
-| codex_cli | ✅ | ✅（唯一） | ✅ |
-| claude_code | ✅ | ❌ | ✅ |
+| codex_cli | ✅ | ✅ | ✅ |
+| claude_code | ✅ | ✅ | ✅ |
 | claude_desktop | ❌（按设计仅 MCP） | ❌ | ✅ |
-| opencode | ✅（TS） | ❌ | ✅ |
+| opencode | ✅（TS） | ✅（SQLite） | ✅ |
 | cursor | ✅ | ❌ | ✅ |
 | zcode | ✅ | ❌ | ✅ |
 | t3code | ❌（新 harness，仓库无此名） | ❌ | ❌ |
 
 回填扩展的最小单位 = 一个 `transcript.py` + 一行 `IMPORT_SOURCES` + 测试，**不改 daemon、不加新路由**。
-本机已确认 claude_code 的 transcript 是 `~/.claude/projects/**/*.jsonl`（行事件 JSON，无原生 ordinal，需合成）；opencode / cursor / zcode 的本机聊天正文未找到，先探测再估工。
+本机已确认 claude_code 的 transcript 是 `~/.claude/projects/**/*.jsonl`（行事件 JSON，无原生 ordinal，需合成）；opencode 的正文在 `~/.local/share/opencode/opencode.db`（SQLite，`mode=ro` 读 WAL，只用 `seq` 与 `text` 部件）。cursor / zcode 的本机聊天正文未找到，先探测再估工。
 
 ## 3. 内核边界：单 profile 内核可移植
 
