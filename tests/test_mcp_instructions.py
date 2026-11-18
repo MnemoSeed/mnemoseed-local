@@ -48,6 +48,8 @@ The rules below are situations and actions, not suggestions:
 
 An empty result means no relevant memory exists: say so plainly and continue.
 Do not guess, and do not repeat the query.
+{recent_sessions} unresolved: resolution failed, not "no relevant history"; follow
+next_step (bind, add resume_query id).
 
 A pin is an entry the user explicitly asked to keep: provenance_source is
 "memory.remember", or explicit_pin is true. A captured entry is one written
@@ -65,6 +67,8 @@ REQUIRED_PHRASES = (
     "empty result",
     "explicit_pin",
     "memory.remember",
+    "resolution failed",
+    "next_step",
 )
 
 
@@ -144,6 +148,16 @@ def test_the_block_states_the_four_intentions_as_situations_and_actions() -> Non
     assert "Never capture" in text and "guesses" in text
     # intention 4: an explicit ask -> remember; replacement -> supersede
     assert "explicitly asks to remember" in text
+
+
+def test_the_block_distinguishes_unresolved_recovery_from_no_history() -> None:
+    """An empty recall result means no relevant memory; an unresolved recovery is a
+    resolution failure that must be answered with its next_step, not 'no history'."""
+    text = _flatten(_surfaced("generic"))
+    assert "unresolved: resolution failed" in text
+    assert 'not "no relevant history"' in text
+    assert "next_step" in text
+    assert "resume_query" in text
 
 
 def test_the_block_claims_no_activation() -> None:

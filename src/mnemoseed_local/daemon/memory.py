@@ -459,6 +459,19 @@ _RECENT_SESSIONS_GUIDANCE = (
     "work already in flight here first."
 )
 
+#: The documented, non-guessing way to give a workspace a memory profile.
+_BIND_STEP = (
+    "bind the workspace without guessing: 'mnemoseed-local project bind "
+    "--root <dir> --profile <existing-id>' (create the profile first with "
+    "'mnemoseed-local profile create <id>' if needed)"
+)
+
+#: Only resume_query carries anchors; the other resume inputs never do.
+_ANCHOR_STEP = (
+    "put a repository or session identifier in resume_query; only that field produces "
+    "anchors (kebab-case, snake_case, backticked tokens, dotted paths, path basenames)"
+)
+
 
 def _window_iso(window: SessionWindow) -> dict[str, str] | None:
     """ISO-8601 UTC rendering of an exact window; null when it has no chunks
@@ -1247,10 +1260,10 @@ class MemoryService:
             "profile_last_persisted_at": profile_newest,
         }
 
-    def _unresolved(self, profile_id: str, reason: str) -> dict[str, Any]:
+    def _unresolved(self, profile_id: str, reason: str, *, next_step: str | None = None) -> dict[str, Any]:
         """The explicit no-context result: zero injectable tails plus the
         machine-readable reason a recovery consumer needs to react."""
-        return {
+        result: dict[str, Any] = {
             "profile_id": profile_id,
             "sessions": [],
             "self_window": None,
@@ -1259,6 +1272,9 @@ class MemoryService:
             "selection_reason": reason,
             "visibility": self._visibility_mode_payload(),
         }
+        if next_step is not None:
+            result["next_step"] = next_step
+        return result
 
     def _session_recent_scoped(
         self,
@@ -1271,12 +1287,19 @@ class MemoryService:
         active_sessions: frozenset[str] = frozenset(),
         resume_query: str | None,
         self_parent_id: str | None = None,
+        no_anchor_context: str = "",
     ) -> dict[str, Any]:
         """Scoped-resume matching (issue #187): extract anchors, scan USER
         segments, filter to root sessions, return matched tails."""
         anchors = _extract_resume_anchors(resume_query)
         if not anchors:
-            return self._unresolved(profile_id, "no anchors")
+            context = f"{no_anchor_context} and " if no_anchor_context else ""
+            return self._unresolved(
+                profile_id,
+                f"{context}resume_query has no anchor identifier: resolution failed, "
+                "not 'no relevant history'",
+                next_step=f"{_ANCHOR_STEP}; or {_BIND_STEP}",
+            )
         # Scan a bounded page for anchor hits in USER segments only
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RECENT_SCAN_LIMIT)
@@ -1391,7 +1414,9 @@ class MemoryService:
             # still applies; without one there is no honest recovery input.
             if resume_query is None:
                 return self._unresolved(
-                    profile_id, "caller workspace is not a bound project and no resume_query"
+                    profile_id,
+                    "caller workspace is not a bound project and no resume_query",
+                    next_step=_BIND_STEP,
                 )
             return self._anchor_recovery(
                 profile_id=profile_id,
@@ -1403,6 +1428,7 @@ class MemoryService:
                 resume_query=resume_query,
                 self_parent_id=self_parent_id,
                 reason="anchors from the raw prompt",
+                no_anchor_context="caller workspace is not a bound project",
             )
         if bound_profiles != {profile_id}:
             shown = ", ".join(sorted(bound_profiles))
@@ -1464,6 +1490,7 @@ class MemoryService:
         resume_query: str | None,
         self_parent_id: str | None,
         reason: str,
+        no_anchor_context: str = "",
     ) -> dict[str, Any]:
         """The #187 anchor path under recovery dispatch: matched results carry
         the resolution reason so a consumer can tell how the project was
@@ -1477,6 +1504,7 @@ class MemoryService:
             active_sessions=active_sessions,
             resume_query=resume_query,
             self_parent_id=self_parent_id,
+            no_anchor_context=no_anchor_context,
         )
         if result["selection"] == "matched":
             result["selection_reason"] = reason

@@ -185,6 +185,25 @@ def test_tools_list_has_exactly_the_seven_tools_with_valid_schemas() -> None:
     assert windows["inputSchema"]["properties"]["n_sessions"]["type"] == "integer"
 
 
+def test_recent_sessions_input_contract_names_the_anchor_producing_field() -> None:
+    """The tool contract must say which inputs actually produce anchors and that an
+    unresolved resolution is not the same as 'no relevant history'."""
+    _, responses = run_gateway([_request(2, "tools/list")], StubClient())
+    recent = next(tool for tool in responses[0]["result"]["tools"] if tool["name"] == "recent_sessions")
+    description = recent["description"]
+    assert "Only resume_query produces anchors" in description
+    assert "never produce anchors" in description
+    for field in ("n_sessions", "n_per_session", "self_parent_id", "caller_cwd"):
+        assert field in description
+    assert "no relevant history" in description
+    assert "project bind" in description
+
+    properties = recent["inputSchema"]["properties"]
+    assert "ONLY field" in properties["resume_query"]["description"]
+    assert "never an anchor" in properties["caller_cwd"]["description"]
+    assert "never produces anchors" in properties["self_parent_id"]["description"]
+
+
 # ---------------------------------------------------------------- tools/call
 
 

@@ -336,6 +336,33 @@ def test_unbound_workspace_keeps_legacy_anchor_path_and_never_replays_broadly(
         assert anchorless["sessions"] == []
 
 
+def test_unbound_anchorless_query_is_actionable_not_a_no_history_report(
+    config_path: Path, home: Path, tmp_path: Path
+) -> None:
+    """A plain prompt in an unbound workspace is an explicit resolution failure:
+    the reason names the missing binding and the absent anchor, and next_step gives
+    the documented, non-guessing way to bind instead of an unexplained empty result."""
+    unbound = _mkdir(tmp_path / "elsewhere")
+    with auth_support.boot(config_path.parent) as client:
+        _ingest(client, "root-alpha", "some earlier conversation", profile="alpha")
+        _end(client, "root-alpha", "alpha")
+
+        payload = _recover(client, "alpha", str(unbound), "what did we do so far?")
+        assert payload["selection"] == "unresolved"
+        assert payload["sessions"] == []
+        reason = payload["selection_reason"]
+        assert "not a bound project" in reason
+        assert "no anchor" in reason
+        assert "no relevant history" in reason
+        step = payload["next_step"]
+        assert "project bind" in step
+        assert "profile create" in step
+
+        no_query = _recover(client, "alpha", str(unbound))
+        assert no_query["selection"] == "unresolved"
+        assert "project bind" in no_query["next_step"]
+
+
 def test_unreadable_registry_is_explicit_unresolved(config_path: Path, home: Path, tmp_path: Path) -> None:
     """A corrupt registry fails the recovery read closed with an explicit
     reason — never a 500, never a silent fallback to broad history."""
