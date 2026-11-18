@@ -57,6 +57,7 @@ from mnemoseed_local.hosts.common.commands import (
     render_command as render_command,
 )
 from mnemoseed_local.hosts.common.config import ConfigParseError, load_object, write_atomic, write_text_atomic
+from mnemoseed_local.hosts.common.zstd import require_zstandard, zstandard_available
 from mnemoseed_local.hosts.install import HookStatus
 
 #: Reserved command fragment identifying our handler entries.
@@ -93,6 +94,10 @@ MANUAL_TRUST_STEP = "review and approve the hooks in Codex via /hooks"
 #: Structural status of a complete canonical install: the host still asks the
 #: user to approve the hooks once.
 TRUST_UNVERIFIED = f"installed, trust unverified ({MANUAL_TRUST_STEP})"
+
+#: A runtime without the reader extra cannot capture Codex rollouts, so its
+#: installed hooks never count as an install.
+MISSING_EXTRA_STATE = "not-installed (missing extra)"
 
 #: The structural state that means the manual trust step is still the standing
 #: verdict; a status surface reports it as its own trust observation.
@@ -434,7 +439,9 @@ def install(dry_run: bool = False) -> tuple[Path, bool]:
     """Merge one canonical handler group per event into hooks.json and the
     canonical MCP entry into config.toml; returns ``(hooks path, changed)``.
     Both targets validate before either writes; a dry run previews without
-    writing."""
+    writing. The reader extra is probed first so a runtime that cannot read a
+    Codex rollout never reports a successful install."""
+    require_zstandard()
     target = hooks_path()
     data = load_object(target)
     container = _validate(target, data)
@@ -513,6 +520,8 @@ def _own_events(holder: dict[str, object]) -> set[str]:
 
 def _structural_state(target: Path) -> str:
     """The structural install state alone; daemon reachability is reported apart."""
+    if not zstandard_available():
+        return MISSING_EXTRA_STATE
     try:
         data = load_object(target)
         container = _validate(target, data)
@@ -543,11 +552,13 @@ def status(path: Path | None = None, base_url: str | None = None) -> HookStatus:
     """Structural state of the sandbox Codex home plus the shared /healthz
     reachability probe.
 
-    States: ``not-installed`` / ``partial`` (a known event lacks our canonical
-    handler, the shape is legacy flat, the MCP entry is missing or drifted, or
-    marker-owned handlers sit under unregistered events — the state names them) /
-    ``malformed`` (hooks.json or config.toml does not parse or has an unexpected
-    shape) / the trust-unverified state of a complete canonical install.
+    States: ``not-installed (missing extra)`` when the runtime cannot read a
+    Codex rollout, ``not-installed`` / ``partial`` (a known event lacks our
+    canonical handler, the shape is legacy flat, the MCP entry is missing or
+    drifted, or marker-owned handlers sit under unregistered events — the state
+    names them) / ``malformed`` (hooks.json or config.toml does not parse or has
+    an unexpected shape) / the trust-unverified state of a complete canonical
+    install.
     """
     target = path or hooks_path()
     resolved_base = base_url if base_url is not None else shared.resolve_base_url()

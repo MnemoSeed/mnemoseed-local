@@ -164,11 +164,11 @@ def test_codex_extra_pins_zstandard() -> None:
     assert data["project"]["optional-dependencies"]["codex"] == ["zstandard"]
 
 
-def test_zstandard_helper_reports_the_missing_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_zstandard_helper_reports_the_working_local_path_command(monkeypatch: pytest.MonkeyPatch) -> None:
     from mnemoseed_local.hosts.common.zstd import require_zstandard
 
     monkeypatch.setitem(sys.modules, "zstandard", None)
-    with pytest.raises(RuntimeError, match=r"mnemoseed-local\[codex\]"):
+    with pytest.raises(RuntimeError, match=r"uv tool install --with zstandard \."):
         require_zstandard()
 
 
@@ -178,3 +178,12 @@ def test_zstandard_helper_returns_the_lazy_imported_module(monkeypatch: pytest.M
     fake = ModuleType("zstandard")
     monkeypatch.setitem(sys.modules, "zstandard", fake)
     assert require_zstandard() is fake
+
+
+def test_zstandard_availability_probe_tracks_the_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mnemoseed_local.hosts.common.zstd import zstandard_available
+
+    monkeypatch.setitem(sys.modules, "zstandard", ModuleType("zstandard"))
+    assert zstandard_available() is True
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+    assert zstandard_available() is False

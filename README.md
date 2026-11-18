@@ -25,10 +25,16 @@ newer (uv can provision Python). Then run:
 ```sh
 git clone https://github.com/MnemoSeed/mnemoseed-local.git
 cd mnemoseed-local
-uv tool install --python 3.14 --force ".[codex]"
+uv tool install --python 3.14 --force --with zstandard .
 mnemoseed-local init --mode capture-recall
 mnemoseed-local doctor
 ```
+
+For a local path, the working form for the optional Codex reader extra is
+`uv tool install --with zstandard .`; the `[codex]` extra cannot be requested
+with `uv tool install --from <path> "mnemoseed-local[codex]"`, which uv rejects.
+Without that extra, `host install --host codex_cli` refuses and `host status`
+reports `not-installed (missing extra)`.
 
 Capture uses a local embedding model whose assets may need an initial download;
 resolve readiness failures reported by `doctor`.
