@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from mnemoseed_local.config import load_config
+from mnemoseed_local.config import ROLE_ROUTE_REQUIRED_MESSAGE, load_config
 from mnemoseed_local.configwrite.routes import router as configwrite_router
 from mnemoseed_local.configwrite.service import ConfigWriteService
 from mnemoseed_local.storage.drivers.sqlite_meta import SqliteMetaDriver
@@ -225,3 +225,80 @@ def test_concurrent_rollbacks_exactly_one_200_one_409(tmp_path: Path) -> None:
     t2.join()
 
     assert sorted(results) == [200, 409]
+
+
+# ------------------------------------------------------------- set-many HTTP
+
+
+def _fresh_client(tmp_path: Path) -> tuple[TestClient, ConfigWriteService, Path]:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'preset = "embedded"\nbaseurl = "http://localhost:7788"\n[dream]\nauto_trigger = false\n',
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    service = ConfigWriteService(config, None)
+    app = FastAPI()
+    app.state.config = config  # type: ignore[attr-defined]
+    app.state.configwrite = service  # type: ignore[attr-defined]
+    app.include_router(configwrite_router)
+    return TestClient(app), service, path
+
+
+def test_http_set_many_success_shape_and_generation(tmp_path: Path) -> None:
+    client, service, _ = _fresh_client(tmp_path)
+    resp = client.post(
+        "/api/v1/config/set-many",
+        json={
+            "updates": [
+                {"key_path": "dream.llm.dream.driver", "value": "ollama"},
+                {"key_path": "dream.llm.dream.model", "value": "llama3.1:8b"},
+            ]
+        },
+        headers={"If-Match": "0"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"ok", "applied", "generation"}
+    assert body["ok"] is True
+    assert [a["key_path"] for a in body["applied"]] == [
+        "dream.llm.dream.driver",
+        "dream.llm.dream.model",
+    ]
+    assert body["generation"] == service.generation == 2
+
+
+def test_http_set_many_driver_only_returns_422_and_no_change(tmp_path: Path) -> None:
+    client, service, path = _fresh_client(tmp_path)
+    before = path.read_bytes()
+    resp = client.post(
+        "/api/v1/config/set-many",
+        json={"updates": [{"key_path": "dream.llm.dream.driver", "value": "ollama"}]},
+    )
+    assert resp.status_code == 422, resp.text
+    assert ROLE_ROUTE_REQUIRED_MESSAGE in str(resp.json().get("detail", ""))
+    assert path.read_bytes() == before
+    assert service.generation == 0
+
+
+def test_http_set_many_bad_body_returns_422(tmp_path: Path) -> None:
+    client, _, _ = _fresh_client(tmp_path)
+    for body in ({}, {"updates": []}, {"updates": [{"value": 1}]}):
+        assert client.post("/api/v1/config/set-many", json=body).status_code == 422
+
+
+def test_http_set_many_stale_if_match_returns_409(tmp_path: Path) -> None:
+    client, service, _ = _fresh_client(tmp_path)
+    service.set("dream.auto_trigger", True, actor="test")
+    resp = client.post(
+        "/api/v1/config/set-many",
+        json={
+            "updates": [
+                {"key_path": "dream.llm.dream.driver", "value": "ollama"},
+                {"key_path": "dream.llm.dream.model", "value": "llama3.1:8b"},
+            ]
+        },
+        headers={"If-Match": "0"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert str(service.generation) in str(resp.json().get("detail", ""))
