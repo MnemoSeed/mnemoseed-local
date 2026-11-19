@@ -64,6 +64,7 @@ from mnemoseed_local.daemon.actor import resolve_actor
 from mnemoseed_local.daemon.observability import RECALL_FEEDBACK_KINDS, Observability, is_iso8601
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
+from mnemoseed_local.hosts.common.fence import PROVENANCE_UNKNOWN, TIME_UNKNOWN
 from mnemoseed_local.hosts.common.project_binding import (
     BindingError,
     bindings_path,
@@ -108,6 +109,24 @@ from mnemoseed_local.storage.ports import (
 )
 
 logger = logging.getLogger("mnemoseed_local.daemon.memory")
+
+PAST_OBSERVATION_MARKER = "past_observation"
+
+
+def _past_observation_fields(source: str | None, *times: str | None) -> dict[str, str]:
+    """The marker chain served on every delivered memory item. Provenance is the
+    real source; observation time walks the supplied candidates in priority
+    order. Both degrade explicitly and emit a debug trace, never a bare null."""
+    provenance = source if isinstance(source, str) and source else PROVENANCE_UNKNOWN
+    observed = next((value for value in times if isinstance(value, str) and value), TIME_UNKNOWN)
+    if provenance == PROVENANCE_UNKNOWN or observed == TIME_UNKNOWN:
+        logger.debug("past-observation marker degraded: missing source or observation time")
+    return {
+        "memory_marker": PAST_OBSERVATION_MARKER,
+        "memory_provenance": provenance,
+        "memory_observed_at": observed,
+    }
+
 
 # Bounded index-residue rendering (design/09 §3.6): one line per dead-zone pin
 # (weight below the rescue floor) — date + verbatim head slice of the stored
@@ -605,6 +624,7 @@ def _group_session_tails(
             {
                 "session_id": session_id,
                 "latest_at": chunks_desc[0].ingested_at,
+                **_past_observation_fields(session_id, iso8601_utc(chunks_desc[0].ingested_at)),
                 "chunks": [
                     {
                         "chunk_id": chunk.chunk_id,
@@ -615,6 +635,7 @@ def _group_session_tails(
                         "turn_end": chunk.turn_end,
                         "origin_agent": chunk.origin_agent,
                         "host": chunk.cues.host,
+                        **_past_observation_fields(chunk.provenance.source, iso8601_utc(chunk.ingested_at)),
                     }
                     for chunk in tail
                 ],
@@ -851,6 +872,11 @@ class MemoryService:
             "origin_agent": entry.origin_agent,
             "host": entry.host,
             "needs_reconcile": entry.needs_reconcile,
+            **_past_observation_fields(
+                entry.source,
+                iso8601_utc(entry.valid_from) if entry.valid_from is not None else None,
+                iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
+            ),
         }
 
     def _index_residue(self, profile_id: str) -> dict[str, Any]:
@@ -1821,12 +1847,13 @@ class MemoryService:
         budget = self._config.capture.auto_recall_budget_chars
         items: list[dict[str, str]] = []
         remaining = budget
-        for _expired, _decay, _stamp, _turn_start, kind, candidate_id, text, source in sorted(
+        for _expired, _decay, stamp, _turn_start, kind, candidate_id, text, source in sorted(
             candidates, key=lambda c: (c[0], -c[1], -c[2], -c[3])
         ):
+            fields = _past_observation_fields(source, iso8601_utc(stamp))
             cost = len(text) + 1
             if cost <= remaining:
-                items.append({"kind": kind, "id": candidate_id, "text": text, "source": source})
+                items.append({"kind": kind, "id": candidate_id, "text": text, "source": source, **fields})
                 remaining -= cost
                 continue
             slice_budget = remaining - 2  # the "…" marker and the newline (T1)
@@ -1838,6 +1865,7 @@ class MemoryService:
                     "id": candidate_id,
                     "text": "…" + text[-slice_budget:],
                     "source": source,
+                    **fields,
                 }
             )
             remaining = 0

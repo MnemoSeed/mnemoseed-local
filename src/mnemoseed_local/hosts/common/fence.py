@@ -14,6 +14,15 @@ RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
 RECALL_DISCLAIMER = (
     "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
 )
+RECALL_ITEM_MARKER = "[past observation]"
+PROVENANCE_UNKNOWN = "provenance-unknown"
+TIME_UNKNOWN = "time-unknown"
+
+
+def recall_item_prefix(provenance: str | None, observed: str | None) -> str:
+    """The literal per-item marker that labels served memory as a past record."""
+    return f"{RECALL_ITEM_MARKER} [{provenance or PROVENANCE_UNKNOWN}; {observed or TIME_UNKNOWN}] "
+
 
 RULES_FENCE_OPEN = "<mnemoseed-rules-budget>"
 RULES_FENCE_CLOSE = "</mnemoseed-rules-budget>"

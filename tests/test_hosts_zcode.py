@@ -380,8 +380,9 @@ def test_t1_boundary_chunk_keeps_its_tail_slice() -> None:
     sessions = [{"session_id": "s-1", "latest_at": 1.0, "chunks": chunks}]
     block = events.build_t1_context(sessions, 4000)
     assert block is not None
-    assert "\naaa" in block, "the newer chunk renders whole"
-    assert "\n…bbb" in block, "the boundary chunk keeps its newest tail slice"
+    prefix = "[past observation] [1; 1970-01-01T00:00:01+00:00] "
+    assert "\n" + prefix + "aaa" in block, "the newer chunk renders whole and marked"
+    assert "\n" + prefix + "…bbb" in block, "the boundary chunk keeps its marked newest tail slice"
     assert len(block) <= 4000
 
 

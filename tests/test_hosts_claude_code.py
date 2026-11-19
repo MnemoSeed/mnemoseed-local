@@ -955,7 +955,7 @@ def test_injection_pulls_recall_pending_and_formats_budget_equality(
     budget_chars as the item budget (never a hardcoded cap) and assembles the
     fenced additionalContext envelope. A selection whose item cost lands inside
     (1200 - wrapper, 2000] is STILL appended — block length pinned exactly:
-    wrapper(156) + item(1902) = 2058 (QA BLOCKER-1 mirror)."""
+    wrapper(156) + item(1902) + marker(54) = 2112 (QA BLOCKER-1 mirror)."""
     item_text = "x" * 1901  # line cost 1902
     calls = _capture_pull(
         monkeypatch,
@@ -978,15 +978,15 @@ def test_injection_pulls_recall_pending_and_formats_budget_equality(
     assert block.startswith(events.RECALL_FENCE_OPEN)
     assert block.count("<mnemoseed-memory-recall>") == 1
     assert block.endswith(events.RECALL_FENCE_CLOSE)
-    assert len(block) == 2058, f"wrapper(156)+item(1902) must land exactly: {len(block)}"
+    assert len(block) == 2112, f"wrapper(156)+item(1902)+marker(54) must land exactly: {len(block)}"
 
 
 def test_injection_below_slice_floor_still_appends(monkeypatch: pytest.MonkeyPatch) -> None:
     """QA IMPORTANT-3 mirror: the daemon is the sole budget authority across the
     WHOLE positive-int range — budget_chars=150 (below the T1 slice floor) is
     daemon-legal; a full item that fits IS served and appended. Block length
-    pinned: wrapper(156) + item(101) = 257. The T2 injection path must not
-    re-impose a slicing floor it does not own."""
+    pinned: wrapper(156) + item(101) + marker(54) = 311. The T2 injection path
+    must not re-impose a slicing floor it does not own."""
     item_text = "y" * 100  # line cost 101
     _capture_pull(
         monkeypatch,
@@ -999,7 +999,7 @@ def test_injection_below_slice_floor_still_appends(monkeypatch: pytest.MonkeyPat
         "cc-sess-01", DaemonClient(base_url="http://daemon", profile_id="default")
     )
     assert block is not None
-    assert len(block) == 257, f"wrapper(156)+item(101) must land exactly: {len(block)}"
+    assert len(block) == 311, f"wrapper(156)+item(101)+marker(54) must land exactly: {len(block)}"
 
 
 def test_injection_oversized_item_drops_whole_block_fail_closed(
@@ -1100,7 +1100,9 @@ def test_t2_marker_renders_only_on_pinned_source_items() -> None:
     block = events.build_t2_context(items, 1200)
     assert block is not None
     lines = block.split("\n")
-    assert lines[2] == "偏好：零拷贝 ⟵ pinned", f"the pinned line must carry the affix: {lines}"
+    assert lines[2] == "[past observation] [provenance-unknown; time-unknown] 偏好：零拷贝 ⟵ pinned", (
+        f"the pinned line must carry the marker and affix: {lines}"
+    )
     assert "抓取：存储层确认" in lines[3] and "pinned" not in lines[3]
     assert "无溯源：副本" in lines[4] and "pinned" not in lines[4]
     assert block.count("⟵ pinned") == 1, "exactly one pinned affix in the selection"
@@ -1129,7 +1131,7 @@ def test_t2_marker_budget_pressure_drops_the_affix_not_the_item() -> None:
     assert text in block, "the bare verbatim line must survive"
     wrapper = len(events.RECALL_FENCE_OPEN) + 1 + len(events.RECALL_DISCLAIMER) + 1
     wrapper += len(events.RECALL_FENCE_CLOSE)
-    assert len(block) == 150 + wrapper
+    assert len(block) == 150 + wrapper + 54
 
 
 def test_t2_marker_never_relaxes_the_fail_closed_oversized_drop() -> None:
@@ -1217,9 +1219,9 @@ def test_t2_marker_two_sheds_keep_prior_bare_line_intact() -> None:
     block = events.build_t2_context(items, 2400)
     assert block is not None, "the bare selection must be served, not dropped"
     lines = block.split("\n")
-    assert lines[2] == a, (
-        "the earlier committed bare line must be byte-identical (no 1800->1791 "
-        f"corruption) — got length {len(lines[2])}"
+    assert lines[2] == "[past observation] [provenance-unknown; time-unknown] " + a, (
+        "the earlier committed bare line must keep its marker and verbatim "
+        f"content — got length {len(lines[2])}"
     )
     assert "pinned" not in block, f"every kept affix must be shed: {block}"
     assert c in block, "the mid-selection decorated item must be served bare"

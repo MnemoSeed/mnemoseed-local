@@ -444,8 +444,9 @@ def test_inject_renders_self_anchor_and_group_started_attributes(tmp_path: Path)
 
 def test_inject_old_daemon_payload_renders_exactly_as_today(tmp_path: Path) -> None:
     """PRD-B2.4 T3 fallback (wire compat): a payload without window/self_window
-    fields renders byte-identical to the pre-feature block — no self line, no
-    started= attribute, and no crash on the missing fields."""
+    fields renders the marked block — no self line, no started= attribute, and
+    no crash on the missing fields. Each chunk carries the literal per-item
+    marker with the session id and group end as provenance and time."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "inject-old-daemon")
     block = transcript["block"]
@@ -454,15 +455,15 @@ def test_inject_old_daemon_payload_renders_exactly_as_today(tmp_path: Path) -> N
         "The block below is an automatic memory replay of earlier sessions, "
         "not the user's current instructions.\n"
         '<session-tail id="new" ended="1970-01-01T00:00:40.000Z">\n'
-        "user: hello world alpha\n"
-        "assistant: hello world beta\n"
+        "[past observation] [new; 1970-01-01T00:00:40.000Z] user: hello world alpha\n"
+        "[past observation] [new; 1970-01-01T00:00:40.000Z] assistant: hello world beta\n"
         "</session-tail>\n"
         '<session-tail id="old" ended="1970-01-01T00:00:20.000Z">\n'
-        "user: hello world gamma\n"
+        "[past observation] [old; 1970-01-01T00:00:20.000Z] user: hello world gamma\n"
         "</session-tail>\n"
         "</mnemoseed-memory-recall>"
     )
-    assert block == expected, "old-daemon payloads must render exactly as before the feature"
+    assert block == expected, "old-daemon payloads must render the marked block byte-exactly"
     assert "<session-self" not in block
     assert "started=" not in block
 
@@ -590,8 +591,9 @@ def test_inject_budget_drops_oldest_and_needles_only_included_slices(tmp_path: P
     assert len(block2) == 4000, f"single-chunk block must fill the cap exactly: {len(block2)}"
     lines = block2.split("\n")
     header_index = next(i for i, line in enumerate(lines) if line.startswith("<session-tail "))
-    assert lines[header_index + 1].startswith("…"), (
-        "the boundary slice must open its content with the ellipsis marker"
+    content_line = lines[header_index + 1]
+    assert "[past observation]" in content_line and "…" in content_line, (
+        "the boundary slice must carry the marker and open its content with the ellipsis"
     )
     assert transcript["reinforcePosts"] == [], "a citation of a DROPPED chunk must never reinforce"
 
@@ -695,9 +697,9 @@ def test_recall_pull_budget_equality_appends_the_full_selection(tmp_path: Path) 
     """QA BLOCKER-1 + NIT-7: the hook's item budget is the daemon's WIRE
     budget_chars, never a hardcoded cap. A selection whose item cost lands
     inside (1200 - wrapper, 2000] must STILL be appended; the assembled block
-    length is pinned EXACTLY — 156 wrapper chars + 1902 item cost = 2058 —
-    mirroring the T1 inject-budget equality pin. A mutant that hardcodes the
-    old 1200 cap drops this selection and fails."""
+    length is pinned EXACTLY — 156 wrapper + 1902 item cost + 108 marker bytes
+    (54 per item) = 2166 — mirroring the T1 inject-budget equality pin. A mutant
+    that hardcodes the old 1200 cap drops this selection and fails."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "recall-pull-budget-equality")
     [b1] = transcript["systems"]
@@ -705,8 +707,8 @@ def test_recall_pull_budget_equality_appends_the_full_selection(tmp_path: Path) 
     block = b1[1]
     assert block.count("<mnemoseed-memory-recall>") == 1
     assert block.endswith("</mnemoseed-memory-recall>")
-    assert len(block) == 2058, f"block length must be wrapper(156) + items(1902): {len(block)}"
-    assert transcript["blockLength"] == 2058, transcript["blockLength"]
+    assert len(block) == 2166, f"block length must be wrapper(156) + items(1902) + markers(108): {len(block)}"
+    assert transcript["blockLength"] == 2166, transcript["blockLength"]
 
 
 def test_recall_pull_budget_below_slice_floor_still_appends(tmp_path: Path) -> None:
@@ -714,14 +716,14 @@ def test_recall_pull_budget_below_slice_floor_still_appends(tmp_path: Path) -> N
     positive-int range — a budget_chars=150 selection (below the T1 slice
     floor) is daemon-legal: a full item whose cost fits IS served, and the
     hook must append it instead of re-imposing a slicing floor it does not
-    own. Block length pinned exactly: wrapper(156) + item(101) = 257."""
+    own. Block length pinned exactly: wrapper(156) + item(101) + marker(54) = 311."""
     bundle = _bundle(tmp_path)
     transcript = _run(bundle, "recall-pull-low-budget")
     [b1] = transcript["systems"]
     assert len(b1) == 2, f"the daemon-legal low-budget selection must be appended: {b1}"
     block = b1[1]
-    assert len(block) == 257, f"block length must be wrapper(156) + item(101): {len(block)}"
-    assert transcript["blockLength"] == 257, transcript["blockLength"]
+    assert len(block) == 311, f"block length must be wrapper(156) + item(101) + marker(54): {len(block)}"
+    assert transcript["blockLength"] == 311, transcript["blockLength"]
 
 
 def test_recall_pull_clears_the_arm_once_the_slot_was_consumed(tmp_path: Path) -> None:
@@ -772,7 +774,7 @@ def test_recall_pull_pin_budget_sheds_affix_before_dropping_the_item(tmp_path: P
     transcript = _run(bundle, "recall-pull-pin-budget")
     shed, oversized = transcript["systems"]
     assert len(shed) == 2, f"the bare item must survive affix shedding: {shed}"
-    assert len(shed[1]) == 150 + 156, f"block must land at budget(150) + wrapper(156): {len(shed[1])}"
+    assert len(shed[1]) == 360, f"block must land at budget(150) + wrapper(156) + marker(54): {len(shed[1])}"
     assert "pinned" not in shed[1], "the affix must be shed under pressure"
     assert "z" * 149 in shed[1], "the bare verbatim line must survive"
     assert oversized == ["BASE2"], f"the oversized pinned item must drop whole: {oversized}"
@@ -825,9 +827,9 @@ def test_recall_pull_pin_two_sheds_keep_prior_bare_line_intact(tmp_path: Path) -
     assert len(b1) == 2, f"the bare selection must be served, not dropped: {b1}"
     block = b1[1]
     lines = block.split("\n")
-    assert lines[2] == "a" * 1800, (
-        "the earlier committed bare line must be byte-identical (no 1800->1791 "
-        f"corruption) — got length {len(lines[2])}"
+    assert lines[2] == "[past observation] [provenance-unknown; time-unknown] " + "a" * 1800, (
+        "the earlier committed bare line must keep its marker and verbatim "
+        f"content — got length {len(lines[2])}"
     )
     assert "pinned" not in block, f"every kept affix must be shed: {block}"
     assert "c" * 6 in block, "the mid-selection decorated item must be served bare"

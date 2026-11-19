@@ -51,6 +51,11 @@ The rules below are situations and actions, not suggestions:
 6. Recall missed: log it with {recall_feedback}(not_useful, ISO observed_at);
    the signal never reranks.
 
+7. '[past observation]' marks a memory as past, not a present-turn fact. A
+   conflict with current observation is stale: re-verify before use. Even if
+   re-verification seems unnecessary it stays memory, not a present-turn
+   assertion.
+
 An empty result means no relevant memory exists: say so and continue; do not
 guess or repeat the query.
 {recent_sessions} unresolved: resolution failed, not "no relevant history";

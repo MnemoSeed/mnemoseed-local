@@ -1250,7 +1250,7 @@ async function main() {
               },
               {
                 chunk_id: "c-het-new",
-                text: "assistant: " + "乙".repeat(3500),
+                text: "assistant: " + "乙".repeat(3400),
                 ingested_at: 50.0,
                 turn_start: 0,
                 turn_end: 0,
