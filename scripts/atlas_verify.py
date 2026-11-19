@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -31,6 +32,15 @@ STOP_GRACE_SECONDS = 15.0
 SURVIVOR_POLL_SECONDS = 0.1
 PORT_RELEASE_ATTEMPTS = 40
 PORT_RELEASE_INTERVAL_SECONDS = 0.25
+COUNT_RETRY_SECONDS = 0.5
+COUNT_PATTERN = re.compile(r"(\d+)\s+items.*?Rescue\s+(\d+).*?Fading\s+(\d+)", re.DOTALL)
+COUNT_TEXT_JS = (
+    "() => { const el = document.querySelector('#atlas-count'); return el ? (el.textContent || '') : ''; }"
+)
+COUNT_SETTLED_JS = (
+    "() => { const el = document.querySelector('#atlas-count');"
+    " return !el || !/Loading/.test(el.textContent || ''); }"
+)
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
@@ -435,6 +445,35 @@ def _await_port_release(base_url: str) -> None:
     raise RuntimeError(f"owned daemon port still answers: {base_url}")
 
 
+def parse_counts(text: str) -> list[int] | None:
+    match = COUNT_PATTERN.search(text)
+    if match is None:
+        return None
+    return [int(group) for group in match.groups()]
+
+
+def read_counts(page: object, timeout_ms: int = 15000) -> list[int] | None:
+    page.wait_for_function(COUNT_SETTLED_JS, timeout=timeout_ms)  # type: ignore[attr-defined]
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        counts = parse_counts(str(page.evaluate(COUNT_TEXT_JS)))  # type: ignore[attr-defined]
+        if counts is not None:
+            return counts
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(COUNT_RETRY_SECONDS)
+
+
+def require_empty_counts(raw: str, parsed: list[int] | None) -> None:
+    if parsed != [0, 0, 0]:
+        raise AssertionError(f"Atlas empty state missing: raw={raw!r} parsed={parsed!r}")
+
+
+def require_filled_counts(raw: str, parsed: list[int] | None) -> None:
+    if parsed is None or parsed[0] <= 0:
+        raise AssertionError(f"Atlas count did not update: raw={raw!r} parsed={parsed!r}")
+
+
 def wait_for_count(page: object, timeout_ms: int = 15000) -> str:
     count = page.locator("#atlas-count")  # type: ignore[attr-defined]
     count.wait_for(state="visible", timeout=timeout_ms)
@@ -533,8 +572,8 @@ def main() -> int:
                     page = browser.new_page()
                     page.goto(base_url + "/#/memory/atlas?profile=default&mode=list")
                     empty_count = wait_for_count(page)
-                    if "0 items" not in empty_count:
-                        raise AssertionError(f"Atlas empty state missing: {empty_count!r}")
+                    empty_parsed = read_counts(page)
+                    require_empty_counts(empty_count, empty_parsed)
                     page.locator("#atlas-filtered-empty").wait_for(state="visible", timeout=15000)
                 finally:
                     browser.close()
@@ -572,8 +611,8 @@ def main() -> int:
                     page = browser.new_page()
                     page.goto(base_url + "/#/memory/atlas?profile=default&mode=list")
                     filled_count = wait_for_count(page)
-                    if "0 items" in filled_count:
-                        raise AssertionError(f"Atlas count did not update: {filled_count!r}")
+                    filled_parsed = read_counts(page)
+                    require_filled_counts(filled_count, filled_parsed)
                     page.locator("#atlas-list-wrap").wait_for(state="visible", timeout=15000)
                     page.wait_for_function(
                         "(text) => { const el = document.querySelector('#list-viewport');"
@@ -584,8 +623,9 @@ def main() -> int:
                 finally:
                     browser.close()
             pending_evidence = (
-                f"PASS\nbase_url={base_url}\nempty_count={empty_count}\n"
-                f"filled_count={filled_count}\n"
+                f"PASS\nbase_url={base_url}\n"
+                f"empty_count={empty_count}\nempty_parsed={empty_parsed}\n"
+                f"filled_count={filled_count}\nfilled_parsed={filled_parsed}\n"
                 "profile_isolation=PASS\nremember_to_atlas=PASS\n"
             )
         finally:
