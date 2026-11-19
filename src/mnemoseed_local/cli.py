@@ -2,7 +2,7 @@
 
 Verbs: init / up / on / off / status / doctor / recall / remember / import /
 dream (--once, status) / forget / profile (create | list | archive | unarchive) /
-config (get | set | rollback) / credential (rotate) / uninstall (--purge) /
+config (get | set | rollback | repair-dream-route) / credential (rotate) / uninstall (--purge) /
 hook (install | uninstall | status) / host (install | uninstall | status) /
 project (bind | run) / mcp (MCP stdio gateway) / instructions (--surface).
 Local loopback by default;
@@ -18,6 +18,7 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -28,6 +29,7 @@ from mnemoseed_local import __version__, endpoint
 from mnemoseed_local.config import (
     CONFIG_DIR,
     CONFIG_PATH,
+    ROLE_ROUTE_REQUIRED_MESSAGE,
     Config,
     ConfigError,
     RoleLLMConfig,
@@ -192,6 +194,9 @@ def _init_mode_on_existing(mode: str) -> int:
         config = load_config()
     except ValueError as exc:
         print(f"error: the existing config could not be loaded: {exc}")
+        hint = _legacy_route_migration_hint(exc)
+        if hint is not None:
+            print(hint)
         print("the setup changed nothing; fix the file and re-run")
         return 1
     print(f"config: {CONFIG_PATH}")
@@ -250,11 +255,28 @@ def _capture_recall_conflicts(config: Config) -> list[str]:
     return conflicts
 
 
+def _legacy_route_migration_hint(exc: ValueError) -> str | None:
+    """The explicit repair line for a legacy incomplete role, or None."""
+    if not isinstance(exc, ConfigError):
+        return None
+    if not exc.key.startswith("dream.llm.") or ROLE_ROUTE_REQUIRED_MESSAGE not in str(exc):
+        return None
+    return (
+        f"{exc} (an incomplete dream route from an older install)\n"
+        "repair it with one command (no daemon needed):\n"
+        "  mnemoseed-local config repair-dream-route --driver YOUR_DRIVER --model YOUR_MODEL_ID\n"
+        "pick values from the provider catalog; the command writes both keys and re-checks boot"
+    )
+
+
 def _print_embedder_readiness() -> None:
     try:
         config = load_config()
     except ValueError as exc:
         print(f"embedding readiness: failed - the config could not be loaded: {exc}")
+        hint = _legacy_route_migration_hint(exc)
+        if hint is not None:
+            print(hint)
         return
     state, detail = _embedder_readiness(config)
     print(f"embedding readiness: {state} - {detail}")
@@ -272,7 +294,7 @@ def _embedder_readiness(config: Config) -> tuple[str, str]:
     try:
         instances = config.layer_instances("embed")
     except ConfigError as exc:
-        return "failed", str(exc)
+        return "failed", _legacy_route_migration_hint(exc) or str(exc)
     state = "ready"
     details: list[str] = []
     for instance in instances.values():
@@ -323,7 +345,7 @@ def _up_locked(args: argparse.Namespace, ready_callback: Any = None) -> int:
     try:
         config = load_config()
     except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(_legacy_route_migration_hint(exc) or f"error: {exc}", file=sys.stderr)
         return 1
     print(f"preset: {config.preset}")
     if config.preset == "embedded":
@@ -654,7 +676,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         config = load_config()
         checks.append(("config", True, f"loaded from {config.source}"))
     except ConfigError as exc:
-        checks.append(("config", False, str(exc)))
+        checks.append(("config", False, _legacy_route_migration_hint(exc) or str(exc)))
         return _doctor_report(checks)
 
     from mnemoseed_local.rest_client import is_loopback
@@ -1576,6 +1598,99 @@ def _parse_config_value(raw: str) -> Any:
         return json.loads(raw)
     except ValueError:
         return raw
+
+
+def _remove_role_table(text: str, role: str) -> str:
+    """Drop a role's whole table from a config text without touching other bytes."""
+    prefix = f"dream.llm.{role}"
+    kept: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            name = stripped.split("]", 1)[0].lstrip("[")
+            in_role = name == prefix or name.startswith(prefix + ".")
+            if skipping and not in_role:
+                skipping = False
+            if in_role:
+                skipping = True
+                continue
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
+
+
+def cmd_repair_dream_route(args: argparse.Namespace) -> int:
+    """Repair incomplete legacy dream routes in-process, without a daemon."""
+    from mnemoseed_local.configwrite.service import ConfigWriteService
+    from mnemoseed_local.storage.factory import build_stores
+    from mnemoseed_local.storage.ports import StorageError
+
+    real_path = CONFIG_PATH
+    try:
+        text = real_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot read config {real_path}: {exc}", file=sys.stderr)
+        return 1
+
+    descriptor, temp_name = tempfile.mkstemp(prefix="mnemoseed-repair-", suffix=".toml")
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    roles: list[str] = []
+    try:
+        while True:
+            temp_path.write_text(text, encoding="utf-8")
+            try:
+                config = load_config(temp_path)
+            except ConfigError as exc:
+                if _legacy_route_migration_hint(exc) is None:
+                    print(f"error: config could not be loaded: {exc}", file=sys.stderr)
+                    return 1
+                role = exc.key[len("dream.llm.") :].partition(".")[0]
+                roles.append(role)
+                text = _remove_role_table(text, role)
+                continue
+            break
+    except (OSError, ValueError) as exc:
+        print(f"error: config could not be prepared for repair: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    if not roles:
+        print("no incomplete dream route found; nothing was changed")
+        return 0
+
+    config.source = real_path
+    updates = [
+        (f"dream.llm.{role}.{field}", value)
+        for role in roles
+        for field, value in (("driver", args.driver), ("model", args.model))
+    ]
+    try:
+        stores = build_stores(config)
+    except StorageError as exc:
+        print(f"error: storage stack failed to build: {exc}", file=sys.stderr)
+        return 1
+    write_error: Exception | None = None
+    try:
+        try:
+            ConfigWriteService(config, getattr(stores, "meta", None)).set_many(updates, actor="migration")
+        except Exception as exc:
+            write_error = exc
+    finally:
+        asyncio.run(stores.close())
+
+    try:
+        load_config(real_path)
+    except (ConfigError, ValueError) as exc:
+        print(f"error: repair left the config reload-invalid: {exc}", file=sys.stderr)
+        return 1
+    if write_error is not None:
+        print(f"error: repair write failed: {write_error}", file=sys.stderr)
+        return 1
+    print(f"repaired {len(roles)} dream route(s) ({', '.join(roles)}): {args.driver}/{args.model}")
+    return 0
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -2518,6 +2633,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_config_rollback.add_argument("version_id")
     p_config_rollback.add_argument("--baseurl", default=None)
     p_config_rollback.add_argument("--json", action="store_true")
+    p_config_repair = config_sub.add_parser(
+        "repair-dream-route", help="repair an incomplete legacy dream route without a daemon"
+    )
+    p_config_repair.add_argument("--driver", required=True)
+    p_config_repair.add_argument("--model", required=True)
 
     p_credential = sub.add_parser("credential", help="daemon credential lifecycle: rotate")
     credential_sub = p_credential.add_subparsers(dest="credential_command", required=True)
@@ -2678,6 +2798,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "forget":
         return cmd_forget(args)
     if args.command == "config":
+        if args.config_command == "repair-dream-route":
+            return cmd_repair_dream_route(args)
         return cmd_config(args) if args.config_command != "rollback" else cmd_config_rollback(args)
     if args.command == "profile":
         return cmd_profile(args)
