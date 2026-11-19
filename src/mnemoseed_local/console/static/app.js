@@ -312,7 +312,7 @@ const CONFIG_KEYS = [
 ];
 const LLM_ROLES = ["dream","dream_verifier","dream_vote"];
 const LLM_FIELDS = [
-  { key:"driver", type:"string", label:"Driver", hint:"ollama | openai_compatible | stub — the route's driver." },
+  { key:"driver", type:"string", label:"Driver", hint:"ollama | openai_compatible | anthropic | stub | stub_verifier — the route's driver." },
   { key:"model", type:"string", label:"Model", hint:"The model this role generates with." },
   { key:"base_url", type:"string", label:"Base URL", hint:"Endpoint for the driver (e.g. http://localhost:11434)." },
   { key:"api_key_env", type:"env", label:"API key env", hint:"Env-var NAME only — the key value is never stored or shown.", secret:true },
@@ -578,6 +578,19 @@ async function saveConfigKey(key){
   }
 }
 
+async function writeRoleBatch(role, driver, model, extra=[]){
+  const updates = [
+    { key_path: `dream.llm.${role}.driver`, value: driver },
+    { key_path: `dream.llm.${role}.model`, value: model },
+    ...extra,
+  ];
+  return fetchJson("/api/v1/config/set-many", {
+    method:"POST",
+    headers: configWriteHeaders(),
+    body: JSON.stringify({ updates }),
+  });
+}
+
 async function saveRoleRoute(role, triggerKey){
   const driverKey = `dream.llm.${role}.driver`;
   const modelKey = `dream.llm.${role}.model`;
@@ -592,14 +605,7 @@ async function saveRoleRoute(role, triggerKey){
   const btns = [driverKey, modelKey].map(k=>$(`[data-save-key="${k}"]`)).filter(Boolean);
   btns.forEach(b=>{ b.disabled = true; b.textContent = "Saving\u2026"; });
   try{
-    await fetchJson("/api/v1/config/set-many", {
-      method:"POST",
-      headers: configWriteHeaders(),
-      body: JSON.stringify({ updates:[
-        { key_path: driverKey, value: driver },
-        { key_path: modelKey, value: model },
-      ]}),
-    });
+    await writeRoleBatch(role, driver, model);
     a11yLive(`Saved ${role} route (driver + model)`);
     await loadConfigPage();
     if($("#config-versions-body").dataset.loaded === "true"){
@@ -2130,6 +2136,8 @@ function initEvents(){
   // Config / Profiles / Dream tab wiring
   const cfgVerBtn = $("#config-versions-refresh");
   if(cfgVerBtn) cfgVerBtn.addEventListener("click", loadConfigVersions);
+  const wizardBtn = $("#config-wizard-open");
+  if(wizardBtn) wizardBtn.addEventListener("click", openProviderWizard);
   $("#profiles-refresh").addEventListener("click", refreshProfilesList);
   $("#profile-create-form").addEventListener("submit", async (e)=>{
     e.preventDefault();
@@ -2216,6 +2224,207 @@ let debounceTimer=null;
 function debounceFetch(){
   clearTimeout(debounceTimer);
   debounceTimer=setTimeout(fetchAtlas, 300);
+}
+
+// ---------- Provider wizard (config-page modal) ----------
+const WIZARD_PRESETS = [
+  { id:"openai", display:"OpenAI" }, { id:"anthropic", display:"Anthropic" },
+  { id:"google", display:"Google" }, { id:"deepseek", display:"DeepSeek" },
+  { id:"moonshot", display:"Moonshot" }, { id:"xai", display:"xAI" },
+  { id:"openrouter", display:"OpenRouter" }, { id:"nvidia", display:"NVIDIA" },
+  { id:"custom", display:"Custom" },
+];
+const WIZARD_OLLAMA_FIELDS = [".wizard-ollama-only"];
+let wizardPreset = "";
+let wizardModels = [];
+let wizardSelectedModel = "";
+
+function providerWizardHtml(catalog){
+  const presets = (catalog && Array.isArray(catalog.presets) && catalog.presets.length)
+    ? catalog.presets : WIZARD_PRESETS;
+  const cards = presets.map(p => {
+    const id = String(p.id || "");
+    const name = String(p.display || id);
+    return `<label class="card provider-card"><input class="provider-radio" type="radio" name="wizard-provider" value="${esc(id)}" data-provider="${esc(id)}"><span class="provider-name">${esc(name)}</span></label>`;
+  }).join("");
+  return `<div class="wizard-presets" role="radiogroup" aria-label="Provider">${cards}</div>
+    <div class="wizard-fields">
+      <label class="wizard-field">Base URL <input id="wizard-base-url" class="input" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://api.provider.com/v1"></label>
+      <div class="wizard-key-row">
+        <label class="wizard-field">API key <input id="wizard-api-key" class="input" type="password" autocomplete="off" spellcheck="false" aria-describedby="wizard-key-status"></label>
+        <button id="wizard-toggle-key" class="btn btn-ghost btn-sm" type="button" aria-pressed="false" aria-label="Show API key">Show</button>
+      </div>
+      <span id="wizard-key-status" class="muted small" role="status"></span>
+      <label class="wizard-field wizard-ollama-only" hidden>Thinking <input id="wizard-think" type="checkbox"></label>
+      <label class="wizard-field wizard-ollama-only" hidden>Context size <input id="wizard-num-ctx" class="input" type="number" step="1"></label>
+      <label class="wizard-field wizard-ollama-only" hidden>Max predict <input id="wizard-num-predict" class="input" type="number" step="1"></label>
+    </div>
+    <div class="wizard-actions">
+      <button id="wizard-test" class="btn btn-primary" type="button">Test connection</button>
+      <span id="wizard-test-status" class="muted small" role="status"></span>
+    </div>
+    <div class="wizard-models">
+      <label class="wizard-field">Model <input id="wizard-model-search" class="input" type="search" enterkeyhint="search" autocomplete="off" spellcheck="false" placeholder="Filter models\u2026"></label>
+      <div id="wizard-model-list" class="wizard-model-list" role="listbox" aria-label="Models"></div>
+    </div>
+    <label class="wizard-field"><input id="wizard-verifier" type="checkbox"> Also use this provider for dream_verifier</label>
+    <div class="dialog-actions">
+      <button id="wizard-bind" class="btn btn-primary" type="button">Save and bind dream</button>
+      <button id="wizard-cancel" class="btn btn-ghost" type="button">Cancel</button>
+    </div>`;
+}
+
+async function openProviderWizard(){
+  const modal = $("#provider-wizard"), body = $("#provider-wizard-body");
+  if(!modal || !body) return;
+  let catalog = { presets: WIZARD_PRESETS };
+  try{ catalog = await fetchJson("/api/v1/llm/catalog") || catalog; }catch(e){ /* offline: static presets */ }
+  try{
+    const local = await fetchJson("/api/v1/llm/detect-local", {
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}",
+    });
+    if(local && local.available){
+      catalog = { presets: [{ id:"ollama", display:"Ollama (local)" }, ...(catalog.presets||[])] };
+    }
+  }catch(e){ /* local detection is best-effort */ }
+  wizardPreset = ""; wizardModels = []; wizardSelectedModel = "";
+  body.innerHTML = providerWizardHtml(catalog);
+  if(typeof modal.showModal === "function") modal.showModal();
+  else modal.setAttribute("open", "");
+  wireProviderWizard();
+}
+
+function closeProviderWizard(){
+  const modal = $("#provider-wizard");
+  if(!modal) return;
+  if(typeof modal.close === "function") modal.close();
+  else modal.removeAttribute("open");
+}
+
+function wizardDriver(){
+  if(wizardPreset === "ollama") return "ollama";
+  if(wizardPreset === "anthropic") return "anthropic";
+  return "openai_compatible";
+}
+
+function wizardParams(){
+  const params = {};
+  const base = ($("#wizard-base-url") || {}).value || "";
+  const key = ($("#wizard-api-key") || {}).value || "";
+  if(base) params.base_url = base;
+  if(key) params.api_key = key;
+  if(wizardSelectedModel) params.model = wizardSelectedModel;
+  if(wizardPreset === "ollama"){
+    const think = $("#wizard-think"), ctx = $("#wizard-num-ctx"), predict = $("#wizard-num-predict");
+    if(think) params.think = !!think.checked;
+    if(ctx && ctx.value !== "") params.num_ctx = Number(ctx.value);
+    if(predict && predict.value !== "") params.num_predict = Number(predict.value);
+  }
+  return params;
+}
+
+function wizardRenderModels(){
+  const list = $("#wizard-model-list");
+  if(!list) return;
+  const q = (($("#wizard-model-search") || {}).value || "").toLowerCase();
+  const matches = wizardModels.filter(m => !q || String(m).toLowerCase().includes(q));
+  list.innerHTML = matches.length
+    ? matches.map(m => `<button type="button" class="wizard-model${m===wizardSelectedModel?" is-selected":""}" role="option" aria-selected="${m===wizardSelectedModel}" data-model="${esc(m)}">${esc(m)}</button>`).join("")
+    : `<p class="muted small">No models yet \u2014 run Test connection first.</p>`;
+  $$(".wizard-model", list).forEach(btn => btn.addEventListener("click", ()=>{
+    wizardSelectedModel = btn.dataset.model;
+    wizardRenderModels();
+    a11yLive(`Selected model ${wizardSelectedModel}`);
+  }));
+}
+
+async function wizardLoadModels(){
+  try{
+    const res = await fetchJson("/api/v1/llm/models", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ preset: wizardPreset, driver: wizardDriver(), params: wizardParams() }),
+    });
+    wizardModels = Array.isArray(res && res.models) ? res.models : [];
+    wizardRenderModels();
+  }catch(e){ /* model discovery is best-effort; Test connection still works */ }
+}
+
+async function wizardTestConnection(){
+  const status = $("#wizard-test-status");
+  if(status) status.textContent = "Testing\u2026";
+  try{
+    const res = await fetchJson("/api/v1/llm/probe", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ driver: wizardDriver(), params: wizardParams() }),
+    });
+    if(Array.isArray(res && res.models) && res.models.length){ wizardModels = res.models; wizardRenderModels(); }
+    if(status) status.textContent = res.ok ? "Connected" : "Provider reported unavailable";
+    a11yLive(res.ok ? "Connection OK" : "Provider unavailable");
+  }catch(e){
+    if(status) status.textContent = e.message || "Connection failed";
+  }
+}
+
+async function wizardBind(){
+  const err = $("#wizard-test-status");
+  if(!wizardPreset){ if(err) err.textContent = "Pick a provider first."; return; }
+  if(!wizardSelectedModel){ if(err) err.textContent = "Pick a model first (run Test connection)."; return; }
+  const driver = wizardDriver(), model = wizardSelectedModel;
+  const extra = [];
+  const verifier = $("#wizard-verifier");
+  if(verifier && verifier.checked){
+    extra.push({ key_path:"dream.llm.dream_verifier.driver", value:driver });
+    extra.push({ key_path:"dream.llm.dream_verifier.model", value:model });
+  }
+  const keyInput = $("#wizard-api-key");
+  const key = keyInput ? keyInput.value : "";
+  if(key){
+    try{
+      await fetchJson("/api/v1/secrets/set", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({name:"mnemoseed/dream/dream", value:key})});
+    }catch(e){
+      if(err) err.textContent = "Could not save the key.";
+      return;
+    }
+    extra.push({ key_path:"dream.llm.dream.api_key_env", value:`secrets:mnemoseed/dream/dream` });
+    keyInput.value = "";
+  }
+  try{
+    await writeRoleBatch("dream", driver, model, extra);
+    await refreshConfigGeneration();
+    closeProviderWizard();
+    a11yLive(`Dream bound to ${driver} / ${model}`);
+    await loadConfigPage();
+  }catch(e){
+    if(err) err.textContent = e.status === 409 ? "Config changed \u2014 reload and retry." : (e.message || "Save failed");
+  }
+}
+
+function wireProviderWizard(){
+  $$("#provider-wizard-body .provider-radio").forEach(radio => radio.addEventListener("change", ()=>{
+    wizardPreset = radio.value;
+    wizardSelectedModel = ""; wizardModels = [];
+    const isOllama = wizardPreset === "ollama";
+    $$("#provider-wizard-body .wizard-ollama-only").forEach(el => { el.hidden = !isOllama; });
+    const base = $("#wizard-base-url");
+    if(base){
+      if(isOllama) base.value = base.value || "http://127.0.0.1:11434";
+      else if(!base.value) base.value = "";
+    }
+    wizardRenderModels();
+    a11yLive(`Selected provider ${wizardPreset}`);
+  }));
+  const toggle = $("#wizard-toggle-key"), keyInput = $("#wizard-api-key");
+  if(toggle && keyInput) toggle.addEventListener("click", ()=>{
+    const show = keyInput.type === "password";
+    keyInput.type = show ? "text" : "password";
+    toggle.setAttribute("aria-pressed", String(show));
+    toggle.setAttribute("aria-label", show ? "Hide API key" : "Show API key");
+    toggle.textContent = show ? "Hide" : "Show";
+  });
+  const test = $("#wizard-test"); if(test) test.addEventListener("click", ()=> wizardTestConnection());
+  const bind = $("#wizard-bind"); if(bind) bind.addEventListener("click", ()=> wizardBind());
+  const cancel = $("#wizard-cancel"); if(cancel) cancel.addEventListener("click", closeProviderWizard);
+  const search = $("#wizard-model-search"); if(search) search.addEventListener("input", wizardRenderModels);
 }
 
 // ---------- boot ----------
