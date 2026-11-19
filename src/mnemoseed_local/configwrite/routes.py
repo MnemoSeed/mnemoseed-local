@@ -8,6 +8,10 @@ The /api/v1/config contract the CLI codes against:
 - POST   /api/v1/config/set         ``{key_path, value}`` -> ``{ok, version_id,
                                      restart_required}``; a typed failure is a
                                      422 whose message names the offending key.
+- POST   /api/v1/config/set-many    ``{updates: [{key_path, value}...]}`` ->
+                                     ``{ok, applied, generation}``; the whole
+                                     batch is all-or-nothing under one If-Match
+                                     generation check and reload validation.
 - GET    /api/v1/config/versions    the versioned history.
 - POST   /api/v1/config/rollback    ``{version_id}`` -> ``{ok, version_id,
                                      restored}``, append-only.
@@ -119,6 +123,38 @@ def set_config(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         "version_id": result["version_id"],
         "restart_required": result["restart_required"],
     }
+
+
+@router.post("/config/set-many")
+def set_many_config(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Atomically land a batch of config writes under one generation check."""
+    actor = resolve_actor(request)
+    _reject_remote_writes(request)
+    raw_updates = body.get("updates")
+    if not isinstance(raw_updates, list) or not raw_updates:
+        raise HTTPException(
+            status_code=422,
+            detail="body.updates must be a non-empty list of {key_path, value} objects",
+        )
+    updates: list[tuple[str, Any]] = []
+    for index, item in enumerate(raw_updates):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail=f"body.updates[{index}] must be an object")
+        key_path = item.get("key_path")
+        if not isinstance(key_path, str) or not key_path:
+            raise HTTPException(
+                status_code=422,
+                detail=f"body.updates[{index}].key_path must be a non-empty string",
+            )
+        updates.append((key_path, item.get("value")))
+    expected = _expected_generation(request)
+    try:
+        result = _service(request).set_many(updates, actor=actor, expected_generation=expected)
+    except GenerationMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ConfigWriteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": result["ok"], "applied": result["applied"], "generation": result["generation"]}
 
 
 @router.get("/config/versions")
