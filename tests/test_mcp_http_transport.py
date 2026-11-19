@@ -32,7 +32,7 @@ from mnemoseed_local.mcp_gateway.http_transport import (
     MISSING_PROFILE_DETAIL,
     PROFILE_HEADER,
 )
-from mnemoseed_local.mcp_gateway.server import PROTOCOL_VERSION
+from mnemoseed_local.mcp_gateway.server import PROTOCOL_VERSION, STDIO_ALTERNATE
 from mnemoseed_local.rest_client import ACTOR_HEADER, DaemonClient
 
 TOOL_NAMES = {
@@ -43,6 +43,7 @@ TOOL_NAMES = {
     "dream_once",
     "recent_sessions",
     "session_windows",
+    "recall_feedback",
 }
 
 #: The tools/call round trip must finish far below the self-call's own 30s
@@ -245,6 +246,24 @@ def test_tools_call_against_a_down_daemon_is_a_structured_error(home: Path) -> N
     result = response.json()["result"]
     assert result["isError"] is True
     assert "cannot reach" in result["content"][0]["text"]
+
+
+def test_tools_call_error_passes_the_entry_failure_field_through(home: Path) -> None:
+    """The HTTP route forwards the typed result dict unchanged; no schema
+    filter strips the additive field on the way back to the client."""
+    with auth_support.boot(home) as client:
+        response = client.post(
+            MCP_PATH,
+            json=_rpc(4, "tools/call", {"name": "recall", "arguments": {"query": "x"}}),
+            headers={PROFILE_HEADER: "default"},
+        )
+
+    result = response.json()["result"]
+    assert result["isError"] is True
+    failure = result["entry_failure"]
+    assert failure["kind"] == "entry_unavailable"
+    assert failure["alternate"] == STDIO_ALTERNATE
+    assert failure["retry_policy"]
 
 
 # ---------------------------------------------------------------- the real-daemon surface

@@ -25,15 +25,23 @@ the package-index installers described below are currently unavailable.
 Prepare [Git](https://git-scm.com/downloads),
 [uv](https://docs.astral.sh/uv/getting-started/installation/), and Python 3.14 or
 newer. The command below asks uv to use Python 3.14; uv can provision it when
-needed. The `[codex]` extra includes `zstandard` for compressed Codex transcripts.
+needed. The `[codex]` extra includes `zstandard`, which is required to read
+compressed Codex transcripts.
 
 ```sh
 git clone https://github.com/MnemoSeed/mnemoseed-local.git
 cd mnemoseed-local
-uv tool install --python 3.14 --force ".[codex]"
+uv tool install --python 3.14 --force --with zstandard .
 mnemoseed-local init --mode capture-recall
 mnemoseed-local doctor
 ```
+
+For a local-path install, `uv tool install --with zstandard .` is the working
+form for that extra. `uv tool install --from <path> "mnemoseed-local[codex]"`
+fails because uv rejects a package requirement provided together with `--from`.
+Without the extra, `mnemoseed-local host install --host codex_cli` refuses with
+the working command and `mnemoseed-local host status --host codex_cli` reports
+`not-installed (missing extra)`.
 
 If the installed CLI is not on PATH, follow uv's tool PATH guidance before
 continuing. User configuration and memory live in `~/.mnemoseed-local`, separate
@@ -132,7 +140,9 @@ mnemoseed-local host install --host codex_cli
 mnemoseed-local host status --host codex_cli
 ```
 
-The source install above includes the optional `[codex]` extra. Registration
+The source install above includes `zstandard`. Without it, registration refuses
+before writing anything and status reports `not-installed (missing extra)`,
+because a Codex rollout is compressed and cannot be read. Registration
 writes user-level `hooks.json` and the stdio gateway entry in `config.toml`.
 The hooks file keeps one top-level `hooks` object: event names map to matcher
 groups, each holding `type: command` handlers. Installation adds one MnemoSeed
@@ -439,8 +449,8 @@ JSON-RPC body to `/mcp`.
 Tools: `recall(query, top_k?)`, `remember(text, rules?)`, `capture(text)`,
 `supersede(superseded_node_id, successor_node_id)`,
 `dream_once()`, `recent_sessions(resume_query, n_sessions?, n_per_session?, self_parent_id?, caller_cwd?)`,
-`session_windows(n_sessions?)`. The handshake works even when the daemon is down; only tool calls report the
-connectivity error.
+`session_windows(n_sessions?)`, `recall_feedback(kind, observed_at)`. The handshake works even when the daemon is
+down; only tool calls report the connectivity error.
 
 A `recall` result can be empty when no stored candidate clears the semantic
 relevance floor; that is a meaningful answer ("no relevant memory"), not a

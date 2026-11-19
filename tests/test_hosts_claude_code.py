@@ -725,6 +725,7 @@ def test_session_end_uses_tight_per_phase_timeout_budget(monkeypatch: pytest.Mon
 
     class FakeResponse:
         status_code = 200
+        content = b"{}"
 
         def json(self) -> dict:
             return {}

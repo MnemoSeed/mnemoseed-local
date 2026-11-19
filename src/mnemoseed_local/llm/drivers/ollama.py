@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from mnemoseed_local.llm.drivers._usage import build_usage
 from mnemoseed_local.llm.registry import LLM_DRIVERS, register
 from mnemoseed_local.llm.types import (
     ChatResult,
@@ -149,28 +150,19 @@ class OllamaLLM:
             return HealthReport(ok=False, detail={"error": str(exc)})
 
 
-def _int_or_none(value: Any) -> int | None:
-    """Coerce a reported count; malformed values degrade to None."""
-    try:
-        return int(value)
-    except TypeError, ValueError:
-        return None
-
-
 def _usage_from(body: Any) -> Usage | None:
     """Ollama's native /api/chat reports token counts at the RESPONSE ROOT
     (prompt_eval_count / eval_count), never inside a "usage" key — the driver's
     previous nested-only read silently dropped every provider token (verified
     against live ollama 0.32). A {"usage": {...}} body stays honored for nested
     shapes some middleware emits."""
-    prompt = _int_or_none(body.get("prompt_eval_count"))
-    completion = _int_or_none(body.get("eval_count"))
-    if prompt is not None or completion is not None:
-        return Usage(prompt_tokens=prompt, completion_tokens=completion)
+    usage = build_usage(body.get("prompt_eval_count"), body.get("eval_count"))
+    if usage is not None:
+        return usage
     data = body.get("usage")
     if not isinstance(data, dict):
         return None
-    return Usage(
-        prompt_tokens=data.get("prompt_eval_count", data.get("prompt_tokens")),
-        completion_tokens=data.get("eval_count", data.get("completion_tokens")),
+    return build_usage(
+        data.get("prompt_eval_count", data.get("prompt_tokens")),
+        data.get("eval_count", data.get("completion_tokens")),
     )

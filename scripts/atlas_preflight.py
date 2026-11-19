@@ -6,7 +6,7 @@ import os
 import re
 import tomllib
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 REQUIRED_ENV_VARS = ("MNEMOSEED_LOCAL_HOME", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
 RESERVED_PORTS = frozenset({7788, 4096})
@@ -96,7 +96,9 @@ def validate_config(config_text: str, home: Path, base_url: str) -> list[str]:
             errors.append("isolated graph path is not a usable path")
         else:
             try:
-                resolved_target = Path(target).resolve()
+                candidate = Path(target)
+                absolute = candidate.is_absolute() or PureWindowsPath(target).is_absolute()
+                resolved_target = (candidate if absolute else home / candidate).resolve()
             except OSError:
                 errors.append(f"isolated graph path is not resolvable: {target}")
             else:

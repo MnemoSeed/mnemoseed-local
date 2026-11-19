@@ -90,6 +90,12 @@ from mnemoseed_local.instrument.sql_readonly import (
     crosscheck_receipts,
     query_hash,
     query_hash_for,
+    read_meta_profile_count,
+    read_product_node,
+    read_product_node_page,
+    read_product_profile_ids,
+    read_product_receipt_counts,
+    read_product_version_count,
     read_unresolved_receipts,
     readonly_connection,
 )
@@ -814,17 +820,15 @@ def _read_cohort_pair(paths: InstrumentPaths) -> _ProductRead:
             raise BindingIncompleteError(
                 {"reason": "receipt_crosscheck_mismatch", "nomination_ids": mismatched}
             )
-        meta_profiles = len(meta.list_profiles())
-        profiles = sorted(
-            {entry.profile_id for entry in graph.pending_reconciliation_audits(_PRODUCT_READ_LIMIT)}
-        )
+        meta_profiles = read_meta_profile_count(meta)
+        profiles = read_product_profile_ids(graph, limit=_PRODUCT_READ_LIMIT)
         queries = {label: query_hash(text) for label, text in _QUERY_LABELS}
         current_nodes = 0
         version_rows = 0
         receipt_counts: dict[str, int] = {}
         for profile in profiles:
-            page = graph.list_nodes(NodeFilter(profile_id=profile), Page(offset=0, limit=_PRODUCT_READ_LIMIT))
-            node_ids = [node.node_id for node in page.items]
+            page = read_product_node_page(graph, profile_id=profile, limit=_PRODUCT_READ_LIMIT)
+            node_ids = list(page.node_ids)
             if page.total > len(node_ids):
                 raise BindingIncompleteError(
                     {"reason": "node_page_truncated", "profile_id": profile, "total": page.total}
@@ -832,13 +836,13 @@ def _read_cohort_pair(paths: InstrumentPaths) -> _ProductRead:
             queries[f"node_versions[{profile}]"] = query_hash_for(NODE_VERSIONS_QUERY_TEMPLATE, len(node_ids))
             before = capture_node_integrity(graph, connection, profile_id=profile, node_ids=node_ids)
             for node_id in node_ids:
-                if graph.get_node(node_id) is None:
+                if read_product_node(graph, node_id=node_id) is None:
                     raise BindingIncompleteError({"reason": "node_missing", "node_id": node_id})
-                version_rows += len(graph.versions(node_id))
+                version_rows += read_product_version_count(graph, node_id=node_id)
             after = capture_node_integrity(graph, connection, profile_id=profile, node_ids=node_ids)
             assert_node_integrity(before, after)
             current_nodes += len(node_ids)
-            counts = graph.count_reconciliation_receipts(profile_id=profile)
+            counts = read_product_receipt_counts(graph, profile_id=profile)
             for disposition, count in counts.items():
                 receipt_counts[disposition] = receipt_counts.get(disposition, 0) + count
         return _ProductRead(

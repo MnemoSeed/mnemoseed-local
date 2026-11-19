@@ -1102,7 +1102,7 @@ def test_missing_zstandard_answers_with_the_install_hint(
     captured = capsys.readouterr()
     assert captured.out == "", "stdout stays empty even on a setup fault"
     assert "zstandard" in captured.err
-    assert "[codex]" in captured.err
+    assert "uv tool install --with zstandard ." in captured.err
 
 
 def test_missing_zstandard_still_settles_session_end(
@@ -1990,3 +1990,67 @@ def test_host_cli_lifecycle_wiring(
 
     assert main(["host", "uninstall", "--host", "codex_cli"]) == 0
     assert "applied" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- optional reader extra
+
+
+def _without_zstandard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+
+
+def test_install_refuses_before_any_write_without_zstandard(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _without_zstandard(monkeypatch)
+    with pytest.raises(RuntimeError, match=r"uv tool install --with zstandard \."):
+        cx_install.install()
+    assert not (cx_home / "hooks.json").exists()
+    assert not (cx_home / "config.toml").exists()
+
+
+def test_host_install_reports_the_working_command_without_a_traceback(
+    cx_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    _without_zstandard(monkeypatch)
+    assert main(["host", "install", "--host", "codex_cli"]) == 1
+    captured = capsys.readouterr()
+    assert "zstandard" in captured.err
+    assert "uv tool install --with zstandard ." in captured.err
+    assert "Traceback" not in captured.err
+    assert not (cx_home / "hooks.json").exists()
+
+
+def test_status_reports_missing_extra_for_a_complete_install(
+    cx_home: Path, stable_command: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    cx_install.install()
+    assert "unverified" in cx_install.status().state.lower()
+    _without_zstandard(monkeypatch)
+    assert cx_install.status().state == "not-installed (missing extra)"
+
+
+def test_status_reports_missing_extra_for_an_empty_home(
+    cx_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    _without_zstandard(monkeypatch)
+    assert cx_install.status().state == "not-installed (missing extra)"
+
+
+def test_host_status_reports_missing_extra(
+    cx_home: Path,
+    stable_command: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("mnemoseed_local.hosts.install.daemon_reachable", lambda *a, **k: False)
+    cx_install.install()
+    _without_zstandard(monkeypatch)
+    assert main(["host", "status", "--host", "codex_cli"]) == 0
+    assert "not-installed (missing extra)" in capsys.readouterr().out

@@ -251,6 +251,38 @@ def test_build_client_uses_cli_actor_and_long_timeout(monkeypatch: pytest.Monkey
     assert seen["timeout"] != POST_TIMEOUT_SECONDS
 
 
+def _capture_settle_timeout(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+
+    def fake_client_for(
+        base_url: str,
+        *,
+        profile_id: str,
+        actor: str,
+        timeout: float,
+        token: str | None = None,
+    ) -> object:
+        seen.update(timeout=timeout)
+        return object()
+
+    monkeypatch.setattr(runner, "client_for", fake_client_for)
+    return seen
+
+
+def test_build_client_settle_timeout_defaults_to_3600(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MNEMOSEED_IMPORT_SETTLE_TIMEOUT_SECONDS", raising=False)
+    seen = _capture_settle_timeout(monkeypatch)
+    build_client("http://127.0.0.1:9911", "prof")
+    assert seen["timeout"] == 3600.0
+
+
+def test_build_client_settle_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MNEMOSEED_IMPORT_SETTLE_TIMEOUT_SECONDS", "7200")
+    seen = _capture_settle_timeout(monkeypatch)
+    build_client("http://127.0.0.1:9911", "prof")
+    assert seen["timeout"] == 7200.0
+
+
 # ---------------------------------------------------------------- skip reasons
 
 

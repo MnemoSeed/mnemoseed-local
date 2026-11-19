@@ -225,6 +225,7 @@ def test_ping_and_tools_list_never_touch_the_client() -> None:
         "dream_once",
         "recent_sessions",
         "session_windows",
+        "recall_feedback",
     }
     assert client.calls == []
 
@@ -234,3 +235,20 @@ def test_wrap_is_idempotent() -> None:
     wrapped = GatewayClient.wrap(client)
     assert isinstance(wrapped, GatewayClient)
     assert GatewayClient.wrap(wrapped) is wrapped
+
+
+def test_refused_after_retry_carries_typed_entry_unavailable() -> None:
+    client = ScriptedClient([("raise", _refused_error()), ("raise", _refused_error())])
+    _, responses = run_gateway([_call("recall", {"query": "x"})], client)
+    result = responses[0]["result"]
+    assert result["isError"] is True
+    failure = result["entry_failure"]
+    assert failure["kind"] == "entry_unavailable"
+    assert failure["alternate"] == "stdio gateway: mnemoseed-local mcp"
+
+
+def test_refused_credential_carries_typed_auth_refused() -> None:
+    client = ScriptedClient([("raise", DaemonRestError(401, "daemon credential required"))])
+    _, responses = run_gateway([_call("recall", {"query": "x"})], client)
+    failure = responses[0]["result"]["entry_failure"]
+    assert failure["kind"] == "auth_refused"

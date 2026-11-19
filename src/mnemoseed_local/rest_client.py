@@ -48,6 +48,14 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _json_body(content: bytes) -> Any:
+    """Parse a daemon body as UTF-8, independent of locale and headers."""
+    try:
+        return json.loads(content.decode("utf-8"))
+    except ValueError:
+        return None
+
+
 class DaemonUnavailableError(Exception):
     """The daemon did not answer (connect refused, timeout, DNS, ...)."""
 
@@ -84,19 +92,10 @@ class DaemonClient:
         return headers
 
     def _decode(self, response: httpx.Response) -> dict[str, Any]:
+        body = _json_body(response.content)
         if response.status_code >= 400:
-            detail: Any = None
-            try:
-                body = response.json()
-                if isinstance(body, dict):
-                    detail = body.get("detail")
-            except ValueError:
-                pass
+            detail = body.get("detail") if isinstance(body, dict) else None
             raise DaemonRestError(response.status_code, detail)
-        try:
-            body = response.json()
-        except ValueError:
-            return {}
         return body if isinstance(body, dict) else {}
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

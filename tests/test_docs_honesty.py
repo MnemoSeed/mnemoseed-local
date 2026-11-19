@@ -184,9 +184,15 @@ def test_overview_links_to_the_complete_guide_and_valid_sections() -> None:
 
 def test_public_docs_use_the_source_install_route_and_correct_manual_dream_command() -> None:
     for document in (README, GUIDE):
-        assert 'uv tool install --python 3.14 --force ".[codex]"' in document
+        assert "uv tool install --python 3.14 --force --with zstandard ." in document
+        assert "uv tool install --with zstandard ." in document
         assert "init --mode capture-recall" in document
         assert "not yet published" in document and "PyPI" in document
         assert "dream once" not in document
     assert "dream --once" in GUIDE
     assert GUIDE.index("## Install from source") < GUIDE.index("## Package-index installers")
+
+
+def test_public_docs_explain_the_local_path_extra_form() -> None:
+    assert 'uv tool install --from <path> "mnemoseed-local[codex]"' in GUIDE
+    assert "not-installed (missing extra)" in GUIDE

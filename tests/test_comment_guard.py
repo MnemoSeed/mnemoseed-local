@@ -236,6 +236,26 @@ def test_preflight_rejects_outside_root_link_missing_and_decoy(tmp_path, monkeyp
     assert any("HOMEPATH" in error for error in preflight.validate_run_root(repo, run, home, 54321, bad_env))
 
 
+def test_preflight_resolves_relative_isolated_path_against_home(tmp_path) -> None:
+    from mnemoseed_local.config import default_config_toml
+
+    preflight = load_harness_script("atlas_preflight.py")
+    home = tmp_path / "home"
+    home.mkdir()
+    base_url = "http://127.0.0.1:54321"
+    config_text = default_config_toml().replace(
+        'baseurl = "http://localhost:7788"', f'baseurl = "{base_url}"', 1
+    )
+    assert 'path = "isolated.db"' in config_text
+    assert preflight.validate_config(config_text, home, base_url) == []
+
+    traversal = config_text.replace('path = "isolated.db"', 'path = "../outside.db"')
+    assert any("escapes" in error for error in preflight.validate_config(traversal, home, base_url))
+    outside = (tmp_path / "outside.db").as_posix()
+    absolute = config_text.replace('path = "isolated.db"', f'path = "{outside}"')
+    assert any("escapes" in error for error in preflight.validate_config(absolute, home, base_url))
+
+
 def test_preflight_accepts_posix_empty_homedrive(tmp_path, monkeypatch) -> None:
     preflight = load_harness_script("atlas_preflight.py")
     repo = tmp_path / "repo"

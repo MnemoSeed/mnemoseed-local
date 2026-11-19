@@ -454,6 +454,7 @@ def test_dream_status_counting_wrappers_perform_zero_writes_and_no_invocations(
                 "dream_once",
                 "recent_sessions",
                 "session_windows",
+                "recall_feedback",
             ],
             [
                 "/memory/recall",
@@ -461,6 +462,7 @@ def test_dream_status_counting_wrappers_perform_zero_writes_and_no_invocations(
                 "/memory/supersede",
                 "/memory/dream_once",
                 "/memory/dream_status",
+                "/memory/recall_feedback",
             ],
         ),
     ],

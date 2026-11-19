@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemoseed_local.cli import build_parser, main, models_contain
+from mnemoseed_local.cli import _opencode_mcp_registered, build_parser, main, models_contain
 from mnemoseed_local.config import default_config_toml, load_config
 from mnemoseed_local.hardware import recommended_tier
 from mnemoseed_local.llm.types import HealthReport
@@ -999,6 +999,8 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     """A stale plugin does not error — it keeps calling the daemon the old way,
     which the credential boundary refuses. The doctor must name it, or capture
     stops silently after an upgrade."""
+    import httpx
+
     from mnemoseed_local import cli
     from mnemoseed_local.hosts import install as hook_install
 
@@ -1011,6 +1013,17 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"):
         monkeypatch.delenv(var, raising=False)
+    # the real warning resolves its daemon base from the environment; aim it at
+    # the unroutable loopback base so a doctor run cannot dial the live daemon
+    monkeypatch.setenv("MNEMOSEED_LOCAL_BASEURL", hook_install.DETECTION_PROBE_BASE)
+    probed_urls: list[str] = []
+    real_get = httpx.get
+
+    def _record_get(url: str, **kwargs: object) -> httpx.Response:
+        probed_urls.append(url)
+        return real_get(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", _record_get)
     root = tmp_path / ".config" / "opencode"
     target = hook_install.target_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1022,6 +1035,7 @@ def test_doctor_warns_about_an_installed_plugin_that_differs_from_the_shipped_by
     assert "[warn] stale plugin:" in out
     assert "hook install opencode" in out
     assert str(target) in out
+    assert set(probed_urls) == {f"{hook_install.DETECTION_PROBE_BASE}/healthz"}
 
 
 def _write_opencode_registration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str = "") -> Path:
@@ -1126,6 +1140,31 @@ def test_doctor_stays_quiet_without_a_live_registration(
     _mock_daemon_activity(monkeypatch, ingests=3, gateway_calls=0)
     assert main(["doctor"]) == 0
     assert "[warn]" not in capsys.readouterr().out
+
+
+def test_namespace_absent_cli_and_gateway_still_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-A3: no MCP tools registered in the host, yet the CLI and the stdio
+    gateway still work."""
+    from mnemoseed_local.mcp_gateway import server
+
+    config = tmp_path / "opencode.json"
+    config.write_text('{"mcp": {}}', encoding="utf-8")
+    assert _opencode_mcp_registered(config) is False
+
+    assert main(["instructions", "--surface", "generic"]) == 0
+    assert capsys.readouterr().out.strip()
+
+    class _Client:
+        profile_id = "default"
+
+        def post(self, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
+            del path, body
+            return {"memory": {"entries": []}}
+
+    result = server.call_tool(_Client(), "recall", {"query": "x"})  # type: ignore[arg-type]
+    assert result["isError"] is False
 
 
 def test_doctor_absent_opencode_config_skips_silently(

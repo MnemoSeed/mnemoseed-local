@@ -14,10 +14,11 @@ Protocol surface (MCP ``2024-11-05`` shape):
 - ``notifications/initialized`` and every other ``notifications/*`` ->
   ignored, never answered;
 - ``tools/list`` -> the daemon tools (recall / remember / capture / supersede /
-  dream_once / recent_sessions / session_windows — recent_sessions is the B2
-  time-ordered resume surface, session_windows the B2.4 per-session
-  time-window surface, supersede the deliberate belief-replacement verb, and
-  capture the hook-less chat write arm of remember);
+  dream_once / recent_sessions / session_windows / recall_feedback —
+  recent_sessions is the B2 time-ordered resume surface, session_windows the
+  B2.4 per-session time-window surface, supersede the deliberate
+  belief-replacement verb, capture the hook-less chat write arm of remember,
+  and recall_feedback the store-only one-shot miss signal);
 - ``tools/call`` -> proxied to the daemon REST (actor ``mcp``); daemon
   failures and unknown tools come back as structured ``isError`` results so
   the stdin loop never dies;
@@ -35,9 +36,11 @@ import logging
 import re
 import sys
 from dataclasses import replace
-from typing import Any, TextIO
+from datetime import UTC, datetime
+from typing import Any, Final, TextIO
 
 from mnemoseed_local import __version__, daemon_state
+from mnemoseed_local.daemon.observability import RECALL_FEEDBACK_KINDS, is_iso8601
 from mnemoseed_local.mcp_gateway import instructions
 from mnemoseed_local.mcp_gateway.reliable_client import (
     DAEMON_AUTH_HINT,
@@ -62,6 +65,23 @@ METHOD_NOT_FOUND = -32601
 
 #: Audit actor the daemon attributes this surface to.
 ACTOR = "mcp"
+
+#: Immutable failure vocabulary; each gateway failure has exactly one kind.
+ENTRY_FAILURE_KINDS: Final[frozenset[str]] = frozenset(
+    {"entry_unavailable", "auth_refused", "result_not_delivered", "tool_error"}
+)
+
+#: Alternate entry advertised when the daemon could not be entered.
+STDIO_ALTERNATE = "stdio gateway: mnemoseed-local mcp"
+
+#: Credential and config-home cues carried on a refused-credential failure.
+AUTH_ALTERNATE = (
+    "credential/config-home: check MNEMOSEED_LOCAL_HOME on both processes "
+    "or run 'mnemoseed-local credential rotate'"
+)
+
+#: Bounded retry guidance carried on every typed entry failure.
+RETRY_POLICY = "one bounded retry via the stdio gateway"
 
 #: The tool surface: JSON Schema inputSchemas in MCP tools/list shape.
 TOOLS: list[dict[str, Any]] = [
@@ -161,30 +181,45 @@ TOOLS: list[dict[str, Any]] = [
         "Pass caller_cwd (the current workspace directory) for project-context recovery: "
         "the daemon verifies the project binding first and serves only the bound project's "
         "root conversation — selection=unresolved with a reason means nothing was recovered, "
-        "never search other workspaces or chats on your own.",
+        "never search other workspaces or chats on your own. "
+        "Only resume_query produces anchors: its raw text is scanned for bare kebab-case "
+        "identifiers, snake_case, backticked tokens, dotted paths and path basenames. "
+        "n_sessions, n_per_session, self_parent_id and caller_cwd never produce anchors: "
+        "caller_cwd only verifies the binding and self_parent_id only filters roots. "
+        "selection=unresolved carries a reason and next_step and means resolution failed, "
+        "never 'no relevant history'; follow next_step (bind a workspace with "
+        "'mnemoseed-local project bind --root <dir> --profile <id>', or add an identifier "
+        "to resume_query) instead of reporting no history.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "n_sessions": {
                     "type": "integer",
-                    "description": "how many recent session groups to return (default 2, max 5)",
+                    "description": "how many recent session groups to return (default 2, max 5); "
+                    "does not produce anchors",
                 },
                 "n_per_session": {
                     "type": "integer",
-                    "description": "verbatim tail size per session, in chunks (default 20, max 100)",
+                    "description": "verbatim tail size per session, in chunks (default 20, max 100); "
+                    "does not produce anchors",
                 },
                 "resume_query": {
                     "type": "string",
-                    "description": "raw current prompt for scoped-resume matching (max 500 chars)",
+                    "description": "raw current prompt for scoped-resume matching (max 500 chars); "
+                    "the ONLY field whose text produces anchors (kebab-case, snake_case, "
+                    "backticked tokens, dotted paths, path basenames)",
                 },
                 "self_parent_id": {
                     "type": "string",
-                    "description": "the calling session's own parent id (None=root caller, string=child)",
+                    "description": "the calling session's own parent id (None=root caller, string=child); "
+                    "filters roots, never produces anchors",
                 },
                 "caller_cwd": {
                     "type": "string",
                     "description": "the current workspace directory; enables project-context recovery "
-                    "verified against the project binding registry",
+                    "verified against the project binding registry; verifies the binding only, "
+                    "never an anchor — with no binding and no anchors the result is "
+                    "selection=unresolved with a binding next_step",
                 },
             },
             "required": ["resume_query"],
@@ -204,6 +239,28 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "how many recent session groups to return (default 3, max 10)",
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "recall_feedback",
+        "description": "Record a one-shot 'this recall was not useful' signal after a recall miss. "
+        "Stores the signal only: no reranking, no retention change, and no calibration from it alone. "
+        "Call it once per miss; it never changes what future recalls return.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(RECALL_FEEDBACK_KINDS),
+                    "description": "stable signal kind; the first cut serves only 'not_useful'",
+                },
+                "observed_at": {
+                    "type": "string",
+                    "description": "ISO-8601 instant the miss was observed",
+                },
+            },
+            "required": ["kind", "observed_at"],
             "additionalProperties": False,
         },
     },
@@ -285,21 +342,77 @@ def call_tool(client: DaemonClient, name: str, arguments: dict[str, Any]) -> dic
             if arguments.get("n_sessions") is not None:
                 windows_body["sessions"] = arguments["n_sessions"]
             payload = client.post("/session/windows", windows_body)
+        elif name == "recall_feedback":
+            kind = arguments.get("kind")
+            if kind not in RECALL_FEEDBACK_KINDS:
+                return _error_result(f"recall_feedback requires a kind in {sorted(RECALL_FEEDBACK_KINDS)}")
+            observed_at = arguments.get("observed_at")
+            if not isinstance(observed_at, str) or not is_iso8601(observed_at):
+                return _error_result("recall_feedback requires an ISO-8601 observed_at")
+            payload = client.post(
+                "/memory/recall_feedback",
+                {"profile_id": client.profile_id, "kind": kind, "observed_at": observed_at},
+            )
         else:
             return _error_result(f"unknown tool: {name!r}")
     except DaemonRestError as exc:
         if exc.status == 401:
             # A refused credential is its own failure shape: it must never
             # read as a connectivity problem.
-            return _error_result(DAEMON_AUTH_HINT)
-        return _error_result(f"daemon error: {exc}")
+            return entry_error_result(
+                "auth_refused", DAEMON_AUTH_HINT, observed_at=_now_iso(), alternate=AUTH_ALTERNATE
+            )
+        return entry_error_result(
+            "result_not_delivered",
+            f"daemon error: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     except DaemonUnavailableError as exc:
-        return _error_result(f"daemon error: {exc}")
+        return entry_error_result(
+            "entry_unavailable",
+            f"daemon error: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     except Exception as exc:  # never kill the loop on a tool call
-        return _error_result(f"tool {name!r} failed: {exc}")
+        return entry_error_result(
+            "tool_error",
+            f"tool {name!r} failed: {exc}",
+            observed_at=_now_iso(),
+            alternate=STDIO_ALTERNATE,
+        )
     return {
         "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}],
         "isError": False,
+    }
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def entry_error_result(
+    kind: str,
+    reason: str,
+    *,
+    observed_at: str,
+    alternate: str,
+) -> dict[str, Any]:
+    """An isError result that keeps ``reason`` verbatim and adds a typed,
+    additive entry-failure descriptor for callers that can act on it."""
+    if kind not in ENTRY_FAILURE_KINDS:
+        raise ValueError(f"unknown entry failure kind: {kind!r}")
+    datetime.fromisoformat(observed_at)
+    return {
+        "content": [{"type": "text", "text": reason}],
+        "isError": True,
+        "entry_failure": {
+            "kind": kind,
+            "observed_at": observed_at,
+            "alternate": alternate,
+            "retry_policy": RETRY_POLICY,
+        },
     }
 
 

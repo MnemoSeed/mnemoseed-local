@@ -56,12 +56,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from mnemoseed_local.capture.stamper import ConsistencyVerdict, NearDuplicateChecker, WriteConfig
 from mnemoseed_local.config import Config, live_home_dir
 from mnemoseed_local.daemon.actor import resolve_actor
-from mnemoseed_local.daemon.observability import Observability
+from mnemoseed_local.daemon.observability import RECALL_FEEDBACK_KINDS, Observability, is_iso8601
 from mnemoseed_local.decay import Reinforcer
 from mnemoseed_local.dream import DreamTrigger, TriggerStatus
 from mnemoseed_local.hosts.common.project_binding import (
@@ -328,6 +328,28 @@ class ReinforceRequest(BaseModel):
         return self
 
 
+class RecallFeedbackRequest(BaseModel):
+    """One-shot store-only recall miss signal."""
+
+    profile_id: ProfileRef
+    kind: str
+    observed_at: str
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, value: str) -> str:
+        if value not in RECALL_FEEDBACK_KINDS:
+            raise ValueError(f"unknown recall feedback kind: {value!r}")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def _iso_observation(cls, value: str) -> str:
+        if not is_iso8601(value):
+            raise ValueError("observed_at must be ISO-8601")
+        return value
+
+
 # Scoped-resume anchor extraction (issue #187): bare kebab identifiers (at
 # least 8 chars, OR 2+ hyphens, OR a digit), bare snake_case, backticked
 # tokens, dotted paths, and path basenames — the stable identifiers a resuming
@@ -457,6 +479,19 @@ _RECENT_SESSIONS_GUIDANCE = (
     "dormant session (active=false), resume its work only when the user asks "
     "this session to continue THAT specific work, and prefer finishing the "
     "work already in flight here first."
+)
+
+#: The documented, non-guessing way to give a workspace a memory profile.
+_BIND_STEP = (
+    "bind the workspace without guessing: 'mnemoseed-local project bind "
+    "--root <dir> --profile <existing-id>' (create the profile first with "
+    "'mnemoseed-local profile create <id>' if needed)"
+)
+
+#: Only resume_query carries anchors; the other resume inputs never do.
+_ANCHOR_STEP = (
+    "put a repository or session identifier in resume_query; only that field produces "
+    "anchors (kebab-case, snake_case, backticked tokens, dotted paths, path basenames)"
 )
 
 
@@ -1247,10 +1282,10 @@ class MemoryService:
             "profile_last_persisted_at": profile_newest,
         }
 
-    def _unresolved(self, profile_id: str, reason: str) -> dict[str, Any]:
+    def _unresolved(self, profile_id: str, reason: str, *, next_step: str | None = None) -> dict[str, Any]:
         """The explicit no-context result: zero injectable tails plus the
         machine-readable reason a recovery consumer needs to react."""
-        return {
+        result: dict[str, Any] = {
             "profile_id": profile_id,
             "sessions": [],
             "self_window": None,
@@ -1259,6 +1294,9 @@ class MemoryService:
             "selection_reason": reason,
             "visibility": self._visibility_mode_payload(),
         }
+        if next_step is not None:
+            result["next_step"] = next_step
+        return result
 
     def _session_recent_scoped(
         self,
@@ -1271,12 +1309,19 @@ class MemoryService:
         active_sessions: frozenset[str] = frozenset(),
         resume_query: str | None,
         self_parent_id: str | None = None,
+        no_anchor_context: str = "",
     ) -> dict[str, Any]:
         """Scoped-resume matching (issue #187): extract anchors, scan USER
         segments, filter to root sessions, return matched tails."""
         anchors = _extract_resume_anchors(resume_query)
         if not anchors:
-            return self._unresolved(profile_id, "no anchors")
+            context = f"{no_anchor_context} and " if no_anchor_context else ""
+            return self._unresolved(
+                profile_id,
+                f"{context}resume_query has no anchor identifier: resolution failed, "
+                "not 'no relevant history'",
+                next_step=f"{_ANCHOR_STEP}; or {_BIND_STEP}",
+            )
         # Scan a bounded page for anchor hits in USER segments only
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RECENT_SCAN_LIMIT)
@@ -1391,7 +1436,9 @@ class MemoryService:
             # still applies; without one there is no honest recovery input.
             if resume_query is None:
                 return self._unresolved(
-                    profile_id, "caller workspace is not a bound project and no resume_query"
+                    profile_id,
+                    "caller workspace is not a bound project and no resume_query",
+                    next_step=_BIND_STEP,
                 )
             return self._anchor_recovery(
                 profile_id=profile_id,
@@ -1403,6 +1450,7 @@ class MemoryService:
                 resume_query=resume_query,
                 self_parent_id=self_parent_id,
                 reason="anchors from the raw prompt",
+                no_anchor_context="caller workspace is not a bound project",
             )
         if bound_profiles != {profile_id}:
             shown = ", ".join(sorted(bound_profiles))
@@ -1464,6 +1512,7 @@ class MemoryService:
         resume_query: str | None,
         self_parent_id: str | None,
         reason: str,
+        no_anchor_context: str = "",
     ) -> dict[str, Any]:
         """The #187 anchor path under recovery dispatch: matched results carry
         the resolution reason so a consumer can tell how the project was
@@ -1477,6 +1526,7 @@ class MemoryService:
             active_sessions=active_sessions,
             resume_query=resume_query,
             self_parent_id=self_parent_id,
+            no_anchor_context=no_anchor_context,
         )
         if result["selection"] == "matched":
             result["selection_reason"] = reason
@@ -2762,6 +2812,18 @@ class MemoryService:
             "limit": page.limit,
         }
 
+    def recall_feedback(self, *, profile_id: str, kind: str, observed_at: str, actor: str) -> dict[str, Any]:
+        """Append one miss signal to the immutable audit ledger and change nothing else."""
+        self._stores.meta.audit_append(
+            AuditEntry(
+                actor=actor,
+                action="recall_feedback",
+                detail={"profile_id": profile_id, "kind": kind, "observed_at": observed_at},
+                at=time.time(),
+            )
+        )
+        return {"ok": True, "kind": kind, "observed_at": observed_at}
+
     def _audit(self, profile_id: str, action: str, detail: dict[str, Any], *, actor: str = "console") -> None:
         self._stores.meta.audit_append(AuditEntry(actor=actor, action=action, detail=detail, at=time.time()))
 
@@ -2925,6 +2987,18 @@ def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, 
     """B1 read route: profile-scoped error_events with evidence-fate resolution."""
     service: MemoryService = request.app.state.memory
     return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
+
+
+@router.post("/memory/recall_feedback")
+def memory_recall_feedback(req: RecallFeedbackRequest, request: Request) -> dict[str, Any]:
+    """Store-only one-shot recall miss signal; no ranking or retention effect."""
+    service: MemoryService = request.app.state.memory
+    return service.recall_feedback(
+        profile_id=req.profile_id,
+        kind=req.kind,
+        observed_at=req.observed_at,
+        actor=resolve_actor(request),
+    )
 
 
 @router.post("/memory/forget_this")
