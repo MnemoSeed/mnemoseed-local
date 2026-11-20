@@ -2046,3 +2046,29 @@ def test_recall_pending_sweep_finds_effective_slot(config_path: Path) -> None:
         ).json()
         # after fix, HTTP pull via wire must find the effective slot (sweep), before fix it returns []
         assert len(http_pulled["items"]) > 0, http_pulled
+
+
+def test_recent_sessions_unresolved_reports_bind_next_step(
+    config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbound caller with an anchorless resume_query is unresolved, and the
+    wire payload names the bind command so the caller can act on the signal."""
+    monkeypatch.setenv("MNEMOSEED_LOCAL_HOME", str(tmp_path / "isolated-home"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with _boot(config_path) as client:
+        payload = client.post(
+            "/session/recent",
+            json={
+                "profile_id": PROFILE,
+                "caller_cwd": str(workspace),
+                "resume_query": "codex 对话记录 导入 mnemoseed 记忆 历史回填 import",
+                "self_parent_id": None,
+            },
+        ).json()
+
+    assert payload["selection"] == "unresolved"
+    assert "not a bound project" in payload["selection_reason"]
+    assert "no anchor identifier" in payload["selection_reason"]
+    assert "next_step" in payload
+    assert "mnemoseed-local project bind --root <dir> --profile <" in payload["next_step"]
