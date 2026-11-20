@@ -1,7 +1,7 @@
 # PRD-309 · 公开 Alpha 执行计划（证据刷新版）
 
-> 版本：`2026-11-18-309-alpha-refresh`。状态：**PLANNING REFRESH / NOT AN ENGINEERING AUTHORIZATION**。
-> 基线：当前 `main` = `8a9a1158a41e6633aaa1c9a0eb60e26d22b24fea`（2026-11-18 查询）。
+> 版本：`2026-11-19-309-alpha-refresh`。状态：**PLANNING REFRESH / NOT AN ENGINEERING AUTHORIZATION**。
+> 基线：当前 `main` = `8ad2d6ace54c1fca467796cc6ddfcbf596318168`（2026-11-19 查询）。
 > 席位：`product-manager`。本文件只做计划对账、门槛与决策点定义；不授权工程、发布、部署、对外联系或改动已安装运行时。
 > 证据纪律：所有判断链接到下方证据；无证据标 `[未验证]`。本轮未跑产品测试，门槛数值为**待冻结的提案目标**，不是已测 SLA。
 
@@ -23,7 +23,7 @@ below. Eight customer-facing claims are marked SHIPPED / PARTIAL / UNVERIFIED / 
 ## 0. PM 结论（先读）
 
 1. **Alpha 的出口不是"功能齐全"，而是 G1 的一段真实闭环**：真实 host 捕获 → 持久化 → 受控重启 → 新会话恢复 → MCP 实际调用与代理使用 → 人工确认有用。原计划 §3 的硬门保持不变，不能用文档、ACK、握手或模型复述替代。
-2. **当前 main 的能力面比原计划假设更靠前**：#281 与 #310 已 CLOSED，四个历史 reader 已合并且已在代码中注册。原 r3 的"36 open 快照"已过时（今日为 35 open）。这些变化缩短了部分工程面，但**没有**产生任何真实 host 有用性证据。
+2. **当前 main 的能力面比原计划假设更靠前**：#281 与 #310 已 CLOSED，四个历史 reader 已合并且已在代码中注册。原 r3 的"36 open 快照"已过时（2026-11-19 执行时 `gh issue list` 实测为 23 open）。这些变化缩短了部分工程面，但**没有**产生任何真实 host 有用性证据。
 3. **自助 Alpha（G2）仍被四个客户可见缺口卡住**：PyPI 未发布（#179 OPEN，404 实测）、provider catalog 未实现（#381 OPEN）、`recent_sessions` 锚点语法（#411 OPEN）、配置重载无效写入未拦截（#385 OPEN）。加上跨 host 项目绑定 #311 OPEN，G2 不具备"无人值守可自助"的前提。
 4. **设计 14 是工程架构事实，不是产品承诺**：其 §6 的 `mnemoseed-local setup` 一条命令流程在 CLI 中**不存在**（当前动词为 `init --mode capture-recall` + `doctor` + installers）；其 §2 的 host 矩阵把 zcode 回填标为 ❌，与今日已合并的 zcode reader 冲突。两者都需在 G0 文档门中处理。
 5. **不要重问 D01–D06**：原 owner 已授权方向；本文只新增需要今日裁决的 D-A..D-F（§5）。
@@ -62,11 +62,13 @@ below. Eight customer-facing claims are marked SHIPPED / PARTIAL / UNVERIFIED / 
 | 跨 host 同一项目绑定 | #311 OPEN | 计划 G2 单元 B311-BINDING/HOSTS | **NOT SHIPPED**；G2 BLOCKER |
 | Python 3.14 | `requires-python >=3.14`、ruff/mypy `py314`、commit `68b2dcf` | design 14 §7 | **SHIPPED（工程事实）** |
 
+> 在途项真实状态（2026-11-19 执行时 `gh issue list` / `gh pr view` 实测）：#385 OPEN，其修复 PR #432 OPEN / MERGEABLE（独立 QA 判词 CLOSABLE，合并待执行）；#440、#390、#441 均为 queue / OPEN，未关闭。本批 W1-D（#441 + G0 文档对齐）承接 design 14 §2/§6 的 G0-2 项。
+
 ## 3. 与原 #309 计划的差异（reconciliation）
 
 | 原计划假设（r3 / retrieval-v1，2026-10-30） | 今日事实 | 对计划的影响 |
 |---|---|---|
-| 61 单元 / 36 open 快照 | 35 open；#281、#310 已 CLOSED | 从 G2 依赖中移除 B281/B310 的"关闭"义务，但**保留**真实 host 证据义务（G1 必须重新证明"当前事实"与"无 Ollama 模式"） |
+| 61 单元 / 36 open 快照 | 23 open（2026-11-19 执行时实测）；#281、#310 已 CLOSED | 从 G2 依赖中移除 B281/B310 的"关闭"义务，但**保留**真实 host 证据义务（G1 必须重新证明"当前事实"与"无 Ollama 模式"） |
 | 停点 B301 现有候选待 QA、A292 文档收口 | 今日 issue 列表不含 B301/A292 的未完成标记；本轮不重判其终态 | 不宣称它们已完成；按原 admission 规则逐片核验，不因本计划刷新释放旧 unknown |
 | G1 手工固定源码、不依赖 PyPI/v2/第二 host | 仍成立，且更紧迫：PyPI 404、版本回退 0.1.0 | G1 路线**不变**；R310 的 index 路线仍 `BLOCKED_OPERATOR` |
 | R310 冻结版本（原计划"不猜版本号"） | 曾冻结 0.3.0，后被 owner 重新冻结 0.1.0；PyPI 仍 404 | 版本身份以 main 当前 0.1.0 为准；不得 retag 0.3.0，发布必须重新生成 manifest |
@@ -83,9 +85,11 @@ below. Eight customer-facing claims are marked SHIPPED / PARTIAL / UNVERIFIED / 
 | 项 | 退出判据 | 证据 | Owner |
 |---|---|---|---|
 | G0-1 | README/guide 的 import 段列出 4 个 host 的真实命令与 `--dry-run` 用法；三个新 reader 各附至少一个真实或合成 fixture 的导入报告 | 文档 diff + fixture 报告 | PM + docs engineer |
-| G0-2 | design 14 §2 host 矩阵把 zcode 回填更新为 ✅（或注明"reader 已合并、真实数据待证"）；§6 明确 `setup` 是设计目标、当前动词为 `init --mode capture-recall` | 设计文档 diff | PM + solution-architect |
+| G0-2 | design 14 §2 host 矩阵把 zcode 回填更新为 ✅（或注明"reader 已合并、真实数据待证"）；§6 明确 `setup` 是设计目标、当前动词为 `init --mode capture-recall`（本批 W1-D 已承接：design 14 §2 zcode 行与 §6 setup 注记已更新） | 设计文档 diff | PM + solution-architect |
 | G0-3 | 本文落主干，且 org `_state.md` 当前指针指向本文（不是旧 v1/不存在的 accepted-v1） | 合并 PR + `_state.md` | PM |
 | G0-4 | §7 的 8 条客户承诺逐条裁定：CONTRADICTED 项要么改代码、要么改文档措辞，不允许保持"文档暗示已交付" | 对账表更新 | PM + owner（D-A/D-B） |
+
+> **G0-4 后续对账（W1-D 登记）**：README.md:47-53 仍宣称"bind a model through the console provider catalog"，而本文 §2 catalog 行（第 59 行）把同一能力标为 CONTRADICTED / PARTIAL（#381 OPEN）。S5/S6（W1-B，#381）排在本批之后，故本批不改 README 的该声明；**待 W1-B/S6 合并后，对账 README.md:47-53 与本文 §2 catalog 行并关闭 G0-4**，不得静默遗留。
 
 ### G1 — 陪同私测（沿用原计划 §3，不降门）
 
