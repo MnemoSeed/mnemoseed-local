@@ -35,6 +35,16 @@ ALLOWED_CONSTRUCTIONS = {
     "test_daemon_credential_boundary.py": (
         "the issuer-swap app is driven with explicit headers, including the empty set that must be refused"
     ),
+    "test_llm_routes.py": (
+        "a bare FastAPI app carrying only the llm router: no credential gate exists on it; "
+        "the credential gate is verified separately by the daemon credential-boundary suites"
+    ),
+    "test_secrets_routes.py": (
+        "a bare FastAPI app carrying only the secrets router (one site also adds request logging): "
+        "no credential gate exists on it; the create_app site sends no credential on purpose to "
+        "assert default-deny 401; the credential gate is verified separately by the daemon "
+        "credential-boundary suites"
+    ),
 }
 
 BYPASS_TOKENS = (

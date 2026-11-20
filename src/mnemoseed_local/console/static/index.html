@@ -432,6 +432,7 @@
       <div class="page-head">
         <h1 id="config-page-title" class="page-title">Config</h1>
         <p class="page-desc">Edit one key at a time. Every write is validated, versioned, audited, and applied to the running daemon — the settings DB is primary, <code>config.toml</code> is its mirror.</p>
+        <button id="config-wizard-open" class="btn btn-primary" type="button">Configure Dream provider</button>
       </div>
 
       <div id="config-restart-banner" class="banner banner-warn" hidden role="status">
@@ -620,6 +621,14 @@
         <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
         <button value="confirm" class="btn btn-primary" type="submit">Supersede</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="provider-wizard" class="dialog wizard-dialog" aria-labelledby="wizard-title">
+    <form method="dialog" class="dialog-body">
+      <h3 id="wizard-title" class="dialog-title">Configure Dream provider</h3>
+      <p class="muted small">Pick a provider, enter its key, test the connection, then choose a model. Nothing is preselected.</p>
+      <div id="provider-wizard-body"></div>
     </form>
   </dialog>
 

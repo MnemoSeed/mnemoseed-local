@@ -65,6 +65,8 @@ from mnemoseed_local.daemon.ingest_recovery import queue_drain_fn, recover_pendi
 from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.daemon.memory import router as memory_router
 from mnemoseed_local.daemon.observability import Observability
+from mnemoseed_local.daemon.secrets_routes import LazySecretStore
+from mnemoseed_local.daemon.secrets_routes import router as secrets_router
 from mnemoseed_local.decay import DecaySweeper
 from mnemoseed_local.decay.rebuild import rebuild_pin_weights
 from mnemoseed_local.dream import (
@@ -85,6 +87,7 @@ from mnemoseed_local.dream.pipeline import ExtractFailure, RunCompletion
 from mnemoseed_local.dream.readiness import NO_ROUTE_DETAIL, DreamRouteReadiness
 from mnemoseed_local.endpoint import EndpointRecord, clear_endpoint, write_endpoint
 from mnemoseed_local.llm import RoleRouter
+from mnemoseed_local.llm.routes import router as llm_router
 from mnemoseed_local.llm.types import (
     ChatResult,
     DreamLLM,
@@ -97,6 +100,7 @@ from mnemoseed_local.mcp_gateway.http_transport import router as mcp_router
 from mnemoseed_local.retrieve.cues import CueConfig, _is_tool_name, extract_cues
 from mnemoseed_local.schema.stamp import CognitiveTier
 from mnemoseed_local.schema.turn import ProfileArchiveRequest, ProfileCreateRequest, Turn, TurnRole
+from mnemoseed_local.secrets.store import SecretStore
 from mnemoseed_local.storage.factory import Stores, build_stores
 from mnemoseed_local.storage.ports import (
     AuditEntry,
@@ -822,7 +826,7 @@ def _audit_extract_failure(meta: Any, failure: ExtractFailure) -> None:
 
 
 def _build_capture(
-    stores: Stores, config: Config, configwrite: ConfigWriteService
+    stores: Stores, config: Config, configwrite: ConfigWriteService, secret_store: SecretStore
 ) -> tuple[
     WritingPipeline,
     DreamTrigger,
@@ -868,7 +872,7 @@ def _build_capture(
         routes=config.llm,
         audit=stores.meta,
         generation=configwrite.generation_for,
-        secrets=None,
+        secrets=secret_store,
     )
     if not config.llm:
         logger.info(DREAM_NOT_CONFIGURED_NOTICE)
@@ -1134,6 +1138,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # registry keys once and then lets the DB win over a hand-edited file.
     app.state.configwrite = ConfigWriteService(config, stores.meta)
     app.state.configwrite.reconcile_boot()
+    if getattr(app.state, "secret_store", None) is None:
+        app.state.secret_store = LazySecretStore()
     (
         app.state.capture,
         app.state.dream,
@@ -1144,7 +1150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         deferred_resumes,
         app.state.score_pool,
         app.state.dream_readiness,
-    ) = _build_capture(stores, config, app.state.configwrite)
+    ) = _build_capture(stores, config, app.state.configwrite, app.state.secret_store)
     app.state.segmenter = TurnSegmenter(app.state.capture)
     app.state.ingest_queue = IngestQueue(stores.meta)
     app.state.drain = queue_drain_fn(app.state.ingest_queue, app.state.capture)
@@ -1319,13 +1325,18 @@ def _request_logging_middleware(app: Any, get_state: Callable[[], Any]) -> Any:
     return _entry
 
 
-def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
+def create_app(
+    *, token_verifier: TokenVerifier | None = None, secret_store: SecretStore | None = None
+) -> FastAPI:
     """Build the daemon app.
 
     ``token_verifier`` is the authorization seam: omitted, the local issuer's
     verifier (the credential file in the config home) guards the surface;
     passed explicitly, a different issuer's verifier guards it. The clients
-    have no knowledge of which one is in play.
+    have no knowledge of which one is in play. ``secret_store`` is the shared
+    key-custody seam: the write route and the role router both read the same
+    instance from ``app.state``. Omitted, resolution stays lazy so boot callers
+    never trigger the OS-keyring build probe.
     """
     app = FastAPI(title="MnemoSeed Local", version=__version__, lifespan=lifespan)
     app.state.instance_id = str(uuid.uuid4())
@@ -1336,12 +1347,15 @@ def create_app(*, token_verifier: TokenVerifier | None = None) -> FastAPI:
     app.state.segmenter = TurnSegmenter(app.state.capture)
     app.state.observability = Observability()
     app.state.token_verifier = token_verifier if token_verifier is not None else LocalFileTokenVerifier()
+    app.state.secret_store = secret_store if secret_store is not None else LazySecretStore()
     # The console document set is enumerated at every boot (and here, so an app
     # whose lifespan never ran still answers only the enumerated documents).
     app.state.console_documents = console_documents()
     app.include_router(ingest_router)
     app.include_router(memory_router)
     app.include_router(configwrite_router)
+    app.include_router(llm_router)
+    app.include_router(secrets_router)
     # The loopback HTTP MCP transport: registered with the other routers, ahead
     # of the console mount below (Starlette matches in registration order, and
     # the mount would otherwise swallow /mcp).

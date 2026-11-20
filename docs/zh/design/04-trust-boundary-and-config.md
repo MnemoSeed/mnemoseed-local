@@ -122,6 +122,11 @@ flowchart LR
 | `POST /api/v1/config/set` | 单一写者写路径 | 非回环 baseurl 403；未知键/坏值 422 命名键 |
 | `GET /api/v1/config/versions` | 版本化历史（注册表键，内部记录永不外泄） | 逐键从 v1 起滚读，`value` 经 `_redact` |
 | `POST /api/v1/config/rollback` | 回滚（**append-only**：新记录，永不删除） | `version_id` 解码→(key,version)→还原值→patch→热生效→审计 `config.rollback` |
+| `GET /api/v1/llm/catalog` | provider preset 目录 + 已注册 driver 名 | 纯静态数据，零 key、零 I/O |
+| `POST /api/v1/llm/probe` | Test Connection：ad-hoc 构造临时 driver 调 `check()` | 结果白名单（status + model id）；绝不触 RoleRouter 缓存、绝不持久化/审计/日志 key；错误详情不含原始异常文本 |
+| `POST /api/v1/llm/models` | 拉 provider 模型清单（curated + API） | 同 probe 白名单；完整请求字节（base_url 含 query/key/model）零 key 出流 |
+| `POST /api/v1/llm/detect-local` | 探测本机 Ollama（`OLLAMA_HOST`，默认 `127.0.0.1:11434/api/tags`） | 有界超时；不可达返回 `available=false`；继承 loopback + 凭据门 |
+| `POST /api/v1/secrets/set` | 向导先把 provider key 值写入 SecretStore，再绑定 `secrets:mnemoseed/dream/<role>` 引用 | 手动解析 body + 固定 detail；名称仅允许 `mnemoseed/dream/<role>`（拒 `daemon/credential` 及别名、共享槽后延）；响应只含 ok/name/backend，无 value/masked_tail；默认拒绝凭据门自动覆盖；不写审计、请求日志只记 method/path/status；默认 store 懒解析，裸 `create_app()` 不探 OS keyring |
 
 ### 1.5 信任边界流
 

@@ -1,0 +1,115 @@
+{
+  "targetDir": "src/mnemoseed_local/console/static/app.js",
+  "totalFindings": 6,
+  "guides": [
+    {
+      "guideId": "ime-safe-enter-submit",
+      "retrieveCommand": "npx modern-web-guidance retrieve ime-safe-enter-submit",
+      "count": 2,
+      "rules": [
+        {
+          "ruleId": "ime-safe-enter-submit",
+          "summary": "Flag keydown event listeners on inputs or textareas intercepting Enter (event.key or event.code \"Enter\") to submit forms, send messages, or trigger actions without checking event.isComposing or event.keyCode === 229, breaking IME input in CJK languages.",
+          "verifierRubric": {
+            "keepWhen": [
+              "Keydown event listeners on inputs or textareas checking event.key === \"Enter\" or event.code === \"Enter\" to trigger submission, search, or message sending without checking event.isComposing or event.keyCode === 229.",
+              "Custom enter-to-submit implementations intercepting Enter to call form.submit(), form.requestSubmit(), or trigger a click on a submit button without IME composition gating."
+            ],
+            "dropWhen": [
+              "Keyup or keypress event listeners (composition has already ended by keyup).",
+              "Handlers that check event.isComposing or event.keyCode === 229.",
+              "Handlers that detect Enter only through event.keyCode === 13 or event.which === 13 (the keydown that confirms an IME composition reports keyCode 229, so these never fire mid-composition).",
+              "Handlers strictly requiring modifier keys (Ctrl+Enter or Cmd+Enter) where IME character selection is not triggered.",
+              "Native form submit events or standard inputs inside a form with no custom Enter keydown listener (native Enter submission handles IME automatically).",
+              "Global document-level hotkeys, non-text UI widgets (buttons, menus, tabs, treeviews, dropdowns, modals, media players), or rich-text/code editor newline/indentation handlers rather than text-input submission."
+            ]
+          },
+          "count": 2,
+          "findings": [
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 412,
+              "message": "Keydown Enter listener triggers submission/action without checking event.isComposing or event.keyCode === 229 for IME composition safety",
+              "lineContent": "inp.addEventListener(\"keydown\", (e)=>{ if(e.key===\"Enter\" && inp.tagName!==\"TEXTAREA\"){ e.preventDefault(); saveConfigKey(inp.dataset.key); } });"
+            },
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 1831,
+              "message": "Keydown Enter listener triggers submission/action without checking event.isComposing or event.keyCode === 229 for IME composition safety",
+              "lineContent": "if(e.key===\"Enter\"){ row.click(); }"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "guideId": "js",
+      "retrieveCommand": "npx modern-web-guidance retrieve js",
+      "count": 4,
+      "rules": [
+        {
+          "ruleId": "js/copying-array-methods",
+          "summary": "Replace shallow-copy array sorting, reversing, and reverse search with toSorted(), toReversed(), findLast(), and findLastIndex().",
+          "verifierRubric": {
+            "keepWhen": [
+              "Array (or TypedArray via .slice()) copied via [...arr], arr.slice(), arr.slice(0), or arr.concat()."
+            ],
+            "dropWhen": [
+              "Spread [...x] on non-Array iterable (Set, Map, NodeList, HTMLCollection, DOMTokenList, FileList, arguments, string).",
+              "Sparse holes (slice preserves holes; toSorted fills undefined), callback index/array args for findLast/findLastIndex (does not apply to toReversed() or toSorted()), or un-inverted findIndex.",
+              "Visible project configuration in snippet targets pre-ES2023 (explicit engines.node < 20 or tsconfig lib/target older than ES2023; do not drop code merely because it uses var, ES5 syntax, or sits in a library/vendor file) or feature guards/polyfills."
+            ]
+          },
+          "count": 2,
+          "findings": [
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 668,
+              "message": "Use versions.toSorted((a,b)=> (b.version_id||b.version||0) - (a.version_id||a.version||0)) instead of copying before .sort().",
+              "lineContent": "const sorted = [...versions].sort((a,b)=> (b.version_id||b.version||0) - (a.version_id||a.version||0));"
+            },
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 1306,
+              "message": "Use atlasState.items.toSorted((a,b)=> hash01(a.id||a.chunk_id||a.node_id) - hash01(b.id||b.chunk_id||b.node_id)) instead of copying before .sort().",
+              "lineContent": "const sorted = [...atlasState.items].sort((a,b)=> hash01(a.id||a.chunk_id||a.node_id) - hash01(b.id||b.chunk_id||b.node_id));"
+            }
+          ]
+        },
+        {
+          "ruleId": "js/replace-children-innerhtml",
+          "summary": "Replace standalone empty innerHTML assignments (el.innerHTML = \"\") with el.replaceChildren() to avoid HTML parsing and Trusted Types CSP failures.",
+          "verifierRubric": {
+            "keepWhen": [
+              "A standalone statement clears a DOM Element, ShadowRoot, or SVGElement via .innerHTML = \"\" or .innerHTML = null (including when followed by appendChild/append calls to insert new nodes), where el.replaceChildren() avoids HTML parsing and Trusted Types CSP failures."
+            ],
+            "dropWhen": [
+              "The receiver is a <template> element (where template.innerHTML = \"\" clears template.content, whereas template.replaceChildren() leaves template.content untouched) or a DocumentFragment / template.content (DocumentFragment has no innerHTML setter, so .innerHTML = \"\" is a no-op whereas replaceChildren() removes children).",
+              "The receiver is bare document or a non-DOM mock, serializer, virtual DOM node, or plain JavaScript object that happens to define an innerHTML property.",
+              "The empty innerHTML assignment is redundantly followed by another innerHTML assignment (= or +=) on the same receiver in the same block without intervening control flow, await/yield, or reads of its HTML/text content.",
+              "The assignment is part of a chained assignment or expression context whose empty-string result is consumed, relies on Custom Element disconnectedCallback() ordering, or sits inside a genuine legacy-browser DOM polyfill/shim or explicit replaceChildren() feature-detection guard."
+            ]
+          },
+          "count": 2,
+          "findings": [
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 374,
+              "message": "Assigning empty innerHTML invokes the HTML parser and fails under Trusted Types; use element.replaceChildren() (or element.replaceChildren(newContent)) instead.",
+              "lineContent": "body.innerHTML = \"\";"
+            },
+            {
+              "file": "src/mnemoseed_local/console/static/app.js",
+              "line": 2167,
+              "message": "Assigning empty innerHTML invokes the HTML parser and fails under Trusted Types; use element.replaceChildren() (or element.replaceChildren(newContent)) instead.",
+              "lineContent": "editor.innerHTML = \"\";"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "activeRuleCount": 52,
+  "activeGuideCount": 38,
+  "note": "Checked 38 guides (52 deterministic rules; ~20% of the guidance corpus). Finding 6 items here only reflects deterministic legacy patterns; use 'search <topic>' for the rest of the catalog."
+}

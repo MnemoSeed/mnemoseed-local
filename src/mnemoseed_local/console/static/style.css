@@ -346,3 +346,18 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font
   .drawer{position:relative; width:100% !important; min-height: 320px}
   .legend{left:8px; right:8px; bottom:30px}
 }
+
+/* ---------- Provider wizard ---------- */
+.wizard-dialog{max-width:640px}
+.wizard-presets{display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px}
+.provider-card{cursor:pointer; display:flex; align-items:center; gap:8px; padding:10px 12px; border:2px solid transparent}
+.provider-card:has(> :checked){outline:2px solid var(--accent); border-color:var(--accent)}
+.provider-radio{accent-color:var(--accent)}
+.provider-name{font-size:12px; font-weight:600}
+.wizard-fields,.wizard-actions,.wizard-models{display:grid; gap:8px; margin-top:12px}
+.wizard-field{display:grid; gap:4px; font-size:12px; color:var(--muted)}
+.wizard-key-row{display:flex; align-items:end; gap:8px}
+.wizard-key-row .wizard-field{flex:1}
+.wizard-model-list{display:grid; gap:4px; max-height:180px; overflow:auto; border:1px solid var(--line); border-radius:var(--radius); padding:6px}
+.wizard-model{text-align:left; cursor:pointer; border:1px solid transparent; background:var(--surface-2); border-radius:8px; padding:6px 10px; font-size:12px}
+.wizard-model.is-selected{outline:2px solid var(--accent); border-color:var(--accent)}
