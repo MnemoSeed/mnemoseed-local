@@ -13,6 +13,7 @@ from mnemoseed_local.hosts.common.fence import (
     RECALL_DISCLAIMER,
     RECALL_FENCE_CLOSE,
     RECALL_FENCE_OPEN,
+    recall_item_prefix,
     sanitize_recall_text,
 )
 from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE
@@ -22,6 +23,12 @@ from mnemoseed_local.schema.stamp import EXPLICIT_PIN_SOURCE
 #: annotated (absence is the captured signal). 9 chars including the leading
 #: separator; decoration only, NEVER part of the verbatim text.
 PIN_SUFFIX = " ⟵ pinned"
+
+
+def _item_marker_prefix(item: Any) -> str:
+    provenance = item.get("memory_provenance") if isinstance(item, dict) else None
+    observed = item.get("memory_observed_at") if isinstance(item, dict) else None
+    return recall_item_prefix(provenance, observed)
 
 
 def build_t2_context(
@@ -69,6 +76,7 @@ def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal:
     # tracked so a rebuild can never be mis-indexed against `lines[2 + i]`
     # when the affix is shed a second time in one call.
     kept_affix = 0
+    marker_chars = 0
     affix_indices: list[int] = []
     for item in items:
         raw = item.get("text") if isinstance(item, dict) else None
@@ -78,6 +86,7 @@ def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal:
         # The affix rides ONLY an explicitly-pinned item; a captured (other
         # source) or source-less item is NOT annotated — absence is the
         # captured signal, the most token-lean rendering.
+        prefix = _item_marker_prefix(item)
         pinned = isinstance(item, dict) and item.get("source") == EXPLICIT_PIN_SOURCE
         affix_len = len(PIN_SUFFIX) if pinned else 0
         line_cost = len(text) + 1 + affix_len
@@ -94,13 +103,15 @@ def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal:
                     for index in affix_indices:
                         lines[index] = lines[index][: -len(PIN_SUFFIX)]
                     affix_indices = []
-                lines.append(text)
+                lines.append(prefix + text)
                 remaining -= len(text) + 1
+                marker_chars += len(prefix)
                 committed = True
                 continue
             return None
-        lines.append(text + PIN_SUFFIX if pinned else text)
+        lines.append(prefix + (text + PIN_SUFFIX if pinned else text))
         remaining -= line_cost
+        marker_chars += len(prefix)
         kept_affix += affix_len
         if pinned:
             affix_indices.append(len(lines) - 1)
@@ -109,6 +120,6 @@ def _build_t2_lines(items: list[dict[str, Any]] | Any, item_budget: int, signal:
         return None
     lines.append(RECALL_FENCE_CLOSE)
     block = "\n".join(lines)
-    if len(block) > item_budget + wrapper:
+    if len(block) > item_budget + wrapper + marker_chars:
         return None
     return block
