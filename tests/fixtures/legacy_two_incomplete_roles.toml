@@ -1,0 +1,18 @@
+preset = "embedded"
+baseurl = "__BASEURL__"
+
+[storage.graph.instances.isolated]
+driver = "sqlite_graph"
+path = "isolated.db"
+
+[storage.meta]
+path = "meta.db"
+
+[dream]
+auto_trigger = false
+
+[dream.llm.dream]
+driver = "ollama"
+
+[dream.llm.dream_verifier]
+model = "llama3.1:8b"
