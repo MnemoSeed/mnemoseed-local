@@ -37,7 +37,8 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -52,12 +53,14 @@ from mnemoseed_local.config import (
     VISIBILITY_MODES,
     CaptureConfig,
     Config,
+    ConfigError,
     DecayConfig,
     DreamConfig,
     ExperienceChannelConfig,
     ProfilesConfig,
     RoleLLMConfig,
     VisibilityConfig,
+    _optional_driver,
     validate_agent_bindings,
 )
 from mnemoseed_local.secrets.refs import SECRETS_REF_RE, is_secrets_ref
@@ -1008,6 +1011,30 @@ def _file_fingerprint(path: Path) -> tuple[float, str]:
     return stat.st_mtime, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# ---------------------------------------------------------------- reload validity
+
+
+def _assert_reload_valid(config: Config) -> None:
+    """Every role table in the would-be config must carry driver and model.
+
+    Identity keys are re-read through the loader's own parser so the write path
+    cannot drift from the load contract that rejects partial tables.
+    """
+    llm_tables = config.raw.get("dream", {}).get("llm", {})
+    for role in LLM_ROLES:
+        table = llm_tables.get(role)
+        if not isinstance(table, dict):
+            continue
+        role_path = f"dream.llm.{role}"
+        try:
+            driver = _optional_driver(table.get("driver"), f"{role_path}.driver")
+            model = _optional_driver(table.get("model"), f"{role_path}.model")
+        except ConfigError:
+            raise ConfigWriteError(role_path, ROLE_ROUTE_REQUIRED_MESSAGE) from None
+        if driver is None or model is None:
+            raise ConfigWriteError(role_path, ROLE_ROUTE_REQUIRED_MESSAGE)
+
+
 # ---------------------------------------------------------------- service
 
 
@@ -1178,54 +1205,107 @@ class ConfigWriteService:
                     spec.cross_validate(self._config, validated)
                 except ValueError as exc:
                     raise ConfigWriteError(key_path, str(exc)) from exc
-            path = self._config_path()
-            _patch_toml(path, key_path, validated)
-            version_id = self._record(key_path, validated)
-            spec.apply(self._config, validated)
-            # orphan namespace warning (IMPORTANT-1): typo like {"planner":"reserach"}
-            # would silently route to a non-existent profile. Warn + audit, not reject.
-            if key_path == "profiles.agent_bindings" and self._meta is not None:
+            return self._land(key_path, spec, validated, actor=actor)
+
+    def set_many(
+        self,
+        updates: Sequence[tuple[str, Any]],
+        *,
+        actor: str = "console",
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Land a whole batch under one generation check, all-or-nothing.
+
+        Updates are validated and applied to a simulated config first; the
+        registry cross-checks then run against that complete would-be state so
+        a role pair written in any order is accepted while a half-route is
+        refused. Nothing is patched until every check and the loader-validity
+        check pass, so a rejected batch leaves no partial role table behind.
+        """
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise GenerationMismatchError(self._generation)
+            if not updates:
+                raise ConfigWriteError("updates", "must be a non-empty list of updates")
+            simulated: Config = deepcopy(self._config)
+            resolved: list[tuple[str, ConfigKey, Any]] = []
+            for key_path, value in updates:
+                spec = CONFIG_KEY_REGISTRY.get(key_path)
+                if spec is None:
+                    raise ConfigWriteError(key_path, "unknown config key (not writable)")
                 try:
-                    list_profiles = getattr(self._meta, "list_profiles", None)
-                    if callable(list_profiles):
-                        existing = {p.profile_id for p in list_profiles()}
-                        existing.add("default")
-                        orphans = sorted({t for t in validated.values() if t not in existing})
-                        if orphans:
-                            logger.warning(
-                                "profile_binding_orphan: bindings %s point to non-existent profile(s) %s",
-                                validated,
-                                orphans,
-                            )
-                            self._audit(
-                                "profile_binding_orphan",
-                                {"orphans": orphans, "key_path": key_path, "value": validated},
-                                actor,
-                            )
-                except Exception:  # pragma: no cover - warning path must never fail the write
-                    logger.warning("orphan binding check failed", exc_info=True)
-            self._touch_fingerprint()
-            self._bump(key_path)
-            restart_required = not spec.live_apply
-            self._audit(
-                "config.set",
-                {
-                    "key_path": key_path,
-                    "value": validated,
-                    "version_id": version_id,
-                    "restart_required": restart_required,
-                },
-                actor,
-            )
-            return {
-                "ok": True,
-                "version_id": version_id,
-                "restart_required": restart_required,
+                    validated = spec.validate(value)
+                except ValueError as exc:
+                    raise ConfigWriteError(key_path, str(exc)) from exc
+                spec.apply(simulated, validated)
+                resolved.append((key_path, spec, validated))
+            for key_path, spec, validated in resolved:
+                if spec.cross_validate is not None:
+                    try:
+                        spec.cross_validate(simulated, validated)
+                    except ValueError as exc:
+                        raise ConfigWriteError(key_path, str(exc)) from exc
+            _assert_reload_valid(simulated)
+            applied: list[dict[str, Any]] = []
+            for key_path, spec, validated in resolved:
+                landed = self._land(key_path, spec, validated, actor=actor)
+                applied.append(
+                    {
+                        "key_path": key_path,
+                        "version_id": landed["version_id"],
+                        "restart_required": landed["restart_required"],
+                    }
+                )
+            return {"ok": True, "applied": applied, "generation": self._generation}
+
+    def _land(self, key_path: str, spec: ConfigKey, validated: Any, *, actor: str) -> dict[str, Any]:
+        """Patch, record, live-apply, bump and audit one validated write."""
+        path = self._config_path()
+        _patch_toml(path, key_path, validated)
+        version_id = self._record(key_path, validated)
+        spec.apply(self._config, validated)
+        if key_path == "profiles.agent_bindings" and self._meta is not None:
+            try:
+                list_profiles = getattr(self._meta, "list_profiles", None)
+                if callable(list_profiles):
+                    existing = {p.profile_id for p in list_profiles()}
+                    existing.add("default")
+                    orphans = sorted({t for t in validated.values() if t not in existing})
+                    if orphans:
+                        logger.warning(
+                            "profile_binding_orphan: bindings %s point to non-existent profile(s) %s",
+                            validated,
+                            orphans,
+                        )
+                        self._audit(
+                            "profile_binding_orphan",
+                            {"orphans": orphans, "key_path": key_path, "value": validated},
+                            actor,
+                        )
+            except Exception:  # pragma: no cover - warning path must never fail the write
+                logger.warning("orphan binding check failed", exc_info=True)
+        self._touch_fingerprint()
+        self._bump(key_path)
+        restart_required = not spec.live_apply
+        self._audit(
+            "config.set",
+            {
                 "key_path": key_path,
                 "value": validated,
-                "persisted_to": str(path),
-                "actor": actor,
-            }
+                "version_id": version_id,
+                "restart_required": restart_required,
+            },
+            actor,
+        )
+        return {
+            "ok": True,
+            "version_id": version_id,
+            "restart_required": restart_required,
+            "key_path": key_path,
+            "value": validated,
+            "persisted_to": str(path),
+            "actor": actor,
+        }
 
     def rollback(
         self,

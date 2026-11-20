@@ -68,7 +68,10 @@ Host coverage varies by platform. Codex Desktop app-server mode is unverified.
 ## Import historical sessions
 
 Backfill sessions that predate hook capture with
-`mnemoseed-local import --host codex_cli` (options: `--source`, `--profile`,
+`mnemoseed-local import --host codex_cli`,
+`mnemoseed-local import --host claude_code`,
+`mnemoseed-local import --host opencode`, or
+`mnemoseed-local import --host zcode` (options: `--source`, `--profile`,
 `--limit`, `--dry-run`, `--json`, `--yes`). Progress goes to stderr and the
 reconciled report to stdout; `--dry-run` counts turns without sending anything.
 

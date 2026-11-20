@@ -496,6 +496,7 @@ def test_external_surface_inventory_equals_frozen_baseline(
         "/api/v1/profiles/archive",
         "/api/v1/config",
         "/api/v1/config/set",
+        "/api/v1/config/set-many",
         "/api/v1/config/versions",
         "/api/v1/config/rollback",
         "/daemon/shutdown",

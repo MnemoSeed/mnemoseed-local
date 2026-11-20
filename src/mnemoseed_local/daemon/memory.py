@@ -848,6 +848,7 @@ class MemoryService:
                 "fresh_evidence_chunks": coverage.fresh_evidence_chunks,
                 "pending_marked": coverage.pending_marked,
                 "floor_dropped": coverage.floor_dropped,
+                "dedup_collapsed": coverage.dedup_collapsed,
             },
         }
 
