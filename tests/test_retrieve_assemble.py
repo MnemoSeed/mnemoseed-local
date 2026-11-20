@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
+from mnemoseed_local.daemon.memory import MemoryService
 from mnemoseed_local.dream.delta import estimate_tokens
 from mnemoseed_local.retrieve.assemble import (
     AssembleConfig,
@@ -237,10 +238,10 @@ def test_budget_gate_exact_boundary_admits_and_drops_tail(stack) -> None:
 
 
 def test_budget_gate_drops_sixth_candidate(stack) -> None:
-    # Identical text => identical embedding => id-order tie-break is decisive.
-    for i in range(6):
-        _write(stack, _chunk(f"c{i}", "LanceDb loader cache", entities=("LanceDb",)))
-    result = _assemble(stack, _recall(stack, "lancedb loader", _query_cues(("LanceDb",))))
+    # Six distinct texts with one score: id tie-break + 6th-drop, not score tie-break.
+    candidates = [_pool_candidate(f"c{i}", f"distinct loader text {i}", score=1.0) for i in range(6)]
+    recall = HybridRecall(candidates=candidates, vector_hits=6, graph_hits=0)
+    result = _assemble(stack, recall)
     assert [entry.id for entry in result.entries] == [f"c{i}" for i in range(5)]
     assert result.dropped_count == 1
     assert result.coverage.pool_size == 6
@@ -261,9 +262,9 @@ def test_budget_gate_reports_dropped_count_never_silent(stack) -> None:
 def test_budget_estimator_counts_cjk_characters_tokens(stack) -> None:
     # 100 CJK chars estimate to 100 tokens under the reused estimator; a naive
     # len//4 inline surrogate would round them to 25 and admit both halves.
-    whole = "梦" * 100
-    _write(stack, _chunk("c_a", whole, entities=("LanceDb",)))
-    _write(stack, _chunk("c_b", whole, entities=("LanceDb",)))
+    # Distinct CJK texts keep this a budget-drop probe, not a dedup probe.
+    _write(stack, _chunk("c_a", "梦" * 100, entities=("LanceDb",)))
+    _write(stack, _chunk("c_b", "想" * 100, entities=("LanceDb",)))
     result = _assemble(
         stack,
         _recall(stack, "lancedb loader", _query_cues(("LanceDb",))),
@@ -274,6 +275,52 @@ def test_budget_estimator_counts_cjk_characters_tokens(stack) -> None:
     assert result.tokens_used == 100
     assert result.dropped_count == 1
     assert result.coverage.pool_size == 2
+
+
+# ------------------------------------------------------------ exact-content dedup
+
+
+def test_exact_content_dedup_frees_budget_for_distinct_target(stack) -> None:
+    dedup_text = "d" * 692  # 173 tokens under the reused estimator
+    target_text = "t" * 800  # 200 tokens
+    candidates = [_pool_candidate(f"d{i}", dedup_text, score=1.2968) for i in range(1, 5)]
+    candidates.append(_pool_candidate("target", target_text, score=0.5))
+    recall = HybridRecall(candidates=candidates, vector_hits=5, graph_hits=0)
+
+    result = _assemble(stack, recall, AssembleConfig(top_k=5, budget_tokens=800))
+
+    ids = [entry.id for entry in result.entries]
+    assert "target" in ids  # killer: the distinct item must surface before budget is spent
+    assert [item for item in ids if item in {"d1", "d2", "d3", "d4"}] == ["d1"]
+    assert result.tokens_used == 373
+    assert result.coverage.dedup_collapsed == 3
+    assert result.coverage.pool_size == 5  # pre-collapse candidate count
+    assert result.dropped_count == 0
+    representative = next(entry for entry in result.entries if entry.id == "d1")
+    assert EntryFlag.DEDUP_REPRESENTATIVE in representative.flags
+    assert representative.dedup_of == ("d2", "d3", "d4")
+    assert representative.text == dedup_text
+    wire_entry = MemoryService._entry_payload(representative)
+    assert "dedup_of" not in wire_entry
+    wire = object.__new__(MemoryService)._memory_payload(result)
+    assert wire["coverage"]["dedup_collapsed"] == 3
+    assert "dedup_of" not in repr(wire)
+
+
+def test_dedup_keeps_highest_rank_representative(stack) -> None:
+    text = "r" * 40
+    candidates = [
+        _pool_candidate("low", text, score=0.5),
+        _pool_candidate("high", text, score=2.0),
+        _pool_candidate("mid", text, score=1.0),
+    ]
+    recall = HybridRecall(candidates=candidates, vector_hits=3, graph_hits=0)
+
+    result = _assemble(stack, recall)
+
+    assert [entry.id for entry in result.entries] == ["high"]
+    assert result.entries[0].dedup_of == ("mid", "low")
+    assert result.coverage.dedup_collapsed == 2
 
 
 # ------------------------------------------------------------ conflict pairing
