@@ -33,6 +33,7 @@ from mnemoseed_local.hosts.common.fence import (
     RULES_DISCLAIMER,
     RULES_FENCE_CLOSE,
     RULES_FENCE_OPEN,
+    recall_item_prefix,
     sanitize_recall_text,
     sanitize_rules_text,
 )
@@ -200,6 +201,16 @@ def _iso_ended(group: dict[str, Any]) -> str:
     return ""
 
 
+def _chunk_marker_prefix(chunk: Any, group: dict[str, Any]) -> str:
+    provenance = chunk.get("memory_provenance") if isinstance(chunk, dict) else None
+    observed = chunk.get("memory_observed_at") if isinstance(chunk, dict) else None
+    if not isinstance(provenance, str) or not provenance:
+        provenance = _session_tail_id(group)
+    if not isinstance(observed, str) or not observed:
+        observed = _iso_ended(group)
+    return recall_item_prefix(provenance, observed)
+
+
 def _session_tail_header(group: dict[str, Any]) -> str:
     started = ""
     window = group.get("window")
@@ -255,18 +266,20 @@ def _build_t1_base(sessions: Any, budget: int) -> tuple[str, int, int, int] | No
             text = sanitize_recall_text(raw if isinstance(raw, str) else "")
             if not text:
                 continue
-            if len(text) + 1 <= remaining:
-                rendered.append(text)
-                remaining -= len(text) + 1
+            prefix = _chunk_marker_prefix(chunk, group)
+            prefix_len = len(prefix)
+            if prefix_len + len(text) + 1 <= remaining:
+                rendered.append(prefix + text)
+                remaining -= prefix_len + len(text) + 1
                 chars += len(text)
                 memories += 1
                 got_chunk = True
                 continue
-            slice_budget = remaining - 2  # reserve the "…" marker and the newline
+            slice_budget = remaining - prefix_len - 2  # reserve prefix, "…" marker and newline
             if slice_budget < T1_MIN_SLICE_CHARS:
                 break
             sliced = "…" + text[-slice_budget:]
-            rendered.append(sliced)
+            rendered.append(prefix + sliced)
             remaining = 0
             chars += len(sliced) + 1
             memories += 1

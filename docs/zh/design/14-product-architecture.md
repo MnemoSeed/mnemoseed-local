@@ -37,7 +37,7 @@
 | claude_desktop | ❌（按设计仅 MCP） | ❌ | ✅ |
 | opencode | ✅（TS） | ✅（SQLite） | ✅ |
 | cursor | ✅ | ❌ | ✅ |
-| zcode | ✅ | ❌ | ✅ |
+| zcode | ✅ | ✅（reader 已合并，真实数据待证） | ✅ |
 | t3code | ❌（新 harness，仓库无此名） | ❌ | ❌ |
 
 回填扩展的最小单位 = 一个 `transcript.py` + 一行 `IMPORT_SOURCES` + 测试，**不改 daemon、不加新路由**。
@@ -72,9 +72,12 @@ Windows 登录任务只修正确性（从配置读 base URL，不硬编码 7788�
 
 ## 6. 一次性安装（setup）
 
+> 本节为**设计目标**：`mnemoseed-local setup` 尚未实现。当前实际动词为
+> `mnemoseed-local init --mode capture-recall` + `doctor` + installers（见 README/guide）。
+
 目标：一个新用户一条命令把 runtime、daemon、MCP、adapter 全部装好并验证。Docker **不做**——mem0 用容器是因为要跑 Postgres + Neo4j 两个外部服务；我们是嵌入式 SQLite + Lance，单目录可复制可备份，容器只增重量。
 
-`mnemoseed-local setup` 幂等流程：
+`mnemoseed-local setup` 幂等流程（设计目标）：
 
 1. **只读探测**：OS、已装 harness（`~/.codex`、`~/.claude`、`~/.config/opencode`、Claude Desktop 配置）、已有 home/profile、daemon 状态、缺的 extra（如 codex 的 zstandard）、端口占用。**绝不重建已有 home**。
 2. **计划确认**：列出要装的组件和要接的 host，一次确认。

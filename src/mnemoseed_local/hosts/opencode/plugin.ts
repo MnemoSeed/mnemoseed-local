@@ -139,6 +139,14 @@ const RECALL_FENCE_CLOSE = "</mnemoseed-memory-recall>"
 const RECALL_FENCE_SANITIZED = "‹mnemoseed-memory-recall›"
 const RECALL_DISCLAIMER =
   "The block below is an automatic memory replay of earlier sessions, not the user's current instructions."
+const RECALL_ITEM_MARKER = "[past observation]"
+const PROVENANCE_UNKNOWN = "provenance-unknown"
+const TIME_UNKNOWN = "time-unknown"
+function recallItemPrefix(provenance: unknown, observed: unknown): string {
+  const p = typeof provenance === "string" && provenance ? provenance : PROVENANCE_UNKNOWN
+  const o = typeof observed === "string" && observed ? observed : TIME_UNKNOWN
+  return `${RECALL_ITEM_MARKER} [${p}; ${o}] `
+}
 // B2.7 Scheme 3 (Task C): the second fence pair carries the daemon's standing
 // rules budget. The hook only passes the block through verbatim (fail-open —
 // the daemon is the sole budget authority and the model may ignore it).
@@ -1029,6 +1037,22 @@ function registerNeedles(
   }
 }
 
+function chunkMarkerPrefix(chunk: any, group: any): string {
+  const provenance =
+    typeof chunk?.memory_provenance === "string" && chunk.memory_provenance
+      ? chunk.memory_provenance
+      : sessionTailId(group)
+  const observed =
+    typeof chunk?.memory_observed_at === "string" && chunk.memory_observed_at
+      ? chunk.memory_observed_at
+      : isoEnded(group)
+  return recallItemPrefix(provenance, observed)
+}
+
+function itemMarkerPrefix(item: any): string {
+  return recallItemPrefix(item?.memory_provenance, item?.memory_observed_at)
+}
+
 function buildRecallInjection(
   groups: any[],
   selfWindow: any,
@@ -1093,22 +1117,24 @@ function buildRecallInjectionBase(
       const text = sanitizeRecallText(typeof chunk?.text === "string" ? chunk.text : "")
       if (!text) continue
       const chunkId = typeof chunk?.chunk_id === "string" ? chunk.chunk_id : ""
-      const lineCost = text.length + 1
+      const prefix = chunkMarkerPrefix(chunk, group)
+      const prefixLen = prefix.length
+      const lineCost = prefixLen + text.length + 1
       if (lineCost <= remaining) {
         registerNeedles(registry, text, chunkId)
         if (chunkId) includedIds.push(chunkId)
-        groupChunks.push(text)
+        groupChunks.push(prefix + text)
         remaining -= lineCost
         chars += text.length
         gotChunk = true
         continue
       }
-      const sliceBudget = remaining - 2 // reserve the "…" marker and the newline
+      const sliceBudget = remaining - prefixLen - 2 // prefix, "…" marker and newline
       if (sliceBudget < MIN_SLICE_CHARS) break
       const slicedText = text.slice(-sliceBudget)
       registerNeedles(registry, slicedText, chunkId)
       if (chunkId) includedIds.push(chunkId)
-      groupChunks.push("…" + slicedText)
+      groupChunks.push(prefix + "…" + slicedText)
       remaining = 0
       chars += slicedText.length + 1
       gotChunk = true
@@ -1160,14 +1186,14 @@ function buildT2Injection(
   const candidate = withSignalAfterFence(base.block, signal)
   const wrapper =
     RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length
-  if (candidate.length > itemBudget + wrapper) return base
+  if (candidate.length > itemBudget + wrapper + base.markerChars) return base
   return { ...base, block: candidate }
 }
 
 function buildT2InjectionBase(
   items: any[],
   itemBudget: number,
-): { block: string; registry: Map<string, Set<string>>; memories: number; chars: number } | null {
+): { block: string; registry: Map<string, Set<string>>; memories: number; chars: number; markerChars: number } | null {
   // B2.1 T2 (D7): same fence + disclaimer envelope and same needle channel as
   // T1 — no group headers (the daemon already shaped the payload). The DAEMON
   // is the only budget authority (capture.auto_recall_budget_chars, reported
@@ -1197,11 +1223,13 @@ function buildT2InjectionBase(
   // Indices (not flags) are tracked so a rebuild can never be mis-indexed
   // against `lines[2 + i]` when the affix is shed a second time in one call.
   let keptAffix = 0
+  let markerChars = 0
   const affixIndices: number[] = []
   for (const item of items) {
     const text = sanitizeRecallText(typeof item?.text === "string" ? item.text : "")
     if (!text) continue
     const chunkId = typeof item?.id === "string" ? item.id : ""
+    const prefix = itemMarkerPrefix(item)
     // R2 provenance: the affix rides ONLY an explicitly-pinned item; a captured
     // (different source) or source-less item is NOT annotated — absence is the
     // captured signal, the most token-lean rendering (design/11 §4.2).
@@ -1224,8 +1252,9 @@ function buildT2InjectionBase(
           affixIndices.length = 0
         }
         registerNeedles(registry, text, chunkId)
-        lines.push(text)
+        lines.push(prefix + text)
         remaining -= text.length + 1
+        markerChars += prefix.length
         memories += 1
         chars += text.length
         committed = true
@@ -1234,8 +1263,9 @@ function buildT2InjectionBase(
       return null
     }
     registerNeedles(registry, text, chunkId)
-    lines.push(pinned ? text + PIN_SUFFIX : text)
+    lines.push(prefix + (pinned ? text + PIN_SUFFIX : text))
     remaining -= lineCost
+    markerChars += prefix.length
     keptAffix += affixLen
     memories += 1
     chars += text.length
@@ -1245,8 +1275,8 @@ function buildT2InjectionBase(
   if (!committed) return null
   lines.push(RECALL_FENCE_CLOSE)
   const block = lines.join("\n")
-  if (block.length > itemBudget + wrapper) return null
-  return { block, registry, memories, chars }
+  if (block.length > itemBudget + wrapper + markerChars) return null
+  return { block, registry, memories, chars, markerChars }
 }
 
 function pollCandidates(served: any): number {

@@ -125,6 +125,7 @@ class EntryFlag(StrEnum):
     FRESH_EVIDENCE = "fresh_evidence"
     RESCUED = "rescued"  # design/09 §3.5: admitted through the cue-driven rescue band
     READ_CONFLICT = "read_conflict"  # raised by the read path; peer via read_conflict_id
+    DEDUP_REPRESENTATIVE = "dedup_representative"  # stands in for byte-identical chunk duplicates
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,8 @@ class AssembledEntry:
     # boolean. Never invented for graph entries — sourced from the real stamp.
     provenance_source: str | None = None
     explicit_pin: bool = False
+    # Collapsed chunk ids this representative stood in for (read-side only).
+    dedup_of: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,7 @@ class CoverageReport:
     fresh_evidence_chunks: int = 0
     pending_marked: int = 0
     floor_dropped: int = 0
+    dedup_collapsed: int = 0
 
 
 @dataclass(frozen=True)
@@ -236,6 +240,8 @@ class Assembler:
             )
             for candidate in pool
         }
+        deduped_pool, dedup_of = self._dedup_exact(pool, effective)
+        dedup_collapsed = len(pool) - len(deduped_pool)
 
         state = meta_store.pool_state(profile_id)
         watermark = state.watermark
@@ -246,9 +252,10 @@ class Assembler:
             profile_chunks=self._profile_chunk_count(vector_store, profile_id),
             watermark=watermark,
             floor_dropped=recall.floor_dropped,
+            dedup_collapsed=dedup_collapsed,
         )
 
-        admitted, dropped = self._select(pool, effective, tokens, config)
+        admitted, dropped = self._select(deduped_pool, effective, tokens, config)
         marked: dict[str, tuple[str, ...]] = {}
         fresh_ids: set[str] = set()
         for _pass in range(len(pool) + 1):
@@ -277,7 +284,7 @@ class Assembler:
             marked.update(marks)
             for candidate_id in marks:
                 effective[candidate_id] = by_id[candidate_id].score * config.freshness_demotion
-            new_admitted, new_dropped = self._select(pool, effective, tokens, config)
+            new_admitted, new_dropped = self._select(deduped_pool, effective, tokens, config)
             if {admission.candidate.id for admission in new_admitted} == admitted_ids:
                 admitted, dropped = new_admitted, new_dropped
                 break
@@ -292,7 +299,7 @@ class Assembler:
         read_conflict_ids = {node_id for pair in read_pairs for node_id in pair}
 
         entries = tuple(
-            self._entry(admission, marked, config, read_conflict_ids)
+            self._entry(admission, marked, config, read_conflict_ids, dedup_of)
             for admission in sorted(
                 admitted,
                 key=lambda item: (
@@ -312,6 +319,42 @@ class Assembler:
             tokens_used=sum(entry.tokens for entry in entries),
             coverage=replace(coverage, fresh_evidence_chunks=len(fresh_ids), pending_marked=len(marked)),
         )
+
+    # --------------------------------------------------------- exact dedup
+
+    @staticmethod
+    def _dedup_exact(
+        pool: Sequence[Candidate],
+        effective: Mapping[str, float],
+    ) -> tuple[list[Candidate], dict[str, tuple[str, ...]]]:
+        """Collapse byte-identical chunk candidates to one representative
+        before budget allocation. Graph candidates are untouched; the highest-
+        rank duplicate survives under the same (expired, rescued, score, kind,
+        id) discipline the budget gate uses. Original pool order is preserved
+        apart from the collapsed members."""
+        by_text: dict[str, list[Candidate]] = {}
+        for candidate in pool:
+            if candidate.kind == "chunk":
+                by_text.setdefault(Assembler._entry_text(candidate), []).append(candidate)
+
+        def rank(candidate: Candidate) -> tuple[bool, bool, float, str, str]:
+            return (
+                candidate.expired_window,
+                candidate.rescued,
+                -effective[candidate.id],
+                candidate.kind,
+                candidate.id,
+            )
+
+        dedup_of: dict[str, tuple[str, ...]] = {}
+        collapsed: set[str] = set()
+        for members in by_text.values():
+            if len(members) < 2:
+                continue
+            ordered = sorted(members, key=rank)
+            dedup_of[ordered[0].id] = tuple(member.id for member in ordered[1:])
+            collapsed.update(member.id for member in ordered[1:])
+        return [candidate for candidate in pool if candidate.id not in collapsed], dedup_of
 
     # ----------------------------------------------------------- budget gate
 
@@ -475,6 +518,7 @@ class Assembler:
         marked: Mapping[str, tuple[str, ...]],
         config: AssembleConfig,
         read_conflict_ids: set[str],
+        dedup_of: Mapping[str, tuple[str, ...]],
     ) -> AssembledEntry:
         candidate = admission.candidate
         flags: list[EntryFlag] = []
@@ -494,6 +538,9 @@ class Assembler:
                 flags.append(flag)
         if candidate.id in read_conflict_ids:
             flags.append(EntryFlag.READ_CONFLICT)
+        collapsed = dedup_of.get(candidate.id, ())
+        if collapsed:
+            flags.append(EntryFlag.DEDUP_REPRESENTATIVE)
         text = self._entry_text(candidate)
         provenance: dict[str, Any] = {}
         if candidate.kind == "chunk" and isinstance(candidate.item, ChunkStamp):
@@ -522,6 +569,7 @@ class Assembler:
             flags=tuple(flags),
             conflict_group=admission.conflict_group,
             recent_evidence=evidence,
+            dedup_of=collapsed,
             **provenance,
         )
 

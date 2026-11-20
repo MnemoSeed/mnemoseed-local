@@ -63,6 +63,11 @@ The rules below are situations and actions, not suggestions:
 6. Recall missed: log it with {recall_feedback}(not_useful, ISO observed_at);
    the signal never reranks.
 
+7. '[past observation]' marks a memory as past, not a present-turn fact. A
+   conflict with current observation is stale: re-verify before use. Even if
+   re-verification seems unnecessary it stays memory, not a present-turn
+   assertion.
+
 An empty result means no relevant memory exists: say so and continue; do not
 guess or repeat the query.
 {recent_sessions} unresolved: resolution failed, not "no relevant history";
@@ -79,22 +84,16 @@ false.
 #: ingested.
 SURFACE_PREAMBLES: dict[str, str] = {
     "claude_chat": (
-        "Paste this into Claude's personal preferences (Settings > Profile). Those preferences "
-        "are account-level and cloud-synced, so this text travels with the account; the memory "
-        "tools come from the mnemoseed MCP server connected on this machine, and this chat "
-        "surface has no capture hook - memory is written only when the assistant calls them."
+        "Paste into Claude's personal preferences. Account-level and cloud-synced; memory tools "
+        "come from the local mnemoseed MCP server."
     ),
     "chatgpt": (
-        "Paste this into ChatGPT's custom instructions (Settings > Personalization). Custom "
-        "instructions are account-level and cloud-synced, and this surface cannot register the "
-        "local mnemoseed MCP server: follow the rules below wherever a mnemoseed MCP server is "
-        "connected, and where no memory tool is available say plainly that this surface has no "
-        "memory instead of guessing."
+        "Paste into ChatGPT's custom instructions. Account-level and cloud-synced; follow these "
+        "rules wherever mnemoseed MCP is connected."
     ),
     "claude_code": (
-        "Keep this in a CLAUDE.md or project instruction file. Claude Code has the mnemoseed "
-        "capture hook, so an injected memory block is the normal case (rule 1); the tools below "
-        "are the deliberate supplement for the sessions that start without one."
+        "Keep in a CLAUDE.md or project instructions. Claude Code has the capture hook; tools "
+        "below supplement sessions without one."
     ),
 }
 
