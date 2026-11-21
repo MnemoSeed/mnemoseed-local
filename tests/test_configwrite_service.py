@@ -32,10 +32,11 @@ HTTP layer:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from mnemoseed_local.config import LLM_ROLES, load_config
+from mnemoseed_local.config import LLM_ROLES, ROLE_ROUTE_REQUIRED_MESSAGE, load_config
 from mnemoseed_local.configwrite.service import (
     _FROZEN_LEGACY_ORDER,
     _SLOT_KEYS,
@@ -328,6 +329,49 @@ def test_set_single_field_first_write_rejected_when_role_table_missing(tmp_path)
     with pytest.raises(ConfigWriteError):
         service.set("dream.llm.dream.driver", "openai_compatible", actor="console")
     assert path.read_bytes() == before
+
+
+def test_role_subfield_write_to_unconfigured_role_is_refused_and_mirror_unchanged(
+    tmp_path: Path,
+) -> None:
+    """A sub-field write cannot create a route: on a role with no complete
+    route, a single-key write is refused with the named route error, the
+    mirror stays byte-identical and the file still loads."""
+    service = ConfigWriteService(load_config(_config_toml(tmp_path)), None, clock=lambda: 1_700_000_000.0)
+    path = tmp_path / "config.toml"
+    before = path.read_bytes()
+    with pytest.raises(ConfigWriteError) as exc:
+        service.set("dream.llm.dream_vote.base_url", "http://example.test/v1", actor="console")
+    assert ROLE_ROUTE_REQUIRED_MESSAGE in str(exc.value)
+    assert path.read_bytes() == before
+    assert load_config(path).llm.get("dream_vote") is None
+    assert service.generation == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("api_key_env", "MNEMOSEED_DREAM_VOTE_API_KEY"),
+        ("max_tokens", 4096),
+        ("provider", "ollama"),
+        ("think", True),
+        ("num_ctx", 8192),
+        ("num_predict", 1024),
+    ],
+)
+def test_every_role_subfield_write_to_unconfigured_role_is_refused(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    """No role sub-field may create a route: without driver and model already
+    complete, every role-field write to the unconfigured role is refused and
+    the mirror stays byte-identical."""
+    service = ConfigWriteService(load_config(_config_toml(tmp_path)), None, clock=lambda: 1_700_000_000.0)
+    path = tmp_path / "config.toml"
+    before = path.read_bytes()
+    with pytest.raises(ConfigWriteError):
+        service.set(f"dream.llm.dream_vote.{field}", value, actor="console")
+    assert path.read_bytes() == before
+    assert load_config(path).llm.get("dream_vote") is None
 
 
 # ---------------------------------------------------------------- typed validation

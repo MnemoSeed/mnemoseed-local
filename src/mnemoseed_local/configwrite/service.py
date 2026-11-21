@@ -40,6 +40,7 @@ import time
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from dataclasses import fields as dc_fields
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -255,7 +256,10 @@ def _cross_validate_floor(config: Config, value: float) -> None:
 
 
 def _cross_validate_role_route(role: str, field: str) -> Callable[[Config, Any], None]:
-    """A driver/model write must leave both parts of the role route set."""
+    """Every role-field write must leave the role's route complete: a
+    driver/model write supplies the missing identity half, while any other
+    field requires an already-complete route — a sub-field write can never
+    create the half route that load() refuses."""
 
     def check(config: Config, value: Any) -> None:
         route = config.llm.get(role)
@@ -537,17 +541,17 @@ def _role_applier(role: str, field: str) -> Callable[[Config, Any], None]:
 def _role_key_specs(role: str) -> dict[str, ConfigKey]:
     """The writable fields of one dream role (design/02 section 6; ``think``
     landed with the D4 thinking-output fix)."""
-    fields: dict[str, tuple[str, Callable[[Any], Any], bool, Callable[[Config, Any], None] | None]] = {
-        "driver": ("string", _validate_nonempty_str, False, _cross_validate_role_route(role, "driver")),
-        "model": ("string", _validate_nonempty_str, False, _cross_validate_role_route(role, "model")),
-        "base_url": ("string", _validate_optional_str, False, None),
-        "api_key_env": ("env-var names or secrets: reference", _validate_env_name_list, True, None),
-        "max_tokens": ("positive integer", _validate_optional_positive_int, False, None),
-        "provider": ("string", _validate_optional_str, False, None),
-        "think": ("boolean", _validate_bool, False, None),
+    fields: dict[str, tuple[str, Callable[[Any], Any], bool]] = {
+        "driver": ("string", _validate_nonempty_str, False),
+        "model": ("string", _validate_nonempty_str, False),
+        "base_url": ("string", _validate_optional_str, False),
+        "api_key_env": ("env-var names or secrets: reference", _validate_env_name_list, True),
+        "max_tokens": ("positive integer", _validate_optional_positive_int, False),
+        "provider": ("string", _validate_optional_str, False),
+        "think": ("boolean", _validate_bool, False),
         # ollama context knobs; the doctor ctx-window check hints at these
-        "num_ctx": ("positive integer", _validate_optional_positive_int, False, None),
-        "num_predict": ("positive integer", _validate_optional_positive_int, False, None),
+        "num_ctx": ("positive integer", _validate_optional_positive_int, False),
+        "num_predict": ("positive integer", _validate_optional_positive_int, False),
     }
     return {
         f"dream.llm.{role}.{field}": ConfigKey(
@@ -558,9 +562,9 @@ def _role_key_specs(role: str) -> dict[str, ConfigKey]:
             apply=_role_applier(role, field),
             live_apply=True,
             secret=is_secret,
-            cross_validate=cross_validate,
+            cross_validate=_cross_validate_role_route(role, field),
         )
-        for field, (label, validator, is_secret, cross_validate) in fields.items()
+        for field, (label, validator, is_secret) in fields.items()
     }
 
 
@@ -1220,7 +1224,9 @@ class ConfigWriteService:
         registry cross-checks then run against that complete would-be state so
         a role pair written in any order is accepted while a half-route is
         refused. Nothing is patched until every check and the loader-validity
-        check pass, so a rejected batch leaves no partial role table behind.
+        check pass, so a rejected batch leaves no partial role table behind;
+        a fault while landing rolls the file, the live config and the
+        generation counters back to the pre-batch snapshot before re-raising.
         """
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
@@ -1246,17 +1252,119 @@ class ConfigWriteService:
                     except ValueError as exc:
                         raise ConfigWriteError(key_path, str(exc)) from exc
             _assert_reload_valid(simulated)
+            path = self._config_path()
+            file_before = path.read_bytes() if path.exists() else None
+            snapshot = deepcopy(self._config)
+            generation_before = self._generation
+            role_generations_before = dict(self._role_generations)
+            pre_batch: dict[str, ConfigEntry | None] = {}
+            if self._meta is not None:
+                pre_batch = {key_path: self._meta.get_config(key_path) for key_path, _, _ in resolved}
             applied: list[dict[str, Any]] = []
-            for key_path, spec, validated in resolved:
-                landed = self._land(key_path, spec, validated, actor=actor)
-                applied.append(
-                    {
-                        "key_path": key_path,
-                        "version_id": landed["version_id"],
-                        "restart_required": landed["restart_required"],
-                    }
+            try:
+                for key_path, spec, validated in resolved:
+                    landed = self._land(key_path, spec, validated, actor=actor)
+                    applied.append(
+                        {
+                            "key_path": key_path,
+                            "version_id": landed["version_id"],
+                            "restart_required": landed["restart_required"],
+                        }
+                    )
+            except BaseException:
+                self._restore_pre_batch_state(
+                    path,
+                    file_before,
+                    snapshot,
+                    generation_before,
+                    role_generations_before,
+                    resolved,
+                    pre_batch,
+                    actor,
                 )
+                raise
             return {"ok": True, "applied": applied, "generation": self._generation}
+
+    def _restore_pre_batch_state(
+        self,
+        path: Path,
+        file_before: bytes | None,
+        snapshot: Config,
+        generation: int,
+        role_generations: dict[str, int],
+        resolved: list[tuple[str, ConfigKey, Any]],
+        pre_batch: dict[str, ConfigEntry | None],
+        actor: str,
+    ) -> None:
+        """Roll the file, the live config, the generation counters and the
+        versioned records back to the pre-batch state after a landing fault
+        (all-or-nothing landing)."""
+        if file_before is None:
+            # The batch created the file; absent is the pre-batch state.
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(file_before)
+        self._restore_config(snapshot)
+        self._generation = generation
+        self._role_generations = dict(role_generations)
+        compensated: list[str] = []
+        try:
+            compensated = self._compensate_batch_records(resolved, pre_batch, snapshot)
+            self._touch_fingerprint()
+        except Exception:
+            logger.warning("config_batch_rollback: record compensation failed", exc_info=True)
+        logger.warning(
+            "config_batch_rollback: a landing fault rolled the batch back; %d landed key(s) compensated: %s",
+            len(compensated),
+            compensated,
+        )
+        try:
+            self._audit("config_batch_rollback", {"keys": compensated, "reason": "landing_fault"}, actor)
+        except Exception:
+            logger.warning("config_batch_rollback: audit record failed", exc_info=True)
+
+    def _compensate_batch_records(
+        self,
+        resolved: list[tuple[str, ConfigKey, Any]],
+        pre_batch: dict[str, ConfigEntry | None],
+        snapshot: Config,
+    ) -> list[str]:
+        """Supersede every versioned record the batch landed: the append-only
+        store cannot delete, so each record newer than its pre-batch version is
+        followed by a compensating record. A key with a pre-batch record is
+        restored to that record's value (the same append-only restore the
+        rollback surface uses); a key with none is superseded by its pre-batch
+        resolved value. The boot overlay's latest-version-wins then compares
+        equal against the restored config and rewrites nothing."""
+        if self._meta is None:
+            return []
+        compensated: list[str] = []
+        for key_path, spec, _validated in resolved:
+            current = self._meta.get_config(key_path)
+            pre = pre_batch.get(key_path)
+            if current is None or (pre is not None and current.version == pre.version):
+                continue
+            if pre is not None:
+                self._meta.rollback_config(key_path, pre.version)
+            else:
+                self._meta.set_config(key_path, {"value": spec.read(snapshot)})
+            compensated.append(key_path)
+        return compensated
+
+    def _restore_config(self, snapshot: Config) -> None:
+        """Copy a snapshot back into the live config in place: consumers hold
+        this Config instance, so the object and its ``llm``/``raw`` dicts keep
+        their identity while every value is restored."""
+        for spec in dc_fields(self._config):
+            if spec.name == "source":
+                continue
+            value = deepcopy(getattr(snapshot, spec.name))
+            current = getattr(self._config, spec.name)
+            if isinstance(current, dict):
+                current.clear()
+                current.update(value)
+            else:
+                setattr(self._config, spec.name, value)
 
     def _land(self, key_path: str, spec: ConfigKey, validated: Any, *, actor: str) -> dict[str, Any]:
         """Patch, record, live-apply, bump and audit one validated write."""
