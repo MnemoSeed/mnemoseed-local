@@ -15,6 +15,7 @@ import auth_support
 import pytest
 from fastapi.testclient import TestClient
 
+from mnemoseed_local.retrieve import readview
 from mnemoseed_local.schema.turn import HostId
 from mnemoseed_local.storage.drivers import (
     bge_m3_onnx,
@@ -271,6 +272,28 @@ def test_recall_counters_are_cumulative_across_multiple_serves(recall_config_pat
         assert obs["recall_injection_count"] == 2
         assert obs["recall_injection_chars_total"] == chars_a + chars_b
         assert obs["recall_pending_served_count"] == 2
+
+
+def test_bridge_shadow_fallback_counter_appears_and_increments(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prd-448 fail-closed shadow-degradation counter rides the additive
+    snapshot and moves only when a recall's shadow enrichment actually degrades
+    (recall itself proceeds, fail-closed)."""
+    with _boot(config_path) as client:
+        assert client.get("/api/v1/observability").json()["bridge_shadow_fallback_total"] == 0
+        remembered = client.post(
+            "/memory/remember", json={"profile_id": PROFILE, "text": "lancedb 向量存储层已就绪"}
+        )
+        assert remembered.status_code == 200, remembered.text
+
+        def boom(text: str, config: object = None) -> tuple[str, ...]:
+            raise RuntimeError("shadow failure")
+
+        monkeypatch.setattr(readview, "lexical_shadow_tokens", boom)
+        recall = client.post("/memory/recall", json={"profile_id": PROFILE, "query": "lancedb"})
+        assert recall.status_code == 200, recall.text
+        assert client.get("/api/v1/observability").json()["bridge_shadow_fallback_total"] == 1
 
 
 def test_healthz_and_observability_carry_process_commit_mb(config_path: Path) -> None:

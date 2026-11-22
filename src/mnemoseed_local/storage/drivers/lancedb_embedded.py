@@ -67,6 +67,23 @@ _DEFAULT_TABLE = "chunks"
 _DEFAULT_URI = CONFIG_DIR / "chunks.lance"
 _DENSE_FUSION_WEIGHT = 0.5
 
+
+def _fused_similarity(dense_sim: float, sparse_sim: float | None) -> float:
+    """The store-level fused similarity with the gated dense floor (prd-448
+    §8.2.1): a row is never admitted below what its dense similarity alone
+    would admit. No sparse leg collapses to the dense score; a sparse leg
+    carrying any mass (> 0.0) lifts the plain 0.5/0.5 fusion to
+    ``max(dense, fused)`` — per-row monotonic non-decreasing vs the plain
+    fusion — while an exactly-zero sparse leg (structurally disjoint XLM-R
+    token ids, e.g. cross-lingual query vs stored text) keeps the plain
+    fusion so lexically-disjoint queries admit nothing new.
+    """
+    if sparse_sim is None:
+        return dense_sim
+    fused = _DENSE_FUSION_WEIGHT * dense_sim + (1.0 - _DENSE_FUSION_WEIGHT) * sparse_sim
+    return max(dense_sim, fused) if sparse_sim > 0.0 else fused
+
+
 _NEAR_DUP_PREFILTER_K = 50
 _NEAR_DUP_WIDEN_MARGIN = 0.05
 _NEAR_DUP_WIDEN_FACTOR = 4
@@ -353,12 +370,8 @@ class LanceDbEmbeddedStore:
         hits: list[SearchHit] = []
         for row in rows:
             dense_sim = 1.0 - float(row["_distance"])
-            sparse_sim = self._sparse_similarity(sparse, row) if sparse is not None else 0.0
-            score = (
-                _DENSE_FUSION_WEIGHT * dense_sim + (1.0 - _DENSE_FUSION_WEIGHT) * sparse_sim
-                if sparse is not None
-                else dense_sim
-            )
+            sparse_sim = self._sparse_similarity(sparse, row) if sparse is not None else None
+            score = _fused_similarity(dense_sim, sparse_sim)
             hits.append(SearchHit(chunk=self._to_stamp(row), similarity=float(score)))
         hits.sort(key=lambda hit: hit.similarity, reverse=True)
         return hits[:top_k]

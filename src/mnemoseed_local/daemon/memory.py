@@ -84,6 +84,7 @@ from mnemoseed_local.retrieve.assemble import (
 )
 from mnemoseed_local.retrieve.cues import CueExtractor
 from mnemoseed_local.retrieve.hybrid import HybridConfig, HybridRetriever
+from mnemoseed_local.retrieve.readview import RecallVectorView
 from mnemoseed_local.retrieve.temporal import evaluate_temporal
 from mnemoseed_local.schema.stamp import (
     EXPLICIT_PIN_SOURCE,
@@ -671,6 +672,11 @@ class MemoryService:
             )
         )
         self._assembler = Assembler()
+        # prd-448: the recall path reads the vector store through the
+        # lexical-shadow view (search-only enrichment under the copy
+        # discipline); every other store consumer (assembler freshness probe,
+        # capture, dream) keeps the raw store.
+        self._recall_view = RecallVectorView(stores.vector, observability=observability)
         self._activation = ShortTermActivation.default(clock=clock)
         # FR-4.2 event side: retrieval usage becomes a reinforcement event
         # (baseline refresh + bounded rebound), the counterpart of the sweep.
@@ -757,7 +763,7 @@ class MemoryService:
             query,
             extracted,
             profile_id=profile_id,
-            vector_store=self._stores.vector,
+            vector_store=self._recall_view,
             graph_store=self._stores.graph,
             embedder=self._stores.embed,
             activation_snapshot=(self._activation.snapshot() if session_id is not None else None),

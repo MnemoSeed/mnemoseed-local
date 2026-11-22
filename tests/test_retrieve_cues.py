@@ -14,6 +14,7 @@ from mnemoseed_local.retrieve.cues import (
     ExtractedCues,
     Intent,
     extract_cues,
+    lexical_shadow_tokens,
 )
 from mnemoseed_local.schema.stamp import Cues
 
@@ -272,3 +273,51 @@ def test_module_level_convenience_matches() -> None:
     assert result.intent is Intent.DEBUG
     assert "heater" in result.cues.entities
     assert result.cues.host == "cursor"
+
+
+# --------------------------------------------------------------- lexical shadow
+
+
+def test_shadow_preserves_extractor_entities() -> None:
+    tokens = lexical_shadow_tokens("LanceDb loader config", None)
+    assert "LanceDb" in tokens
+
+
+def test_shadow_joins_lowercase_ascii_words() -> None:
+    tokens = lexical_shadow_tokens("atlasdb index rebuild ran clean overnight", None)
+    assert "atlasdb" in tokens
+    assert "rebuild" in tokens
+    assert "overnight" in tokens
+
+
+def test_shadow_excludes_stopwords_and_short_tokens() -> None:
+    tokens = lexical_shadow_tokens("the cat is on the mat at it ran", None)
+    assert "the" not in tokens
+    assert "is" not in tokens
+    assert "on" not in tokens
+    assert "at" not in tokens
+    assert "it" not in tokens
+    assert "cat" in tokens
+    assert "mat" in tokens
+
+
+def test_shadow_cap_is_24() -> None:
+    text = " ".join(f"tok{i:02d}word" for i in range(40))
+    assert len(lexical_shadow_tokens(text, None)) == 24
+
+
+def test_shadow_dedupes_case_insensitively_keeping_the_entity_form() -> None:
+    tokens = lexical_shadow_tokens("AtlasDb atlasdb loader", None)
+    folded = [token.casefold() for token in tokens]
+    assert folded.count("atlasdb") == 1
+    assert "AtlasDb" in tokens
+
+
+def test_shadow_tokens_are_unique() -> None:
+    tokens = lexical_shadow_tokens("loader loader loader Loader", None)
+    assert tokens.count("loader") == 1
+
+
+def test_shadow_is_deterministic() -> None:
+    text = "AtlasDb loader 重构 index rebuild 夜间"
+    assert lexical_shadow_tokens(text, None) == lexical_shadow_tokens(text, None)

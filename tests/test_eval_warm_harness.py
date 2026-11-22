@@ -92,20 +92,28 @@ def test_warm_baseline_point_metric_can_move(rig_root: Path, no_similarity_floor
     delayed = by_window[WINDOW_DELAYED]
     assert delayed.first_surfaced is True
     # the delayed window's decoy-leaning re-query lets the same-band decoys
-    # claim the slots and the needle drops OUT of top-k — the decay the window
-    # exists to probe, never a frozen identical rank-1 across both windows.
-    assert delayed.re_surfaced is False, "the decoys must claim the delayed window"
-    assert delayed.re_rank is None
+    # claim the ahead slots and the needle demotes strictly behind them — the
+    # decay the window exists to probe, never a frozen identical rank-1 across
+    # both windows. Under the depth-8 assembly the demoted needle still fits
+    # the served window (it holds the depth tail, rank 7 of 8); the demotion
+    # itself is the metric, pinned exactly for loud drift.
+    assert delayed.re_surfaced is True
+    assert delayed.re_rank == 7
 
     negative = by_window[WINDOW_NEGATIVE_CONTROL]
     assert negative.first_surfaced is True
-    assert negative.re_surfaced is False, "the decoy-aligned control must NOT re-surface the needle"
-    assert negative.re_rank is None
+    # under the depth-8 assembly the decoy-aligned control's needle still fits
+    # the served window, demoted behind the decoys (rank 6): the control
+    # discriminates by rank against the needle-aligned re-query's rank 1, not
+    # by absence.
+    assert negative.re_surfaced is True
+    assert negative.re_rank == 6
 
-    # the metric can move: the needle surfaces on the needle-aligned re-query
-    # and is absent on the decoy-aligned control, and its rank drops across the
-    # warm window — the report is discriminative, never a vacuous flatline.
-    assert {metric.re_surfaced for metric in result.probe_metrics if metric.first_surfaced} == {True, False}
+    # the metric can move: the needle holds rank 1 on the needle-aligned
+    # re-query and demotes behind the decoys on the delayed window (7) and the
+    # decoy-aligned control (6) — the report is discriminative by rank, never a
+    # vacuous flatline.
+    assert {metric.re_rank for metric in result.probe_metrics if metric.first_surfaced} == {1, 6, 7}
 
     # the recorded delays match the declared warm window
     assert slept[0] == 0.0
@@ -124,11 +132,13 @@ def test_warm_harness_can_measure_activation_on_without_changing_materials(
 
     assert result.activation_enabled is True
     assert result.activation_eps == ACTIVATION_MAX_BOOST
-    assert [metric.re_surfaced for metric in result.probe_metrics] == [True, False, False]
+    assert [metric.re_surfaced for metric in result.probe_metrics] == [True, True, True]
     assert [metric.re_surfaced for metric in result.probe_metrics] == [
         metric.re_surfaced for metric in off.probe_metrics
     ]
     assert result.probe_metrics[0].re_score is not None
     assert off.probe_metrics[0].re_score is not None
     assert result.probe_metrics[0].re_score > off.probe_metrics[0].re_score
-    assert {metric.re_rank for metric in result.probe_metrics} == {1, None}
+    # immediate re-query holds rank 1; the delayed demotion parks the needle at
+    # the depth tail (rank 7); the decoy-aligned control demotes it to rank 6
+    assert {metric.re_rank for metric in result.probe_metrics} == {1, 6, 7}

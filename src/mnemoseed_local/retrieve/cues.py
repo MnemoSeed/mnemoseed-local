@@ -1020,3 +1020,38 @@ def extract_cues(
         project=project,
         time_bucket=time_bucket,
     )
+
+
+# ------------------------------------------------------- lexical shadow (read side)
+
+#: The read-side shadow token shape (prd-448): lowercase ASCII words of at
+#: least three characters, word-bounded (hyphens/underscores join).
+_SHADOW_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_-]{2,}\b")
+
+#: The shadow tuple cap.
+_SHADOW_TOKEN_CAP = 24
+
+
+def lexical_shadow_tokens(text: str, config: CueConfig | None = None) -> tuple[str, ...]:
+    """Read-side lexical shadow of one verbatim text: the extractor's entities
+    plus significant lowercase ASCII words (minus the shared stopword set),
+    deduplicated case-insensitively with the entity form winning, capped at
+    24. Pure read-side helper — the capture path never calls it, so stored
+    cues stay exactly what the capture funnel stamped.
+    """
+    extractor = CueExtractor(config)
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        folded = value.casefold()
+        if folded in seen or folded in _CAP_STOPWORDS:
+            return
+        seen.add(folded)
+        tokens.append(value)
+
+    for entity in extractor.extract(text).cues.entities:
+        add(entity)
+    for match in _SHADOW_TOKEN_RE.finditer(text):
+        add(match.group(0))
+    return tuple(tokens[:_SHADOW_TOKEN_CAP])
