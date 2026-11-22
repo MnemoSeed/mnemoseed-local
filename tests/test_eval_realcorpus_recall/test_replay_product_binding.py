@@ -79,9 +79,11 @@ def test_honest_empty_observation_has_no_served_entries() -> None:
 
 
 def test_no_synthetic_rig_imports() -> None:
-    package = Path(__file__).resolve().parents[1] / "src/mnemoseed_local/eval/realcorpus_recall"
+    package = Path(__file__).resolve().parents[2] / "src/mnemoseed_local/eval/realcorpus_recall"
     forbidden = ("synthetic_embedder", "stub_dream", "recall_matrix", "TARGET_BARS")
-    for path in package.glob("*.py"):
+    sources = list(package.glob("*.py"))
+    assert sources, f"no eval source files pinned at {package}"
+    for path in sources:
         source = path.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in source, (path.name, token)
