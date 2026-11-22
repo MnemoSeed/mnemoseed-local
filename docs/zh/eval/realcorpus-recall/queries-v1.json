@@ -1,10 +1,15 @@
 {
-  "status": "DRAFT — owner signature pending; not frozen",
-  "signed": false,
-  "owner_signature": null,
-  "draft_sha256_algorithm": "sha256 of UTF-8 JSON of this document with draft_sha256 removed, sort_keys=True, ensure_ascii=False, separators=(',', ':')",
-  "draft_sha256": "dec8f9cc00857bf52eadbb495d256329efa4c4e82142476e1bb593b98bad0af7",
-  "note": "target_chunk_ids and target_content_sha256 were read directly from the pinned corpus copy; no value was invented. author 'draft' is neutral until the owner signs; signed=false and owner_signature=null until that explicit act.",
+  "status": "FROZEN — owner-signed; immutable baseline (v1). Append-only: create queries-v2.json for any change.",
+  "signed": true,
+  "owner_signature": {
+    "kind": "owner_chat_authorization",
+    "verbatim": "确认署名冻结，开跑",
+    "date": "2026-11-23",
+    "provenance": "owner 2026-11-23 direct chat turn in @mnemoseeding session; authorizes freeze of this exact query set and running the baseline harness"
+  },
+  "frozen_at": "2026-11-23",
+  "frozen_sha256_algorithm": "sha256 of UTF-8 JSON with frozen_sha256 removed (top and per-entry), sort_keys=True, ensure_ascii=False, separators=(',', ':')",
+  "note": "target_chunk_ids and target_content_sha256 were read from the pinned corpus copy (corpus_manifest_sha256=f3e1761b...f858153); no value invented. Owner signed via the verbatim chat authorization above.",
   "queries": [
     {
       "qid": "Q-001",
@@ -19,11 +24,11 @@
       "target_content_sha256": "27b85db34c54e94373005243a823bf934c6ca2438a24731b22e64fc10505f791",
       "ingestion_verified": true,
       "rationale": "Diagnosis 2026-11-20 confirmed miss: natural phrasing failed while storage vocabulary scored 0.95-0.99; targets are the real execution-state chunks read from the frozen corpus copy.",
-      "author": "draft",
-      "date": "2026-11-22",
+      "author": "owner",
+      "date": "2026-11-23",
       "holdout": true,
       "seen": false,
-      "frozen_sha256": ""
+      "frozen_sha256": "1ba4388393970416c72d78ccf6a9f686e46292d5c0eecf31818a74a2459fe7f7"
     },
     {
       "qid": "Q-002",
@@ -36,11 +41,11 @@
       "target_content_sha256": "61df0d5cead17d7110f11e207ad20be9786459749c4c1ea937e0b2aeab42e8b2",
       "ingestion_verified": true,
       "rationale": "Real chunk from the corpus copy records the recall-weakness diagnosis; a natural paraphrase should surface it.",
-      "author": "draft",
-      "date": "2026-11-22",
+      "author": "owner",
+      "date": "2026-11-23",
       "holdout": true,
       "seen": false,
-      "frozen_sha256": ""
+      "frozen_sha256": "99e3c91b8967a0923d08cee7b0ca2b8e428db82a65a037e0c5e3f9556e2f8fd1"
     },
     {
       "qid": "Q-003",
@@ -51,11 +56,11 @@
       "target_content_sha256": "",
       "ingestion_verified": false,
       "rationale": "No chunk in the corpus copy contains 氦三 or 量子退火 (0 hits each); the honest answer is empty.",
-      "author": "draft",
-      "date": "2026-11-22",
+      "author": "owner",
+      "date": "2026-11-23",
       "holdout": true,
       "seen": false,
-      "frozen_sha256": ""
+      "frozen_sha256": "ab3efce31dcbacbc08b8b063df93fd9ee221aa8710f9657676b0608e789feee1"
     },
     {
       "qid": "Q-004",
@@ -66,11 +71,12 @@
       "target_content_sha256": "",
       "ingestion_verified": false,
       "rationale": "No chunk in the corpus copy contains 南极 or 冰淇淋 (0 hits each); the honest answer is empty.",
-      "author": "draft",
-      "date": "2026-11-22",
+      "author": "owner",
+      "date": "2026-11-23",
       "holdout": true,
       "seen": false,
-      "frozen_sha256": ""
+      "frozen_sha256": "9ebcc69aa38ece5a5896668f8270fbcfb5521bab9a1ae275d7c31387ea0ab1da"
     }
-  ]
+  ],
+  "frozen_sha256": "a43e94cb3460aa41fc0084297b8e683d08b4a3895176c410d001e67597028172"
 }
