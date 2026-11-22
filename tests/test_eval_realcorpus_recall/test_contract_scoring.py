@@ -140,6 +140,27 @@ def test_seen_only_subset_cannot_pass() -> None:
     assert result.verdict is not Verdict.PASS
 
 
+def test_holdout_only_bars_ignore_seen_hits() -> None:
+    queries = [
+        _query("Q-001", "miss_seed", targets=("chunk-a",)),
+        _query("Q-002", "honest_empty", targets=()),
+        _query("Q-003", "positive", targets=("chunk-target",)),
+        _query("Q-004", "positive", holdout=False, seen=True, targets=("chunk-seen",)),
+    ]
+    run = {
+        "Q-001": _observation("Q-001", (("chunk-a", 0.9, 10),)),
+        "Q-002": _observation("Q-002", ()),
+        "Q-003": _observation("Q-003", (("other", 0.9, 10),)),
+        "Q-004": _observation("Q-004", (("chunk-seen", 0.9, 10),)),
+    }
+    result = judge([run], queries, Thresholds(b2_recall_at_8=0.6))  # type: ignore[arg-type]
+    assert result.b2_denominator == 2
+    assert result.bars["B1"].verdict is Verdict.PASS
+    assert result.bars["B3"].verdict is Verdict.PASS
+    assert result.bars["B2"].verdict is Verdict.FAIL
+    assert result.verdict is Verdict.FAIL
+
+
 def test_ratified_miss_seed_and_honest_empty_are_enforced() -> None:
     queries = [
         _query("Q-001", "miss_seed"),

@@ -99,10 +99,10 @@ def score_run(
     positive = [
         metric
         for metric in per_query
-        if metric.kind in ("positive", "miss_seed") and metric.ingestion_verified
+        if metric.holdout and metric.kind in ("positive", "miss_seed") and metric.ingestion_verified
     ]
-    miss_seeds = [metric for metric in per_query if metric.kind == "miss_seed"]
-    honest_empty = [metric for metric in per_query if metric.kind == "honest_empty"]
+    miss_seeds = [metric for metric in per_query if metric.holdout and metric.kind == "miss_seed"]
+    honest_empty = [metric for metric in per_query if metric.holdout and metric.kind == "honest_empty"]
     served_total = sum(metric.served_count for metric in per_query)
     noise_total = sum(metric.noise_count for metric in per_query)
     return RunMetrics(

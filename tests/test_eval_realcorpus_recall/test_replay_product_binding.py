@@ -90,3 +90,26 @@ def test_no_synthetic_rig_imports() -> None:
 def test_replay_rejects_missing_product_payload() -> None:
     with pytest.raises(ValueError, match="memory"):
         ProductRecallReplay(_FakeService({})).replay("q", qid="Q-005", profile_id="p")
+
+
+def test_http_recall_route_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    from mnemoseed_local.eval.realcorpus_recall.replay import HttpRecallService
+
+    captured: dict[str, str] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"memory": {"entries": [], "dropped_count": 0, "tokens_used": 0}}
+
+    def _post(url: str, **kwargs: Any) -> _Response:
+        captured["url"] = url
+        return _Response()
+
+    monkeypatch.setattr(httpx, "post", _post)
+    HttpRecallService("http://127.0.0.1:45001").recall(query="q")
+    assert captured["url"] == "http://127.0.0.1:45001/memory/recall"

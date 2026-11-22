@@ -8,8 +8,10 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from mnemoseed_local.eval.realcorpus_recall.contract import (
+    ContractResult,
     Thresholds,
     Verdict,
     check_no_drift,
@@ -31,7 +33,7 @@ from mnemoseed_local.eval.realcorpus_recall.manifest import (
     verify_manifest,
     write_manifest,
 )
-from mnemoseed_local.eval.realcorpus_recall.metrics import QuerySpec, score_run
+from mnemoseed_local.eval.realcorpus_recall.metrics import QuerySpec, RunMetrics, score_run
 from mnemoseed_local.eval.realcorpus_recall.replay import HttpRecallService, ProductRecallReplay
 from mnemoseed_local.eval.realcorpus_recall.report import append_report
 
@@ -98,42 +100,15 @@ def _verify_home(home: Path, expected: CorpusManifest) -> None:
     )
 
 
-def run_command(args: argparse.Namespace) -> int:
-    pin_path = Path(args.pin)
-    expected = read_manifest(pin_path)
-    queries = _load_queries(Path(args.queries))
-    thresholds = _load_thresholds(Path(args.thresholds) if args.thresholds else None)
-    temp_root = Path(args.temp_root) if args.temp_root else default_temp_root()
-
-    if args.home:
-        home = Path(args.home)
-    else:
-        home = copy_corpus(
-            Path(args.source),
-            temp_root=temp_root,
-            code_revision=expected.code_revision,
-            embedder_version=expected.embedder_model_version,
-        ).home
-    _verify_home(home, expected)
-    pristine = snapshot_pristine(home, temp_root / f"s0-pristine-{uuid.uuid4().hex[:8]}")
-    baseline = directory_digest(pristine)
-    work = temp_root / f"s0-work-{uuid.uuid4().hex[:8]}"
-    runs = []
-    for index in range(thresholds.n_runs):
-        restore_writable_state(pristine, work)
-        if directory_digest(work) != baseline:
-            raise InvalidRun("pristine restore mismatch")
-        pin_home_in_config(work)
-        with daemon_context(work) as handle:
-            replay = ProductRecallReplay(HttpRecallService(handle.base_url, home=work))
-            observations = {
-                query.qid: replay.replay(query.text, qid=query.qid, profile_id=args.profile_id)
-                for query in queries
-            }
-            runs.append(score_run(observations, queries, run_index=index, baseline_sha256=baseline))
-    check_no_drift(runs)
-    result = judge(runs, queries, thresholds)
-    record = {
+def _emit(
+    out: str,
+    expected: CorpusManifest,
+    thresholds: Thresholds,
+    result: ContractResult,
+    runs: Sequence[RunMetrics],
+    **extra: Any,
+) -> int:
+    record: dict[str, Any] = {
         "utc": datetime.now(UTC).isoformat(),
         "run_id": uuid.uuid4().hex,
         "verdict": result.verdict.value,
@@ -163,9 +138,54 @@ def run_command(args: argparse.Namespace) -> int:
             for run in runs
         ],
     }
-    append_report(Path(args.out), record)
-    print(json.dumps({"verdict": result.verdict.value, "report": args.out}, indent=2))
+    record.update(extra)
+    append_report(Path(out), record)
+    summary: dict[str, Any] = {"verdict": result.verdict.value, "report": out}
+    summary.update(extra)
+    print(json.dumps(summary, indent=2))
     return 0 if result.verdict is Verdict.PASS else 1
+
+
+def run_command(args: argparse.Namespace) -> int:
+    pin_path = Path(args.pin)
+    expected = read_manifest(pin_path)
+    queries = _load_queries(Path(args.queries))
+    thresholds = _load_thresholds(Path(args.thresholds) if args.thresholds else None)
+    temp_root = Path(args.temp_root) if args.temp_root else default_temp_root()
+    runs: list[RunMetrics] = []
+
+    try:
+        if args.home:
+            home = Path(args.home)
+        else:
+            home = copy_corpus(
+                Path(args.source),
+                temp_root=temp_root,
+                code_revision=expected.code_revision,
+                embedder_version=expected.embedder_model_version,
+            ).home
+        _verify_home(home, expected)
+        pristine = snapshot_pristine(home, temp_root / f"s0-pristine-{uuid.uuid4().hex[:8]}")
+        baseline = directory_digest(pristine)
+        work = temp_root / f"s0-work-{uuid.uuid4().hex[:8]}"
+        for index in range(thresholds.n_runs):
+            restore_writable_state(pristine, work)
+            if directory_digest(work) != baseline:
+                raise InvalidRun("pristine restore mismatch")
+            pin_home_in_config(work)
+            with daemon_context(work) as handle:
+                replay = ProductRecallReplay(HttpRecallService(handle.base_url, home=work))
+                observations = {
+                    query.qid: replay.replay(query.text, qid=query.qid, profile_id=args.profile_id)
+                    for query in queries
+                }
+                runs.append(score_run(observations, queries, run_index=index, baseline_sha256=baseline))
+        check_no_drift(runs)
+        result = judge(runs, queries, thresholds)
+    except InvalidRun as exc:
+        result = judge(runs, queries, thresholds, invalid_runs=1)
+        return _emit(args.out, expected, thresholds, result, runs, error=str(exc))
+    return _emit(args.out, expected, thresholds, result, runs)
 
 
 def build_parser() -> argparse.ArgumentParser:
