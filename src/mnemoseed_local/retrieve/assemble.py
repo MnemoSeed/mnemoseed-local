@@ -73,13 +73,13 @@ from mnemoseed_local.storage.ports import (
 class AssembleConfig:
     """Tunable bounds for the assembly step.
 
-    Defaults follow design item 1 on retrieval discipline: top-k of 5 and a
+    Defaults follow design item 1 on retrieval discipline: top-k of 8 and an
     800-token budget (both overridable). Freshness demotion matches design/02
     section 9 (x0.8 rerank demotion); at most 2 truncated evidence snippets
     per pending graph candidate.
     """
 
-    top_k: int = 5
+    top_k: int = 8
     budget_tokens: int = 800
     evidence_cap: int = 2
     evidence_max_chars: int = 400

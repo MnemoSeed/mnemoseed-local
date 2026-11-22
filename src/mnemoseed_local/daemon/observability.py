@@ -73,6 +73,9 @@ class Observability:
         # observation numbers — no per-session breakdown, no ids, no text.
         self._recall_injection_count = 0
         self._recall_injection_chars_total = 0
+        # prd-448: fail-closed read-side shadow degradations (enrichment
+        # skipped, recall proceeds) — visible, never silent.
+        self._bridge_shadow_fallback_total = 0
         # The newest hook-attributed ingest is the real verification instant
         # the host status reads back over REST. No TS debug file or wire marker
         # is involved: stale is the honest default, and a hook ingest observed
@@ -115,6 +118,16 @@ class Observability:
             self._recall_injection_count += 1
             self._recall_injection_chars_total += char_count
 
+    def note_bridge_shadow_fallback(self) -> None:
+        """Record one fail-closed shadow-enrichment degradation (prd-448):
+        the recall result returns unenriched; recall itself proceeds."""
+        with self._lock:
+            self._bridge_shadow_fallback_total += 1
+
+    def bridge_shadow_fallback_total(self) -> int:
+        with self._lock:
+            return self._bridge_shadow_fallback_total
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -124,6 +137,7 @@ class Observability:
                 "recall_injection_count": self._recall_injection_count,
                 "recall_injection_chars_total": self._recall_injection_chars_total,
                 "recall_pending_served_count": self._recall_injection_count,
+                "bridge_shadow_fallback_total": self._bridge_shadow_fallback_total,
                 "last_anchored_at": self._last_anchored_at,
                 "anchor_status": self._anchor_status,
                 "process_commit_mb": process_commit_mb(),

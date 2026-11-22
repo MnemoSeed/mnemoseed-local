@@ -239,12 +239,21 @@ def test_budget_gate_exact_boundary_admits_and_drops_tail(stack) -> None:
 
 def test_budget_gate_drops_sixth_candidate(stack) -> None:
     # Six distinct texts with one score: id tie-break + 6th-drop, not score tie-break.
+    # Explicit depth: the drop mechanics are pinned at top_k=5, decoupled from
+    # the shipped default (depth 8).
     candidates = [_pool_candidate(f"c{i}", f"distinct loader text {i}", score=1.0) for i in range(6)]
     recall = HybridRecall(candidates=candidates, vector_hits=6, graph_hits=0)
-    result = _assemble(stack, recall)
+    result = _assemble(stack, recall, AssembleConfig(top_k=5, budget_tokens=800))
     assert [entry.id for entry in result.entries] == [f"c{i}" for i in range(5)]
     assert result.dropped_count == 1
     assert result.coverage.pool_size == 6
+
+
+def test_default_assembly_depth_is_eight() -> None:
+    """The shipped assembly depth (prd-448 R-2): eight served entries at the
+    unchanged 800-token budget."""
+    assert AssembleConfig().top_k == 8
+    assert AssembleConfig().budget_tokens == 800
 
 
 def test_budget_gate_reports_dropped_count_never_silent(stack) -> None:
