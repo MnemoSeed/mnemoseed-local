@@ -1,0 +1,73 @@
+{
+  "status": "DRAFT — owner signature pending; not frozen",
+  "draft_sha256": "ccaa481d01cfa0b4db9693b878cfdadd7a7e07f8d545f6ead3f6e4bf956debca",
+  "note": "target_chunk_ids and target_content_sha256 were read directly from the pinned corpus copy; no value was invented.",
+  "queries": [
+    {
+      "qid": "Q-001",
+      "text": "把一部分 codex 的对话记录导入 mnemoseed 记忆里",
+      "lang": "zh",
+      "kind": "miss_seed",
+      "target_chunk_ids": [
+        "039d7d239382480ea5108d76b389c3f8",
+        "16ece6f0d7cb45aba8e7198b3b001a0c",
+        "51318607b0eb42009b9797ab03fc0faa"
+      ],
+      "target_content_sha256": "27b85db34c54e94373005243a823bf934c6ca2438a24731b22e64fc10505f791",
+      "ingestion_verified": true,
+      "rationale": "Diagnosis 2026-11-20 confirmed miss: natural phrasing failed while storage vocabulary scored 0.95-0.99; targets are the real execution-state chunks read from the frozen corpus copy.",
+      "author": "owner",
+      "date": "2026-11-22",
+      "holdout": true,
+      "seen": false,
+      "frozen_sha256": ""
+    },
+    {
+      "qid": "Q-002",
+      "text": "之前那次 recall 弱点的诊断结论是什么",
+      "lang": "zh",
+      "kind": "positive",
+      "target_chunk_ids": [
+        "886e5261b87e46189570606d854d68d2"
+      ],
+      "target_content_sha256": "61df0d5cead17d7110f11e207ad20be9786459749c4c1ea937e0b2aeab42e8b2",
+      "ingestion_verified": true,
+      "rationale": "Real chunk from the corpus copy records the recall-weakness diagnosis; a natural paraphrase should surface it.",
+      "author": "owner",
+      "date": "2026-11-22",
+      "holdout": true,
+      "seen": false,
+      "frozen_sha256": ""
+    },
+    {
+      "qid": "Q-003",
+      "text": "我的量子退火机的氦三库存余额是多少",
+      "lang": "zh",
+      "kind": "honest_empty",
+      "target_chunk_ids": [],
+      "target_content_sha256": "",
+      "ingestion_verified": false,
+      "rationale": "No chunk in the corpus copy contains 氦三 or 量子退火 (0 hits each); the honest answer is empty.",
+      "author": "owner",
+      "date": "2026-11-22",
+      "holdout": true,
+      "seen": false,
+      "frozen_sha256": ""
+    },
+    {
+      "qid": "Q-004",
+      "text": "南极科考队今年的冰淇淋口味偏好记录",
+      "lang": "zh",
+      "kind": "honest_empty",
+      "target_chunk_ids": [],
+      "target_content_sha256": "",
+      "ingestion_verified": false,
+      "rationale": "No chunk in the corpus copy contains 南极 or 冰淇淋 (0 hits each); the honest answer is empty.",
+      "author": "owner",
+      "date": "2026-11-22",
+      "holdout": true,
+      "seen": false,
+      "frozen_sha256": ""
+    }
+  ]
+}

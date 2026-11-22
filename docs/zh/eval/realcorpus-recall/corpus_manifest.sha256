@@ -1,0 +1,6 @@
+{
+  "code_revision": "d6808f47f75d0e33b6fffc3e57c1df44527a0dfa",
+  "config_sha256": "87146bcb0368e566ab13adde72a1744536f0a045fa40e3c96232672c212e5505",
+  "corpus_manifest_sha256": "f3e1761be065c9a34a36f0a378be9e16ccd613b8d94f065d71352ea20f858153",
+  "embedder_model_version": "bge_m3_onnx@7e3d169cca88c313"
+}
