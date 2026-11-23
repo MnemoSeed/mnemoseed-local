@@ -1193,3 +1193,53 @@ def test_visibility_signal_text_is_never_citable(tmp_path: Path) -> None:
     assert len(reinforce) == 1, f"only the injected chunk is citable: {reinforce}"
     assert reinforce[0]["body"]["chunk_ids"] == ["c-mid"], reinforce
     assert reinforce[0]["body"]["profile_id"] == "default"
+
+
+def test_consumption_posts_carry_per_chunk_serve_id_and_weak_marking(tmp_path: Path) -> None:
+    """The additive consumption POST carries the per-chunk serve_id on both
+    injected and consumed_attested rows. A needle injected by two serves is
+    ambiguous, so its consumed rows carry an empty correlation_id (weak); a
+    needle unique to one serve keeps that serve_id (exact). Block rendering,
+    needle derivation and the reinforce call set stay unchanged."""
+    bundle = _bundle(tmp_path)
+    transcript = _run(bundle, "consumption-attribution")
+    posts = transcript["consumptionPosts"]
+    assert posts
+
+    def items_for(kind: str, session: str) -> list[dict]:
+        return [
+            item
+            for post in posts
+            if post["session_id"] == session
+            for item in post["items"]
+            if item["event_kind"] == kind
+        ]
+
+    injected_exact = {
+        (item["evidence_id"], item["correlation_id"]) for item in items_for("injected", "sess-behavior")
+    }
+    assert ("c-attr-1", "serve-A") in injected_exact, injected_exact
+    assert ("c-attr-2", "serve-B") in injected_exact, injected_exact
+    consumed_exact = {
+        (item["evidence_id"], item["correlation_id"])
+        for item in items_for("consumed_attested", "sess-behavior")
+    }
+    assert consumed_exact == {("c-attr-1", "serve-A"), ("c-attr-2", "serve-B")}, consumed_exact
+    for item in items_for("consumed_attested", "sess-behavior"):
+        assert item["method"] == "citation_substring_v1"
+        assert item["needle_hash"] and item["needle_len"] > 0
+
+    injected_weak = {
+        (item["evidence_id"], item["correlation_id"]) for item in items_for("injected", "sess-weak")
+    }
+    assert ("c-weak-1", "serve-A") in injected_weak, injected_weak
+    assert ("c-weak-2", "serve-C") in injected_weak, injected_weak
+    consumed_weak = items_for("consumed_attested", "sess-weak")
+    assert {item["evidence_id"] for item in consumed_weak} == {"c-weak-1", "c-weak-2"}
+    assert {item["correlation_id"] for item in consumed_weak} == {""}, consumed_weak
+
+    for post in posts:
+        for item in post["items"]:
+            assert not ({"text", "query", "content", "reply"} & set(item)), item
+    assert "alpha serve attribution needle content" in transcript["exactBlock"]
+    assert transcript["exactBlock"].count("<mnemoseed-memory-recall>") == 1

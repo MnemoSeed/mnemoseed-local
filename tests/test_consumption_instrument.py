@@ -78,13 +78,17 @@ def _rows(client: TestClient, action: str = "recall_feedback") -> list[dict[str,
     return response.json()["items"]
 
 
-def _consumption_rows(client: TestClient, *, kind: str | None = None) -> list[dict[str, Any]]:
+def _consumption_events(client: TestClient, *, kind: str | None = None) -> list[ConsumptionEvent]:
     store = client.app.state.stores.meta
     flt = ConsumptionEventFilter(
         profile_id="default",
         event_kind=ConsumptionEventKind(kind) if kind else None,
     )
-    page = store.query_consumption_events(flt, Page(0, 100))
+    return store.query_consumption_events(flt, Page(0, 100)).items
+
+
+def _consumption_rows(client: TestClient, *, kind: str | None = None) -> list[dict[str, Any]]:
+    page_items = _consumption_events(client, kind=kind)
     return [
         {
             "event_kind": event.event_kind.value,
@@ -93,12 +97,13 @@ def _consumption_rows(client: TestClient, *, kind: str | None = None) -> list[di
             "method": event.method.value if event.method else None,
             "source": event.source.value,
         }
-        for event in page.items
+        for event in page_items
     ]
 
 
-def _bootable_home(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _bootable_home(home: Path, monkeypatch: pytest.MonkeyPatch, *, auto_recall: bool = False) -> None:
     home.mkdir(parents=True, exist_ok=True)
+    capture = "[capture]\nauto_recall = true\n" if auto_recall else ""
     (home / "config.toml").write_text(
         'preset = "embedded"\n'
         f'[storage.vector]\nuri = "{(home / "chunks.lance").as_posix()}"\ndimensions = 64\n'
@@ -106,7 +111,7 @@ def _bootable_home(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         f'[storage.graph.instances.isolated]\npath = "{(home / "isolated.db").as_posix()}"\n'
         f'[storage.meta]\npath = "{(home / "meta.db").as_posix()}"\n'
         '[storage.embed]\ndriver = "synthetic"\ndimension = 64\n'
-        '[dream.llm.dream]\ndriver = "stub"\nmodel = "stub"\n',
+        '[dream.llm.dream]\ndriver = "stub"\nmodel = "stub"\n' + capture,
         encoding="utf-8",
     )
     monkeypatch.delenv("STORAGE_MODE", raising=False)
@@ -520,3 +525,74 @@ def test_feedback_old_caller_without_correlation_id_stays_compatible(
         assert len(rows) == 1
         assert rows[0]["correlation_id"] == ""
         assert rows[0]["method"] == "explicit_unknown"
+
+
+# ---------------------------------------------------------------- AC-2: served writers
+
+
+def test_recall_writes_a_served_row_per_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_similarity_floor: None
+) -> None:
+    home = tmp_path / "home"
+    _bootable_home(home, monkeypatch)
+    query = "缓存完整性"
+    with auth_support.boot(home) as client:
+        _ingest_chunk(client, "记忆消费链路的缓存完整性检查流程")
+        response = client.post(
+            "/memory/recall",
+            json={"profile_id": "default", "query": query, "top_k": 5},
+        )
+        assert response.status_code == 200, response.text
+        entries = response.json()["memory"]["entries"]
+        assert entries
+
+        served = _consumption_events(client, kind="served")
+        assert len(served) == len(entries)
+        for rank, (event, entry) in enumerate(zip(served, entries, strict=True)):
+            assert event.profile_id == "default"
+            assert event.event_kind is ConsumptionEventKind.SERVED
+            assert event.source is ConsumptionSource.DAEMON
+            assert event.correlation_id == entry["serve_id"]
+            assert event.evidence_id == entry["id"]
+            assert event.rank == rank
+            assert event.query_hash == hashlib.sha256(query.encode("utf-8")).hexdigest()
+
+
+def test_recall_pending_writes_a_served_row_per_item(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mnemoseed_local.schema.turn import HostId
+
+    home = tmp_path / "home"
+    _bootable_home(home, monkeypatch, auto_recall=True)
+    with auth_support.boot(home) as client:
+        _ingest_chunk(client, "上一轮我们把 LanceDb 定为向量存储")
+        ingest = client.post(
+            "/ingest",
+            json={
+                "host": HostId.CLAUDE_CODE.value,
+                "event": "user_prompt",
+                "session_id": "sess-pull",
+                "profile_id": "default",
+                "ts": 2.0,
+                "content": {"text": "LanceDb 现在处于什么阶段"},
+            },
+        )
+        assert ingest.status_code == 202, ingest.text
+
+        response = client.post(
+            "/session/recall-pending",
+            json={"profile_id": "default", "session_id": "sess-pull"},
+        )
+        assert response.status_code == 200, response.text
+        items = response.json()["items"]
+        assert items
+
+        served = _consumption_events(client, kind="served")
+        assert len(served) == len(items)
+        for rank, (event, item) in enumerate(zip(served, items, strict=True)):
+            assert event.profile_id == "default"
+            assert event.event_kind is ConsumptionEventKind.SERVED
+            assert event.source is ConsumptionSource.DAEMON
+            assert event.correlation_id == item["serve_id"]
+            assert event.evidence_id == item["id"]
+            assert event.rank == rank
+            assert event.query_hash is None
