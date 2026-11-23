@@ -62,12 +62,13 @@ Driver family covered by the `stack` fixture:
 | upsert_node | `test_contract_graph.py::test_upsert_get_roundtrip` |
 | versions | `test_contract_graph.py::test_versions_chain` |
 
-## MetaStore (49 methods)
+## MetaStore (51 methods)
 
 | Method | Contract test |
 |---|---|
 | add_token_usage | `test_contract_meta.py::test_dream_token_ledger_atomic_increment` |
 | advance_watermark | `test_contract_meta.py::test_pool_watermark_gap_raises` |
+| append_consumption_event | `test_consumption_instrument.py::test_duplicate_append_is_idempotent` |
 | append_error_event | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
 | append_reconcile_nomination | `test_contract_meta.py::test_append_reconcile_nomination_atomic_carrier_and_rows` |
 | archive_profile | `test_contract_meta.py::test_profile_archive_flag` |
@@ -102,6 +103,7 @@ Driver family covered by the `stack` fixture:
 | pool_drain | `test_contract_meta.py::test_pool_drain_files_the_lifetime_ledger` |
 | pool_state | `test_contract_meta.py::test_pool_add_state_advance_watermark` |
 | pool_states | `test_contract_meta.py::test_pool_states_returns_all_rows` |
+| query_consumption_events | `test_consumption_instrument.py::test_duplicate_append_is_idempotent` |
 | query_error_events | `test_contract_meta.py::test_error_event_append_and_query_profile_scoped` |
 | query_reconciliation_nominations | `test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence` |
 | read_reconciliation_evidence | `test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence` |

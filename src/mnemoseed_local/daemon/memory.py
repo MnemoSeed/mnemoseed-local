@@ -43,6 +43,7 @@ usage-event ``last_hit_at``); no randomness; no network.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
@@ -100,6 +102,11 @@ from mnemoseed_local.storage.ports import (
     AuditEntry,
     AuditFilter,
     ChunkFilter,
+    ConsumptionEvent,
+    ConsumptionEventKind,
+    ConsumptionEvidenceKind,
+    ConsumptionMethod,
+    ConsumptionSource,
     DreamRunFilter,
     EvidenceKind,
     NodeFilter,
@@ -354,6 +361,7 @@ class RecallFeedbackRequest(BaseModel):
     profile_id: ProfileRef
     kind: str
     observed_at: str
+    correlation_id: str | None = None
 
     @field_validator("kind")
     @classmethod
@@ -368,6 +376,35 @@ class RecallFeedbackRequest(BaseModel):
         if not is_iso8601(value):
             raise ValueError("observed_at must be ISO-8601")
         return value
+
+
+class ConsumptionItem(BaseModel):
+    """One evidence-pointer item on the additive consumption POST.
+
+    Carries store keys, one-way digests, lengths and counts only; no reply,
+    query or injected text. ``correlation_id`` is the per-chunk serve_id, with
+    the envelope ``serve_id`` as a default for single-serve batches.
+    """
+
+    event_kind: ConsumptionEventKind
+    evidence_kind: ConsumptionEvidenceKind
+    evidence_id: NonBlankText
+    method: ConsumptionMethod | None = None
+    rank: int | None = None
+    needle_len: int | None = None
+    needle_hash: str | None = None
+    observed_at: float | None = None
+    correlation_id: str | None = None
+
+
+class ConsumptionRequest(BaseModel):
+    """Additive host POST carrying observed consumption evidence."""
+
+    profile_id: ProfileRef
+    host: NonBlankText
+    session_id: str | None = None
+    serve_id: str | None = None
+    items: list[ConsumptionItem] = Field(default_factory=list, max_length=64)
 
 
 # Scoped-resume anchor extraction (issue #187): bare kebab identifiers (at
@@ -708,6 +745,11 @@ class MemoryService:
         # B2.7: per-session daemon-side T2 char count (served items), reported
         # as ``rules_budget.budget_consumed`` — the hook only reads it.
         self._budget_consumed: dict[tuple[str, str], int] = {}
+        # Consumption ledger: opaque per-serve correlation id, monotonic within
+        # a process. The same id is echoed on the wire and written on served
+        # rows so host-injected/consumed rows join back to the same serve.
+        self._serve_seq = 0
+        self._serve_lock = threading.Lock()
         # B1 provider-failure event arm: per-(profile, session) consumed event
         # ids. A live nomination arms exactly one serve; the serve marks the
         # event id consumed under the same lock, so an unresolved row can
@@ -792,7 +834,22 @@ class MemoryService:
         self._record_hits(context)
         if session_id is not None:
             self._refresh_activation(context, profile_id=profile_id, session_id=session_id)
-        payload = self._memory_payload(context)
+        serve_id = self._next_serve_id(profile_id, session_id)
+        served_pairs = [
+            (
+                ConsumptionEvidenceKind.CHUNK if entry.kind == "chunk" else ConsumptionEvidenceKind.NODE,
+                entry.id,
+            )
+            for entry in context.entries
+        ]
+        self._record_served(
+            profile_id=profile_id,
+            session_id=session_id,
+            serve_id=serve_id,
+            pairs=served_pairs,
+            query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        )
+        payload = self._memory_payload(context, serve_id)
         # design/09 §3.6: dead-zone pins stay reachable as one-line residues on
         # the MCP explicit recall response (never on the T2 injection surface).
         payload["index_residue"] = self._index_residue(profile_id)
@@ -835,11 +892,86 @@ class MemoryService:
         except Exception:  # pragma: no cover - usage accounting must not fail recall
             logger.warning("usage-event write failed; recall proceeds", exc_info=True)
 
-    def _memory_payload(self, context: AssembledContext) -> dict[str, Any]:
+    def _next_serve_id(self, profile_id: str, session_id: str | None) -> str:
+        """Mint an opaque per-serve correlation id, monotonic within the boot."""
+        with self._serve_lock:
+            self._serve_seq += 1
+            seq = self._serve_seq
+        raw = f"{profile_id}|{session_id or ''}|{seq}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _record_served(
+        self,
+        *,
+        profile_id: str,
+        session_id: str | None,
+        serve_id: str,
+        pairs: Sequence[tuple[ConsumptionEvidenceKind, str]],
+        query_hash: str | None = None,
+    ) -> None:
+        """Append one served row per assembled item; failures never fail recall."""
+        try:
+            for rank, (evidence_kind, evidence_id) in enumerate(pairs):
+                appended = self._stores.meta.append_consumption_event(
+                    ConsumptionEvent(
+                        profile_id=profile_id,
+                        correlation_id=serve_id,
+                        event_kind=ConsumptionEventKind.SERVED,
+                        evidence_kind=evidence_kind,
+                        evidence_id=evidence_id,
+                        source=ConsumptionSource.DAEMON,
+                        observed_at=time.time(),
+                        method=ConsumptionMethod.UNSPECIFIED,
+                        rank=rank,
+                        session_id=session_id,
+                        query_hash=query_hash,
+                    )
+                )
+                if appended and self._observability is not None:
+                    self._observability.note_consumption_event(ConsumptionEventKind.SERVED.value)
+        except Exception:
+            logger.warning("consumption ledger write failed; recall proceeds", exc_info=True)
+
+    def record_consumption(
+        self,
+        *,
+        profile_id: str,
+        host: str,
+        session_id: str | None,
+        items: Sequence[ConsumptionItem],
+        serve_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append host-observed injection/consumption evidence, best effort."""
+        accepted = 0
+        for item in items:
+            try:
+                event = ConsumptionEvent(
+                    profile_id=profile_id,
+                    correlation_id=item.correlation_id or serve_id or "",
+                    event_kind=item.event_kind,
+                    evidence_kind=item.evidence_kind,
+                    evidence_id=item.evidence_id,
+                    source=ConsumptionSource.PLUGIN_HOOK,
+                    observed_at=item.observed_at if item.observed_at is not None else time.time(),
+                    method=item.method,
+                    rank=item.rank,
+                    needle_len=item.needle_len,
+                    needle_hash=item.needle_hash,
+                    session_id=session_id,
+                )
+                if self._stores.meta.append_consumption_event(event):
+                    accepted += 1
+                    if self._observability is not None:
+                        self._observability.note_consumption_event(item.event_kind.value)
+            except Exception:
+                logger.warning("consumption event append failed", exc_info=True)
+        return {"ok": True, "accepted": accepted}
+
+    def _memory_payload(self, context: AssembledContext, serve_id: str | None = None) -> dict[str, Any]:
         coverage = context.coverage
         watermark = coverage.watermark
         return {
-            "entries": [self._entry_payload(entry) for entry in context.entries],
+            "entries": [self._entry_payload(entry, serve_id) for entry in context.entries],
             "dropped_count": context.dropped_count,
             "budget_tokens": context.budget_tokens,
             "tokens_used": context.tokens_used,
@@ -859,8 +991,8 @@ class MemoryService:
         }
 
     @staticmethod
-    def _entry_payload(entry: AssembledEntry) -> dict[str, Any]:
-        return {
+    def _entry_payload(entry: AssembledEntry, serve_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "kind": entry.kind,
             "id": entry.id,
             "source": entry.source,
@@ -885,6 +1017,9 @@ class MemoryService:
                 iso8601_utc(entry.ingested_at) if entry.ingested_at is not None else None,
             ),
         }
+        if serve_id is not None:
+            payload["serve_id"] = serve_id
+        return payload
 
     def _index_residue(self, profile_id: str) -> dict[str, Any]:
         """The residue BLOCK for dead-zone flashbulb pins (design/09 §3.6):
@@ -2355,9 +2490,27 @@ class MemoryService:
             conflict_reason = selection["conflict_reason"]
             rule_count = 1 if rule_served else 0
             self._consume_provider_event(profile_id, session_id, live.id)
+        response_items = items
+        if items:
+            serve_id = self._next_serve_id(profile_id, session_id)
+            response_items = [{**item, "serve_id": serve_id} for item in items]
+            self._record_served(
+                profile_id=profile_id,
+                session_id=session_id,
+                serve_id=serve_id,
+                pairs=[
+                    (
+                        ConsumptionEvidenceKind.NODE
+                        if str(item.get("kind")) in {"node", "graph"}
+                        else ConsumptionEvidenceKind.CHUNK,
+                        str(item.get("id", "")),
+                    )
+                    for item in items
+                ],
+            )
         return {
             "enabled": True,
-            "items": items,
+            "items": response_items,
             "non_focal_above_floor": non_focal,
             "budget_chars": budget,
             "slot_consumed": slot_consumed,
@@ -2847,8 +3000,16 @@ class MemoryService:
             "limit": page.limit,
         }
 
-    def recall_feedback(self, *, profile_id: str, kind: str, observed_at: str, actor: str) -> dict[str, Any]:
-        """Append one miss signal to the immutable audit ledger and change nothing else."""
+    def recall_feedback(
+        self,
+        *,
+        profile_id: str,
+        kind: str,
+        observed_at: str,
+        actor: str,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one miss signal to the immutable audit ledger and nothing else."""
         self._stores.meta.audit_append(
             AuditEntry(
                 actor=actor,
@@ -2857,6 +3018,28 @@ class MemoryService:
                 at=time.time(),
             )
         )
+        attributed = bool(correlation_id)
+        try:
+            appended = self._stores.meta.append_consumption_event(
+                ConsumptionEvent(
+                    profile_id=profile_id,
+                    correlation_id=correlation_id or "",
+                    event_kind=ConsumptionEventKind.CONSUMED_EXPLICIT,
+                    evidence_kind=ConsumptionEvidenceKind.CHUNK,
+                    evidence_id=correlation_id or "",
+                    source=ConsumptionSource.AGENT_TOOL,
+                    observed_at=datetime.fromisoformat(observed_at.replace("Z", "+00:00")).timestamp(),
+                    method=(
+                        ConsumptionMethod.EXPLICIT_NOT_USEFUL
+                        if attributed
+                        else ConsumptionMethod.EXPLICIT_UNKNOWN
+                    ),
+                )
+            )
+            if appended and self._observability is not None:
+                self._observability.note_consumption_event(ConsumptionEventKind.CONSUMED_EXPLICIT.value)
+        except Exception:
+            logger.warning("consumption feedback append failed", exc_info=True)
         return {"ok": True, "kind": kind, "observed_at": observed_at}
 
     def _audit(self, profile_id: str, action: str, detail: dict[str, Any], *, actor: str = "console") -> None:
@@ -3024,6 +3207,19 @@ def memory_error_events(req: ErrorEventsRequest, request: Request) -> dict[str, 
     return service.list_error_events(profile_id=req.profile_id, limit=req.limit, offset=req.offset)
 
 
+@router.post("/memory/consumption")
+def memory_consumption(req: ConsumptionRequest, request: Request) -> dict[str, Any]:
+    """Append host-observed consumption evidence; no ranking or retention effect."""
+    service: MemoryService = request.app.state.memory
+    return service.record_consumption(
+        profile_id=req.profile_id,
+        host=req.host,
+        session_id=req.session_id,
+        items=req.items,
+        serve_id=req.serve_id,
+    )
+
+
 @router.post("/memory/recall_feedback")
 def memory_recall_feedback(req: RecallFeedbackRequest, request: Request) -> dict[str, Any]:
     """Store-only one-shot recall miss signal; no ranking or retention effect."""
@@ -3033,6 +3229,7 @@ def memory_recall_feedback(req: RecallFeedbackRequest, request: Request) -> dict
         kind=req.kind,
         observed_at=req.observed_at,
         actor=resolve_actor(request),
+        correlation_id=req.correlation_id,
     )
 
 

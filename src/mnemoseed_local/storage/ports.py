@@ -619,6 +619,117 @@ class ErrorEventFilter:
     composite_group_id: str | None = None
 
 
+class ConsumptionEventKind(StrEnum):
+    """Closed set of consumption-ledger event facts (no verdict)."""
+
+    SERVED = "served"
+    INJECTED = "injected"
+    CONSUMED_ATTESTED = "consumed_attested"
+    CONSUMED_EXPLICIT = "consumed_explicit"
+
+
+class ConsumptionEvidenceKind(StrEnum):
+    """The store surface a consumption evidence pointer names."""
+
+    CHUNK = "chunk"
+    NODE = "node"
+
+
+class ConsumptionSource(StrEnum):
+    """The producer that appended a consumption event."""
+
+    DAEMON = "daemon"
+    PLUGIN_HOOK = "plugin_hook"
+    AGENT_TOOL = "agent_tool"
+
+
+class ConsumptionMethod(StrEnum):
+    """Closed set of evidence-collection methods; not a correctness verdict."""
+
+    CITATION_SUBSTRING_V1 = "citation_substring_v1"
+    EXPLICIT_NOT_USEFUL = "explicit_not_useful"
+    EXPLICIT_UNKNOWN = "explicit_unknown"
+    UNSPECIFIED = "unspecified"
+
+
+@dataclass(frozen=True)
+class ConsumptionEvent:
+    """One append-only consumption-ledger row.
+
+    ``profile_id`` is always explicit and never guessed. ``observed_at`` is a
+    monotonic epoch set at write time; the autoincrement ``id`` gives the stable
+    append order. ``correlation_id`` is the opaque serve_id that relates a
+    served row to its injected/consumed rows across processes; an empty value
+    means no attribution was available and the read side marks it ``weak``.
+    Only store keys, one-way hashes, lengths and counts are carried — never
+    reply text or natural-language query text.
+    """
+
+    profile_id: str
+    correlation_id: str
+    event_kind: ConsumptionEventKind
+    evidence_kind: ConsumptionEvidenceKind
+    evidence_id: str
+    source: ConsumptionSource
+    observed_at: float
+    method: ConsumptionMethod | None = None
+    rank: int | None = None
+    needle_len: int | None = None
+    needle_hash: str | None = None
+    session_id: str | None = None
+    query_hash: str | None = None
+    dedup_key: str | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class ConsumptionEventFilter:
+    """Filter for the profile-scoped, paginated consumption-event read."""
+
+    profile_id: str
+    event_kind: ConsumptionEventKind | None = None
+    evidence_kind: ConsumptionEvidenceKind | None = None
+    session_id: str | None = None
+    correlation_id: str | None = None
+    since: float | None = None
+    until: float | None = None
+
+
+def derive_consumption_dedup_key(
+    profile_id: str,
+    correlation_id: str,
+    event_kind: str,
+    evidence_id: str,
+    method: str | None,
+) -> str:
+    """Stable idempotency key over attribution fields, never over time."""
+    raw = f"{profile_id}|{correlation_id}|{event_kind}|{evidence_id}|{method or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def consumption_status(events: Sequence[ConsumptionEvent]) -> str:
+    """Derive a consumed status from evidence only; silence is ``unknown``."""
+    for event in events:
+        kind = getattr(event.event_kind, "value", event.event_kind)
+        if kind == ConsumptionEventKind.CONSUMED_ATTESTED.value:
+            return "consumed_attested"
+        if kind == ConsumptionEventKind.CONSUMED_EXPLICIT.value:
+            return "consumed_explicit"
+    return "unknown"
+
+
+def consumption_join(consumed: ConsumptionEvent, served: Sequence[ConsumptionEvent]) -> str:
+    """``exact`` only when one served row shares the (serve_id, evidence_id)
+    pair; an absent or ambiguous correlation is ``weak``."""
+    correlation = consumed.correlation_id or ""
+    if not correlation:
+        return "weak"
+    matches = [
+        row for row in served if row.correlation_id == correlation and row.evidence_id == consumed.evidence_id
+    ]
+    return "exact" if len(matches) == 1 else "weak"
+
+
 @dataclass(frozen=True)
 class ConfigEntry:
     """One versioned config value."""
@@ -1471,6 +1582,18 @@ class MetaStore(Protocol):
         append order (id asc), ready for E2 dream adjudication and the issue
         #123 reconciliation channel to consume as evidence pointers.
         """
+        raise NotImplementedError
+
+    # ----------------------------------------- consumption-event ledger (S1)
+
+    def append_consumption_event(self, event: ConsumptionEvent) -> bool:
+        """Append one consumption-ledger row; a duplicate dedup key returns False."""
+        raise NotImplementedError
+
+    def query_consumption_events(
+        self, filter: ConsumptionEventFilter, page: Page
+    ) -> PageResult[ConsumptionEvent]:
+        """Profile-scoped, paginated read in stable append order."""
         raise NotImplementedError
 
     def append_reconcile_nomination(self, request: NominationRequest) -> NominationResult:

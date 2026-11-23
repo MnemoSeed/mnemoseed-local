@@ -73,6 +73,14 @@ class Observability:
         # observation numbers — no per-session breakdown, no ids, no text.
         self._recall_injection_count = 0
         self._recall_injection_chars_total = 0
+        # Consumption ledger: since-boot per-event-kind append counts. Pure
+        # observation numbers; never summed across boots and never a verdict.
+        self._consumption_counts: dict[str, int] = {
+            "served": 0,
+            "injected": 0,
+            "consumed_attested": 0,
+            "consumed_explicit": 0,
+        }
         # prd-448: fail-closed read-side shadow degradations (enrichment
         # skipped, recall proceeds) — visible, never silent.
         self._bridge_shadow_fallback_total = 0
@@ -118,6 +126,11 @@ class Observability:
             self._recall_injection_count += 1
             self._recall_injection_chars_total += char_count
 
+    def note_consumption_event(self, event_kind: str) -> None:
+        """Record one appended consumption-ledger event of this kind."""
+        with self._lock:
+            self._consumption_counts[event_kind] = self._consumption_counts.get(event_kind, 0) + 1
+
     def note_bridge_shadow_fallback(self) -> None:
         """Record one fail-closed shadow-enrichment degradation (prd-448):
         the recall result returns unenriched; recall itself proceeds."""
@@ -137,6 +150,7 @@ class Observability:
                 "recall_injection_count": self._recall_injection_count,
                 "recall_injection_chars_total": self._recall_injection_chars_total,
                 "recall_pending_served_count": self._recall_injection_count,
+                "consumption_events": dict(self._consumption_counts),
                 "bridge_shadow_fallback_total": self._bridge_shadow_fallback_total,
                 "last_anchored_at": self._last_anchored_at,
                 "anchor_status": self._anchor_status,

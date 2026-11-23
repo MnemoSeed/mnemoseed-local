@@ -232,6 +232,8 @@ let sliceTurnsVisible = false
 let t2CiteTurnsVisible = false
 // signal-not-citable: reply quoting the signal line sends no reinforce.
 let signalCiteTurnVisible = false
+// consumption scenario: replies citing injected slices with their serve ids.
+let consumptionTurnsVisible = false
 
 function historyEntries() {
   const entries = [
@@ -375,6 +377,27 @@ function historyEntries() {
       sessionID: SES,
       time: { created: 9_000, completed: 10_000 },
       content: [{ type: "text", text: "[mnemoseed] recalled related memories" }],
+    })
+  }
+  if (consumptionTurnsVisible) {
+    entries.push({
+      id: "m_consume_exact",
+      type: "assistant",
+      sessionID: SES,
+      time: { created: 11_000, completed: 12_000 },
+      content: [
+        {
+          type: "text",
+          text: "alpha serve attribution needle content 111111111111111111111111 bravo serve attribution needle content 222222222222222222222222",
+        },
+      ],
+    })
+    entries.push({
+      id: "m_consume_weak",
+      type: "assistant",
+      sessionID: "sess-weak",
+      time: { created: 12_000, completed: 13_000 },
+      content: [{ type: "text", text: "shared needle attribution content 333333333333333333333333" }],
     })
   }
   return entries
@@ -1130,6 +1153,86 @@ async function main() {
         JSON.stringify({
           injectedBlock,
           reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+        }),
+      )
+      break
+    }
+
+    case "consumption-attribution": {
+      // Host emission of per-chunk serve_id on injected/consumed_attested
+      // rows, plus weak marking when one needle is injected by two serves.
+      await mkdir(dirname(CREDENTIAL_PATH), { recursive: true })
+      await writeFile(CREDENTIAL_PATH, "hook-test-credential\n", "utf8")
+      consumptionTurnsVisible = true
+      recentPayload = { profile_id: "default", sessions: [] }
+      recallPayload = {
+        enabled: true,
+        items: [
+          {
+            kind: "chunk",
+            id: "c-attr-1",
+            text: "user: alpha serve attribution needle content 111111111111111111111111",
+            serve_id: "serve-A",
+            source: "memory.capture",
+          },
+          {
+            kind: "chunk",
+            id: "c-attr-2",
+            text: "assistant: bravo serve attribution needle content 222222222222222222222222",
+            serve_id: "serve-B",
+            source: "memory.capture",
+          },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      await fire.prompt({ sessionID: SES, messageID: "m_attr_arm", prompt: { text: "arm" } })
+      await delay(60)
+      const o = { system: ["BASE"] }
+      await fire.context({ sessionID: SES, system: o.system })
+      await delay(120)
+      const exactBlock = sysTexts(o.system)[1]
+      await fire.assistantReply("m_consume_exact", 3_000)
+      await delay(120)
+
+      recallPayload = {
+        enabled: true,
+        items: [
+          {
+            kind: "chunk",
+            id: "c-weak-1",
+            text: "user: shared needle attribution content 333333333333333333333333",
+            serve_id: "serve-A",
+            source: "memory.capture",
+          },
+          {
+            kind: "chunk",
+            id: "c-weak-2",
+            text: "user: shared needle attribution content 333333333333333333333333",
+            serve_id: "serve-C",
+            source: "memory.capture",
+          },
+        ],
+        non_focal_above_floor: 0,
+        slot_consumed: false,
+        budget_chars: 1200,
+      }
+      const weakSession = "sess-weak"
+      await fire.prompt({ sessionID: weakSession, messageID: "m_weak_arm", prompt: { text: "arm" } })
+      await delay(60)
+      await fire.context({ sessionID: weakSession, system: ["BASE"] })
+      await delay(120)
+      await fire.assistantReply("m_consume_weak", 4_000)
+      await delay(120)
+
+      console.log(
+        JSON.stringify({
+          consumptionPosts: posts
+            .filter((post) => post.url.endsWith("/memory/consumption"))
+            .map((post) => post.body),
+          reinforcePosts: posts.filter((post) => post.url.endsWith("/memory/reinforce")),
+          exactBlock,
         }),
       )
       break
