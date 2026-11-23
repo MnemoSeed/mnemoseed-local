@@ -106,6 +106,9 @@ COVERAGE: dict[str, dict[str, str]] = {
         # error-event ledger (E1 error-experience pipeline, PRD-B2.13)
         "append_error_event": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
         "query_error_events": "test_contract_meta.py::test_error_event_append_and_query_profile_scoped",
+        # consumption ledger (append-only evidence instrumentation)
+        "append_consumption_event": "test_consumption_instrument.py::test_duplicate_append_is_idempotent",
+        "query_consumption_events": "test_consumption_instrument.py::test_duplicate_append_is_idempotent",
         # reconcile nomination (S-A: atomic carrier + NODE rows)
         "query_reconciliation_nominations": (
             "test_contract_reconciliation.py::test_nomination_snapshot_cursor_and_exact_evidence"
@@ -163,10 +166,11 @@ COVERAGE: dict[str, dict[str, str]] = {
 # (append_error_event + query_error_events: the signal-agnostic write seam and
 # profile-scoped paginated read backing PRD-B2.13 E1), and to 38 with
 # append_reconcile_nomination (S-A: the atomic nomination carrier
-# write — one transaction, carrier + two NODE ledger rows, typed dedup).
+# write — one transaction, carrier + two NODE ledger rows, typed dedup), and to
+# 51 with the append-only consumption-evidence ledger write and read seams.
 EXPECTED_METHOD_COUNTS: dict[str, int] = {
     "VectorStore": 16,
     "GraphStore": 28,
-    "MetaStore": 49,
+    "MetaStore": 51,
     "Embedder": 3,
 }

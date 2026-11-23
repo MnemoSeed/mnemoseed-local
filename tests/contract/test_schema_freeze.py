@@ -192,6 +192,7 @@ _FROZEN_META_TABLES = (
     "ingest_events",
     "ingest_watermarks",
     "ingest_applied",
+    "consumption_events",
 )
 _FROZEN_META_INDEXES = (
     "idx_tokens_profile",
@@ -205,6 +206,8 @@ _FROZEN_META_INDEXES = (
     "idx_reconciliation_attempts_profile_nomination",
     "idx_reconcile_nominations_profile_nomination",
     "idx_ingest_events_stream",
+    "idx_consumption_profile_time",
+    "idx_consumption_corr",
 )
 _FROZEN_TRIGGERS = (
     ("trg_audit_no_update", "UPDATE"),
@@ -215,6 +218,8 @@ _FROZEN_TRIGGERS = (
     ("trg_reconcile_nominations_no_delete", "DELETE"),
     ("trg_reconciliation_attempts_no_update", "UPDATE"),
     ("trg_reconciliation_attempts_no_delete", "DELETE"),
+    ("trg_consumption_no_update", "UPDATE"),
+    ("trg_consumption_no_delete", "DELETE"),
 )
 
 

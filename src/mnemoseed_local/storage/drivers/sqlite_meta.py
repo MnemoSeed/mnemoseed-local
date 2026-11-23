@@ -37,6 +37,12 @@ from mnemoseed_local.storage.ports import (
     AuditFilter,
     Capability,
     ConfigEntry,
+    ConsumptionEvent,
+    ConsumptionEventFilter,
+    ConsumptionEventKind,
+    ConsumptionEvidenceKind,
+    ConsumptionMethod,
+    ConsumptionSource,
     DreamRun,
     DreamRunFilter,
     DriverInfo,
@@ -67,6 +73,7 @@ from mnemoseed_local.storage.ports import (
     check_nomination_endpoints,
     check_nomination_provenance,
     derive_composite_group_id,
+    derive_consumption_dedup_key,
     derive_nomination_id,
 )
 from mnemoseed_local.storage.registry import META_DRIVERS, register
@@ -777,6 +784,108 @@ class SqliteMetaDriver:
         items = [_decode_error_event(r) for r in rows]
         return PageResult(items=items, total=total, offset=page.offset, limit=page.limit)
 
+    # ------------------------------------------- consumption-event ledger (S1)
+
+    def append_consumption_event(self, event: ConsumptionEvent) -> bool:
+        """Append one consumption-ledger row; a repeated dedup key returns False.
+
+        ``profile_id`` is stored verbatim and never guessed; ``observed_at``
+        must not move backwards within (profile_id, session_id) so id-order
+        pagination and time-window reads agree. A pre-check returns False for
+        a duplicate before the monotonic guard, keeping repeated deliveries
+        idempotent; the conflict clause still covers a concurrent duplicate.
+        """
+        if not (event.profile_id or "").strip():
+            raise ValueError("consumption event profile_id is required and never guessed")
+        dedup_key = event.dedup_key or derive_consumption_dedup_key(
+            event.profile_id,
+            event.correlation_id,
+            getattr(event.event_kind, "value", event.event_kind),
+            event.evidence_id,
+            getattr(event.method, "value", event.method),
+        )
+        existing = self._conn.execute(
+            "SELECT 1 FROM consumption_events WHERE profile_id = ? AND dedup_key = ?",
+            (event.profile_id, dedup_key),
+        ).fetchone()
+        if existing is not None:
+            return False
+        if event.session_id:
+            row = self._conn.execute(
+                "SELECT observed_at FROM consumption_events "
+                "WHERE profile_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1",
+                (event.profile_id, event.session_id),
+            ).fetchone()
+            if row is not None and event.observed_at < float(row["observed_at"]):
+                raise ValueError(
+                    "consumption event observed_at must not move backwards within "
+                    f"(profile_id, session_id) = ({event.profile_id!r}, {event.session_id!r})"
+                )
+        cursor = self._conn.execute(
+            "INSERT INTO consumption_events (profile_id, observed_at, correlation_id, "
+            "event_kind, evidence_kind, evidence_id, source, method, rank, needle_len, "
+            "needle_hash, session_id, query_hash, dedup_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(profile_id, dedup_key) DO NOTHING",
+            (
+                event.profile_id,
+                event.observed_at,
+                event.correlation_id,
+                getattr(event.event_kind, "value", event.event_kind),
+                getattr(event.evidence_kind, "value", event.evidence_kind),
+                event.evidence_id,
+                getattr(event.source, "value", event.source),
+                getattr(event.method, "value", event.method) if event.method is not None else None,
+                event.rank,
+                event.needle_len,
+                event.needle_hash,
+                event.session_id,
+                event.query_hash,
+                dedup_key,
+            ),
+        )
+        return cursor.rowcount > 0
+
+    def query_consumption_events(
+        self, filter: ConsumptionEventFilter, page: Page
+    ) -> PageResult[ConsumptionEvent]:
+        """Profile-scoped, paginated read in stable append order."""
+        clauses = ["profile_id = ?"]
+        params: list[Any] = [filter.profile_id]
+        if filter.event_kind is not None:
+            clauses.append("event_kind = ?")
+            params.append(filter.event_kind.value)
+        if filter.evidence_kind is not None:
+            clauses.append("evidence_kind = ?")
+            params.append(filter.evidence_kind.value)
+        if filter.session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(filter.session_id)
+        if filter.correlation_id is not None:
+            clauses.append("correlation_id = ?")
+            params.append(filter.correlation_id)
+        if filter.since is not None:
+            clauses.append("observed_at >= ?")
+            params.append(filter.since)
+        if filter.until is not None:
+            clauses.append("observed_at <= ?")
+            params.append(filter.until)
+        where = " AND ".join(clauses)
+        count_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM consumption_events WHERE {where}", params
+        ).fetchone()
+        total = int(count_row[0]) if count_row is not None else 0
+        rows = self._conn.execute(
+            f"SELECT * FROM consumption_events WHERE {where} ORDER BY id LIMIT ? OFFSET ?",
+            [*params, page.limit, page.offset],
+        ).fetchall()
+        return PageResult(
+            items=[_decode_consumption_event(row) for row in rows],
+            total=total,
+            offset=page.offset,
+            limit=page.limit,
+        )
+
     # ------------------------------- reconcile nomination
 
     def append_reconcile_nomination(self, request: NominationRequest) -> NominationResult:
@@ -1304,6 +1413,26 @@ def _decode_error_event(row: sqlite3.Row) -> ErrorEvent:
         retryable=int(retryable) if retryable is not None else None,
         composite_group_id=str(composite_group) if composite_group is not None else None,
         nomination_id=str(nomination_id) if nomination_id is not None else None,
+    )
+
+
+def _decode_consumption_event(row: sqlite3.Row) -> ConsumptionEvent:
+    return ConsumptionEvent(
+        profile_id=str(row["profile_id"]),
+        correlation_id=str(row["correlation_id"]),
+        event_kind=ConsumptionEventKind(str(row["event_kind"])),
+        evidence_kind=ConsumptionEvidenceKind(str(row["evidence_kind"])),
+        evidence_id=str(row["evidence_id"]),
+        source=ConsumptionSource(str(row["source"])),
+        observed_at=float(row["observed_at"]),
+        method=ConsumptionMethod(str(row["method"])) if row["method"] is not None else None,
+        rank=int(row["rank"]) if row["rank"] is not None else None,
+        needle_len=int(row["needle_len"]) if row["needle_len"] is not None else None,
+        needle_hash=str(row["needle_hash"]) if row["needle_hash"] is not None else None,
+        session_id=row["session_id"],
+        query_hash=str(row["query_hash"]) if row["query_hash"] is not None else None,
+        dedup_key=str(row["dedup_key"]) if row["dedup_key"] is not None else None,
+        id=int(row["id"]),
     )
 
 

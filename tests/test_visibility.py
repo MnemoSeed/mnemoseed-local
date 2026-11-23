@@ -388,7 +388,10 @@ def test_signal_text_never_enters_the_needle_registry() -> None:
     for literal in (T1_SIGNAL, T2_SIGNAL, CAPTURE_SIGNAL):
         assert ts_source.count(literal) == 1, literal
     assert len(re.findall(r"registerNeedles\(", ts_source)) == 5  # definition + 4 call sites
-    assert len(re.findall(r"registerNeedles\(registry, (?:text|slicedText), chunkId\)", ts_source)) == 4
+    assert (
+        len(re.findall(r"registerNeedles\(registry, (?:text|slicedText), chunkId(?:, [^)]*)?\)", ts_source))
+        == 4
+    )
     assert len(re.findall(r"needlesOf\(", ts_source)) == 2  # definition + the registerNeedles call
     py_source = EVENTS_PY.read_text(encoding="utf-8")
     assert "needles_of(" not in py_source

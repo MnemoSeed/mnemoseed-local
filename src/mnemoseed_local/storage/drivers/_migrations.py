@@ -561,6 +561,75 @@ _ERROR_EVENTS_DELETE_TRIGGER = AddTrigger(
     pg_action="RAISE EXCEPTION 'error_events is append-only'",
 )
 
+# v18: append-only consumption evidence ledger. One row is one observed event
+# fact (served / injected / consumed_attested / consumed_explicit) keyed by an
+# opaque serve_id, with a pointer and one-way digests only — no reply or query
+# text and no verdict column. Born empty; immutable via BEFORE UPDATE/DELETE
+# triggers, same discipline as error_events.
+_CONSUMPTION_EVENTS_TABLE = CreateTable(
+    store="meta",
+    name="consumption_events",
+    columns=(
+        Column("id", "INTEGER", primary_key=True),
+        Column("profile_id", "TEXT", not_null=True),
+        Column("observed_at", "REAL", not_null=True),
+        Column("correlation_id", "TEXT", not_null=True),
+        Column("event_kind", "TEXT", not_null=True),
+        Column("evidence_kind", "TEXT", not_null=True),
+        Column("evidence_id", "TEXT", not_null=True),
+        Column("source", "TEXT", not_null=True),
+        Column("method", "TEXT"),
+        Column("rank", "INTEGER"),
+        Column("needle_len", "INTEGER"),
+        Column("needle_hash", "TEXT"),
+        Column("session_id", "TEXT"),
+        Column("query_hash", "TEXT"),
+        Column("dedup_key", "TEXT"),
+    ),
+    unique=(("profile_id", "dedup_key"),),
+    checks=(
+        "event_kind IN ('served', 'injected', 'consumed_attested', 'consumed_explicit')",
+        "evidence_kind IN ('chunk', 'node')",
+        "source IN ('daemon', 'plugin_hook', 'agent_tool')",
+        "method IS NULL OR method IN "
+        "('citation_substring_v1', 'explicit_not_useful', 'explicit_unknown', 'unspecified')",
+    ),
+)
+
+_CONSUMPTION_PROFILE_TIME_INDEX = CreateIndex(
+    store="meta",
+    name="idx_consumption_profile_time",
+    table="consumption_events",
+    columns=("profile_id", "observed_at"),
+)
+
+_CONSUMPTION_CORR_INDEX = CreateIndex(
+    store="meta",
+    name="idx_consumption_corr",
+    table="consumption_events",
+    columns=("profile_id", "correlation_id"),
+)
+
+_CONSUMPTION_UPDATE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_consumption_no_update",
+    timing="BEFORE",
+    event="UPDATE",
+    table="consumption_events",
+    action="BEGIN SELECT RAISE(ABORT, 'consumption_events is append-only'); END",
+    pg_action="RAISE EXCEPTION 'consumption_events is append-only'",
+)
+
+_CONSUMPTION_DELETE_TRIGGER = AddTrigger(
+    store="meta",
+    name="trg_consumption_no_delete",
+    timing="BEFORE",
+    event="DELETE",
+    table="consumption_events",
+    action="BEGIN SELECT RAISE(ABORT, 'consumption_events is append-only'); END",
+    pg_action="RAISE EXCEPTION 'consumption_events is append-only'",
+)
+
 # v12 (B1 provider-failure nomination carrier): nullable provider/model/status/reason/retryable
 _V12_ADD_PROVIDER = AddColumn(store="meta", table="error_events", column=Column("provider", "TEXT"))
 _V12_ADD_MODEL = AddColumn(store="meta", table="error_events", column=Column("model", "TEXT"))
@@ -1027,6 +1096,17 @@ MIGRATIONS: tuple[Migration, ...] = (
             _INGEST_EVENTS_STREAM_INDEX,
             _INGEST_WATERMARKS_TABLE,
             _INGEST_APPLIED_TABLE,
+        ),
+    ),
+    Migration(
+        version=18,
+        description="append-only consumption evidence ledger with serve-id correlation",
+        ops=(
+            _CONSUMPTION_EVENTS_TABLE,
+            _CONSUMPTION_PROFILE_TIME_INDEX,
+            _CONSUMPTION_CORR_INDEX,
+            _CONSUMPTION_UPDATE_TRIGGER,
+            _CONSUMPTION_DELETE_TRIGGER,
         ),
     ),
 )

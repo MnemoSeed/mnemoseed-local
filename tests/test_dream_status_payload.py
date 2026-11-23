@@ -463,6 +463,7 @@ def test_dream_status_counting_wrappers_perform_zero_writes_and_no_invocations(
                 "/memory/dream_once",
                 "/memory/dream_status",
                 "/memory/recall_feedback",
+                "/memory/consumption",
             ],
         ),
     ],

@@ -60,7 +60,7 @@
 
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { readFileSync, realpathSync } from "node:fs"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join, sep } from "node:path"
 
@@ -755,6 +755,65 @@ function post(endpoint: string, body: JsonRecord, ack?: () => void, nack?: () =>
   })()
 }
 
+type ConsumptionEvidence = {
+  eventKind: string
+  evidenceId: string
+  serveId: string
+  method: string
+  observedAt: number
+  needle?: string
+}
+
+// Additive consumption evidence: store keys, one-way hashes, lengths and
+// counts leave the host — never reply, injected or query text.
+function buildConsumptionBody(sessionID: string, evidence: ConsumptionEvidence[]): JsonRecord {
+  return {
+    profile_id: PROFILE_ID,
+    host: HOST_ID,
+    session_id: sessionID,
+    items: evidence.map((entry) => ({
+      event_kind: entry.eventKind,
+      evidence_kind: "chunk",
+      evidence_id: entry.evidenceId,
+      method: entry.method,
+      correlation_id: entry.serveId,
+      observed_at: entry.observedAt,
+      needle_len: entry.needle ? entry.needle.length : undefined,
+      needle_hash: entry.needle ? createHash("sha256").update(entry.needle).digest("hex") : undefined,
+    })),
+  }
+}
+
+function postConsumption(sessionID: string, evidence: ConsumptionEvidence[]): void {
+  if (evidence.length === 0) return
+  for (let i = 0; i < evidence.length; i += REINFORCE_BATCH_SIZE) {
+    const batch = evidence.slice(i, i + REINFORCE_BATCH_SIZE)
+    post("/memory/consumption", buildConsumptionBody(sessionID, batch), undefined, () =>
+      debugLog("consumption POST failed", { sessionID }),
+    )
+  }
+}
+
+function registryToInjectedEvidence(registry: Map<string, Map<string, string>>): ConsumptionEvidence[] {
+  const seen = new Set<string>()
+  const out: ConsumptionEvidence[] = []
+  for (const pairs of registry.values()) {
+    for (const [chunkId, serveId] of pairs) {
+      const key = chunkId + "|" + serveId
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        eventKind: "injected",
+        evidenceId: chunkId,
+        serveId,
+        method: "unspecified",
+        observedAt: Date.now() / 1000,
+      })
+    }
+  }
+  return out
+}
+
 // ---- bounded FIFO dedup (Map preserves insertion order; the oldest key is
 // evicted first past the cap) ---------------------------------------------
 
@@ -843,10 +902,10 @@ const REANCHOR_RETRYABLE: ReadonlySet<string> = new Set(
   ["daemon_unreachable", "index_unavailable", "result_not_delivered"]
 )
 const reanchorState = new Map<string, ReanchorState>()
-// sessionID -> needle -> chunk ids: the consumption fingerprint registry, one
-// entry per INJECTED slice (needles derive from the exact sanitized/sliced
-// text that actually entered the block — never from budget-dropped content).
-const injectedRegistry = new Map<string, Map<string, Set<string>>>()
+// sessionID -> needle -> (chunkId -> serveId): the consumption fingerprint
+// registry, one entry per INJECTED slice. The per-chunk serve_id comes from the
+// daemon's additive echo and joins injected/consumed rows back to one serve.
+const injectedRegistry = new Map<string, Map<string, Map<string, string>>>()
 // sessionID -> chunk ids already counted as consumed: at most one reinforce
 // per chunk per session (bounded FP, PRD-B2.1).
 const citedChunks = new Map<string, Set<string>>()
@@ -1022,18 +1081,19 @@ function sessionSelfLine(selfWindow: any): string {
 }
 
 function registerNeedles(
-  registry: Map<string, Set<string>>,
+  registry: Map<string, Map<string, string>>,
   text: string,
   chunkId: string,
+  serveId: string,
 ): void {
   if (!chunkId) return
   for (const needle of needlesOf(text)) {
-    let ids = registry.get(needle)
-    if (ids === undefined) {
-      ids = new Set<string>()
-      registry.set(needle, ids)
+    let pairs = registry.get(needle)
+    if (pairs === undefined) {
+      pairs = new Map<string, string>()
+      registry.set(needle, pairs)
     }
-    ids.add(chunkId)
+    pairs.set(chunkId, serveId)
   }
 }
 
@@ -1057,7 +1117,7 @@ function buildRecallInjection(
   groups: any[],
   selfWindow: any,
   mode: string | null = null,
-): { block: string; registry: Map<string, Set<string>>; includedIds: string[] } | null {
+): { block: string; registry: Map<string, Map<string, string>>; includedIds: string[] } | null {
   // the visibility signal rides inside the block when the mode renders
   // AND the result stays within MAX_INJECT_CHARS; otherwise it sheds whole and
   // the base block is returned byte-identical to the off-mode build.
@@ -1073,7 +1133,7 @@ function buildRecallInjection(
 function buildRecallInjectionBase(
   groups: any[],
   selfWindow: any,
-): { block: string; registry: Map<string, Set<string>>; includedIds: string[]; groupCount: number; chars: number } | null {
+): { block: string; registry: Map<string, Map<string, string>>; includedIds: string[]; groupCount: number; chars: number } | null {
   // Accrue newest-first (groups in payload order, chunks within a group
   // reversed) against a char budget whose final assembled block must stay
   // within MAX_INJECT_CHARS INCLUDING the fence, the disclaimer line, the
@@ -1086,7 +1146,7 @@ function buildRecallInjectionBase(
   // includedIds lists every ADMITTED chunk id (needle or not) — the T2 pull's
   // seen list must match what the session already holds.
   if (!Array.isArray(groups)) return null
-  const registry = new Map<string, Set<string>>()
+  const registry = new Map<string, Map<string, string>>()
   const includedIds: string[] = []
   const lines: string[] = []
   const selfLine = sessionSelfLine(selfWindow)
@@ -1121,7 +1181,7 @@ function buildRecallInjectionBase(
       const prefixLen = prefix.length
       const lineCost = prefixLen + text.length + 1
       if (lineCost <= remaining) {
-        registerNeedles(registry, text, chunkId)
+        registerNeedles(registry, text, chunkId, "")
         if (chunkId) includedIds.push(chunkId)
         groupChunks.push(prefix + text)
         remaining -= lineCost
@@ -1132,7 +1192,7 @@ function buildRecallInjectionBase(
       const sliceBudget = remaining - prefixLen - 2 // prefix, "…" marker and newline
       if (sliceBudget < MIN_SLICE_CHARS) break
       const slicedText = text.slice(-sliceBudget)
-      registerNeedles(registry, slicedText, chunkId)
+      registerNeedles(registry, slicedText, chunkId, "")
       if (chunkId) includedIds.push(chunkId)
       groupChunks.push(prefix + "…" + slicedText)
       remaining = 0
@@ -1155,19 +1215,20 @@ function buildRecallInjectionBase(
 }
 
 function mergeRegistry(
-  target: Map<string, Set<string>>,
-  addition: Map<string, Set<string>>,
+  target: Map<string, Map<string, string>>,
+  addition: Map<string, Map<string, string>>,
 ): void {
   // D7: T2 injections share the SAME needle registry as T1 — later citations
   // of a T2-served chunk reinforce it through the existing consumption guard
-  // (TA-6 by construction). Never replaces the T1 entries.
-  for (const [needle, ids] of addition) {
+  // (TA-6 by construction). Never replaces the T1 entries; each chunk keeps
+  // its own serve_id so a repeated needle keeps distinct serves.
+  for (const [needle, pairs] of addition) {
     let existing = target.get(needle)
     if (existing === undefined) {
-      existing = new Set<string>()
+      existing = new Map<string, string>()
       target.set(needle, existing)
     }
-    for (const id of ids) existing.add(id)
+    for (const [chunkId, serveId] of pairs) existing.set(chunkId, serveId)
   }
 }
 
@@ -1175,7 +1236,7 @@ function buildT2Injection(
   items: any[],
   itemBudget: number,
   mode: string | null = null,
-): { block: string; registry: Map<string, Set<string>> } | null {
+): { block: string; registry: Map<string, Map<string, string>> } | null {
   // the visibility signal rides inside the block when the mode renders
   // AND the result stays within itemBudget + wrapper; otherwise it sheds whole
   // and the base block is returned byte-identical to the off-mode build.
@@ -1193,7 +1254,7 @@ function buildT2Injection(
 function buildT2InjectionBase(
   items: any[],
   itemBudget: number,
-): { block: string; registry: Map<string, Set<string>>; memories: number; chars: number; markerChars: number } | null {
+): { block: string; registry: Map<string, Map<string, string>>; memories: number; chars: number; markerChars: number } | null {
   // B2.1 T2 (D7): same fence + disclaimer envelope and same needle channel as
   // T1 — no group headers (the daemon already shaped the payload). The DAEMON
   // is the only budget authority (capture.auto_recall_budget_chars, reported
@@ -1208,7 +1269,7 @@ function buildT2InjectionBase(
   if (!Array.isArray(items)) return null
   const wrapper =
     RECALL_FENCE_OPEN.length + 1 + RECALL_DISCLAIMER.length + 1 + RECALL_FENCE_CLOSE.length
-  const registry = new Map<string, Set<string>>()
+  const registry = new Map<string, Map<string, string>>()
   const lines: string[] = []
   let remaining = itemBudget
   lines.push(RECALL_FENCE_OPEN, RECALL_DISCLAIMER)
@@ -1229,6 +1290,7 @@ function buildT2InjectionBase(
     const text = sanitizeRecallText(typeof item?.text === "string" ? item.text : "")
     if (!text) continue
     const chunkId = typeof item?.id === "string" ? item.id : ""
+    const serveId = typeof item?.serve_id === "string" ? item.serve_id : ""
     const prefix = itemMarkerPrefix(item)
     // R2 provenance: the affix rides ONLY an explicitly-pinned item; a captured
     // (different source) or source-less item is NOT annotated — absence is the
@@ -1251,7 +1313,7 @@ function buildT2InjectionBase(
           }
           affixIndices.length = 0
         }
-        registerNeedles(registry, text, chunkId)
+        registerNeedles(registry, text, chunkId, serveId)
         lines.push(prefix + text)
         remaining -= text.length + 1
         markerChars += prefix.length
@@ -1262,7 +1324,7 @@ function buildT2InjectionBase(
       }
       return null
     }
-    registerNeedles(registry, text, chunkId)
+    registerNeedles(registry, text, chunkId, serveId)
     lines.push(prefix + (pinned ? text + PIN_SUFFIX : text))
     remaining -= lineCost
     markerChars += prefix.length
@@ -1411,6 +1473,7 @@ async function tryReanchor(sessionID: string, event: any): Promise<void> {
     Date.now() / 1000,
     {},
   )
+  postConsumption(sessionID, registryToInjectedEvidence(built.registry))
 }
 
 async function pullPendingRecall(sessionID: string): Promise<any | null> {
@@ -1517,6 +1580,7 @@ async function onSessionContext(event: any): Promise<void> {
       if (built !== null) {
         event.system.push({ type: "text", text: built.block })
         injectedRegistry.set(sessionID, built.registry)
+        postConsumption(sessionID, registryToInjectedEvidence(built.registry))
         // the T2 seen list = every chunk the T1 injection ADMITTED (needle
         // or not): the daemon merges it so a focal hit never re-serves a T1
         // replay. The daemon caps the list at 16 ids; the T1 budget
@@ -1615,10 +1679,11 @@ async function onSessionContext(event: any): Promise<void> {
         injectedChars = built.block.length
         let registry = injectedRegistry.get(sessionID)
         if (registry === undefined) {
-          registry = new Map<string, Set<string>>()
+          registry = new Map<string, Map<string, string>>()
           injectedRegistry.set(sessionID, registry)
         }
         mergeRegistry(registry, built.registry)
+        postConsumption(sessionID, registryToInjectedEvidence(built.registry))
       } else if (served.enabled === true && served.slot_consumed === true) {
         // IMPORTANT-2: a serve whose response was lost in transit must not
         // leave the arm pulling into the void — the daemon already consumed
@@ -2498,12 +2563,24 @@ function noteConsumption(sessionID: string, text: string): void {
     citedChunks.set(sessionID, cited)
   }
   const hits: string[] = []
-  for (const [needle, chunkIds] of registry) {
+  const consumed: ConsumptionEvidence[] = []
+  for (const [needle, pairs] of registry) {
     if (!normalized.includes(needle)) continue
-    for (const chunkId of chunkIds) {
+    const serveIds = new Set<string>()
+    for (const serveId of pairs.values()) if (serveId) serveIds.add(serveId)
+    const exact = serveIds.size === 1
+    for (const [chunkId, serveId] of pairs) {
       if (cited.has(chunkId)) continue
       cited.add(chunkId)
       hits.push(chunkId)
+      consumed.push({
+        eventKind: "consumed_attested",
+        evidenceId: chunkId,
+        serveId: exact ? serveId : "",
+        method: "citation_substring_v1",
+        observedAt: Date.now() / 1000,
+        needle,
+      })
     }
   }
   if (hits.length === 0) return
@@ -2515,6 +2592,7 @@ function noteConsumption(sessionID: string, text: string): void {
       debugLog("reinforce POST failed", { sessionID, hits: batch }),
     )
   }
+  if (consumed.length > 0) postConsumption(sessionID, consumed)
 }
 
 // Per-session FIFO task chain (B2.2 BLOCKER): turn boundaries at the daemon
