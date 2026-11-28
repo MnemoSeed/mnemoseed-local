@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -143,6 +144,7 @@ def _past_observation_fields(source: str | None, *times: str | None) -> dict[str
 # explicit recall response only, never on the T2 auto-injection surface.
 RESIDUE_HEAD_CHARS = 80
 _RESIDUE_ROW_CAP = 8
+_RESIDUE_TTL_S = 60.0
 _RESIDUE_SCAN_LIMIT = 2000
 
 # B2.1 T2 (design/01 §4.6, PRD-B2.1): the mid-session auto-recall focal scan.
@@ -774,6 +776,24 @@ class MemoryService:
         # Ingest-boundary dedup only — scoring/ranking/provenance never read it.
         self._transcript_ordinals: dict[tuple[str, str, str | None], int] = {}
         self._capture_lock = threading.Lock()
+        # PRD-recall-latency-fix: bounded reinforcement queue; overflow drops
+        # the oldest hit, close() flushes the remainder.
+        self._reinforce_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=64)
+        self._reinforce_dropped = 0
+        self._reinforce_warned = False
+        self._reinforce_closing = False
+        self._reinforce_inflight = 0
+        self._reinforce_state_lock = threading.Lock()
+        self._reinforce_idle = threading.Event()
+        self._reinforce_idle.set()
+        self._reinforce_thread = threading.Thread(
+            target=self._reinforce_loop, daemon=True, name="reinforce-worker"
+        )
+        self._reinforce_thread.start()
+        # The residue scan costs ~1.26 s per recall on the real corpus
+        # (eval/2026-11-28T04-18-07Z); a per-profile TTL cache keeps the block
+        # fresh while recall stops paying the scan on every call.
+        self._residue_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @property
     def retriever(self) -> HybridRetriever:
@@ -782,7 +802,22 @@ class MemoryService:
     def close(self) -> None:
         """Release the retrieval engine (T4 lifecycle fix): the daemon owns the
         HybridRetriever and shuts its track executor down on teardown so worker
-        threads never outlive the process."""
+        threads never outlive the process. Flushes the reinforcement queue
+        first so pending usage writes land while the stores are still open."""
+        self._reinforce_closing = True
+        self._flush_reinforcement()
+        self._reinforce_queue.put(None)
+        self._reinforce_thread.join(timeout=10.0)
+        # Drain whatever raced past the closing check (or outlived the join):
+        # count real items as dropped, swallow the sentinels.
+        while True:
+            try:
+                leftover = self._reinforce_queue.get_nowait()
+            except queue.Empty:
+                break
+            if leftover is not None:
+                with self._reinforce_state_lock:
+                    self._reinforce_dropped += 1
         self._retriever.close()
 
     # ------------------------------------------------------------ recall
@@ -831,7 +866,12 @@ class MemoryService:
             vector_store=self._stores.vector,
             graph_store=self._stores.graph,
         )
-        self._record_hits(context)
+        stamps = {
+            candidate.id: candidate.item
+            for candidate in getattr(recall_result, "candidates", [])
+            if candidate.kind == "chunk"
+        }
+        self._record_hits(context, stamps=stamps)
         if session_id is not None:
             self._refresh_activation(context, profile_id=profile_id, session_id=session_id)
         serve_id = self._next_serve_id(profile_id, session_id)
@@ -867,16 +907,21 @@ class MemoryService:
         except Exception:
             logger.warning("activation refresh failed; recall proceeds", exc_info=True)
 
-    def _record_hits(self, context: AssembledContext) -> None:
-        """FR-3.7 usage events + FR-4.2 reinforcement: fire-and-forget, never
-        failing or blocking recall.
+    def _record_hits(self, context: AssembledContext, stamps: dict[str, Any] | None = None) -> None:
+        """FR-3.7 usage events + FR-4.2 reinforcement: fire-and-forget — the
+        write is enqueued onto the background reinforcement worker so the
+        recall wire never waits on storage (the synchronous write measured
+        3,078 ms on the real corpus, eval/2026-11-28T04-18-07Z).
 
         Only items that made the context package are counted and reinforced (a
         hit means the recalled memory). The raw store write is best-effort by
-        design; the Reinforcer additionally refreshes ``last_reinforced`` and
-        rebounds ``decay_weight`` (bounded at 1.0) for every above-floor hit —
-        and for rescue-admitted pins (design/09 §3.2), whose hits are real
-        consumption events despite sitting below the main floor.
+        design: overflow drops the oldest queued hit (counted), worker errors
+        are logged, and close() flushes the remainder. The Reinforcer
+        additionally refreshes ``last_reinforced`` and rebounds ``decay_weight``
+        (bounded at 1.0) for every above-floor hit — and for rescue-admitted
+        pins (design/09 §3.2), whose hits are real consumption events despite
+        sitting below the main floor. ``stamps`` carries the recall-time
+        ChunkStamps so the worker skips per-id point reads.
         """
         chunk_ids = [entry.id for entry in context.entries if entry.kind == "chunk"]
         node_ids = [entry.id for entry in context.entries if entry.kind == "graph"]
@@ -887,10 +932,87 @@ class MemoryService:
         ]
         if not chunk_ids and not node_ids:
             return
+        self._enqueue_reinforce(chunk_ids, node_ids, rescued, stamps or {})
+
+    def _enqueue_reinforce(
+        self,
+        chunk_ids: Sequence[str],
+        node_ids: Sequence[str],
+        rescued: Sequence[str],
+        stamps: dict[str, Any],
+    ) -> None:
+        if self._reinforce_closing:
+            with self._reinforce_state_lock:
+                self._reinforce_dropped += 1
+            logger.warning("reinforcement enqueue after close; dropped")
+            return
+        item = {
+            "chunk_ids": list(chunk_ids),
+            "node_ids": list(node_ids),
+            "rescued": list(rescued),
+            "stamps": stamps,
+        }
         try:
-            self._reinforcer.record_hits(chunk_ids, node_ids, rescued_chunk_ids=rescued)
-        except Exception:  # pragma: no cover - usage accounting must not fail recall
-            logger.warning("usage-event write failed; recall proceeds", exc_info=True)
+            self._reinforce_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        with self._reinforce_state_lock:
+            self._reinforce_dropped += 1
+        try:
+            self._reinforce_queue.get_nowait()
+            with self._reinforce_state_lock:
+                self._reinforce_dropped += 1
+        except queue.Empty:  # pragma: no cover - raced drain
+            pass
+        try:
+            self._reinforce_queue.put_nowait(item)
+        except queue.Full:  # pragma: no cover - raced drain
+            with self._reinforce_state_lock:
+                self._reinforce_dropped += 1
+        with self._reinforce_state_lock:
+            warned = self._reinforce_warned
+            if not warned:
+                self._reinforce_warned = True
+        if not warned:
+            logger.warning("reinforcement queue overflow; dropping oldest hits (best-effort)")
+
+    def _reinforce_loop(self) -> None:
+        while True:
+            item = self._reinforce_queue.get()
+            if item is None:
+                self._reinforce_queue.task_done()
+                return
+            with self._reinforce_state_lock:
+                self._reinforce_inflight += 1
+            self._reinforce_idle.clear()
+            try:
+                self._reinforcer.record_hits(
+                    item["chunk_ids"],
+                    item["node_ids"],
+                    rescued_chunk_ids=item["rescued"],
+                    stamps=item.get("stamps"),
+                )
+            except Exception:  # pragma: no cover - usage accounting must not fail recall
+                logger.warning("reinforcement write failed; dropped", exc_info=True)
+            finally:
+                with self._reinforce_state_lock:
+                    self._reinforce_inflight -= 1
+                    if self._reinforce_inflight == 0:
+                        self._reinforce_idle.set()
+                self._reinforce_queue.task_done()
+
+    def _flush_reinforcement(self, timeout: float = 15.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._reinforce_queue.empty() and self._reinforce_idle.is_set():
+                return True
+            time.sleep(0.02)
+        logger.warning(
+            "reinforcement flush timed out; %d queued item(s) dropped",
+            self._reinforce_queue.qsize(),
+        )
+        return False
 
     def _next_serve_id(self, profile_id: str, session_id: str | None) -> str:
         """Mint an opaque per-serve correlation id, monotonic within the boot."""
@@ -1029,7 +1151,19 @@ class MemoryService:
         profile holds more chunks than the bounded newest-first scan covered,
         so silently invisible older residues stay detectable. Deterministic,
         zero model calls: the point is a Koriat-style feeling-of-knowing hook,
-        not a served memory."""
+        not a served memory. The scan costs ~1.26 s per call on the real
+        corpus, so the block is cached per profile behind a TTL; ``cached`` /
+        ``cache_age_s`` disclose the staleness on the wire."""
+        now = self._clock()
+        cached = self._residue_cache.get(profile_id)
+        if cached is not None and now < cached[0]:
+            block_age = round(now - (cached[0] - _RESIDUE_TTL_S), 3)
+            return {**cached[1], "cached": True, "cache_age_s": block_age}
+        block = self._compute_index_residue(profile_id)
+        self._residue_cache[profile_id] = (now + _RESIDUE_TTL_S, block)
+        return {**block, "cached": False, "cache_age_s": 0.0}
+
+    def _compute_index_residue(self, profile_id: str) -> dict[str, Any]:
         rescue_floor = self._retriever.config.rescue_min_decay
         page = self._stores.vector.list_chunks(
             ChunkFilter(profile_id=profile_id), Page(offset=0, limit=_RESIDUE_SCAN_LIMIT)
@@ -1081,6 +1215,7 @@ class MemoryService:
         B2.7: every branch persists the standing ``rules`` on the chunk
         (``rules_json``) — the driver merges them by identity on a re-upsert, so
         a near-duplicate re-pin never drops rules."""
+        self._residue_cache.pop(profile_id, None)
         now = time.time()
         rules_dicts = [rule.model_dump() for rule in rules] if rules else []
         extracted = self._cues.extract(text)
