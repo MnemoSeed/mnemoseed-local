@@ -427,6 +427,7 @@ class TestRescueReboundPath:
         )
 
         result = svc.recall(profile_id=_PROFILE, query="what happened with AtlasDb")
+        svc._flush_reinforcement()
 
         entries = result["memory"]["entries"]
         rescued = [entry for entry in entries if entry["id"] == "aged-pin"]

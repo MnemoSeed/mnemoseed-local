@@ -228,6 +228,8 @@ def run_rescue_point(
         rig.seed_material(material)
         weights_before = rig.chunk_weights()
         response = rig.recall(material.query)
+        # Reinforcement is queued off-wire; flush before reading.
+        rig._state.memory._flush_reinforcement()
         weights_after = rig.chunk_weights()
     metrics = score_rescue_run(
         material,

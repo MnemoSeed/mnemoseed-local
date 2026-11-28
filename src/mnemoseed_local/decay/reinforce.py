@@ -31,7 +31,7 @@ same flat-step semantics, so both event sides stay consistent.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from mnemoseed_local.schema.graph import GraphNode
@@ -93,6 +93,7 @@ class Reinforcer:
         node_ids: Sequence[str],
         *,
         rescued_chunk_ids: Sequence[str] = (),
+        stamps: Mapping[str, ChunkStamp] | None = None,
     ) -> None:
         """Consume one batch of retrieval usage events.
 
@@ -102,16 +103,32 @@ class Reinforcer:
         rebounded; below-floor items only count their usage — except chunks
         named in ``rescued_chunk_ids`` (design/09 §3.2): a cue-rescued hit is a
         real consumption event, so the below-floor pin gets the same rebound.
+        ``stamps`` carries recall-time ChunkStamps keyed by id; an id present
+        there skips the per-id ``get_chunk`` point read (measured ~500 ms each
+        on the real corpus, eval/2026-11-28T04-18-07Z). Recall-time weights
+        coalesce rapid repeat hits inside one drain window: two hits on a 0.5
+        chunk rebound once to 0.6 where the old re-read path stepped 0.6 then
+        0.7 — bounded by one bonus step per coalesced pair (the spacing-effect
+        cooldown at reinforce.py:24-28, deliberately unimplemented, is thereby
+        approximated at drain-window scale).
         """
         now = self._clock()
         rescued = frozenset(rescued_chunk_ids)
-        self._record_chunk_hits(chunk_ids, now, rescued)
+        self._record_chunk_hits(chunk_ids, now, rescued, stamps or {})
         self._record_node_hits(node_ids, now)
 
-    def _record_chunk_hits(self, chunk_ids: Sequence[str], now: float, rescued: frozenset[str]) -> None:
+    def _record_chunk_hits(
+        self,
+        chunk_ids: Sequence[str],
+        now: float,
+        rescued: frozenset[str],
+        stamps: Mapping[str, ChunkStamp],
+    ) -> None:
         updates: list[WeightUpdate] = []
         for chunk_id in chunk_ids:
-            chunk = self._stores.vector.get_chunk(chunk_id)
+            chunk = stamps.get(chunk_id)
+            if chunk is None:
+                chunk = self._stores.vector.get_chunk(chunk_id)
             if chunk is None:
                 continue
             if chunk.decay_weight >= self._config.min_decay or chunk_id in rescued:
